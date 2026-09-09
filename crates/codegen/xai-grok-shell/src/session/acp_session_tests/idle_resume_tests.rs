@@ -39,7 +39,6 @@ async fn test_last_api_request_at_idle_detection() {
         .await;
 }
 /// End-to-end test for `maybe_refresh_model_metadata_on_resume`.
-///
 /// Simulates a session idle for more than 10 minutes, then verifies the function fetches `/models-v2` and parses the response.
 /// The refresh must update `context_window` and `max_completion_tokens` in the sampling config.
 #[tokio::test(flavor = "current_thread")]
@@ -105,12 +104,16 @@ async fn test_e2e_idle_resume_refreshes_model_metadata() {
                 vec![],
                 xai_grok_sampling_types::SamplingConfig {
                     base_url: mock_url,
+                    mtls_cert_dir: None,
                     model: "test-model".to_string(),
                     max_completion_tokens: Some(8192),
                     temperature: None,
                     top_p: None,
+                    max_retries: None,
+                    rate_limit_retry_threshold: None,
                     api_backend: Default::default(),
                     extra_headers: Default::default(),
+                    conversation_group_id: None,
                     query_params: Default::default(),
                     env_http_headers: Default::default(),
                     context_window: std::num::NonZeroU64::new(200_000).unwrap(),
@@ -144,15 +147,15 @@ async fn test_e2e_idle_resume_refreshes_model_metadata() {
                 model_auth_memo: std::cell::RefCell::new(None),
                 auth_manager: {
                     let dir = tempfile::tempdir().unwrap();
-                    let mgr = std::sync::Arc::new(crate::auth::AuthManager::new(
+                    let mgr = std::sync::Arc::new(xai_grok_login::AuthManager::new(
                         dir.path(),
-                        crate::auth::GrokComConfig::default(),
+                        xai_grok_login::GrokComConfig::default(),
                     ));
-                    mgr.hot_swap(crate::auth::GrokAuth {
-                        auth_mode: crate::auth::AuthMode::Oidc,
+                    mgr.hot_swap(xai_grok_login::GrokAuth {
+                        auth_mode: xai_grok_login::AuthMode::Oidc,
                         refresh_token: Some("rt".into()),
                         expires_at: Some(chrono::Utc::now() + chrono::Duration::hours(1)),
-                        ..crate::auth::GrokAuth::test_default()
+                        ..xai_grok_login::GrokAuth::test_default()
                     });
                     std::mem::forget(dir);
                     Some(mgr)
@@ -234,6 +237,7 @@ async fn test_e2e_idle_resume_refreshes_model_metadata() {
                 },
                 session_start: std::time::Instant::now(),
                 inference_idle_timeout: Duration::from_secs(300),
+                uncharged_401_park_enabled: true,
                 max_retries: 3,
                 rate_limit_waits: crate::session::acp_session::RateLimitWaitConfig::default(),
                 max_turns: None,
@@ -305,11 +309,13 @@ async fn test_e2e_idle_resume_refreshes_model_metadata() {
                 mcp_reminder_mode: McpReminderMode::Delta,
                 mcp_reminder_dirty: Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 mcp_connecting_reminder_injected: std::cell::Cell::new(false),
-                mcp_handshakes_done: Arc::new(tokio::sync::Notify::new()),
+                mcp_refresh_gate: Arc::new(tokio::sync::Mutex::new(())),
                 user_input_generation: std::sync::atomic::AtomicU64::new(0),
                 laziness_debug_log: None,
                 last_live_orphan_reconcile: std::cell::Cell::new(None),
-                deferred_prefix: TaskSlot::new(),
+                deferred_prefix: DeferredPrefix::new(),
+                mcp_startup_waits: Default::default(),
+                mcp_init_tasks: Default::default(),
                 extension_registry: xai_agent_lifecycle::LocalExtensionRegistry::default(),
                 last_announced_local_date: std::cell::Cell::new(chrono::Local::now().date_naive()),
                 prefix_carries_fallback_date: std::cell::Cell::new(false),
@@ -328,6 +334,7 @@ async fn test_e2e_idle_resume_refreshes_model_metadata() {
                 events: crate::session::events::EventTracker::new(std::path::Path::new("/tmp")),
                 observability_bridge: noop_observability_bridge(),
                 current_turn_number: std::cell::Cell::new(0),
+                turn_phases: std::sync::Arc::default(),
                 last_recap_main_turn: std::cell::Cell::new(0),
                 recap_in_flight: std::cell::Cell::new(false),
                 recap_epoch: std::cell::Cell::new(0),
@@ -340,6 +347,8 @@ async fn test_e2e_idle_resume_refreshes_model_metadata() {
                 title_refresh_enabled: false,
                 session_turn_active: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 streaming_turn_capture: parking_lot::Mutex::new(StreamingTurnCapture::default()),
+                stream_apply_span: parking_lot::Mutex::new(None),
+                current_turn_span_id: parking_lot::Mutex::new(None),
                 turn_stream_drained: parking_lot::Mutex::new(std::collections::HashMap::new()),
                 pending_image_strip: parking_lot::Mutex::new(std::collections::HashMap::new()),
                 image_strip_rewrite_barrier: ImageStripRewriteBarrier::new(),

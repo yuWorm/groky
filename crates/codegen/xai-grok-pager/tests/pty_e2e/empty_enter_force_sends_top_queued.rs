@@ -9,6 +9,14 @@ use super::common::*;
 #[ignore]
 async fn empty_enter_force_sends_top_queued() {
     let content = ContentController::start().await.expect("start content");
+    content
+        .server()
+        .set_settings(json!({ "allow_access": true, "dock_enabled": true }));
+    std::fs::write(
+        content.sandbox().grok_home().join("requirements.toml"),
+        "[features]\ndock = true\n",
+    )
+    .expect("pin dock in test requirements");
     let mut turn_one = content
         .expect_agent_turn_blocked("running turn before send-now", slow_turn_text("TURNONE"));
     let mut turn_two = content.expect_agent_turn(
@@ -17,9 +25,16 @@ async fn empty_enter_force_sends_top_queued() {
     );
 
     let binary = pager_binary().expect("resolve pager binary");
-    let mut harness =
-        PtyHarness::spawn_with_content(&binary, DEFAULT_ROWS, DEFAULT_COLS, &content, &[])
-            .expect("spawn pager");
+    let mut harness = PtyHarness::spawn_with_content_env_in_dir(
+        &binary,
+        DEFAULT_ROWS,
+        DEFAULT_COLS,
+        &content,
+        &[],
+        &[("GROK_DOCK", "1")],
+        Some(content.home()),
+    )
+    .expect("spawn pager");
 
     harness
         .wait_for_text(WELCOME_SCREEN_SENTINEL, WELCOME_TIMEOUT)
@@ -40,6 +55,11 @@ async fn empty_enter_force_sends_top_queued() {
     harness
         .wait_for_text("please also check the logs", Duration::from_secs(10))
         .expect("queued text visible");
+    assert!(
+        !harness.contains_text("Queued · Enter to send now"),
+        "dock-shown queueing must not show the send-now tip\nscreen:\n{}",
+        harness.screen_contents()
+    );
 
     // Composer is empty after queue; bare Enter sends the top row now
     // The shell cancels turn 1 (the abort beats the held completion) and promotes the row to run as turn 2

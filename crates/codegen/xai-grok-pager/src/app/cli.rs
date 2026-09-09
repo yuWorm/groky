@@ -36,10 +36,7 @@ pub enum Command {
         )]
         device_auth: bool,
         /// Authenticate for remote development environments (hidden).
-        ///
-        /// Field is always present so match arms stay feature-unification-safe
-        /// across Bazel/cargo graphs; clap only registers `--devbox` when
-        /// `devbox-login` is enabled (`arg(skip)` otherwise → always false).
+        /// Field is always present so match arms stay feature-unification-safe; clap registers `--devbox` only when that feature is enabled (`arg(skip)` otherwise → always false).
         #[arg(skip)]
         devbox: bool,
     },
@@ -142,7 +139,6 @@ See ~/.grok/README.md for more information.
     #[command(hide = true)]
     Workspace(WorkspaceMgmtArgs),
     /// Open the Agent Dashboard view at startup.
-    ///
     /// The dashboard shows every session, top-level and subagents.
     /// Disabled when `[dashboard].enabled = false` in `~/.grok/config.toml` or when the `GROK_AGENT_DASHBOARD=0` env var is set.
     Dashboard,
@@ -386,7 +382,6 @@ pub struct LeaderArgs {
     pub no_exit_on_disconnect: bool,
     /// Defer the grok.com relay WebSocket until the first headless IPC client registers.
     /// Without this flag the leader connects the relay eagerly at startup.
-    /// Bare leaders (headless remote env / systemd) need the eager connect: they receive remote prompts *through* the relay.
     /// Passed by leaders auto-spawned from interactive clients (TUI/IDE), which only need the relay if a headless client appears.
     #[arg(long)]
     pub relay_on_demand: bool,
@@ -427,6 +422,8 @@ pub struct PagerArgs {
     #[arg(long)]
     pub cwd: Option<PathBuf>,
     /// Use a custom leader socket path instead of the default `~/.grok/leader.sock`.
+    /// A local/branch build can thus run an isolated leader without colliding with the default one already running on the machine
+    /// Name it `~/.grok/leader-*.sock` to keep `grok leader list/kill` able to find it; any other location works but won't be auto-discovered
     #[arg(
         long = "leader-socket",
         value_name = "PATH",
@@ -589,7 +586,6 @@ pub struct PagerArgs {
     pub fork_session: bool,
     /// Start the session in a new git worktree, optionally named.
     /// With `--resume` of a remote session, pass `--restore-code` to apply the snapshot codebase (conversation is restored either way).
-    /// Headless (`-p`) does not create a worktree from this flag.
     #[arg(short = 'w', long = "worktree", num_args = 0..= 1, default_missing_value = "")]
     pub worktree: Option<String>,
     /// Branch, tag, or commit to base the worktree on (with `--worktree`).
@@ -649,7 +645,7 @@ pub struct PagerArgs {
         hide = true
     )]
     pub no_memory: bool,
-    /// Run a memory flush after the headless turn (or instead of a prompt when
+    /// Run a memory flush after the headless turn (or instead of a prompt when resuming). Calls `x.ai/memory/flush` and waits for the flush LLM.
     /// resuming). Calls `x.ai/memory/flush` and waits for the flush LLM.
     /// Headless only: `/flush` as `-p` text is not a reliable flush trigger.
     #[arg(long = "memory-flush", hide = true)]
@@ -686,7 +682,6 @@ pub struct PagerArgs {
     #[arg(long = "disable-web-search")]
     pub disable_web_search: bool,
     /// Exit as soon as the first agent turn ends, without waiting for pending background bash/monitor tasks or background subagents (headless only).
-    /// Default for all `grok -p` runs is to wait (up to `--background-wait-timeout`) so eval harnesses see full task completion.
     /// Use this for fast scripts that only need the first turn's text.
     /// Does not wait for server-side auto-wake output or persistent monitors (those hit the timeout).
     #[arg(long = "no-wait-for-background", hide = true)]
@@ -694,7 +689,6 @@ pub struct PagerArgs {
     /// Max seconds to wait for background work after the first turn ends (headless only).
     /// Applies to bash/monitor `task_completed`, background subagents (`SubagentFinished`), and any still-running non-persistent work.
     /// Persistent `monitor(persistent:true)` never completes and always waits the full timeout.
-    /// Use `--no-wait-for-background` or a lower timeout for throughput. Conflicts with `--no-wait-for-background`.
     #[arg(
         long = "background-wait-timeout",
         value_name = "SECS",
@@ -729,7 +723,6 @@ pub struct PagerArgs {
     #[arg(long = "no-auto-update", hide = true)]
     pub no_auto_update: bool,
     /// Enable the runtime turn-end TodoGate for this session.
-    ///
     /// Session-scoped (not persisted).
     /// Highest precedence: overrides remote `todo_gate_enabled` and the built-in default (which is `false`).
     #[arg(long = "todo-gate", hide = true)]
@@ -742,9 +735,7 @@ pub struct PagerArgs {
     pub no_alt_screen: bool,
     /// Experimental: scrollback-native rendering.
     /// Finalized blocks are printed into the terminal's native scrollback (use the terminal's own scroll / selection).
-    /// A small pinned region holds the prompt and running turn.
     /// Session-scoped only, does not write config.
-    /// To default plain `grok` to minimal, set `[ui] screen_mode = "minimal"` in ~/.grok/config.toml.
     #[arg(long = "minimal")]
     pub minimal: bool,
     /// Open in the standard fullscreen TUI for this session, overriding a config `[ui] screen_mode = "minimal"` preference.
@@ -884,7 +875,6 @@ impl PagerArgs {
         self.local_workspace_cwd.as_deref()
     }
     /// Get the session ID to resume, from either --resume or --load (hidden alias).
-    ///
     /// Returns `None` when `--resume` was used without a value (the empty-string sentinel).
     /// Use [`resume_most_recent`] to detect that case.
     pub fn session_to_resume(&self) -> Option<&str> {
@@ -939,21 +929,14 @@ impl PagerArgs {
     }
     /// Resolve the sandbox profile to apply at startup, accounting for the profile the resumed session was created with.
     /// `saved` is the resumed session's persisted profile (read once via [`Self::saved_resume_profile`]).
-    ///
-    /// A session's profile is fixed at creation. Resuming restores it.
     /// An explicit `--sandbox`/`GROK_SANDBOX` that differs from the saved profile is refused: changing a session's sandbox on resume would be unsafe.
-    /// A matching flag, or no flag, resumes with the saved profile.
     pub fn startup_sandbox_profile(&self, saved: Option<&str>) -> SandboxStartup {
         let explicit = self.sandbox.as_deref().filter(|s| !s.is_empty());
         Self::resolve_startup_sandbox(explicit, saved.map(String::from))
     }
-    /// Pin an explicit non-UUID, non-chat resume/load target to its canonical local session id, before the (irreversible) OS sandbox is applied.
-    ///
-    /// Resolving once makes the saved-profile peek and materialization consume the same immutable target.
     /// `resume_target_pinned` records the pin so materialization never re-runs local title selection.
     /// Re-selecting after the sandbox would race a concurrent rename/create.
     /// Listing failures and ambiguity are hard errors here, reported before the sandbox (fail closed).
-    /// A definitive no-match keeps the raw arg for the legacy remote/worktree id path.
     pub fn pin_local_resume_target(&mut self) -> anyhow::Result<()> {
         let cwd_buf = std::env::current_dir().ok();
         let cwd_str = cwd_buf.as_deref().map(|p| p.to_string_lossy());

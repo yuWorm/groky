@@ -1,9 +1,8 @@
 pub mod config;
-pub(crate) mod dual_clock;
-pub mod grok_auth_credentials;
+// Extracted to the `xai-grok-login` crate; re-exported so `crate::util::grok_auth_credentials::*` call sites keep compiling unchanged.
+pub use xai_grok_login::grok_auth_credentials;
 pub mod hooks;
 pub mod limits;
-pub(crate) mod subprocess;
 pub(crate) mod text_sanitize;
 pub(crate) mod user_identity;
 
@@ -47,61 +46,6 @@ pub(crate) struct AbortOnDrop(pub tokio::task::JoinHandle<()>);
 impl Drop for AbortOnDrop {
     fn drop(&mut self) {
         self.0.abort();
-    }
-}
-
-/// Expand a leading `~` to the home directory; other paths pass through.
-pub(crate) fn expand_home(s: &str) -> std::path::PathBuf {
-    if let Some(stripped) = s.strip_prefix("~/") {
-        if let Some(home) = xai_dirs::home_dir() {
-            return home.join(stripped);
-        }
-    } else if s == "~"
-        && let Some(home) = xai_dirs::home_dir()
-    {
-        return home;
-    }
-    std::path::PathBuf::from(s)
-}
-
-#[cfg(test)]
-mod expand_home_tests {
-    use super::expand_home;
-
-    #[test]
-    fn passthrough_for_absolute_path() {
-        assert_eq!(
-            expand_home("/abs/path"),
-            std::path::PathBuf::from("/abs/path")
-        );
-    }
-
-    #[test]
-    fn passthrough_for_relative_path() {
-        assert_eq!(
-            expand_home("rel/path"),
-            std::path::PathBuf::from("rel/path")
-        );
-    }
-
-    #[test]
-    fn bare_tilde() {
-        let home = xai_dirs::home_dir().expect("home_dir required for this test");
-        assert_eq!(expand_home("~"), home);
-    }
-
-    #[test]
-    fn tilde_slash() {
-        let home = xai_dirs::home_dir().expect("home_dir required for this test");
-        assert_eq!(expand_home("~/foo/bar"), home.join("foo/bar"));
-    }
-
-    #[test]
-    fn does_not_handle_user_tilde() {
-        assert_eq!(
-            expand_home("~bob/path"),
-            std::path::PathBuf::from("~bob/path")
-        );
     }
 }
 

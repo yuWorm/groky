@@ -9,7 +9,6 @@ use crate::event::HookEventName;
 use crate::matcher::HookMatcher;
 
 /// The loaded set of hooks, indexed by event type for fast lookup.
-///
 /// This is a point-in-time snapshot.
 /// Edits to hook files on disk are only picked up by new sessions.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -165,8 +164,6 @@ pub fn load_hooks_from_sources(
 }
 
 /// Load hook specs from global and project sources WITHOUT deduplicating.
-/// A caller can combine them with specs from other origins (e.g. config layers) and run a single dedup pass.
-/// Global specs are prefixed `global/` and project specs `project/`.
 /// Global specs precede project specs so a later first-wins dedup keeps the global copy of an identical duplicate.
 pub fn collect_specs_from_sources(
     global_sources: &[HookSource<'_>],
@@ -213,13 +210,8 @@ pub fn collect_specs_from_sources(
 }
 
 /// Build a registry from specs, deduping on (canonical event, command_raw, url_raw, configured_matcher) so a hook from several origins runs once.
-/// Earlier specs win, so callers place higher-authority first.
 /// `timeout_ms`/`extra_env` are intentionally excluded from the key.
-///
-/// Exception: the copy with the highest [`HookProvenance::authority_rank`] wins regardless of arrival order.
 /// Otherwise a byte-identical hook in a user-writable layer (which loads earlier) would shadow the root-owned copy's provenance.
-/// With it would go the no-disable rule and the pinned timeout/env.
-/// Rank ordering also settles managed-vs-managed pairs (`$GROK_HOME/requirements.toml` arrives before `/etc/grok`).
 pub fn registry_from_specs_deduped(specs: Vec<HookSpec>) -> HookRegistry {
     let mut hooks: HashMap<HookEventName, Vec<HookSpec>> = HashMap::new();
     let mut seen_content: HashMap<(HookEventName, String, String, String), (HookEventName, usize)> =

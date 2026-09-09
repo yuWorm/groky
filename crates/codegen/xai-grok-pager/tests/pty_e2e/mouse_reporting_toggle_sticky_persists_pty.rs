@@ -2,17 +2,9 @@
 #[allow(unused_imports)]
 use super::common::*;
 
-/// With the toggle enabled in config and env, scrollback Ctrl+R exercises the opt-in mouse reporting toggle.
-/// Non-dev builds have no `tracing_rx` metronome, so the toggle's effect must appear without background ticks.
-///
-/// Success is any visible effect of `dispatch_toggle_mouse_capture` reached through the key-to-Action path:
-/// - sticky off banner (`MOUSE_OFF_*`), and/or
-/// - transient "Mouse reporting on" toast
-///
-/// Which one appears depends on whether PTY startup left capture on or off; both prove the toggle runs without background ticks.
-/// Unit tests in `dispatch.rs` (`mouse_reporting_toggle_off_sticky_*`) cover the sticky off state persisting and capture turning back on.
-///
-/// The product's primary path is Ctrl+R with the scrollback focused (`When::ScrollbackFocused`).
+/// With the toggle enabled in config and env, scrollback. CtrlCtrl+R exercises the opt-in mouse
+/// reporting toggle. Non-dev builds have no `tracing_rx` metronome, so the toggle's effect must
+/// appear without background ticks.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore]
 async fn mouse_reporting_toggle_sticky_persists_pty() {
@@ -39,10 +31,9 @@ async fn mouse_reporting_toggle_sticky_persists_pty() {
     let toggle_visible =
         |h: &PtyHarness| sticky_visible(h) || h.contains_text("Mouse reporting on");
 
-    // Defocus the prompt so the scrollback owns keys. Tab leaves the prompt; Esc is reserved for the cancel/clear/rewind policy.
-    // Tab TOGGLES focus, so never re-press it blindly: a lagged frame would bounce focus back to the prompt
-    // The closure returns if the scrollback already owns keys; otherwise it presses Tab once and waits for the footer's "Space:prompt" to render
-    // This mirrors `drive_to_scrollback_with_turn`
+    // Tab TOGGLES focus, so never re-press it blindly: a lagged frame would bounce focus back to the
+    // prompt. The closure returns if the scrollback already owns keys; otherwise it presses Tab once
+    // and waits for the footer's "Space:prompt" to render.
     let focus_scrollback = |h: &mut PtyHarness| {
         if h.contains_text("Space:prompt") {
             return;

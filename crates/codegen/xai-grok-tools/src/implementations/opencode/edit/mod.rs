@@ -42,10 +42,9 @@ use crate::types::tool::{ToolKind, ToolNamespace};
 // Description
 // ───────────────────────────────────────────────────────────────────────────
 
-// NOTE: OpenCode's `EditInput` serializes camelCase (`oldString`, `newString`,
-// `replaceAll`), so param refs must use the camelCase schema property names —
-// the snake_case `params.edit.old_string` keys of the grok_build twin resolve
-// to "" here (the kind-params map is keyed by schema property names).
+// NOTE: OpenCode's `EditInput` serializes camelCase (`oldString`, `newString`, `replaceAll`), so param refs must use
+// the camelCase schema property names — the snake_case `params.edit.old_string` keys of the grok_build twin resolve to
+// "" here (the kind-params map is keyed by schema property names).
 const DESCRIPTION: &str = r#"Performs exact string replacements in files.
 
 Usage:${%- if tools.by_kind.read %}

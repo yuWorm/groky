@@ -220,10 +220,6 @@ impl ReadToolCallBlock {
     }
 
     /// Header line with only the path (or skill name) span selectable.
-    ///
-    /// Spans: `["Read ", path, optional_range_suffix, optional_extra_suffix]` or `["Skill ", skill_name]`.
-    /// The prefix and suffixes stay out of the selection, with no `selection_text` override.
-    /// Non-skill paths also get a filesystem link target.
     fn header_block_line(&self, line: Line<'static>, cwd: Option<&std::path::Path>) -> BlockLine {
         let path_end = 2.min(line.spans.len()).max(1);
         let link_target = if self.skill_name().is_some() {

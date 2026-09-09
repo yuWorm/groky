@@ -62,23 +62,32 @@ pub struct SessionNotification {
     pub meta: Option<serde_json::Value>,
 }
 
-/// Wire usage for ACP `_meta.usage` and `TurnCompleted.usage`.
-///
-/// # Wire contract (ACP vs headless)
-///
-/// | Surface | `input_tokens` / `inputTokens` | Cost |
-/// |---------|--------------------------------|------|
-/// | **ACP** (`PromptUsage`) | **Full** prompt sum (includes cache reads) | `costUsdTicks` (1e10 ticks = $1), scrubbed when partial/incomplete |
-/// | **Headless** ([`project_result_usage`]) | **Uncached only** (`full − cache_read`) | Float `total_cost_usd` + exact `total_cost_usd_ticks`, only when complete |
-/// | ACP `_meta` sibling fields | **Last model call only** (not whole-prompt) | — |
-///
-/// Trust cost only when present **and** not `usageIsIncomplete` **and** not
-/// `costIsPartial`. Absence of cost means untrustworthy or unknown, not free.
-///
-/// Mixed headless shape is frozen for external-tool compatibility: snake_case
-/// on totals (`usage.input_tokens`, `total_cost_usd`) and camelCase under
-/// `modelUsage` (`inputTokens`, `costUSD`). Per-model rows are a reduced
-/// schema (no reasoning/duration on the wire).
+impl SessionNotification {
+    /// Durable projection: typed field cleared, not a JSON patch.
+    /// Sole strip site for JSONL and GCS writes.
+    pub(crate) fn without_live_agent_address(&self) -> std::borrow::Cow<'_, Self> {
+        match &self.update {
+            SessionUpdate::SubagentSpawned {
+                agent_address: Some(_),
+                ..
+            } => {
+                let mut stripped = self.clone();
+                if let SessionUpdate::SubagentSpawned { agent_address, .. } = &mut stripped.update {
+                    *agent_address = None;
+                }
+                std::borrow::Cow::Owned(stripped)
+            }
+            _ => std::borrow::Cow::Borrowed(self),
+        }
+    }
+
+    pub(crate) fn to_durable_value(&self) -> Result<serde_json::Value, serde_json::Error> {
+        serde_json::to_value(&*self.without_live_agent_address())
+    }
+}
+
+/// | Surface | `input_tokens` / `inputTokens` | Cost | |---------|--------------------------------|------| | **ACP** (`PromptUsage`) | **Full** prompt sum (includes cache reads) | `costUsdTicks` (1e10 ticks = $1), scrubbed when partial/incomplete | | **Headless** ([`project_result_usage`]) | **Uncached only** (`full − cache_read`) | Float `total_cost_usd` + exact `total_cost_usd_ticks`, only when complete | | ACP `_meta` sibling fields | **Last model call only** (not whole-prompt) | — |
+/// Trust cost only when present **and** not `usageIsIncomplete` **and** not `costIsPartial`. Absence of cost means untrustworthy or unknown, not free.
 #[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct PromptUsage {
     #[serde(flatten)]
@@ -294,13 +303,9 @@ pub(crate) fn uncached_input_tokens(full_input: u64, cached_read: u64) -> u64 {
     full_input.saturating_sub(cached_read)
 }
 
-/// Project usage onto a headless result object.
-///
-/// - `usage.input_tokens` is uncached (`full − cache_read − cache_creation`), so the three prompt buckets are disjoint.
-///   The identity is `input_tokens + cache_read + cache_creation + output = total_tokens`.
-/// - Omits all cost floats when partial or incomplete (absent cost does not mean free).
-/// - Incomplete with no tokens emits only `usage_is_incomplete` (no zero usage object).
-/// - `modelUsage` rows are a reduced external-compat schema (camelCase; no reasoning/duration).
+/// Project usage onto a headless result object. `usage.input_tokens` is uncached (`full − cache_read − cache_creation`), so the three prompt buckets are disjoint.
+/// The identity is `input_tokens + cache_read + cache_creation + output = total_tokens`. Omits all cost floats when partial or incomplete (absent cost does not mean free).
+/// Incomplete with no tokens emits only `usage_is_incomplete` (no zero usage object). `modelUsage` rows are a reduced external-compat schema (camelCase; no reasoning/duration).
 pub(crate) fn project_result_usage(result: &mut serde_json::Value, usage: &PromptUsage) {
     if usage.usage_is_incomplete && usage.is_token_empty() {
         result["usage_is_incomplete"] = true.into();
@@ -582,7 +587,6 @@ pub enum SessionUpdate {
         session_summary: String,
     },
     /// A short "where was I" recap of the session so far.
-    ///
     /// The `x.ai/recap` ext method emits it: `/recap` sets `auto = false`, and returning to the terminal after being away sets `auto = true`.
     /// The pager renders it as an informational scrollback line; it is never added to the model conversation.
     SessionRecap {
@@ -596,12 +600,9 @@ pub enum SessionUpdate {
     /// The pager shows a loading spinner for `/recap` and clears it on receipt; without this signal that spinner would animate forever.
     /// Never emitted for an automatic recap (those show no spinner).
     SessionRecapUnavailable,
-    /// Ultra-short summary of the just-finished successful turn, generated at turn end for the dashboard row's secondary line.
-    /// Rows show it until the next successful turn's summary replaces it.
-    ///
+    /// Ultra-short summary of the just-finished successful turn, generated at turn end for the dashboard row's secondary line. Rows show it until the next successful turn's summary replaces it.
     /// Transient (never persisted to `updates.jsonl`): the durable copy lives in `summary.json` and reaches non-attached clients via the roster.
-    /// Generation is serialized shell-side (one in-flight call, aborted by newer turns) and gateway delivery is ordered.
-    /// So the latest delivery is the latest summary, and clients may apply deliveries directly.
+    /// Generation is serialized shell-side (one in-flight call, aborted by newer turns) and gateway delivery is ordered. So the latest delivery is the latest summary, and clients may apply deliveries directly.
     LastTurnSummary {
         /// One-line fragment (roughly 5 to 12 words, capped at a safety limit).
         summary: String,
@@ -609,17 +610,11 @@ pub enum SessionUpdate {
         #[serde(default)]
         prompt_id: Option<String>,
     },
-    /// A compaction checkpoint marker written to `updates.jsonl`.
-    ///
-    /// This is **persist-only**: it is never sent to the gateway/UI. It records that a compaction occurred.
+    /// A compaction checkpoint marker written to `updates.jsonl`. This is **persist-only**: it is never sent to the gateway/UI. It records that a compaction occurred.
     /// The replay pipeline uses it to reconstruct the model's conversation view when rewinding across the compaction boundary.
-    ///
     /// The actual compacted conversation is stored under `compaction_checkpoints/{checkpoint_id}.json` to keep `updates.jsonl` lean.
     CompactionCheckpoint(Box<CompactionCheckpointInfo>),
-    /// A rewind marker written to `updates.jsonl` when a rewind occurs.
-    ///
-    /// This is **persist-only**: it is never sent to the gateway/UI.
-    /// Because `updates.jsonl` is append-only, rewinding creates a timeline branch.
+    /// A rewind marker written to `updates.jsonl` when a rewind occurs. This is **persist-only**: it is never sent to the gateway/UI. Because `updates.jsonl` is append-only, rewinding creates a timeline branch.
     /// The marker tells the replay algorithm to discard accumulated state beyond `target_prompt_index` and continue from that point.
     RewindMarker {
         /// The prompt index being rewound to (0-based).
@@ -636,14 +631,13 @@ pub enum SessionUpdate {
         #[serde(default)]
         will_wake: bool,
     },
-    /// A subagent session has been spawned.
-    ///
-    /// Sent on the PARENT session's notification channel so the client knows this `child_session_id` is a subagent and can route its events.
-    /// Emitted BEFORE dispatching `SessionCommand::Prompt` to the child.
-    /// This prevents a race where child events arrive before the client has the session ID mapping.
+    /// A subagent session has been spawned. Sent on the PARENT session's notification channel so the client knows this `child_session_id` is a subagent and can route its events.
+    /// Emitted BEFORE dispatching `SessionCommand::Prompt` to the child. This prevents a race where child events arrive before the client has the session ID mapping.
     SubagentSpawned {
         /// Unique subagent identifier (same as child session ID).
         subagent_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        attempt_id: Option<String>,
         /// The parent session that spawned this subagent.
         parent_session_id: String,
         /// The parent prompt/turn that spawned this subagent.
@@ -678,15 +672,22 @@ pub enum SessionUpdate {
         resumed_from: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         workflow_run_id: Option<String>,
+        /// Live-only opaque child address. Wire key is `agentAddress`; omitted from `updates.jsonl`.
+        #[serde(
+            default,
+            rename = "agentAddress",
+            alias = "agent_address",
+            skip_serializing_if = "Option::is_none"
+        )]
+        agent_address: Option<String>,
     },
-    /// Periodic progress update for a running subagent.
-    ///
-    /// Sent on the PARENT session's notification channel, rate-limited (every ~2s while the subagent is active).
-    /// Stops automatically when the subagent completes or is cancelled.
+    /// Periodic progress update for a running subagent. Sent on the PARENT session's notification channel, rate-limited (every ~2s while the subagent is active). Stops automatically when the subagent completes or is cancelled.
     /// The TUI merges these into the same state path used by ACP poll responses.
     SubagentProgress {
         /// Unique subagent identifier.
         subagent_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        attempt_id: Option<String>,
         /// The parent session that owns this subagent.
         parent_session_id: String,
         /// The child session's ACP session ID.
@@ -714,6 +715,8 @@ pub enum SessionUpdate {
     SubagentFinished {
         /// Unique subagent identifier.
         subagent_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        attempt_id: Option<String>,
         /// The child session's ACP session ID.
         child_session_id: String,
         /// Outcome: "completed", "failed", or "cancelled".
@@ -798,13 +801,9 @@ pub enum SessionUpdate {
         /// Human-readable reason for the switch.
         reason: String,
     },
-    /// The session's model was switched via `session/setModel`.
-    ///
-    /// Broadcast to every client subscribed to the session in leader mode.
+    /// The session's model was switched via `session/setModel`. Broadcast to every client subscribed to the session in leader mode.
     /// Follower clients (TUI / IDE / web) mirror the change in their local state: status bar, `/model` dropdown, prompt header, etc.
-    /// The originating client also receives this (the leader broadcasts to all subscribers of the session) but skips applying it.
-    /// Its in-flight `SetSessionModel` response is the authority for its local state and drives the single "Switched to X" scrollback entry.
-    /// Followers gate on their own `model_switch_pending` flag to distinguish "I'm waiting on my own switch" from "someone else's switch arrived."
+    /// The originating client also receives this (the leader broadcasts to all subscribers of the session) but skips applying it. Its in-flight `SetSessionModel` response is the authority for its local state and drives the single "Switched to X" scrollback entry. Followers gate on their own `model_switch_pending` flag to distinguish "I'm waiting on my own switch" from "someone else's switch arrived."
     ModelChanged {
         /// The newly-selected model id (catalog key).
         model_id: String,
@@ -813,12 +812,8 @@ pub enum SessionUpdate {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         reasoning_effort: Option<String>,
     },
-    /// Streaming chunk of a tool call's arguments.
-    ///
-    /// Behaves like `acp::SessionUpdate::AgentMessageChunk` / `AgentThoughtChunk`.
-    /// It flows through the replay buffer and merges with adjacent chunks for the same `tool_call_id`.
-    /// It is debounced at the session's buffering interval.
-    /// Only persisted as a full `acp::SessionUpdate::ToolCall`.
+    /// Streaming chunk of a tool call's arguments. Behaves like `acp::SessionUpdate::AgentMessageChunk` / `AgentThoughtChunk`. It flows through the replay buffer and merges with adjacent chunks for the same `tool_call_id`.
+    /// It is debounced at the session's buffering interval. Only persisted as a full `acp::SessionUpdate::ToolCall`.
     ToolCallDeltaChunk {
         /// Stable model-provided id (e.g. `"call_abc"`).
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -885,15 +880,12 @@ pub enum SessionUpdate {
         result_summary: Option<String>,
     },
     /// Goal mode orchestration progress update.
-    ///
     /// Sent on the parent session's notification channel at phase transitions and rate-limited from the progress handler (max 1/s).
     /// Fire-and-forget to the pager; it requires no action.
     GoalUpdated {
         goal_id: String,
         objective: String,
-        /// `"active"`, `"user_paused"`, `"back_off_paused"`,
-        /// `"no_progress_paused"`, `"infra_paused"`, `"blocked"`,
-        /// `"budget_limited"`, `"complete"`, `"cleared"`.
+        /// `"active"`, `"user_paused"`, `"back_off_paused"`, `"no_progress_paused"`, `"infra_paused"`, `"blocked"`, `"budget_limited"`, `"complete"`, `"cleared"`.
         /// Legacy `"doom_loop_paused"` is accepted by pagers as user-paused.
         status: String,
         /// `"idle"`, `"planning"`, `"executing"`
@@ -924,14 +916,9 @@ pub enum SessionUpdate {
         finished_subagent_tokens: i64,
         #[serde(skip_serializing_if = "Option::is_none")]
         live_subagent_tokens: Option<u64>,
-        /// Per-model marginal-token breakdown `(model_id, tokens)`, sorted by tokens descending.
-        /// The producer (`build_goal_updated`) only populates this when two or more distinct models appear.
-        /// A single-model goal collapses to the single tokens line, so the field is empty (and omitted on the wire).
-        /// The pager re-checks the two-model minimum as defence in depth.
-        ///
-        /// This is a live field for the active-subagent window (it mirrors `live_subagent_tokens` and is cleared on `SubagentFinished`).
-        /// The pager renders it only under the "Active subagent" block.
-        /// The producer must keep its populate gate on that same window so the wire and render gates stay aligned.
+        /// Per-model marginal-token breakdown `(model_id, tokens)`, sorted by tokens descending. The producer (`build_goal_updated`) only populates this when two or more distinct models appear.
+        /// A single-model goal collapses to the single tokens line, so the field is empty (and omitted on the wire). The pager re-checks the two-model minimum as defence in depth.
+        /// This is a live field for the active-subagent window (it mirrors `live_subagent_tokens` and is cleared on `SubagentFinished`). The pager renders it only under the "Active subagent" block. The producer must keep its populate gate on that same window so the wire and render gates stay aligned.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         live_tokens_by_model: Vec<(String, u64)>,
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -949,11 +936,9 @@ pub enum SessionUpdate {
         /// Wire compat: always empty in the simplified goal model.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         deliverables: Vec<GoalDeliverableInfo>,
-        /// Human-readable explanation set when the goal entered a paused state with a meaningful reason (today only `"blocked"`).
-        /// Rendered by the pager under the status row in the goal modal.
+        /// Human-readable explanation set when the goal entered a paused state with a meaningful reason (today only `"blocked"`). Rendered by the pager under the status row in the goal modal.
         /// Invariant: `Some` iff `status` is a paused-variant string AND the underlying pause was created via the message-carrying path.
-        /// The shell clears this on every transition out of a paused state (resume / complete / budget_limit).
-        /// The pager also gates rendering on `is_paused()` as a defence in depth.
+        /// The shell clears this on every transition out of a paused state (resume / complete / budget_limit). The pager also gates rendering on `is_paused()` as a defence in depth.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pause_message: Option<String>,
         /// Number of times the goal-achievement classifier has run for this goal.
@@ -1010,14 +995,9 @@ pub enum SessionUpdate {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         elapsed_ms: Option<u64>,
     },
-    /// One model response opened (Messages `message_start`), carrying the real message id, model, and input-side token counts.
-    /// Rides the buffered chunk rail so it is ordered AHEAD of this response's agent chunks.
-    /// Headless partial-mode framing consumes it to emit the real `message_start` id and input usage.
-    /// Without it, framing synthesizes a placeholder id and zero-seeded usage.
-    /// Messages backend only; other backends never emit it (the reducer keeps its placeholder fallback there).
-    ///
-    /// `input_tokens` is the uncached prompt portion.
-    /// `cache_read_input_tokens` and `cache_creation_input_tokens` are the separate prompt-side cache buckets, both already known at `message_start`.
+    /// One model response opened (Messages `message_start`), carrying the real message id, model, and input-side token counts. Rides the buffered chunk rail so it is ordered AHEAD of this response's agent chunks.
+    /// Headless partial-mode framing consumes it to emit the real `message_start` id and input usage. Without it, framing synthesizes a placeholder id and zero-seeded usage.
+    /// Messages backend only; other backends never emit it (the reducer keeps its placeholder fallback there). `input_tokens` is the uncached prompt portion.
     ResponseStarted {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         message_id: Option<String>,
@@ -1030,10 +1010,8 @@ pub enum SessionUpdate {
         #[serde(default)]
         cache_creation_input_tokens: u64,
     },
-    /// This response's reasoning (thinking) block finished; carries its encrypted signature.
-    /// Rides the buffered chunk rail so it is ordered right AFTER this response's thought chunks (and before its text).
-    /// Headless partial-mode framing consumes it to emit `signature_delta` before the thinking block's `content_block_stop`, in order.
-    /// Messages backend only.
+    /// This response's reasoning (thinking) block finished; carries its encrypted signature. Rides the buffered chunk rail so it is ordered right AFTER this response's thought chunks (and before its text).
+    /// Headless partial-mode framing consumes it to emit `signature_delta` before the thinking block's `content_block_stop`, in order. Messages backend only.
     ReasoningCompleted {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         signature: Option<String>,
@@ -1151,9 +1129,7 @@ pub enum RetryState {
     },
 }
 
-/// Whether a terminal retry failure is a recoverable authentication error (expired/invalid credentials, 401).
-/// The user can fix those by signing in again; this drives the actionable re-auth banner.
-///
+/// Whether a terminal retry failure is a recoverable authentication error (expired/invalid credentials, 401). The user can fix those by signing in again; this drives the actionable re-auth banner.
 /// `legacy_auth` is excluded: its message carries its own migration guidance (`grok update` / `grok logout` / `grok login`), shown verbatim.
 /// `auth_transient` is excluded for the opposite reason: it is emitted only when the failure self-heals (`AuthManager::requires_manual_reauth`).
 /// Its message already says it recovers on its own, so no `/login` banner is shown.
@@ -1275,10 +1251,7 @@ pub struct AutoContinueInfo {
     pub prompt_text: String,
 }
 
-/// The on-disk format for a compaction checkpoint file.
-///
-/// Stored at `{session_dir}/compaction_checkpoints/{checkpoint_id}.json`.
-/// Contains the full compacted conversation history.
+/// The on-disk format for a compaction checkpoint file. Stored at `{session_dir}/compaction_checkpoints/{checkpoint_id}.json`. Contains the full compacted conversation history.
 /// The replay pipeline uses it to deterministically reconstruct the model's view without re-running compaction.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -1293,10 +1266,8 @@ pub struct CompactionCheckpointFile {
     pub schema_version: u32,
     /// ISO 8601 timestamp of when the checkpoint was created.
     pub created_at: String,
-    /// The original User(user_info) text from before compaction.
-    /// Cross-compaction rewind uses it to restore the user_info the model originally saw for pre-compaction turns.
-    /// Otherwise the rewind would use the user_info rebuilt from the compacted conversation.
-    /// `None` in older checkpoints (schema_version 1 without this field).
+    /// The original User(user_info) text from before compaction. Cross-compaction rewind uses it to restore the user_info the model originally saw for pre-compaction turns.
+    /// Otherwise the rewind would use the user_info rebuilt from the compacted conversation. `None` in older checkpoints (schema_version 1 without this field).
     #[serde(default)]
     pub original_user_info: Option<String>,
     /// File paths that were re-read and injected after compaction.
@@ -1318,12 +1289,9 @@ pub struct CompactionSegmentFile {
     pub timestamp: String,
 }
 
-/// On-disk artifact capturing the exact compaction request sent to the model plus the response (or final error) it produced.
-///
-/// Stored at `{session_dir}/compaction_requests/{request_id}.json`.
+/// On-disk artifact capturing the exact compaction request sent to the model plus the response (or final error) it produced. Stored at `{session_dir}/compaction_requests/{request_id}.json`.
 /// Rides on the post-turn session archive to cloud storage, where it can be downloaded for prompt iteration.
-/// It records the exact `chat_history` sent, the prompt variant, any `/compact <text>` user context, the model, and the resulting summary (or error).
-/// Replay the request locally to A/B test alternate prompt wordings against the same input.
+/// It records the exact `chat_history` sent, the prompt variant, any `/compact <text>` user context, the model, and the resulting summary (or error). Replay the request locally to A/B test alternate prompt wordings against the same input.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub struct CompactionRequestFile {
@@ -1353,12 +1321,8 @@ pub struct CompactionRequestFile {
     pub tools: Vec<crate::sampling::ToolSpec>,
     /// Generated summary text, on success. `None` if all retries failed.
     pub summary: Option<String>,
-    /// Most recent error message captured during the retry loop, if any.
-    ///
-    /// `None` on a first-attempt success.
-    /// May co-occur with `summary` when a transient failure was eventually retried successfully.
-    /// The field then documents the recovered failure and `summary` carries the final result.
-    /// On total failure (all retries exhausted, or a deterministic error) `summary` is `None` and this field carries the final error.
+    /// Most recent error message captured during the retry loop, if any. `None` on a first-attempt success. May co-occur with `summary` when a transient failure was eventually retried successfully.
+    /// The field then documents the recovered failure and `summary` carries the final result. On total failure (all retries exhausted, or a deterministic error) `summary` is `None` and this field carries the final error.
     pub error: Option<String>,
     /// Number of attempts the retry loop made before settling on the final outcome.
     pub attempts: u32,
@@ -1369,11 +1333,8 @@ pub struct CompactionRequestFile {
     pub attempt_details: Vec<xai_chat_state::compaction_utils::CompactionAttempt>,
 }
 
-/// On-disk artifact capturing the exact recap request sent to the model plus the response (or final error) it produced.
-///
-/// Stored at `{session_dir}/recap_requests/{request_id}.json`.
-/// Rides on the post-turn session archive to cloud storage (same path as compaction request artifacts).
-/// So a recap prompt problem or garbled model output can be replayed offline.
+/// On-disk artifact capturing the exact recap request sent to the model plus the response (or final error) it produced. Stored at `{session_dir}/recap_requests/{request_id}.json`.
+/// Rides on the post-turn session archive to cloud storage (same path as compaction request artifacts). So a recap prompt problem or garbled model output can be replayed offline.
 /// Recap never mutates the conversation; this file is the only durable record of what was sent for `/recap` or an automatic recap.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -1524,6 +1485,7 @@ mod tests {
     #[test]
     fn subagent_progress_serializes_snake_case_tag() {
         let update = SessionUpdate::SubagentProgress {
+            attempt_id: None,
             subagent_id: "sub-1".into(),
             parent_session_id: "parent-1".into(),
             child_session_id: "child-1".into(),
@@ -1555,6 +1517,7 @@ mod tests {
     #[test]
     fn subagent_progress_roundtrips_through_json() {
         let update = SessionUpdate::SubagentProgress {
+            attempt_id: None,
             subagent_id: "sub-rt".into(),
             parent_session_id: "p".into(),
             child_session_id: "c".into(),
@@ -1577,6 +1540,7 @@ mod tests {
         // SubagentProgress must appear between SubagentSpawned and SubagentFinished in the enum definition
         // Clients expect notifications in that order
         let spawned = serde_json::to_value(SessionUpdate::SubagentSpawned {
+            attempt_id: None,
             subagent_id: "s".into(),
             parent_session_id: "p".into(),
             parent_prompt_id: None,
@@ -1591,9 +1555,11 @@ mod tests {
             model: None,
             resumed_from: None,
             workflow_run_id: None,
+            agent_address: None,
         })
         .unwrap();
         let progress = serde_json::to_value(SessionUpdate::SubagentProgress {
+            attempt_id: None,
             subagent_id: "s".into(),
             parent_session_id: "p".into(),
             child_session_id: "c".into(),
@@ -1608,6 +1574,7 @@ mod tests {
         })
         .unwrap();
         let finished = serde_json::to_value(SessionUpdate::SubagentFinished {
+            attempt_id: None,
             subagent_id: "s".into(),
             child_session_id: "c".into(),
             status: "completed".into(),
@@ -1624,6 +1591,60 @@ mod tests {
         assert_eq!(spawned["sessionUpdate"], "subagent_spawned");
         assert_eq!(progress["sessionUpdate"], "subagent_progress");
         assert_eq!(finished["sessionUpdate"], "subagent_finished");
+    }
+
+    #[test]
+    fn subagent_spawned_agent_address_serializes_as_typed_camel_case() {
+        let update = SessionUpdate::SubagentSpawned {
+            attempt_id: None,
+            subagent_id: "s".into(),
+            parent_session_id: "p".into(),
+            parent_prompt_id: None,
+            child_session_id: "c".into(),
+            subagent_type: "explore".into(),
+            description: "d".into(),
+            effective_context_source: None,
+            context_normalized: false,
+            capability_mode: None,
+            persona: None,
+            role: None,
+            model: None,
+            resumed_from: None,
+            workflow_run_id: None,
+            agent_address: Some("opaque-address".into()),
+        };
+        let json = serde_json::to_value(&update).unwrap();
+        assert_eq!(json["agentAddress"], "opaque-address");
+        assert!(json.get("agent_address").is_none());
+
+        let parsed: SessionUpdate = serde_json::from_value(json).unwrap();
+        match &parsed {
+            SessionUpdate::SubagentSpawned { agent_address, .. } => {
+                assert_eq!(agent_address.as_deref(), Some("opaque-address"));
+            }
+            other => panic!("expected SubagentSpawned, got {other:?}"),
+        }
+
+        let aliased: SessionUpdate = serde_json::from_str(
+            r#"{"sessionUpdate":"subagent_spawned","subagent_id":"s","parent_session_id":"p","child_session_id":"c","subagent_type":"explore","description":"d","agent_address":"from-alias"}"#,
+        )
+        .unwrap();
+        match aliased {
+            SessionUpdate::SubagentSpawned { agent_address, .. } => {
+                assert_eq!(agent_address.as_deref(), Some("from-alias"));
+            }
+            other => panic!("expected SubagentSpawned, got {other:?}"),
+        }
+
+        let notification = SessionNotification {
+            session_id: acp::SessionId::new("p"),
+            update,
+            meta: None,
+        };
+        let durable = notification.to_durable_value().unwrap();
+        assert!(durable["update"].get("agentAddress").is_none());
+        let live = serde_json::to_value(&notification).unwrap();
+        assert_eq!(live["update"]["agentAddress"], "opaque-address");
     }
 
     #[test]
@@ -1659,6 +1680,7 @@ mod tests {
     #[test]
     fn subagent_finished_with_tokens_used_roundtrips() {
         let update = SessionUpdate::SubagentFinished {
+            attempt_id: None,
             subagent_id: "sa-rt".into(),
             child_session_id: "cs-rt".into(),
             status: "completed".into(),
@@ -2185,11 +2207,9 @@ mod tests {
 
     // ── ModelChanged (leader-mode multi-client model switch fan-out) ──
 
-    /// Pins the exact `ModelChanged` JSON, since the pager and any third-party clients consume this on the wire.
-    /// - `sessionUpdate` tag is the snake_case variant name.
-    /// - Field names use Rust snake_case (struct fields are not subject to `rename_all`; that only renames the tag).
-    /// - `reasoning_effort` is omitted entirely when `None`.
-    ///   The wire stays smaller, and absence stays distinguishable from an explicit user clear, if that ever becomes a real distinction.
+    /// Pins the exact `ModelChanged` JSON, since the pager and any third-party clients consume this on the wire. `sessionUpdate` tag is the snake_case variant name.
+    /// Field names use Rust snake_case (struct fields are not subject to `rename_all`; that only renames the tag). `reasoning_effort` is omitted entirely when `None`.
+    /// The wire stays smaller, and absence stays distinguishable from an explicit user clear, if that ever becomes a real distinction.
     #[test]
     fn model_changed_serializes_snake_case_with_optional_effort() {
         let with_effort = SessionUpdate::ModelChanged {
@@ -2231,8 +2251,7 @@ mod tests {
 
     /// Wraps `ModelChanged` in the full `SessionNotification` envelope and checks the keys the leader's session-scoped fan-out matches on.
     /// Those are the top-level `sessionId` (camelCase from the envelope's `rename_all`) and the nested `update.sessionUpdate == "model_changed"`.
-    /// Without the top-level `sessionId`, the leader's `extract_session_id` returns `None`.
-    /// The notification then falls through to the last-active-client fallback instead of broadcasting, silently breaking multi-client sync.
+    /// Without the top-level `sessionId`, the leader's `extract_session_id` returns `None`. The notification then falls through to the last-active-client fallback instead of broadcasting, silently breaking multi-client sync.
     #[test]
     fn model_changed_envelope_carries_session_id_at_top_level() {
         let notif = SessionNotification {

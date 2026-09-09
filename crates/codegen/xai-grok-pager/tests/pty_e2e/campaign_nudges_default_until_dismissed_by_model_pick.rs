@@ -2,13 +2,8 @@
 #[allow(unused_imports)]
 use super::common::*;
 
-/// **A campaign nudges a soft default model that overrides the config default for new sessions; an explicit `/model` pick dismisses it (the user wins).**
-///
-/// - Boot with a `[models].default` in config.toml plus a campaign nudging a *different* model (the override env stands in for the remote feed).
-///   The welcome screen shows the **campaign** model.
-/// - Start a session and pick the config model via `/model`; the campaign id is recorded dismissed in `campaigns_state.json`.
-/// - Reboot with the *same* campaign env; the welcome shows the **config** model.
-///   This proves the dismissal persisted (an explicit pick beats the nudge).
+/// A campaign nudges a soft default model that overrides the config default for new sessions; an
+/// explicit `/model` pick dismisses it (the user wins).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore]
 async fn campaign_nudges_default_until_dismissed_by_model_pick() {

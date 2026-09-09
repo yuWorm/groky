@@ -507,6 +507,7 @@ fn model_entry(provider: &ProviderSpec, spec: &ResolvedModel) -> (String, ModelE
     crate::compat::reasoning::apply_to_model_info(&mut info, &spec.api_model);
     let entry = ModelEntry {
         info,
+        mtls_cert_dir: None,
         api_key: None,
         env_key: provider.env_key.map(EnvKeys::single),
         auth_provider: None,
@@ -734,6 +735,7 @@ mod tests {
                     "openai/gpt-4o".into(),
                     crate::agent::config::ModelEntry {
                         info,
+                        mtls_cert_dir: None,
                         api_key: None,
                         env_key: None,
                         auth_provider: None,

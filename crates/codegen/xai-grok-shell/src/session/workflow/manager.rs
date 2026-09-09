@@ -148,7 +148,7 @@ impl WorkflowManager {
                     .ok_or_else(|| LaunchError::UnknownRun(run_id.clone()))?;
                 if !existing.status.is_resumable() {
                     return Err(LaunchError::NotResumable(
-                        existing.status.as_str().to_string(),
+                        existing.status.as_ref().to_string(),
                     ));
                 }
                 if existing.status
@@ -207,7 +207,7 @@ impl WorkflowManager {
                             limit: existing.agent_budget.unwrap_or(0),
                         }
                     } else {
-                        LaunchError::NotResumable(existing.status.as_str().into())
+                        LaunchError::NotResumable(existing.status.as_ref().into())
                     }
                 })?;
 

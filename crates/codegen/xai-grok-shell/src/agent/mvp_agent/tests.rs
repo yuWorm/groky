@@ -41,8 +41,8 @@ fn jwt_tier_claim_maps_free_and_paid() {
     assert_eq!(jwt_tier_claim(&jwt_with_tier(9)).as_deref(), Some("9"));
     assert_eq!(jwt_tier_claim(&jwt_with_tier(99)).as_deref(), Some("99"));
 }
-fn auth_with_mode(mode: crate::auth::AuthMode, key: &str) -> crate::auth::GrokAuth {
-    crate::auth::GrokAuth {
+fn auth_with_mode(mode: xai_grok_login::AuthMode, key: &str) -> xai_grok_login::GrokAuth {
+    xai_grok_login::GrokAuth {
         key: key.into(),
         auth_mode: mode,
         create_time: chrono::Utc::now(),
@@ -75,7 +75,7 @@ fn resolve_subscription_tier_prefers_display_then_api_key_then_jwt() {
         resolve_subscription_tier_for_telemetry(Some("Free".into()), None).as_deref(),
         Some("Free")
     );
-    let api = auth_with_mode(crate::auth::AuthMode::ApiKey, "xai-not-a-jwt");
+    let api = auth_with_mode(xai_grok_login::AuthMode::ApiKey, "xai-not-a-jwt");
     assert_eq!(
         resolve_subscription_tier_for_telemetry(Some("  ".into()), Some(&api)).as_deref(),
         Some("api_key")
@@ -84,7 +84,7 @@ fn resolve_subscription_tier_prefers_display_then_api_key_then_jwt() {
         resolve_subscription_tier_for_telemetry(None, Some(&api)).as_deref(),
         Some("api_key")
     );
-    let oauth = auth_with_mode(crate::auth::AuthMode::Oidc, &jwt_with_tier(0));
+    let oauth = auth_with_mode(xai_grok_login::AuthMode::Oidc, &jwt_with_tier(0));
     assert_eq!(
         resolve_subscription_tier_for_telemetry(None, Some(&oauth)).as_deref(),
         Some("free")
@@ -397,6 +397,55 @@ fn harness_pair(id: &str) -> Vec<xai_grok_sampling_types::conversation::Conversa
         ConversationItem::tool_result(id, "<subagent_result>\nsubagent_id: skeptic-1"),
     ]
 }
+#[test]
+fn retained_resources_empty_without_optional_cache() {
+    let resources = RetainedResources::default();
+    assert!(resources.is_empty());
+}
+#[test]
+fn retained_resources_with_turn_number_is_not_empty() {
+    let resources = RetainedResources {
+        turn_number: Some(1),
+        ..Default::default()
+    };
+    assert!(!resources.is_empty());
+}
+#[tokio::test(flavor = "current_thread")]
+async fn child_attempt_turn_numbers_start_at_zero_and_advance_monotonically() {
+    let agent = build_minimal_agent_for_tests();
+    let sid = acp::SessionId::new("child-attempt-turns");
+    assert_eq!(agent.allocate_subagent_turn_number(&sid), 0);
+    assert_eq!(agent.allocate_subagent_turn_number(&sid), 1);
+    assert_eq!(agent.allocate_subagent_turn_number(&sid), 2);
+    assert_eq!(agent.session_turn_number(&sid), Some(3));
+    agent.release_subagent_turn_number(&sid);
+    assert_eq!(agent.session_turn_number(&sid), None);
+}
+#[tokio::test(flavor = "current_thread")]
+async fn releasing_subagent_turn_number_keeps_resident_session() {
+    let agent = build_minimal_agent_for_tests();
+    let sid = acp::SessionId::new("child-turn-resident");
+    agent.insert_resident(&sid, make_test_handle("test-model", false, None));
+    assert_eq!(agent.allocate_subagent_turn_number(&sid), 0);
+    agent.release_subagent_turn_number(&sid);
+    assert_eq!(agent.session_turn_number(&sid), None);
+    assert!(agent.is_resident(&sid));
+}
+#[tokio::test(flavor = "current_thread")]
+async fn first_subagent_turn_allocation_does_not_walk_the_sessions_index() {
+    crate::session::persistence::set_find_summary_by_session_id_forbidden(true);
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            crate::session::persistence::set_find_summary_by_session_id_forbidden(false);
+        }
+    }
+    let _reset = Reset;
+    let agent = build_minimal_agent_for_tests();
+    let sid = acp::SessionId::new("child-with-no-live-counter");
+    assert_eq!(agent.allocate_subagent_turn_number(&sid), 0);
+    assert_eq!(agent.session_turn_number(&sid), Some(1));
+}
 /// Agent-side upload path: each drained harness turn takes a distinct, monotonic turn number that CONTINUES past the user turn.
 /// It advances the per-session counter, persisted via exactly one `SetNextTraceTurn`.
 /// This is what makes each sibling `turn_{N}` reachable: without the advance every harness turn would clobber the same GCS path.
@@ -511,10 +560,8 @@ async fn upload_harness_trace_turns_uploads_disabled_does_not_burn_counter() {
         "uploads-disabled path must not persist a counter",
     );
 }
-/// Guards three facts of the per-harness-turn manifest.
-/// (1) Every turn's ctx carries a FRESH `artifact_tracker`, so turn 1 never inherits turn 0's recorded artifacts.
-/// (2) Recording the turn's metadata and turn_messages yields a manifest listing exactly those two.
-/// (3) `fully_uploaded` is true iff neither failed.
+/// Guards three facts of the per-harness-turn manifest. (1) Every turn's ctx carries a FRESH `artifact_tracker`, so turn 1 never inherits turn 0's recorded artifacts.
+/// (2) Recording the turn's metadata and turn_messages yields a manifest listing exactly those two. (3) `fully_uploaded` is true iff neither failed.
 #[tokio::test(flavor = "current_thread")]
 async fn upload_harness_trace_turns_build_per_turn_manifest() {
     use crate::upload::manifest::{
@@ -916,6 +963,24 @@ fn startup_hints_from_meta_session_object_wins_whole_not_merged() {
     assert!(!hints.non_interactive);
 }
 #[test]
+fn startup_hints_from_meta_adopts_session_traceparent_only() {
+    let tp = "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01";
+    let meta = serde_json::json!({ "traceparent": tp });
+    assert_eq!(
+        startup_hints_from_meta(meta.as_object(), None)
+            .startup_traceparent
+            .borrow()
+            .as_deref(),
+        Some(tp)
+    );
+    assert!(
+        startup_hints_from_meta(None, meta.as_object())
+            .startup_traceparent
+            .borrow()
+            .is_none()
+    );
+}
+#[test]
 fn startup_hints_from_meta_unparseable_falls_through_then_defaults() {
     let bad = serde_json::json!({ "startupHints": "yes" });
     let init = serde_json::json!({ "startupHints": { "nonInteractive": true } });
@@ -1125,6 +1190,7 @@ fn make_test_handle(
     crate::session::SessionHandle {
         cmd_tx,
         persistence_tx,
+        registry_write_order: Default::default(),
         current_prompt_id: std::sync::Arc::new(std::sync::Mutex::new(None)),
         pending_interactions: std::sync::Arc::new(std::sync::Mutex::new(
             std::collections::HashMap::new(),
@@ -1138,7 +1204,6 @@ fn make_test_handle(
         resolved_tool_overrides: std::sync::Arc::new(arc_swap::ArcSwapOption::empty()),
         spawn_snapshot: crate::session::SpawnSnapshot {
             applied_tool_overrides: None,
-            scheduler_background_loops: true,
         },
         hunk_tracker_handle,
         chat_state_handle: xai_chat_state::ChatStateHandle::noop(),
@@ -1336,9 +1401,9 @@ async fn an_effort_that_names_its_own_model_switches_the_id() {
     use xai_grok_sampling_types::{ReasoningEffort, ReasoningEffortOption};
     let agent = build_minimal_agent_for_tests();
     let option = |value: ReasoningEffort, default: bool| ReasoningEffortOption {
-        id: value.as_str().to_string(),
+        id: value.as_ref().to_string(),
         value,
-        label: value.as_str().to_string(),
+        label: value.as_ref().to_string(),
         description: None,
         default,
     };
@@ -1813,7 +1878,6 @@ fn parse_code_nav_capability_false_returns_false() {
     assert!(!MvpAgent::parse_code_nav_capability(&init));
 }
 /// Verify that two session handles with different code-nav state produce independent eligibility outcomes, the key leader-mode isolation test.
-///
 /// This tests the `code_nav_eligibility_for_request` lookup path directly by inspecting the per-handle fields rather than building a full agent.
 /// That mirrors what the method actually reads at runtime.
 #[tokio::test]
@@ -1864,10 +1928,10 @@ async fn ext_method_routes_auth_cleared_and_refreshes_resident_sessions() {
     let local = tokio::task::LocalSet::new();
     local
         .run_until(async {
-            let agent = build_agent_with_auth(crate::auth::GrokAuth {
+            let agent = build_agent_with_auth(xai_grok_login::GrokAuth {
                 key: "eligible".into(),
-                auth_mode: crate::auth::AuthMode::WebLogin,
-                ..crate::auth::GrokAuth::test_default()
+                auth_mode: xai_grok_login::AuthMode::WebLogin,
+                ..xai_grok_login::GrokAuth::test_default()
             });
             use acp::Agent as _;
             agent.managed_mcp_cache.lock().await.enable_gateway_tools();
@@ -1896,6 +1960,7 @@ fn empty_gateway_catalog() -> crate::session::managed_mcp::GatewayToolCatalog {
         tools: vec![],
         total_tools: 0,
         connectors_needing_reauth: vec![],
+        reauth_connectors: vec![],
     }
 }
 fn assert_no_update_mcp_servers(cmds: &[SessionCommand]) {
@@ -1942,10 +2007,10 @@ async fn mcp_list_gateway_refresh_fans_only_on_committed_uncached_catalog() {
             let proxy_url = format!("http://{}", listener.local_addr().unwrap());
             let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
             let (agent, _rx) = build_agent_with_auth_and_proxy(
-                crate::auth::GrokAuth {
+                xai_grok_login::GrokAuth {
                     key: "eligible".into(),
-                    auth_mode: crate::auth::AuthMode::WebLogin,
-                    ..crate::auth::GrokAuth::test_default()
+                    auth_mode: xai_grok_login::AuthMode::WebLogin,
+                    ..xai_grok_login::GrokAuth::test_default()
                 },
                 proxy_url,
                 crate::agent::config::AgentMode::Generic,
@@ -2033,10 +2098,10 @@ async fn mcp_list_gateway_off_disables_cached_catalog() {
         .run_until(async {
             use crate::session::managed_mcp::GatewayToolCatalogCache;
             let (agent, _rx) = build_agent_with_auth_and_proxy(
-                crate::auth::GrokAuth {
+                xai_grok_login::GrokAuth {
                     key: "eligible".into(),
-                    auth_mode: crate::auth::AuthMode::WebLogin,
-                    ..crate::auth::GrokAuth::test_default()
+                    auth_mode: xai_grok_login::AuthMode::WebLogin,
+                    ..xai_grok_login::GrokAuth::test_default()
                 },
                 "http://127.0.0.1:1".into(),
                 crate::agent::config::AgentMode::Generic,
@@ -2079,6 +2144,33 @@ async fn mcp_list_gateway_off_disables_cached_catalog() {
         })
         .await;
 }
+/// `/skills` scans disk for the modal and must also refresh every live session's baseline.
+#[tokio::test(flavor = "current_thread")]
+async fn skills_list_refreshes_session_skill_baseline() {
+    let agent = build_minimal_agent_for_tests();
+    let sid = acp::SessionId::new("sess-skills-list");
+    let (handle, _tx, mut cmd_rx) = make_live_session_handle(&sid, None);
+    agent.insert_resident(&sid, handle);
+    let req = acp::ExtRequest::new(
+        "x.ai/skills/list",
+        serde_json::value::to_raw_value(&serde_json::json!({ "cwd": "/tmp" }))
+            .unwrap()
+            .into(),
+    );
+    crate::extensions::skills::handle(
+        &agent,
+        &req,
+        None,
+        xai_grok_agent::prompt::skills::CompatConfig::default(),
+    )
+    .await
+    .expect("skills/list succeeds");
+    let cmd = tokio::time::timeout(std::time::Duration::from_secs(1), cmd_rx.recv())
+        .await
+        .expect("RefreshSkillBaseline should be sent")
+        .expect("channel should stay open");
+    assert!(matches!(cmd, SessionCommand::RefreshSkillBaseline));
+}
 /// Gateway tools live on the agent catalog, so sessions only rebuild `search_tool`.
 #[tokio::test(flavor = "current_thread")]
 async fn refresh_mcp_search_index_broadcasts_to_sessions() {
@@ -2095,7 +2187,7 @@ async fn refresh_mcp_search_index_broadcasts_to_sessions() {
 }
 fn build_minimal_agent_for_tests() -> MvpAgent {
     use crate::agent::config::Config as AgentConfig;
-    use crate::auth::{AuthManager, GrokComConfig};
+    use xai_grok_login::{AuthManager, GrokComConfig};
     let temp_dir = tempfile::tempdir().unwrap();
     let auth_manager =
         std::sync::Arc::new(AuthManager::new(temp_dir.path(), GrokComConfig::default()));
@@ -2136,27 +2228,9 @@ async fn session_usage_dead_chat_state_actor_fails_closed() {
             .expect_err("dead chat-state actor");
     assert_eq!(err.code, acp::Error::internal_error().code);
 }
-/// The session responses publish the value THIS session's spawn pinned, so a client describing `/loop` fires can never contradict what the fires do.
-#[tokio::test(flavor = "current_thread")]
-async fn session_meta_publishes_the_sessions_pinned_scheduler_background_loops() {
-    let agent = build_minimal_agent_for_tests();
-    let sid = acp::SessionId::new("loop-mode-sess");
-    let mut handle = make_test_handle("test-model", false, None);
-    handle.info.id = sid.clone();
-    handle.spawn_snapshot.scheduler_background_loops = false;
-    agent.insert_resident(&sid, handle);
-    let model_state = agent.model_state(Some(&sid));
-    let mut meta = serde_json::Map::new();
-    agent.insert_session_config_meta(&mut meta, &sid, "/tmp".to_string(), None, &model_state);
-    assert_eq!(
-        meta.get(crate::session::SCHEDULER_BACKGROUND_LOOPS_META_KEY),
-        Some(&serde_json::json!(false)),
-        "session meta must carry the handle's pinned value"
-    );
-}
-fn build_agent_with_auth(auth: crate::auth::GrokAuth) -> MvpAgent {
+fn build_agent_with_auth(auth: xai_grok_login::GrokAuth) -> MvpAgent {
     use crate::agent::config::Config as AgentConfig;
-    use crate::auth::{AuthManager, GrokComConfig};
+    use xai_grok_login::{AuthManager, GrokComConfig};
     let temp_dir = tempfile::tempdir().unwrap();
     let auth_manager =
         std::sync::Arc::new(AuthManager::new(temp_dir.path(), GrokComConfig::default()));
@@ -2173,11 +2247,11 @@ fn make_trace_card_eligible(agent: &MvpAgent) {
     cfg.features.telemetry = Some(crate::agent::config::TelemetryMode::Enabled);
     cfg.telemetry.trace_upload = Some(false);
 }
-fn personal_xai_oauth_auth() -> crate::auth::GrokAuth {
-    crate::auth::GrokAuth {
-        auth_mode: crate::auth::AuthMode::Oidc,
-        oidc_issuer: Some(crate::auth::XAI_OAUTH2_ISSUER.to_string()),
-        ..crate::auth::GrokAuth::test_default()
+fn personal_xai_oauth_auth() -> xai_grok_login::GrokAuth {
+    xai_grok_login::GrokAuth {
+        auth_mode: xai_grok_login::AuthMode::Oidc,
+        oidc_issuer: Some(xai_grok_login::XAI_OAUTH2_ISSUER.to_string()),
+        ..xai_grok_login::GrokAuth::test_default()
     }
 }
 #[tokio::test]
@@ -2187,6 +2261,7 @@ async fn feedback_trace_offer_asks_personal_oauth_accounts() {
     let _e1 = EnvGuard::unset("GROK_TELEMETRY_ENABLED");
     let _e2 = EnvGuard::unset("GROK_TELEMETRY_TRACE_UPLOAD");
     let _e3 = EnvGuard::unset("GROK_FEEDBACK_TRACE_CARD");
+    let _e4 = EnvGuard::unset("DISABLE_TELEMETRY");
     let agent = build_agent_with_auth(personal_xai_oauth_auth());
     make_trace_card_eligible(&agent);
     assert!(agent.feedback_trace_offer(), "every gate is open");
@@ -2205,8 +2280,9 @@ async fn feedback_trace_offer_suppressed_for_team_accounts_even_admins() {
     let _e1 = EnvGuard::unset("GROK_TELEMETRY_ENABLED");
     let _e2 = EnvGuard::unset("GROK_TELEMETRY_TRACE_UPLOAD");
     let _e3 = EnvGuard::unset("GROK_FEEDBACK_TRACE_CARD");
+    let _e4 = EnvGuard::unset("DISABLE_TELEMETRY");
     for role in ["Admin", "Member"] {
-        let agent = build_agent_with_auth(crate::auth::GrokAuth {
+        let agent = build_agent_with_auth(xai_grok_login::GrokAuth {
             team_name: Some("acme".into()),
             team_role: Some(role.into()),
             ..personal_xai_oauth_auth()
@@ -2232,6 +2308,7 @@ async fn feedback_trace_offer_suppressed_for_managed_deployments() {
     let _e1 = EnvGuard::unset("GROK_TELEMETRY_ENABLED");
     let _e2 = EnvGuard::unset("GROK_TELEMETRY_TRACE_UPLOAD");
     let _e3 = EnvGuard::unset("GROK_FEEDBACK_TRACE_CARD");
+    let _e4 = EnvGuard::unset("DISABLE_TELEMETRY");
     let agent = build_agent_with_auth(personal_xai_oauth_auth());
     make_trace_card_eligible(&agent);
     agent.cfg.borrow_mut().endpoints.deployment_key = Some("dk-test".into());
@@ -2247,15 +2324,501 @@ async fn feedback_trace_offer_suppressed_for_managed_deployments() {
         "a deployment key must close the one-shot upload path"
     );
 }
-/// Regression: boot-time plugin discovery is deferred past ACP `initialize`, so the shared plugin registry starts empty.
-/// `resolve_mcp_servers` reads that snapshot to merge plugin-contributed MCP servers into a new session.
-/// Without lazy population the servers silently vanished until an explicit `/plugins reload`.
-/// `ensure_plugin_registry` must build the snapshot on first use.
+/// Pin every env var feeding the trace-offer / one-shot ladders and sandbox
+/// `GROK_HOME`, so a developer's shell can't flip a gate under test.
+fn trace_gate_env(grok_home: &std::path::Path) -> Vec<xai_grok_test_support::EnvGuard> {
+    use xai_grok_test_support::EnvGuard;
+    vec![
+        EnvGuard::set("GROK_HOME", grok_home),
+        EnvGuard::unset("GROK_TELEMETRY_ENABLED"),
+        EnvGuard::unset("DISABLE_TELEMETRY"),
+        EnvGuard::unset("GROK_TELEMETRY_TRACE_UPLOAD"),
+        EnvGuard::unset("GROK_FEEDBACK_TRACE_CARD"),
+        EnvGuard::unset("GROK_FEEDBACK_ENABLED"),
+        EnvGuard::unset("GROK_CLI_CHAT_PROXY_BASE_URL"),
+        EnvGuard::unset("GROK_TRACE_UPLOAD_URL"),
+        EnvGuard::unset("GROK_TRACE_UPLOAD_BUCKET"),
+        EnvGuard::unset("GROK_TRACE_UPLOAD_ENDPOINT_URL"),
+        EnvGuard::unset("GROK_DEPLOYMENT_KEY"),
+    ]
+}
+fn insert_resident_session(agent: &MvpAgent, session_id: &str, cwd: &std::path::Path) {
+    let sid = acp::SessionId::new(session_id);
+    let mut handle = make_test_handle("test-model", false, None);
+    handle.info.id = sid.clone();
+    handle.info.cwd = cwd.to_string_lossy().into_owned();
+    agent.insert_resident(&sid, handle);
+}
+async fn upload_trace_error(
+    agent: &MvpAgent,
+    params: serde_json::Value,
+    session_dir: Option<std::path::PathBuf>,
+) -> acp::Error {
+    let request = acp::ExtRequest::new(
+        "x.ai/feedback/upload-trace",
+        serde_json::value::to_raw_value(&params).unwrap().into(),
+    );
+    crate::extensions::feedback_trace::handle_upload_trace_for_test(agent, &request, session_dir)
+        .await
+        .expect_err("the gate must reject this request")
+}
+const NOT_AVAILABLE: &str = "trace upload is not available";
+const NO_SESSION_DIR: &str = "session directory not found";
+#[tokio::test]
+#[serial_test::serial]
+async fn upload_trace_unknown_intent_is_rejected() {
+    let tmp = tempfile::tempdir().unwrap();
+    let _env = trace_gate_env(tmp.path());
+    let agent = build_agent_with_auth(personal_xai_oauth_auth());
+    make_trace_card_eligible(&agent);
+    insert_resident_session(&agent, "sess", tmp.path());
+    let err = upload_trace_error(
+        &agent,
+        serde_json::json!({ "sessionId": "sess", "intent": "always" }),
+        None,
+    )
+    .await;
+    assert_eq!(err.code, acp::Error::invalid_params().code);
+    assert!(err.to_string().contains("invalid params"), "got: {err}");
+}
+#[tokio::test]
+#[serial_test::serial]
+async fn upload_trace_missing_intent_keeps_the_legacy_gate_closed() {
+    let tmp = tempfile::tempdir().unwrap();
+    let _env = trace_gate_env(tmp.path());
+    let agent = build_agent_with_auth(personal_xai_oauth_auth());
+    insert_resident_session(&agent, "sess", tmp.path());
+    let err = upload_trace_error(&agent, serde_json::json!({ "sessionId": "sess" }), None).await;
+    assert!(err.to_string().contains(NOT_AVAILABLE), "got: {err}");
+}
+#[tokio::test]
+#[serial_test::serial]
+async fn upload_trace_missing_intent_requires_persisted_consent_even_when_offer_is_on() {
+    let tmp = tempfile::tempdir().unwrap();
+    let _env = trace_gate_env(tmp.path());
+    let agent = build_agent_with_auth(personal_xai_oauth_auth());
+    make_trace_card_eligible(&agent);
+    insert_resident_session(&agent, "sess", tmp.path());
+    let err = upload_trace_error(&agent, serde_json::json!({ "sessionId": "sess" }), None).await;
+    assert!(err.to_string().contains(NOT_AVAILABLE), "got: {err}");
+}
+#[tokio::test]
+#[serial_test::serial]
+async fn upload_trace_missing_intent_with_global_consent_stays_compatible() {
+    let tmp = tempfile::tempdir().unwrap();
+    let _env = trace_gate_env(tmp.path());
+    let agent = build_agent_with_auth(personal_xai_oauth_auth());
+    {
+        let mut cfg = agent.cfg.borrow_mut();
+        cfg.features.telemetry = Some(crate::agent::config::TelemetryMode::Enabled);
+        cfg.telemetry.trace_upload = Some(true);
+    }
+    insert_resident_session(&agent, "sess", tmp.path());
+    assert!(!agent.feedback_trace_offer());
+    let err = upload_trace_error(&agent, serde_json::json!({ "sessionId": "sess" }), None).await;
+    assert!(err.to_string().contains(NO_SESSION_DIR), "got: {err}");
+}
+#[tokio::test]
+#[serial_test::serial]
+async fn upload_trace_exact_intent_cannot_bypass_the_offer_gate() {
+    let tmp = tempfile::tempdir().unwrap();
+    let _env = trace_gate_env(tmp.path());
+    let agent = build_agent_with_auth(personal_xai_oauth_auth());
+    insert_resident_session(&agent, "sess", tmp.path());
+    assert!(!agent.feedback_trace_offer());
+    assert!(!agent.cfg.borrow().is_trace_upload_enabled());
+    let err = upload_trace_error(
+        &agent,
+        serde_json::json!({ "sessionId": "sess", "intent": "send_this_session" }),
+        None,
+    )
+    .await;
+    assert!(err.to_string().contains(NOT_AVAILABLE), "got: {err}");
+}
+#[tokio::test]
+#[serial_test::serial]
+async fn upload_trace_exact_intent_requires_and_consumes_a_matching_grant() {
+    let tmp = tempfile::tempdir().unwrap();
+    let _env = trace_gate_env(tmp.path());
+    let agent = build_agent_with_auth(personal_xai_oauth_auth());
+    make_trace_card_eligible(&agent);
+    insert_resident_session(&agent, "sess", tmp.path());
+    let missing = upload_trace_error(
+        &agent,
+        serde_json::json!({ "sessionId": "sess", "intent": "send_this_session" }),
+        None,
+    )
+    .await;
+    assert!(
+        missing.to_string().contains(NOT_AVAILABLE),
+        "got: {missing}"
+    );
+    let token = agent.issue_feedback_trace_upload_grant(acp::SessionId::new("sess"));
+    let accepted = upload_trace_error(
+        &agent,
+        serde_json::json!({
+            "sessionId": "sess",
+            "intent": "send_this_session",
+            "traceUploadToken": token,
+        }),
+        None,
+    )
+    .await;
+    assert!(
+        accepted.to_string().contains(NO_SESSION_DIR),
+        "got: {accepted}"
+    );
+    let replay = upload_trace_error(
+        &agent,
+        serde_json::json!({
+            "sessionId": "sess",
+            "intent": "send_this_session",
+            "traceUploadToken": token,
+        }),
+        None,
+    )
+    .await;
+    assert!(replay.to_string().contains(NOT_AVAILABLE), "got: {replay}");
+}
+#[tokio::test]
+#[serial_test::serial]
+async fn upload_trace_exact_intent_cannot_bypass_residency() {
+    let tmp = tempfile::tempdir().unwrap();
+    let _env = trace_gate_env(tmp.path());
+    let agent = build_agent_with_auth(personal_xai_oauth_auth());
+    make_trace_card_eligible(&agent);
+    let err = upload_trace_error(
+        &agent,
+        serde_json::json!({ "sessionId": "sess", "intent": "send_this_session" }),
+        None,
+    )
+    .await;
+    assert_eq!(err.code, acp::Error::invalid_params().code);
+    assert!(err.to_string().contains("session not found"), "got: {err}");
+}
+#[tokio::test]
+#[serial_test::serial]
+async fn upload_trace_checks_residency_before_the_offer_gate() {
+    let tmp = tempfile::tempdir().unwrap();
+    let _env = trace_gate_env(tmp.path());
+    let agent = build_agent_with_auth(personal_xai_oauth_auth());
+    let err = upload_trace_error(&agent, serde_json::json!({ "sessionId": "sess" }), None).await;
+    assert!(err.to_string().contains("session not found"), "got: {err}");
+}
+#[tokio::test]
+#[serial_test::serial]
+async fn upload_trace_feedback_disabled_rejects_even_the_exact_intent() {
+    let tmp = tempfile::tempdir().unwrap();
+    let _env = trace_gate_env(tmp.path());
+    let agent = build_agent_with_auth(personal_xai_oauth_auth());
+    make_trace_card_eligible(&agent);
+    agent
+        .cfg
+        .borrow_mut()
+        .feature_values
+        .insert(crate::agent::config::Feature::Feedback, false);
+    insert_resident_session(&agent, "sess", tmp.path());
+    let err = upload_trace_error(
+        &agent,
+        serde_json::json!({ "sessionId": "sess", "intent": "send_this_session" }),
+        None,
+    )
+    .await;
+    assert!(err.to_string().contains(NOT_AVAILABLE), "got: {err}");
+}
+#[tokio::test]
+#[serial_test::serial]
+async fn upload_trace_zdr_team_rejects_even_the_exact_intent() {
+    let tmp = tempfile::tempdir().unwrap();
+    let _env = trace_gate_env(tmp.path());
+    let agent = build_agent_with_auth(xai_grok_login::GrokAuth {
+        team_blocked_reasons: vec!["BLOCKED_REASON_NO_LOGS".into()],
+        ..personal_xai_oauth_auth()
+    });
+    make_trace_card_eligible(&agent);
+    insert_resident_session(&agent, "sess", tmp.path());
+    let err = upload_trace_error(
+        &agent,
+        serde_json::json!({ "sessionId": "sess", "intent": "send_this_session" }),
+        None,
+    )
+    .await;
+    assert!(err.to_string().contains(NOT_AVAILABLE), "got: {err}");
+}
+#[tokio::test]
+#[serial_test::serial]
+async fn upload_trace_team_account_rejects_even_the_exact_intent() {
+    let tmp = tempfile::tempdir().unwrap();
+    let _env = trace_gate_env(tmp.path());
+    let agent = build_agent_with_auth(xai_grok_login::GrokAuth {
+        team_name: Some("acme".into()),
+        ..personal_xai_oauth_auth()
+    });
+    make_trace_card_eligible(&agent);
+    insert_resident_session(&agent, "sess", tmp.path());
+    let err = upload_trace_error(
+        &agent,
+        serde_json::json!({ "sessionId": "sess", "intent": "send_this_session" }),
+        None,
+    )
+    .await;
+    assert!(err.to_string().contains(NOT_AVAILABLE), "got: {err}");
+}
+#[tokio::test]
+#[serial_test::serial]
+async fn upload_trace_archive_failure_uses_an_isolated_directory() {
+    let tmp = tempfile::tempdir().unwrap();
+    let _env = trace_gate_env(tmp.path());
+    let session_dir = tmp.path().join("session");
+    std::fs::create_dir(&session_dir).unwrap();
+    let agent = build_agent_with_auth(personal_xai_oauth_auth());
+    make_trace_card_eligible(&agent);
+    insert_resident_session(&agent, "sess", tmp.path());
+    let token = agent.issue_feedback_trace_upload_grant(acp::SessionId::new("sess"));
+    let err = upload_trace_error(
+        &agent,
+        serde_json::json!({
+            "sessionId": "sess",
+            "intent": "send_this_session",
+            "traceUploadToken": token,
+        }),
+        Some(session_dir),
+    )
+    .await;
+    assert!(
+        err.to_string().contains("couldn't build session archive"),
+        "got: {err}"
+    );
+}
+#[tokio::test]
+#[serial_test::serial]
+async fn upload_trace_upload_failure_uses_an_isolated_directory() {
+    let tmp = tempfile::tempdir().unwrap();
+    let _env = trace_gate_env(tmp.path());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        while let Ok((mut stream, _)) = listener.accept().await {
+            use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+            let mut buf = vec![0u8; 65536];
+            let mut seen = Vec::new();
+            while let Ok(n) = stream.read(&mut buf).await {
+                if n == 0 {
+                    break;
+                }
+                seen.extend_from_slice(&buf[..n]);
+                if seen.windows(4).any(|w| w == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            let _ = stream
+                .write_all(
+                    b"HTTP/1.1 403 Forbidden\r\ncontent-length: 0\r\nconnection: close\r\n\r\n",
+                )
+                .await;
+            let _ = stream.shutdown().await;
+        }
+    });
+    let session_dir = tmp.path().join("session");
+    std::fs::create_dir(&session_dir).unwrap();
+    std::fs::write(session_dir.join("summary.json"), "{}").unwrap();
+    let agent = build_agent_with_auth(personal_xai_oauth_auth());
+    make_trace_card_eligible(&agent);
+    agent.cfg.borrow_mut().endpoints.cli_chat_proxy_base_url = Some(format!("http://{addr}"));
+    insert_resident_session(&agent, "sess", tmp.path());
+    let token = agent.issue_feedback_trace_upload_grant(acp::SessionId::new("sess"));
+    let err = upload_trace_error(
+        &agent,
+        serde_json::json!({
+            "sessionId": "sess",
+            "intent": "send_this_session",
+            "traceUploadToken": token,
+        }),
+        Some(session_dir),
+    )
+    .await;
+    assert!(
+        err.to_string().contains("trace upload failed"),
+        "got: {err}"
+    );
+    server.abort();
+}
+#[tokio::test]
+#[serial_test::serial]
+async fn one_shot_requires_a_cached_credential() {
+    let tmp = tempfile::tempdir().unwrap();
+    let _env = trace_gate_env(tmp.path());
+    let agent = build_minimal_agent_for_tests();
+    make_trace_card_eligible(&agent);
+    assert!(
+        agent
+            .one_shot_feedback_gcs_config("sid".into())
+            .await
+            .is_none()
+    );
+}
+#[tokio::test]
+#[serial_test::serial]
+async fn one_shot_rejects_non_xai_credentials() {
+    let tmp = tempfile::tempdir().unwrap();
+    let _env = trace_gate_env(tmp.path());
+    let agent = build_agent_with_auth(xai_grok_login::GrokAuth {
+        auth_mode: xai_grok_login::AuthMode::ApiKey,
+        ..xai_grok_login::GrokAuth::test_default()
+    });
+    make_trace_card_eligible(&agent);
+    assert!(
+        agent
+            .one_shot_feedback_gcs_config("sid".into())
+            .await
+            .is_none()
+    );
+}
+#[tokio::test]
+#[serial_test::serial]
+async fn one_shot_fails_closed_when_the_auth_fetch_fails() {
+    let tmp = tempfile::tempdir().unwrap();
+    let _env = trace_gate_env(tmp.path());
+    let agent = build_agent_with_auth(xai_grok_login::GrokAuth {
+        auth_mode: xai_grok_login::AuthMode::ApiKey,
+        expires_at: Some(chrono::Utc::now() - chrono::Duration::days(1)),
+        ..xai_grok_login::GrokAuth::test_default()
+    });
+    make_trace_card_eligible(&agent);
+    assert!(
+        agent
+            .one_shot_feedback_gcs_config("sid".into())
+            .await
+            .is_none()
+    );
+}
+#[tokio::test]
+#[serial_test::serial]
+async fn one_shot_rejects_zdr_teams() {
+    let tmp = tempfile::tempdir().unwrap();
+    let _env = trace_gate_env(tmp.path());
+    let agent = build_agent_with_auth(xai_grok_login::GrokAuth {
+        team_blocked_reasons: vec!["BLOCKED_REASON_NO_LOGS".into()],
+        ..personal_xai_oauth_auth()
+    });
+    make_trace_card_eligible(&agent);
+    assert!(
+        agent
+            .one_shot_feedback_gcs_config("sid".into())
+            .await
+            .is_none()
+    );
+}
+#[tokio::test]
+#[serial_test::serial]
+async fn one_shot_requires_telemetry_enabled() {
+    let tmp = tempfile::tempdir().unwrap();
+    let _env = trace_gate_env(tmp.path());
+    let agent = build_agent_with_auth(personal_xai_oauth_auth());
+    make_trace_card_eligible(&agent);
+    agent.cfg.borrow_mut().features.telemetry = Some(crate::agent::config::TelemetryMode::Disabled);
+    assert!(
+        agent
+            .one_shot_feedback_gcs_config("sid".into())
+            .await
+            .is_none()
+    );
+}
+#[tokio::test]
+#[serial_test::serial]
+async fn one_shot_respects_a_requirements_trace_upload_pin() {
+    let tmp = tempfile::tempdir().unwrap();
+    let _env = trace_gate_env(tmp.path());
+    let agent = build_agent_with_auth(personal_xai_oauth_auth());
+    make_trace_card_eligible(&agent);
+    agent
+        .cfg
+        .borrow_mut()
+        .requirements
+        .trace_upload
+        .pin(false, crate::config::RequirementSource::Unknown);
+    assert!(
+        agent
+            .one_shot_feedback_gcs_config("sid".into())
+            .await
+            .is_none()
+    );
+}
+#[tokio::test]
+#[serial_test::serial]
+async fn one_shot_rejects_every_custom_trace_destination() {
+    let tmp = tempfile::tempdir().unwrap();
+    let _env = trace_gate_env(tmp.path());
+    type EndpointMutation = fn(&mut crate::agent::config::EndpointsConfig);
+    let cases: [(&str, EndpointMutation); 3] = [
+        ("custom trace_upload_url", |e| {
+            e.trace_upload_url = Some("https://exfil.example/upload".into());
+        }),
+        ("custom trace_upload_bucket", |e| {
+            e.trace_upload_bucket = Some("gs://exfil-bucket".into());
+        }),
+        ("custom trace_upload_endpoint_url", |e| {
+            e.trace_upload_endpoint_url = Some("https://exfil.example".into());
+        }),
+    ];
+    for (label, mutate) in cases {
+        let agent = build_agent_with_auth(personal_xai_oauth_auth());
+        make_trace_card_eligible(&agent);
+        mutate(&mut agent.cfg.borrow_mut().endpoints);
+        assert!(
+            agent
+                .one_shot_feedback_gcs_config("sid".into())
+                .await
+                .is_none(),
+            "{label} must close the one-shot upload path"
+        );
+    }
+}
+#[tokio::test]
+#[serial_test::serial]
+async fn one_shot_requires_a_resolvable_upload_method() {
+    let tmp = tempfile::tempdir().unwrap();
+    let _env = trace_gate_env(tmp.path());
+    assert!(
+        crate::agent::config::EndpointsConfig::default()
+            .resolve_upload_method(None)
+            .is_none()
+    );
+}
+#[tokio::test]
+#[serial_test::serial]
+async fn one_shot_rejects_non_proxy_upload_methods() {
+    let tmp = tempfile::tempdir().unwrap();
+    let _env = trace_gate_env(tmp.path());
+    let agent = build_agent_with_auth(xai_grok_login::GrokAuth {
+        auth_mode: xai_grok_login::AuthMode::ApiKey,
+        expires_at: Some(chrono::Utc::now() - chrono::Duration::days(1)),
+        ..xai_grok_login::GrokAuth::test_default()
+    });
+    make_trace_card_eligible(&agent);
+    {
+        let mut cfg = agent.cfg.borrow_mut();
+        cfg.endpoints.trace_upload_bucket = Some("gs://test-bucket".to_string());
+        cfg.endpoints.trace_upload_credentials = Some("{}".to_string());
+    }
+    assert!(matches!(
+        agent.cfg.borrow().endpoints.resolve_upload_method(None),
+        Some(crate::session::repo_changes::UploadMethod::Direct { .. })
+    ));
+    assert!(
+        agent
+            .one_shot_feedback_gcs_config("sid".into())
+            .await
+            .is_none()
+    );
+}
+/// Regression: boot-time plugin discovery is deferred past ACP `initialize`, so the shared plugin registry starts empty. `resolve_mcp_servers` reads that snapshot to merge plugin-contributed MCP servers into a new session.
+/// Without lazy population the servers silently vanished until an explicit `/plugins reload`. `ensure_plugin_registry` must build the snapshot on first use.
 #[tokio::test]
 #[serial_test::serial]
 async fn ensure_plugin_registry_lazily_populates_snapshot() {
     use crate::agent::config::Config as AgentConfig;
-    use crate::auth::{AuthManager, GrokComConfig};
+    use xai_grok_login::{AuthManager, GrokComConfig};
     use xai_grok_test_support::EnvGuard;
     let grok_home = tempfile::tempdir().unwrap();
     let _env = EnvGuard::set("GROK_HOME", grok_home.path());
@@ -2448,13 +3011,12 @@ fn drain_roster_changed(
 }
 /// A turn-boundary activity delta (`push_roster_activity_delta`) broadcasts an `x.ai/sessions/changed` upsert carrying the *overridden* activity.
 /// Every attached dashboard then reflects Working/Idle immediately instead of waiting out the roster poll's up-to-1s lag (turn-start/turn-end).
-/// The override matters because at turn-start the actor has not yet published `current_prompt_id`.
-/// A natural `resident_activity` read would emit `Idle` for a session that is in fact starting a turn.
+/// The override matters because at turn-start the actor has not yet published `current_prompt_id`. A natural `resident_activity` read would emit `Idle` for a session that is in fact starting a turn.
 #[tokio::test]
 async fn headless_residents_are_excluded_from_snapshots_and_deltas() {
     use crate::agent::config::Config as AgentConfig;
     use crate::agent::roster::RosterActivity;
-    use crate::auth::{AuthManager, GrokComConfig};
+    use xai_grok_login::{AuthManager, GrokComConfig};
     let temp_dir = tempfile::tempdir().unwrap();
     let auth_manager =
         std::sync::Arc::new(AuthManager::new(temp_dir.path(), GrokComConfig::default()));
@@ -2475,7 +3037,7 @@ async fn headless_residents_are_excluded_from_snapshots_and_deltas() {
 async fn push_roster_activity_delta_broadcasts_overridden_activity() {
     use crate::agent::config::Config as AgentConfig;
     use crate::agent::roster::RosterActivity;
-    use crate::auth::{AuthManager, GrokComConfig};
+    use xai_grok_login::{AuthManager, GrokComConfig};
     let temp_dir = tempfile::tempdir().unwrap();
     let auth_manager =
         std::sync::Arc::new(AuthManager::new(temp_dir.path(), GrokComConfig::default()));
@@ -2675,6 +3237,7 @@ fn find_model_by_id_prefers_key_then_falls_back_to_slug() {
             agent_type: config::default_agent_type(),
             inference_idle_timeout_secs: None,
             max_retries: None,
+            rate_limit_retry_threshold: None,
             subagent_rate_limit_max_attempts: None,
             hidden: false,
             supported_in_api: true,
@@ -2688,6 +3251,7 @@ fn find_model_by_id_prefers_key_then_falls_back_to_slug() {
             stream_tool_calls: None,
             laziness_detector: crate::agent::config::LazinessDetectorPerModelConfig::default(),
         },
+        mtls_cert_dir: None,
         api_key: None,
         env_key: None,
         auth_provider: None,
@@ -2848,10 +3412,8 @@ fn on_demand_enabled_from_remote_settings() {
     let rs: crate::util::config::RemoteSettings = serde_json::from_value(json).unwrap();
     assert_eq!(rs.on_demand_enabled, None);
 }
-/// Regression for a 401 sequence seen in production.
-/// After a long idle window, the auth manager may have no live token by the time `session/new` runs.
-/// For session-based auth methods we MUST still report `SessionToken` so chat_state credentials retain the session-token shape.
-/// `try_refresh_session_token` then runs on the next prompt instead of early-returning.
+/// Regression for a 401 sequence seen in production. After a long idle window, the auth manager may have no live token by the time `session/new` runs.
+/// For session-based auth methods we MUST still report `SessionToken` so chat_state credentials retain the session-token shape. `try_refresh_session_token` then runs on the next prompt instead of early-returning.
 #[tokio::test(flavor = "current_thread")]
 async fn auth_type_session_based_no_current_returns_session_token() {
     for method_id in [
@@ -2896,7 +3458,7 @@ async fn auth_type_xai_api_key_no_current_returns_api_key() {
 /// This is the common case during a healthy session.
 #[tokio::test(flavor = "current_thread")]
 async fn auth_type_session_based_with_current_returns_session_token() {
-    use crate::auth::GrokAuth;
+    use xai_grok_login::GrokAuth;
     let agent = build_minimal_agent_for_tests();
     agent.set_auth_method(acp::AuthMethodId::new(
         crate::agent::auth_method::OIDC_METHOD_ID,
@@ -2905,9 +3467,7 @@ async fn auth_type_session_based_with_current_returns_session_token() {
     assert!(agent.auth_manager.current().is_some());
     assert_eq!(agent.auth_type(), xai_chat_state::AuthType::SessionToken,);
 }
-/// Defensive case: no `auth_method_id` selected yet (pre-`authenticate` state) and no live credential.
-/// We default to `ApiKey`.
-/// Callers key off this value (e.g. `resolve_chat_state_auth_type` for chat routing).
+/// Defensive case: no `auth_method_id` selected yet (pre-`authenticate` state) and no live credential. We default to `ApiKey`. Callers key off this value (e.g. `resolve_chat_state_auth_type` for chat routing).
 /// Any other default would route session-token-shaped traffic through cli-chat-proxy before a method has been chosen.
 #[tokio::test(flavor = "current_thread")]
 async fn auth_type_no_method_id_no_current_returns_api_key() {
@@ -2916,13 +3476,11 @@ async fn auth_type_no_method_id_no_current_returns_api_key() {
     assert!(agent.auth_manager.current().is_none());
     assert_eq!(agent.auth_type(), xai_chat_state::AuthType::ApiKey,);
 }
-/// Live credential present but `auth_method_id` is still `None`.
-/// The in-memory bearer takes precedence: this is the order observed during `initialize()` silent refresh.
-/// A token is hot-swapped in before `authenticate()` writes the method id.
-/// Reporting `SessionToken` here matches pre-fix behavior and keeps logging stable.
+/// Live credential present but `auth_method_id` is still `None`. The in-memory bearer takes precedence: this is the order observed during `initialize()` silent refresh.
+/// A token is hot-swapped in before `authenticate()` writes the method id. Reporting `SessionToken` here matches pre-fix behavior and keeps logging stable.
 #[tokio::test(flavor = "current_thread")]
 async fn auth_type_no_method_id_with_current_returns_session_token() {
-    use crate::auth::GrokAuth;
+    use xai_grok_login::GrokAuth;
     let agent = build_minimal_agent_for_tests();
     agent.auth_manager.hot_swap(GrokAuth::test_default());
     assert!(agent.auth_method_id.load().is_none());
@@ -2932,7 +3490,7 @@ async fn auth_type_no_method_id_with_current_returns_session_token() {
 /// Minimal agent whose `grok_com_config` engages the api-key kill switch (`disable_api_key_auth = true`), mirroring a forced-IdP deployment.
 fn build_agent_with_api_key_auth_disabled() -> MvpAgent {
     use crate::agent::config::Config as AgentConfig;
-    use crate::auth::{AuthManager, GrokComConfig};
+    use xai_grok_login::{AuthManager, GrokComConfig};
     let temp_dir = tempfile::tempdir().unwrap();
     let auth_manager =
         std::sync::Arc::new(AuthManager::new(temp_dir.path(), GrokComConfig::default()));
@@ -3005,14 +3563,7 @@ async fn cached_token_fallthrough_falls_to_grok_com_without_credentials() {
         "no API-key creds and no kill switch -> interactive grok.com login",
     );
 }
-/// Verifies the 4-state matrix of `(disable_zdr_incompatible_tools, zdr_video_output_s3)`:
-///
-/// | ZDR flag | S3 config | Result                                      |
-/// |----------|-----------|---------------------------------------------|
-/// | false    | None      | Enabled, no S3 (normal non-ZDR mode)        |
-/// | true     | None      | Disabled (ZDR with no escape hatch)         |
-/// | false    | Some      | Enabled, S3 **not** threaded (non-ZDR)      |
-/// | true     | Some      | Enabled, S3 threaded (ZDR with upload path) |
+/// Verifies the 4-state matrix of `(disable_zdr_incompatible_tools, zdr_video_output_s3)`: | ZDR flag | S3 config | Result | |----------|-----------|---------------------------------------------| | false | None | Enabled, no S3 (normal non-ZDR mode) | | true | None | Disabled (ZDR with no escape hatch) | | false | Some | Enabled, S3 **not** threaded (non-ZDR) | | true | Some | Enabled, S3 threaded (ZDR with upload path) |
 #[tokio::test(flavor = "current_thread")]
 async fn prepare_video_gen_config_disabled_when_zdr_flag_set() {
     use xai_grok_tools::implementations::grok_build::video_gen::{
@@ -3086,9 +3637,7 @@ async fn prepare_video_gen_config_respects_feature_flag() {
         VideoGenConfig::Disabled
     ));
 }
-/// The imagine tier gate fails **open**: with no resolved auth we can't confirm a restricted personal tier.
-/// The tools stay advertised and un-flagged.
-/// The server 429 remains the authoritative backstop.
+/// The imagine tier gate fails **open**: with no resolved auth we can't confirm a restricted personal tier. The tools stay advertised and un-flagged. The server 429 remains the authoritative backstop.
 /// Guards against accidentally disabling a paid feature when tier info hasn't loaded.
 #[tokio::test(flavor = "current_thread")]
 async fn prepare_image_gen_config_fails_open_without_auth() {
@@ -3148,12 +3697,12 @@ async fn prepare_video_gen_config_sends_client_identifier_header() {
 /// Profile data does not expire with the token, and hiding it made the desktop render "Signed in" with no identity.
 #[tokio::test]
 async fn auth_info_returns_profile_when_token_expired() {
-    let agent = build_agent_with_auth(crate::auth::GrokAuth {
+    let agent = build_agent_with_auth(xai_grok_login::GrokAuth {
         email: Some("user@example.com".into()),
         first_name: Some("Test".into()),
         refresh_token: Some("rt".into()),
         expires_at: Some(chrono::Utc::now() - chrono::Duration::hours(1)),
-        ..crate::auth::GrokAuth::test_default()
+        ..xai_grok_login::GrokAuth::test_default()
     });
     let resp = crate::extensions::auth::handle(
         &agent,
@@ -3170,7 +3719,7 @@ async fn auth_info_returns_profile_when_token_expired() {
 }
 #[tokio::test]
 async fn data_collection_enabled_for_normal_user() {
-    let agent = build_agent_with_auth(crate::auth::GrokAuth::test_default());
+    let agent = build_agent_with_auth(xai_grok_login::GrokAuth::test_default());
     assert!(
         !agent.is_data_collection_disabled(),
         "normal user must have data collection enabled"
@@ -3178,9 +3727,9 @@ async fn data_collection_enabled_for_normal_user() {
 }
 #[tokio::test]
 async fn data_collection_disabled_for_zdr_team() {
-    let agent = build_agent_with_auth(crate::auth::GrokAuth {
+    let agent = build_agent_with_auth(xai_grok_login::GrokAuth {
         team_blocked_reasons: vec!["BLOCKED_REASON_NO_LOGS".into()],
-        ..crate::auth::GrokAuth::test_default()
+        ..xai_grok_login::GrokAuth::test_default()
     });
     assert!(
         agent.is_data_collection_disabled(),
@@ -3193,9 +3742,9 @@ async fn data_collection_disabled_for_zdr_team() {
 }
 #[tokio::test]
 async fn data_collection_disabled_for_zdr_moderated_team() {
-    let agent = build_agent_with_auth(crate::auth::GrokAuth {
+    let agent = build_agent_with_auth(xai_grok_login::GrokAuth {
         team_blocked_reasons: vec!["BLOCKED_REASON_NO_LOGS_MODERATED".into()],
-        ..crate::auth::GrokAuth::test_default()
+        ..xai_grok_login::GrokAuth::test_default()
     });
     assert!(
         agent.is_data_collection_disabled(),
@@ -3204,9 +3753,9 @@ async fn data_collection_disabled_for_zdr_moderated_team() {
 }
 #[tokio::test]
 async fn data_collection_disabled_for_opted_out_team() {
-    let agent = build_agent_with_auth(crate::auth::GrokAuth {
+    let agent = build_agent_with_auth(xai_grok_login::GrokAuth {
         coding_data_retention_opt_out: true,
-        ..crate::auth::GrokAuth::test_default()
+        ..xai_grok_login::GrokAuth::test_default()
     });
     assert!(
         agent.is_data_collection_disabled(),
@@ -3219,10 +3768,10 @@ async fn data_collection_disabled_for_opted_out_team() {
 }
 #[tokio::test]
 async fn data_collection_disabled_for_zdr_plus_opt_out() {
-    let agent = build_agent_with_auth(crate::auth::GrokAuth {
+    let agent = build_agent_with_auth(xai_grok_login::GrokAuth {
         team_blocked_reasons: vec!["BLOCKED_REASON_NO_LOGS".into()],
         coding_data_retention_opt_out: true,
-        ..crate::auth::GrokAuth::test_default()
+        ..xai_grok_login::GrokAuth::test_default()
     });
     assert!(
         agent.is_data_collection_disabled(),
@@ -3231,12 +3780,12 @@ async fn data_collection_disabled_for_zdr_plus_opt_out() {
 }
 #[tokio::test]
 async fn data_collection_enabled_for_non_zdr_team_with_unrelated_blocks() {
-    let agent = build_agent_with_auth(crate::auth::GrokAuth {
+    let agent = build_agent_with_auth(xai_grok_login::GrokAuth {
         team_blocked_reasons: vec![
             "BLOCKED_REASON_BILLING".into(),
             "BLOCKED_REASON_SUSPENDED".into(),
         ],
-        ..crate::auth::GrokAuth::test_default()
+        ..xai_grok_login::GrokAuth::test_default()
     });
     assert!(
         !agent.is_data_collection_disabled(),
@@ -3254,15 +3803,15 @@ fn enable_trace_upload_config(agent: &MvpAgent) {
 }
 #[tokio::test]
 async fn product_analytics_enabled_for_normal_user_with_telemetry_on() {
-    let agent = build_agent_with_auth(crate::auth::GrokAuth::test_default());
+    let agent = build_agent_with_auth(xai_grok_login::GrokAuth::test_default());
     enable_product_telemetry(&agent);
     assert!(agent.product_analytics_enabled());
 }
 #[tokio::test]
 async fn product_analytics_enabled_despite_coding_retention_opt_out() {
-    let agent = build_agent_with_auth(crate::auth::GrokAuth {
+    let agent = build_agent_with_auth(xai_grok_login::GrokAuth {
         coding_data_retention_opt_out: true,
-        ..crate::auth::GrokAuth::test_default()
+        ..xai_grok_login::GrokAuth::test_default()
     });
     enable_product_telemetry(&agent);
     assert!(agent.is_data_collection_disabled());
@@ -3270,16 +3819,16 @@ async fn product_analytics_enabled_despite_coding_retention_opt_out() {
 }
 #[tokio::test]
 async fn product_analytics_disabled_for_zdr_team() {
-    let agent = build_agent_with_auth(crate::auth::GrokAuth {
+    let agent = build_agent_with_auth(xai_grok_login::GrokAuth {
         team_blocked_reasons: vec!["BLOCKED_REASON_NO_LOGS".into()],
-        ..crate::auth::GrokAuth::test_default()
+        ..xai_grok_login::GrokAuth::test_default()
     });
     enable_product_telemetry(&agent);
     assert!(!agent.product_analytics_enabled());
 }
 #[tokio::test]
 async fn product_analytics_disabled_when_telemetry_off() {
-    let agent = build_agent_with_auth(crate::auth::GrokAuth::test_default());
+    let agent = build_agent_with_auth(xai_grok_login::GrokAuth::test_default());
     agent.cfg.borrow_mut().features.telemetry = Some(crate::agent::config::TelemetryMode::Disabled);
     assert!(!agent.product_analytics_enabled());
 }
@@ -3307,9 +3856,9 @@ async fn spawn_counting_storage_stub() -> (String, std::sync::Arc<std::sync::ato
 #[tokio::test]
 async fn diagnostic_upload_skipped_for_opted_out_user() {
     let (stub_url, count) = spawn_counting_storage_stub().await;
-    let agent = build_agent_with_auth(crate::auth::GrokAuth {
+    let agent = build_agent_with_auth(xai_grok_login::GrokAuth {
         coding_data_retention_opt_out: true,
-        ..crate::auth::GrokAuth::test_default()
+        ..xai_grok_login::GrokAuth::test_default()
     });
     enable_trace_upload_config(&agent);
     agent.cfg.borrow_mut().endpoints.trace_upload_url = Some(stub_url);
@@ -3326,7 +3875,7 @@ async fn diagnostic_upload_skipped_for_opted_out_user() {
 #[tokio::test]
 async fn diagnostic_upload_sent_for_normal_user() {
     let (stub_url, count) = spawn_counting_storage_stub().await;
-    let agent = build_agent_with_auth(crate::auth::GrokAuth::test_default());
+    let agent = build_agent_with_auth(xai_grok_login::GrokAuth::test_default());
     enable_trace_upload_config(&agent);
     agent.cfg.borrow_mut().endpoints.trace_upload_url = Some(stub_url);
     let uploader = agent
@@ -3362,7 +3911,7 @@ async fn diagnostic_upload_skipped_without_credentials() {
 #[tokio::test]
 async fn diagnostic_upload_skipped_after_mid_session_trace_upload_kill_switch() {
     let (stub_url, count) = spawn_counting_storage_stub().await;
-    let agent = build_agent_with_auth(crate::auth::GrokAuth::test_default());
+    let agent = build_agent_with_auth(xai_grok_login::GrokAuth::test_default());
     enable_trace_upload_config(&agent);
     agent.cfg.borrow_mut().endpoints.trace_upload_url = Some(stub_url);
     agent.sync_collection_config_gate();
@@ -3402,14 +3951,14 @@ async fn search_index_honors_the_session_search_feature() {
     let (_home, _env) = search_index_env();
     {
         let _off = xai_grok_test_support::EnvGuard::set("GROK_SESSION_SEARCH", "0");
-        let agent = build_agent_with_auth(crate::auth::GrokAuth::test_default());
+        let agent = build_agent_with_auth(xai_grok_login::GrokAuth::test_default());
         agent.decide_search_index();
         assert!(
             matches!(agent.search_index(), IndexDecision::Off),
             "the switch is off, so this process keeps no index"
         );
     }
-    let agent = build_agent_with_auth(crate::auth::GrokAuth::test_default());
+    let agent = build_agent_with_auth(xai_grok_login::GrokAuth::test_default());
     agent.decide_search_index();
     assert!(
         matches!(agent.search_index(), IndexDecision::On(_)),
@@ -3421,7 +3970,7 @@ async fn search_index_honors_the_session_search_feature() {
 #[serial_test::serial]
 async fn auto_gc_declines_until_the_remote_answer_settles() {
     let (_home, _env) = search_index_env();
-    let agent = build_agent_with_auth(crate::auth::GrokAuth::test_default());
+    let agent = build_agent_with_auth(xai_grok_login::GrokAuth::test_default());
     assert!(
         !agent.remote_settings_settled(),
         "precondition: remote fetch is on and no settings have arrived"
@@ -3450,7 +3999,7 @@ async fn auto_gc_declines_until_the_remote_answer_settles() {
 #[serial_test::serial]
 async fn search_before_the_decision_asks_the_caller_to_retry() {
     let (_home, _env) = search_index_env();
-    let agent = build_agent_with_auth(crate::auth::GrokAuth::test_default());
+    let agent = build_agent_with_auth(xai_grok_login::GrokAuth::test_default());
     assert!(
         matches!(agent.search_index(), IndexDecision::Pending),
         "precondition: nothing has decided yet"
@@ -3480,7 +4029,7 @@ async fn search_before_the_decision_asks_the_caller_to_retry() {
 #[serial_test::serial]
 async fn read_before_the_remote_settings_land_does_not_decide() {
     let (_home, _env) = search_index_env();
-    let agent = build_agent_with_auth(crate::auth::GrokAuth::test_default());
+    let agent = build_agent_with_auth(xai_grok_login::GrokAuth::test_default());
     assert!(
         !agent.remote_settings_settled(),
         "precondition: remote fetch is on and no settings have arrived"
@@ -3507,7 +4056,7 @@ async fn read_before_the_remote_settings_land_does_not_decide() {
 #[serial_test::serial]
 async fn exhausted_fetch_decides_on_the_local_layers() {
     use crate::agent::config::Config as AgentConfig;
-    use crate::auth::{AuthManager, GrokComConfig};
+    use xai_grok_login::{AuthManager, GrokComConfig};
     use xai_grok_test_support::EnvGuard;
     let (_home, _env) = search_index_env();
     let _no_inline_auth = EnvGuard::unset("GROK_AUTH");
@@ -3542,7 +4091,7 @@ async fn exhausted_fetch_decides_on_the_local_layers() {
 #[serial_test::serial]
 async fn kill_switch_after_the_decision_leaves_the_index_up() {
     let (_home, _env) = search_index_env();
-    let agent = build_agent_with_auth(crate::auth::GrokAuth::test_default());
+    let agent = build_agent_with_auth(xai_grok_login::GrokAuth::test_default());
     agent.cfg.borrow_mut().remote_settings = Some(crate::util::config::RemoteSettings {
         session_search: Some(true),
         ..Default::default()
@@ -3567,7 +4116,7 @@ async fn kill_switch_after_the_decision_leaves_the_index_up() {
 #[serial_test::serial]
 async fn session_opened_before_the_decision_sees_it_land() {
     let (_home, _env) = search_index_env();
-    let agent = build_agent_with_auth(crate::auth::GrokAuth::test_default());
+    let agent = build_agent_with_auth(xai_grok_login::GrokAuth::test_default());
     let held_by_a_session = agent.search_index_cell();
     assert!(
         matches!(held_by_a_session.decision(), IndexDecision::Pending),
@@ -3588,7 +4137,7 @@ async fn session_opened_before_the_decision_sees_it_land() {
 /// A mid-session remote-settings flip (kill switch) then stops collection without a new session.
 #[tokio::test]
 async fn collection_config_gate_mirror_follows_trace_upload_flip() {
-    let agent = build_agent_with_auth(crate::auth::GrokAuth::test_default());
+    let agent = build_agent_with_auth(xai_grok_login::GrokAuth::test_default());
     enable_trace_upload_config(&agent);
     agent.sync_collection_config_gate();
     assert!(
@@ -4050,6 +4599,52 @@ fn chat_session_spawn_options_matches_thin_profile() {
     );
     assert!(opts.is_chat_kind);
 }
+#[tokio::test(flavor = "current_thread")]
+async fn spawn_seeds_root_conversation_group_in_turn_config() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let agent = build_minimal_agent_for_tests();
+            agent.set_auth_method(acp::AuthMethodId::new("cached_token"));
+            let temp_dir = tempfile::tempdir().expect("temp session cwd");
+            let cwd = xai_grok_paths::AbsPathBuf::new(temp_dir.path().to_path_buf())
+                .expect("absolute temp session cwd");
+            let session_id = acp::SessionId::new("root-conversation-group-session");
+            let session_info = SessionInfo {
+                id: session_id.clone(),
+                cwd: cwd.as_str().to_owned(),
+            };
+            let model_id = agent.models_manager.current_model_id();
+            let mut options =
+                chat_session_spawn_options(session_info, cwd, None, None, model_id, false);
+            options.is_chat_kind = false;
+            let init = acp::InitializeRequest::new(acp::ProtocolVersion::V1).client_capabilities(
+                acp::ClientCapabilities::new()
+                    .fs(acp::FileSystemCapabilities::new())
+                    .terminal(false),
+            );
+            agent
+                .spawn_and_register_session(&init, options)
+                .await
+                .expect("root session spawns");
+            let handle = agent
+                .resident_handle(&session_id)
+                .expect("spawn registers root session");
+            let sampling_config = handle
+                .chat_state_handle
+                .get_sampling_config()
+                .await
+                .expect("spawned root has sampling config");
+            assert_eq!(
+                sampling_config.conversation_group_id,
+                Some(crate::sampling::derive_conversation_group_id(
+                    session_id.0.as_ref(),
+                )),
+            );
+            agent.remove_session(&session_id);
+        })
+        .await;
+}
 /// `remove_session` releases the workspace binding and drains the per-session side maps.
 /// Test agents default to `workspace_ops = None`, so no other test reaches the release.
 #[tokio::test]
@@ -4312,6 +4907,9 @@ fn spawn_fake_actor(
             match cmd {
                 TestSessionCommand::IsBusy { respond_to } => {
                     let _ = respond_to.send(busy);
+                }
+                TestSessionCommand::PersistResumeStatus { respond_to } => {
+                    let _ = respond_to.send(());
                 }
                 other => {
                     let _ = observed_tx.send(other);
@@ -4617,10 +5215,8 @@ async fn ext_notification_queue_edit_survives_dropped_actor_mailbox() {
         .await
         .expect("queue edit must not error when the session actor mailbox is gone");
 }
-/// No-evict keystone: a client disconnecting mid-turn must NOT destroy the session.
-/// The actor stays resident and no `Shutdown` is sent.
-/// The resident session's command channel still **delivers** commands, so a reconnecting `session/load` can keep driving the turn.
-/// `finalize()` is NOT called on a mere disconnect.
+/// No-evict keystone: a client disconnecting mid-turn must NOT destroy the session. The actor stays resident and no `Shutdown` is sent.
+/// The resident session's command channel still **delivers** commands, so a reconnecting `session/load` can keep driving the turn. `finalize()` is NOT called on a mere disconnect.
 #[test]
 fn disconnect_keeps_live_session_resident_without_finalize() {
     run_local_for_bridge_test(|| async {
@@ -4743,10 +5339,8 @@ fn remove_session_keeps_a_running_thread_tracked() {
         );
     });
 }
-/// Idle-unload stub (memory bound) and its supervisor interaction.
-/// A *fully idle* session is unloaded to disk on disconnect (actor `Shutdown`, handle dropped).
-/// The `SessionThread` is **retained** for `drain_old_session_thread`.
-/// It is not finalized, and once the kept thread finishes the supervisor reaps it as a *clean* exit, never `DeadFailed`.
+/// Idle-unload stub (memory bound) and its supervisor interaction. A *fully idle* session is unloaded to disk on disconnect (actor `Shutdown`, handle dropped).
+/// The `SessionThread` is **retained** for `drain_old_session_thread`. It is not finalized, and once the kept thread finishes the supervisor reaps it as a *clean* exit, never `DeadFailed`.
 #[test]
 fn disconnect_unloads_idle_session_without_finalize() {
     run_local_for_bridge_test(|| async {
@@ -4816,11 +5410,8 @@ fn disconnect_unloads_idle_session_without_finalize() {
         );
     });
 }
-/// The `IsBusy` keep-resident path.
-/// A between-turns session (`current_prompt_id = None`) whose actor answers `IsBusy = true` must be kept resident.
-/// True here means inputs are queued at the turn boundary.
-/// It must NOT be unloaded and must receive no `Shutdown`.
-/// This exercises the async round-trip that the sync fast-path tests skip.
+/// The `IsBusy` keep-resident path. A between-turns session (`current_prompt_id = None`) whose actor answers `IsBusy = true` must be kept resident. True here means inputs are queued at the turn boundary.
+/// It must NOT be unloaded and must receive no `Shutdown`. This exercises the async round-trip that the sync fast-path tests skip.
 #[test]
 fn disconnect_keeps_resident_when_actor_reports_busy() {
     run_local_for_bridge_test(|| async {
@@ -4909,8 +5500,7 @@ fn disconnect_keeps_the_workflow_session_and_evicts_the_idle_one() {
 }
 /// Mixed batch in a *single* `x.ai/internal/evict_sessions` notification, the realistic disconnect shape.
 /// This is the path that exercises `handle_evict_sessions`' `join_all` two-pass (concurrent `IsBusy` checks, then sequential act).
-/// One session's actor reports busy (kept resident, `Working`, no `Shutdown`); the other is idle (unloaded, `Dormant`, `Shutdown` sent).
-/// Each must get its own outcome with no cross-contamination between the concurrent check pass and the sequential act pass.
+/// One session's actor reports busy (kept resident, `Working`, no `Shutdown`); the other is idle (unloaded, `Dormant`, `Shutdown` sent). Each must get its own outcome with no cross-contamination between the concurrent check pass and the sequential act pass.
 #[test]
 fn disconnect_mixed_batch_keeps_busy_unloads_idle() {
     run_local_for_bridge_test(|| async {
@@ -4973,8 +5563,9 @@ fn session_live_state_map_is_bounded_across_cycles() {
         let agent = build_minimal_agent_for_tests();
         for i in 0..50 {
             let sid = acp::SessionId::new(format!("sess-cycle-{i}"));
-            let (handle, _tx, _rx) = make_live_session_handle(&sid, Some("turn"));
+            let (handle, _tx, rx) = make_live_session_handle(&sid, Some("turn"));
             agent.insert_resident(&sid, handle);
+            let _observed = spawn_fake_actor(rx, true);
             agent.set_session_live_state(&sid, SessionLiveState::IdleResident);
             assert_eq!(
                 agent.close_active_session(&sid).await,
@@ -4995,8 +5586,9 @@ fn explicit_close_finalizes_the_replica() {
     run_local_for_bridge_test(|| async {
         let agent = build_minimal_agent_for_tests();
         let sid = acp::SessionId::new("sess-close");
-        let (handle, _tx, mut cmd_rx) = make_live_session_handle(&sid, Some("turn-1"));
+        let (handle, _tx, cmd_rx) = make_live_session_handle(&sid, Some("turn-1"));
         agent.insert_resident(&sid, handle);
+        let mut cmd_rx = spawn_fake_actor(cmd_rx, true);
         drive_close(&agent, "no-such-session")
             .await
             .expect("close of a missing session must succeed as a no-op");
@@ -5007,7 +5599,11 @@ fn explicit_close_finalizes_the_replica() {
         drive_close(&agent, sid.0.as_ref())
             .await
             .expect("session close must be handled");
-        let Ok(TestSessionCommand::Cancel(options)) = cmd_rx.try_recv() else {
+        let cmd = tokio::time::timeout(std::time::Duration::from_secs(1), cmd_rx.recv())
+            .await
+            .expect("close must send Cancel")
+            .expect("fake actor channel must stay open");
+        let TestSessionCommand::Cancel(options) = cmd else {
             panic!("close must send Cancel before anything else");
         };
         assert_eq!(
@@ -5061,11 +5657,8 @@ fn explicit_close_finalizes_the_replica() {
         );
     });
 }
-/// Join-handle supervisor: a *resident* actor that panics is reaped promptly.
-/// It is removed from `sessions`/`session_threads` and demoted to `DeadFailed` (seen via the roster delta; the live-state entry is dropped).
-/// It is NOT finalized (the conversation persists).
-///
-/// Polls in real time (the panic unwinds on a real OS thread, independent of the tokio clock); the reap lands within a few supervisor ticks.
+/// Join-handle supervisor: a *resident* actor that panics is reaped promptly. It is removed from `sessions`/`session_threads` and demoted to `DeadFailed` (seen via the roster delta; the live-state entry is dropped).
+/// It is NOT finalized (the conversation persists). Polls in real time (the panic unwinds on a real OS thread, independent of the tokio clock); the reap lands within a few supervisor ticks.
 /// The injected-panic backtrace on stderr is expected and harmless.
 #[test]
 fn supervisor_reaps_panicked_resident_actor() {
@@ -5120,8 +5713,8 @@ fn supervisor_reaps_panicked_resident_actor() {
 #[serial_test::serial]
 async fn storage_mode_self_corrects_to_writeback_when_settings_arrive() {
     let _env = crate::env::EnvVarGuard::remove("GROK_STORAGE_MODE");
-    let auth = crate::auth::GrokAuth {
-        auth_mode: crate::auth::AuthMode::Oidc,
+    let auth = xai_grok_login::GrokAuth {
+        auth_mode: xai_grok_login::AuthMode::Oidc,
         oidc_issuer: Some("https://auth.x.ai".to_string()),
         key: "test-token".to_string(),
         ..Default::default()
@@ -5189,7 +5782,7 @@ fn post_auth_settings_not_coalesced_by_in_flight_reapply() {
         let agent = build_minimal_agent_for_tests();
         agent.spawn_settings_reapply();
         assert!(agent.settings_reapply_in_flight.get());
-        agent.spawn_post_auth_settings(crate::auth::GrokAuth::test_default());
+        agent.spawn_post_auth_settings(xai_grok_login::GrokAuth::test_default());
         assert_eq!(
             agent.post_auth_settings_spawn_count.get(),
             1,
@@ -5198,9 +5791,121 @@ fn post_auth_settings_not_coalesced_by_in_flight_reapply() {
         assert!(agent.post_auth_settings_in_flight.get());
     });
 }
+#[tokio::test(flavor = "current_thread")]
+async fn settings_fetch_coalesces_concurrent_callers() {
+    let agent = build_minimal_agent_for_tests();
+    let calls = std::rc::Rc::new(std::cell::Cell::new(0usize));
+    let leader = || {
+        let calls = calls.clone();
+        move || async move {
+            calls.set(calls.get() + 1);
+            tokio::task::yield_now().await;
+            crate::remote::SettingsFetch::Fetched(Box::default())
+        }
+    };
+    let auth = xai_grok_login::GrokAuth::test_default();
+    let cluster = (0..5).map(|_| agent.settings_manager.fetch(&auth, leader()));
+    let outcomes = futures::future::join_all(cluster).await;
+    assert!(
+        outcomes
+            .iter()
+            .all(|o| matches!(o, Some(crate::remote::SettingsFetch::Fetched(_)))),
+        "every coalesced caller receives the shared success"
+    );
+    assert_eq!(calls.get(), 1, "concurrent callers share one leader fetch");
+    let _ = agent.settings_manager.fetch(&auth, leader()).await;
+    assert_eq!(
+        calls.get(),
+        2,
+        "a sequential trigger re-fetches; no stale replay"
+    );
+}
+#[tokio::test(flavor = "current_thread")]
+async fn dropped_leader_refetches_instead_of_gate_opening_retry() {
+    let agent = build_minimal_agent_for_tests();
+    let auth = xai_grok_login::GrokAuth::test_default();
+    let mut leader = Box::pin(
+        agent
+            .settings_manager
+            .fetch(&auth, std::future::pending::<crate::remote::SettingsFetch>),
+    );
+    tokio::select! {
+        biased;
+        _ = &mut leader => unreachable!("a pending leader cannot complete"),
+        _ = tokio::task::yield_now() => {}
+    }
+    let calls = std::rc::Rc::new(std::cell::Cell::new(0usize));
+    let calls_follower = calls.clone();
+    let mut follower = Box::pin(agent.settings_manager.fetch(&auth, move || async move {
+        calls_follower.set(calls_follower.get() + 1);
+        crate::remote::SettingsFetch::Fetched(Box::default())
+    }));
+    tokio::select! {
+        biased;
+        _ = &mut follower => unreachable!("the follower must park on the in-flight leader"),
+        _ = tokio::task::yield_now() => {}
+    }
+    assert_eq!(calls.get(), 0, "a joining follower must not fetch");
+    drop(leader);
+    assert!(
+        matches!(
+            follower.await,
+            Some(crate::remote::SettingsFetch::Fetched(_))
+        ),
+        "a cancelled leader drives a real re-fetch, not a gate-opening Retry"
+    );
+    assert_eq!(
+        calls.get(),
+        1,
+        "the follower re-plans and leads exactly one fresh fetch"
+    );
+}
+/// A follower that keeps joining leaders which drop before publishing must eventually give up with
+/// `None` — never a fabricated `Retry` that would open the fail-closed OTEL gate on cancellation churn.
+#[tokio::test(flavor = "current_thread")]
+async fn settings_fetch_returns_none_after_repeated_leader_drops() {
+    let agent = build_minimal_agent_for_tests();
+    let auth = xai_grok_login::GrokAuth::test_default();
+    macro_rules! new_fetch {
+        () => {
+            Box::pin(
+                agent
+                    .settings_manager
+                    .fetch(&auth, std::future::pending::<crate::remote::SettingsFetch>),
+            )
+        };
+    }
+    macro_rules! poll_park {
+        ($fut:expr, $msg:expr) => {
+            tokio::select! {
+                biased;
+                _ = &mut $fut => unreachable!($msg),
+                _ = tokio::task::yield_now() => {}
+            }
+        };
+    }
+    let mut leader = new_fetch!();
+    poll_park!(leader, "the first leader parks on its pending fetch");
+    let mut follower = new_fetch!();
+    poll_park!(follower, "the follower joins the first in-flight leader");
+    for _ in 0..3 {
+        let mut next = new_fetch!();
+        drop(leader);
+        poll_park!(next, "a fresh leader grabs the freed lead slot");
+        poll_park!(
+            follower,
+            "the follower re-joins the fresh leader after a drop"
+        );
+        leader = next;
+    }
+    drop(leader);
+    assert!(
+        follower.await.is_none(),
+        "past the reattempt budget the follower yields None, not a gate-opening Retry"
+    );
+}
 /// The tier re-check work is single-flight across every caller: back-to-back gated initializes run at most one live check.
-/// An awaited authenticate-path check skips (rather than doubles or waits out) a check already wedged on a stalled subscription endpoint.
-/// Drives the exact block `initialize` runs when `tier_allowed` is false.
+/// An awaited authenticate-path check skips (rather than doubles or waits out) a check already wedged on a stalled subscription endpoint. Drives the exact block `initialize` runs when `tier_allowed` is false.
 /// The full `initialize` fires once-per-process GROK_HOME cleanup work that a unit test must not run against the developer's real home.
 #[test]
 fn gated_reconnect_tier_recheck_is_single_flight() {
@@ -5231,13 +5936,13 @@ fn gated_reconnect_tier_recheck_is_single_flight() {
             allow_access: Some(false),
             ..Default::default()
         });
-        let auth = crate::auth::GrokAuth {
+        let auth = xai_grok_login::GrokAuth {
             key: "gated-user-key".into(),
             user_id: "user-gated".into(),
-            auth_mode: crate::auth::AuthMode::Oidc,
-            oidc_issuer: Some(crate::auth::XAI_OAUTH2_ISSUER.to_owned()),
+            auth_mode: xai_grok_login::AuthMode::Oidc,
+            oidc_issuer: Some(xai_grok_login::XAI_OAUTH2_ISSUER.to_owned()),
             expires_at: Some(chrono::Utc::now() + chrono::Duration::hours(1)),
-            ..crate::auth::GrokAuth::test_default()
+            ..xai_grok_login::GrokAuth::test_default()
         };
         agent.auth_manager.hot_swap(auth.clone());
         *agent.allow_access_resolved_for.borrow_mut() = Some(auth.user_id.clone());
@@ -5279,11 +5984,11 @@ fn gated_reconnect_tier_recheck_is_single_flight() {
 fn tier_recheck_identity_guard_accepts_enrichment_canonical_user_id() {
     run_local_for_bridge_test(|| async {
         let agent = build_minimal_agent_for_tests();
-        let auth = crate::auth::GrokAuth {
+        let auth = xai_grok_login::GrokAuth {
             key: "seeded-key".into(),
             user_id: "canonical-user".into(),
             expires_at: Some(chrono::Utc::now() + chrono::Duration::hours(1)),
-            ..crate::auth::GrokAuth::test_default()
+            ..xai_grok_login::GrokAuth::test_default()
         };
         agent.auth_manager.hot_swap(auth);
         assert!(!agent.tier_recheck_identity_changed("seeded-user", Some("canonical-user")));
@@ -5295,10 +6000,8 @@ fn tier_recheck_identity_guard_accepts_enrichment_canonical_user_id() {
     });
 }
 /// The other half of the reconnect paywall flash (the wedged test above locks the "gate holds while the check is in flight" half).
-/// A re-check that confirms a qualifying tier lifts `tier_allowed`, so the flash a subscribed user can see on a gated reconnect clears.
-/// Settings stay absent (the mock 404s `/settings`).
-/// That models the remote-fetch-failed / disabled arm where the confirmed tier is the authority for the lift.
-/// The bearer's tier claim already matches the live tier, so the post-unblock mint is skipped and no refresher is needed.
+/// A re-check that confirms a qualifying tier lifts `tier_allowed`, so the flash a subscribed user can see on a gated reconnect clears. Settings stay absent (the mock 404s `/settings`).
+/// That models the remote-fetch-failed / disabled arm where the confirmed tier is the authority for the lift. The bearer's tier claim already matches the live tier, so the post-unblock mint is skipped and no refresher is needed.
 #[test]
 fn gated_reconnect_recheck_lifts_gate_clearing_paywall_flash() {
     run_local_for_bridge_test(|| async {
@@ -5347,9 +6050,9 @@ fn gated_reconnect_recheck_lifts_gate_clearing_paywall_flash() {
             }
         });
         let temp_dir = tempfile::tempdir().unwrap();
-        let auth_manager = std::sync::Arc::new(crate::auth::AuthManager::new(
+        let auth_manager = std::sync::Arc::new(xai_grok_login::AuthManager::new(
             temp_dir.path(),
-            crate::auth::GrokComConfig::default(),
+            xai_grok_login::GrokComConfig::default(),
         ));
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
         let gateway = GatewaySender::new(tx);
@@ -5357,13 +6060,13 @@ fn gated_reconnect_recheck_lifts_gate_clearing_paywall_flash() {
         let agent = MvpAgent::new(gateway, &cfg, auth_manager, None).expect("valid test config");
         agent.cfg.borrow_mut().endpoints.cli_chat_proxy_base_url =
             Some(format!("http://{addr}/v1"));
-        let auth = crate::auth::GrokAuth {
+        let auth = xai_grok_login::GrokAuth {
             key: jwt_with_tier(5),
             user_id: "user-flash".into(),
-            auth_mode: crate::auth::AuthMode::Oidc,
-            oidc_issuer: Some(crate::auth::XAI_OAUTH2_ISSUER.to_owned()),
+            auth_mode: xai_grok_login::AuthMode::Oidc,
+            oidc_issuer: Some(xai_grok_login::XAI_OAUTH2_ISSUER.to_owned()),
             expires_at: Some(chrono::Utc::now() + chrono::Duration::hours(1)),
-            ..crate::auth::GrokAuth::test_default()
+            ..xai_grok_login::GrokAuth::test_default()
         };
         agent.auth_manager.hot_swap(auth);
         agent.tier_allowed.set(false);
@@ -5388,7 +6091,7 @@ fn gated_reconnect_recheck_lifts_gate_clearing_paywall_flash() {
 }
 /// Agent with pre-loaded auth, a gateway receiver (to assert emitted notifications), and the proxy URL pointed at a mock `/v1/settings`.
 fn build_agent_with_auth_and_proxy(
-    auth: crate::auth::GrokAuth,
+    auth: xai_grok_login::GrokAuth,
     proxy_url: String,
     mode: crate::agent::config::AgentMode,
 ) -> (
@@ -5396,7 +6099,7 @@ fn build_agent_with_auth_and_proxy(
     tokio::sync::mpsc::UnboundedReceiver<xai_acp_lib::AcpClientMessage>,
 ) {
     use crate::agent::config::Config as AgentConfig;
-    use crate::auth::{AuthManager, GrokComConfig};
+    use xai_grok_login::{AuthManager, GrokComConfig};
     let temp_dir = tempfile::tempdir().unwrap();
     let auth_manager =
         std::sync::Arc::new(AuthManager::new(temp_dir.path(), GrokComConfig::default()));
@@ -5438,7 +6141,7 @@ impl Drop for RestoreOtelGate {
 #[tokio::test]
 async fn access_gate_does_not_leak_verdict_across_identities() {
     use crate::agent::config::AgentMode;
-    use crate::auth::{GrokAuth, XAI_OAUTH2_ISSUER};
+    use xai_grok_login::{GrokAuth, XAI_OAUTH2_ISSUER};
     let auth_a = GrokAuth {
         oidc_issuer: Some(XAI_OAUTH2_ISSUER.to_string()),
         user_id: "user-a".into(),
@@ -5475,7 +6178,7 @@ async fn access_gate_does_not_leak_verdict_across_identities() {
 #[serial_test::serial]
 async fn post_auth_settings_xai_upgrades_writeback_emits_and_opens_gate() {
     use crate::agent::config::AgentMode;
-    use crate::auth::{GrokAuth, XAI_OAUTH2_ISSUER};
+    use xai_grok_login::{GrokAuth, XAI_OAUTH2_ISSUER};
     let _restore = RestoreOtelGate;
     let _storage_env = crate::env::EnvVarGuard::remove("GROK_STORAGE_MODE");
     let server = xai_grok_test_support::MockInferenceServer::start()
@@ -5519,7 +6222,7 @@ async fn post_auth_settings_xai_upgrades_writeback_emits_and_opens_gate() {
 #[serial_test::serial]
 async fn post_auth_settings_non_xai_keeps_local_but_still_emits() {
     use crate::agent::config::AgentMode;
-    use crate::auth::{AuthMode, GrokAuth};
+    use xai_grok_login::{AuthMode, GrokAuth};
     let _restore = RestoreOtelGate;
     let server = xai_grok_test_support::MockInferenceServer::start()
         .await
@@ -5558,7 +6261,7 @@ async fn post_auth_settings_non_xai_keeps_local_but_still_emits() {
 #[serial_test::serial]
 async fn post_auth_settings_failure_resolves_gate_onto_local_policy() {
     use crate::agent::config::AgentMode;
-    use crate::auth::{GrokAuth, XAI_OAUTH2_ISSUER};
+    use xai_grok_login::{GrokAuth, XAI_OAUTH2_ISSUER};
     let _restore = RestoreOtelGate;
     let server = xai_grok_test_support::MockInferenceServer::start()
         .await
@@ -5587,7 +6290,7 @@ async fn post_auth_settings_failure_resolves_gate_onto_local_policy() {
 #[serial_test::serial]
 async fn same_credential_refresh_does_not_flap_resolved_gate() {
     use crate::agent::config::AgentMode;
-    use crate::auth::{GrokAuth, XAI_OAUTH2_ISSUER};
+    use xai_grok_login::{GrokAuth, XAI_OAUTH2_ISSUER};
     let _restore = RestoreOtelGate;
     let server = xai_grok_test_support::MockInferenceServer::start()
         .await
@@ -5613,8 +6316,8 @@ async fn same_credential_refresh_does_not_flap_resolved_gate() {
 #[serial_test::serial]
 async fn settings_self_heal_refetches_after_token_rotation() {
     use crate::agent::config::AgentMode;
-    use crate::auth::refresh::{RefreshOutcome, TokenRefresher};
-    use crate::auth::{GrokAuth, XAI_OAUTH2_ISSUER};
+    use xai_grok_login::refresh::{RefreshOutcome, TokenRefresher};
+    use xai_grok_login::{GrokAuth, XAI_OAUTH2_ISSUER};
     let _restore = RestoreOtelGate;
     let server = xai_grok_test_support::MockInferenceServer::start_with_required_auth(
         vec![xai_grok_test_support::MockModelEntry::new("grok-build")],
@@ -5626,7 +6329,7 @@ async fn settings_self_heal_refetches_after_token_rotation() {
     struct RotatingRefresher;
     #[async_trait::async_trait]
     impl TokenRefresher for RotatingRefresher {
-        async fn refresh(&self, _r: crate::auth::manager::RefreshReason) -> RefreshOutcome {
+        async fn refresh(&self, _r: xai_grok_login::manager::RefreshReason) -> RefreshOutcome {
             RefreshOutcome::Success(Box::new(GrokAuth {
                 key: "rotated-key".into(),
                 oidc_issuer: Some(XAI_OAUTH2_ISSUER.to_string()),
@@ -5664,7 +6367,7 @@ async fn settings_self_heal_refetches_after_token_rotation() {
 #[serial_test::serial]
 async fn settings_not_cached_when_identity_logs_out_during_fetch() {
     use crate::agent::config::AgentMode;
-    use crate::auth::{GrokAuth, XAI_OAUTH2_ISSUER};
+    use xai_grok_login::{GrokAuth, XAI_OAUTH2_ISSUER};
     let _restore = RestoreOtelGate;
     let server = xai_grok_test_support::MockInferenceServer::start()
         .await
@@ -5707,8 +6410,9 @@ fn reload_after_terminal_removal_starts_clean() {
     run_local_for_bridge_test(|| async {
         let agent = build_minimal_agent_for_tests();
         let sid = acp::SessionId::new("sess-reload");
-        let (handle, _tx, _rx) = make_live_session_handle(&sid, Some("turn-1"));
+        let (handle, _tx, rx) = make_live_session_handle(&sid, Some("turn-1"));
         agent.insert_resident(&sid, handle);
+        let _observed = spawn_fake_actor(rx, true);
         assert_eq!(
             agent.close_active_session(&sid).await,
             crate::agent::mvp_agent::session_lifecycle::CloseOutcome::Closed,
@@ -5736,7 +6440,7 @@ fn build_agent_with_gateway_rx() -> (
     tokio::sync::mpsc::UnboundedReceiver<xai_acp_lib::AcpClientMessage>,
 ) {
     use crate::agent::config::Config as AgentConfig;
-    use crate::auth::{AuthManager, GrokComConfig};
+    use xai_grok_login::{AuthManager, GrokComConfig};
     let temp_dir = tempfile::tempdir().unwrap();
     let auth_manager =
         std::sync::Arc::new(AuthManager::new(temp_dir.path(), GrokComConfig::default()));
@@ -6768,7 +7472,7 @@ mod soft_default_settings_emit {
     #[tokio::test]
     async fn emit_settings_update_carries_permission_mode_from_cfg() {
         use crate::agent::config::Config as AgentConfig;
-        use crate::auth::{AuthManager, GrokComConfig};
+        use xai_grok_login::{AuthManager, GrokComConfig};
         let local = tokio::task::LocalSet::new();
         local
             .run_until(async {

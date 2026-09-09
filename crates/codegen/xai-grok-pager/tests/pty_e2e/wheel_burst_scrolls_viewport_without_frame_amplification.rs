@@ -4,23 +4,9 @@ use super::common::*;
 #[allow(unused_imports)]
 use super::scroll::*;
 
-// ── Infra check: timed wheel bursts, viewport markers, frame capture ────
-//
-// Exercises the scroll-test primitives together against the real pager:
-//
-// 1. `marker_response` / `marker_screen_row` / `topmost_visible_marker`: a transcript of unique one-row `MARKER-nnnn` lines.
-//    The topmost visible index identifies the viewport position
-//    "The view scrolled up" is then a strict index decrease rather than a fragile absolute-row check
-// 2. `send_wheel_burst` / `send_wheel_sequence`: SGR-1006 wheel reports written at a controlled inter-event interval.
-//    The 6ms spaced singles here read as a trackpad stream under the harness terminal's ept=3 classification (see the driver doc in `scroll.rs`)
-// 3. The harness's live frame capture: `reset_timing()` before the burst, `frame_count()` after the drain (the `renders_on_action.rs` pattern).
-//    Only the byte-deterministic frame count is asserted; no wall-clock.
-//
-// This checks the infrastructure, not a regression: it pins the contracts scroll-pacing tests rely on
-// Those are: off-screen-top markers scroll INTO view, at least one repaint happens, and repaints never exceed one per wheel event
-// The frame bound is an AMPLIFICATION bound
-// Real cadence coalescing (16ms `REDRAW_CADENCE`, about 12 frames for this burst) is left to the behavioral tests
-// All three assertions hold under either wheel or trackpad classification, so they are jitter-proof even when host load stretches the nominal 6ms gaps
+// Infra check: timed wheel bursts, viewport markers, frame capture. "The view scrolled up" is then
+// a strict index decrease rather than a fragile absolute-row check. Only the byte-deterministic
+// frame count is asserted; no wall-clock.
 
 /// Marker count: 120 one-row lines far exceed the 50-row PTY, so early markers sit off-screen-top once the finished stream pins the view to the bottom.
 const MARKER_COUNT: usize = 120;

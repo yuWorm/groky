@@ -6,19 +6,9 @@ use crate::common::*;
 /// Unless the pre-suspend drain waits, any frame still queued when the suspend runs lands on the `$PAGER` child's alternate screen.
 const FRAME_DELAY_MS: &str = "40";
 
-/// Dogfood bug: after returning from the minimal `/transcript` pager the live region was "off by one".
-/// Symptoms: a stale status row above a freshly drawn prompt, stray `[` escape fragments, the cursor on the info row.
-/// Root cause: frames are written to the tty by an async writer thread, and the suspend path never drained it.
-/// The frame that triggered the suspend (plus any composer clear / viewport scroll frames queued before) raced `less`.
-/// Those frames landed on `less`'s alternate screen.
-/// The main screen never received those writes, so after `rmcup` restored it, the renderer's diff no longer described reality.
-/// The stale rows were never repainted.
-///
-/// The fix drains the writer before the child takes the tty (deterministic coverage: the `WriterSync` unit tests in `render::draw`).
-/// It then re-anchors and full-repaints after the child exits.
-/// This test drives the user-visible round trip under the frame-write delay.
-/// The round trip: a burst of composer edits, `/transcript`, a real `less` (alt screen and `rmcup`), then `q`.
-/// Asserts the restored screen is exactly the idle live region: one status row, one info row, no stale draft/command text, no torn escape fragments.
+/// Dogfood bug: after returning from the minimal `/transcript` pager the live region was "off by
+/// one". Root cause: frames are written to the tty by an async writer thread, and the suspend path
+/// never drained it. The stale rows were never repainted.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore]
 async fn minimal_transcript_pager_restore_no_artifacts() {
@@ -107,10 +97,8 @@ async fn minimal_transcript_pager_restore_no_artifacts() {
         1,
         "exactly one info row after the pager round trip\nscreen:\n{screen}"
     );
-    // The frames queued right before the suspend (composer kill and /transcript submit-clear) must have LANDED
-    // Without the pre-suspend writer drain they die on the pager's alternate screen
-    // The restored main screen then still shows the killed draft / the submitted command in the prompt
-    // The renderer's diff believes both are gone: exactly the stale-row corruption from the dogfood report
+    // The frames queued right before the suspend (composer kill and /transcript submit-clear) must
+    // have LANDED. Without the pre-suspend writer drain they die on the pager's alternate screen.
     assert!(
         !screen.contains("❯ /transcript"),
         "stale submitted command left in the prompt after the round trip\nscreen:\n{screen}"

@@ -11,8 +11,7 @@
 //!
 //! Set `GROK_PTY_CAST_DIR` to also dump asciinema casts of both pager runs (written before the final asserts so a failing run still produces them).
 //!
-//! [`run_wake_cancel_scenario`] shares the scenario body with the Esc and [stop]-click mirror tests.
-//! Those live in `auto_wake_cancel_via_esc_…` and `auto_wake_cancel_via_stop_click_…`.
+//! [`run_wake_cancel_scenario`] shares the scenario body with the [stop]-click mirror test in `auto_wake_cancel_via_stop_click_…`.
 #[allow(unused_imports)]
 use super::common::*;
 
@@ -38,13 +37,14 @@ const BG_SLEEP_SECS: &str = "6";
 const HOLD_SLEEP_SECS: &str = "15";
 
 /// Which cancel gesture the scenario drives. All three send the same `session/cancel`; only the input path differs.
-/// Esc and StopClick also gate on the wake stop affordance ([stop] while the pane is idle), which only exists with the wake-turn cancel support.
+/// StopClick and SendNow also gate on the wake stop affordance ([stop] while the pane is idle), which only exists with the wake-turn cancel support.
+/// Esc is not a gesture here: it never cancels a turn (it only hints at Ctrl+C).
 #[cfg(unix)]
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum WakeCancelGesture {
     CtrlC,
-    Esc,
     StopClick,
+    SendNow,
 }
 
 #[cfg(unix)]
@@ -54,7 +54,14 @@ async fn auto_wake_cancel_preserves_queued_user_prompt() {
     run_wake_cancel_scenario(WakeCancelGesture::CtrlC, "auto_wake_repro").await;
 }
 
-/// Shared body for the three gesture tests (Ctrl+C here, Esc and a [stop] click in their mirror files).
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "PTY e2e; run the owning pty_e2e_* Cargo test with --ignored (see Cargo.toml)"]
+async fn auto_wake_queued_prompt_can_send_now() {
+    run_wake_cancel_scenario(WakeCancelGesture::SendNow, "auto_wake_send_now").await;
+}
+
+/// Shared body for the cancel and Send now gesture tests.
 /// `cast_prefix` keeps the optional asciinema dumps distinct per gesture.
 #[cfg(unix)]
 pub(crate) async fn run_wake_cancel_scenario(gesture: WakeCancelGesture, cast_prefix: &str) {
@@ -157,7 +164,7 @@ pub(crate) async fn run_wake_cancel_scenario(gesture: WakeCancelGesture, cast_pr
     );
     harness.update(Duration::from_millis(500));
 
-    // Esc / StopClick gate on the wake stop affordance first: the pane is still idle here (nothing typed), so a rendered [stop] is the wake turn's
+    // StopClick / SendNow gate on the wake stop affordance first: the pane is still idle here (nothing typed), so a rendered [stop] is the wake turn's
     // That affordance does not exist without the wake-turn cancel support
     if !matches!(gesture, WakeCancelGesture::CtrlC) {
         harness
@@ -181,14 +188,23 @@ pub(crate) async fn run_wake_cancel_scenario(gesture: WakeCancelGesture, cast_pr
         .inject_keys(b"\r")
         .expect("submit clarifying message");
     harness.update(Duration::from_millis(500));
+    if matches!(gesture, WakeCancelGesture::SendNow) {
+        harness
+            .wait_for_text("send now", Duration::from_secs(3))
+            .unwrap_or_else(|_| {
+                panic!(
+                    "Send now affordance missing during idle-looking wake; screen:\n{}",
+                    harness.screen_contents()
+                )
+            });
+    }
 
-    // One cancel gesture: it must cancel the auto-wake turn (killing the held sleep), not the queued user prompt
     match gesture {
         WakeCancelGesture::CtrlC => {
             harness.inject_keys(keys::CTRL_C).expect("press ctrl+c");
         }
-        WakeCancelGesture::Esc => {
-            harness.inject_keys(keys::ESC).expect("press esc");
+        WakeCancelGesture::SendNow => {
+            harness.inject_keys(b"\r").expect("press empty Enter");
         }
         WakeCancelGesture::StopClick => {
             harness
@@ -207,8 +223,13 @@ pub(crate) async fn run_wake_cancel_scenario(gesture: WakeCancelGesture, cast_pr
     }
     harness.update(Duration::from_secs(2));
 
-    // The surviving prompt is promoted after the cancel and reaches the model.
-    let marker_on_wire = poll_for(Duration::from_secs(20), || {
+    // Send now must beat the 15-second hold; the cancel gestures only need to preserve the row.
+    let delivery_timeout = if matches!(gesture, WakeCancelGesture::SendNow) {
+        Duration::from_secs(5)
+    } else {
+        Duration::from_secs(20)
+    };
+    let marker_on_wire = poll_for(delivery_timeout, || {
         content
             .request_bodies()
             .iter()

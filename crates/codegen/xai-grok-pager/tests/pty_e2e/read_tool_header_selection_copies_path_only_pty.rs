@@ -2,13 +2,9 @@
 #[allow(unused_imports)]
 use super::common::*;
 
-/// PTY: drag-select on a `Read {path}` tool header copies only the path (not the `Read ` label).
-/// Exercises the real pager, mouse selection, and OSC 52.
-///
-/// `SSH_CONNECTION` is set deliberately.
-/// On macOS the clipboard route only emits OSC 52 when it believes the session is remote (see `resolve_clipboard_route`).
-/// The harness strips inherited SSH vars, so this test re-injects a dummy one for OSC 52 readback.
-/// `recap_header_not_in_selection_pty` does the same.
+/// PTY: drag-select on a `Read {path}` tool header copies only the path (not the `Read ` label). On
+/// macOS the clipboard route only emits OSC 52 when it believes the session is remote (see
+/// `resolve_clipboard_route`).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "PTY e2e; run the owning pty_e2e_* Cargo test with --ignored (see Cargo.toml)"]
 async fn read_tool_header_selection_copies_path_only_pty() {
@@ -67,11 +63,8 @@ async fn read_tool_header_selection_copies_path_only_pty() {
             )
         });
 
-    // Wait for the follow-up completion sentinel before selecting
-    // The header renders mid-turn, while the tool call is still running, so dragging then races the streaming turn
-    // The tool block isn't committed into the scrollback selection model yet, so the drag's hit-test misses and no OSC 52 is emitted
-    // Waiting for READ_HDR_SENTINEL (the last text streamed after the tool result) settles the turn first
-    // The sibling recap_header_not_in_selection_pty test does the same
+    // Wait for the follow-up completion sentinel before selecting. The tool block isn't committed into
+    // the scrollback selection model yet, so the drag's hit-test misses and no OSC 52 is emitted.
     harness
         .wait_for_text(READ_HDR_SENTINEL, Duration::from_secs(45))
         .unwrap_or_else(|_| {

@@ -21,10 +21,7 @@ pub fn conversation_has_memory_context(items: &[ConversationItem]) -> bool {
 }
 
 /// Format memory search results as a markdown section for system-reminder injection.
-///
 /// Each result is formatted with score, source, file path, line range, and the snippet in a fenced code block (preserving newlines/markdown).
-/// This matches the output format of the `memory_search` tool.
-///
 /// Returns `None` if results are empty.
 pub fn format_memory_reminder(results: &[MemorySearchResult]) -> Option<String> {
     if results.is_empty() {

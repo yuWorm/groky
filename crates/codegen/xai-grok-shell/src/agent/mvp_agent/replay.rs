@@ -7,7 +7,7 @@ use agent_client_protocol as acp;
 use xai_grok_paths::AbsPathBuf;
 
 use super::{MvpAgent, mark_as_replay, stamp_meta_value};
-use crate::session::storage::ReplayToolCollapser;
+use crate::session::storage::{ReplayToolCollapser, UnfinishedSubagent};
 
 /// Max in-flight `forward_with_completion` receivers during cold resume.
 /// Unbounded enqueue with sync pager apply peaks the pager at multi-GB on huge sessions; this keeps ACP apply roughly windowed.
@@ -72,16 +72,9 @@ impl MvpAgent {
         }
     }
 
-    /// Forward one raw JSONL replay line.
-    /// Returns the completion receiver when a notification was actually sent.
-    ///
-    /// Dispatches by on-disk method name:
-    /// - ACP updates (`"session/update"`) become a typed `SessionNotification` for correct TUI dispatch.
-    ///   Direct dispatch preserves Rust types, not method strings.
-    /// - xAI updates (`"_x.ai/session/update"`) become an `ExtNotification`.
-    ///
-    /// When `mark_replay` is true, the notification is tagged with `_meta.isReplay: true` so the client knows it's historical data.
-    /// Cursor-based reconnects set this to false for events after the cursor so the client processes them as live updates.
+    /// Forward one raw JSONL replay line. Dispatches by on-disk method name: ACP updates (`"session/update"`) become a typed `SessionNotification` for correct TUI dispatch.
+    /// Direct dispatch preserves Rust types, not method strings. xAI updates (`"_x.ai/session/update"`) become an `ExtNotification`.
+    /// When `mark_replay` is true, the notification is tagged with `_meta.isReplay: true` so the client knows it's historical data. Cursor-based reconnects set this to false for events after the cursor so the client processes them as live updates.
     pub(super) fn forward_raw_replay_line(
         &self,
         line: &str,
@@ -195,7 +188,7 @@ impl MvpAgent {
         persist_data: Option<&serde_json::Value>,
         target_client_id: Option<&serde_json::Value>,
         cursor: Option<&str>,
-    ) -> Result<(u64, u64, Vec<(String, String)>), acp::Error> {
+    ) -> Result<(u64, u64, Vec<UnfinishedSubagent>), acp::Error> {
         let mut replay_timer = crate::instrumentation_timer!("session.load_session_replay");
         replay_timer.with_field("session_id", session_id.0.as_ref());
         replay_timer.with_field("cwd", cwd.as_str());
@@ -296,15 +289,9 @@ impl MvpAgent {
         Ok((last_tokens, end_offset, unfinished_subagents))
     }
 
-    /// Enqueue replay notifications for updates appended after `from_offset`.
-    /// Returns completion receivers; callers open the gate then drain.
-    /// Intentionally sync (not async) so no prompt task can make progress before the gate flips.
-    ///
-    /// The delta tail is typically small (appends during the just-finished replay).
-    /// Windowing would require `.await` here and would delay the gate flip; the caller drains the returned receivers before `LoadSessionResponse`.
-    ///
-    /// When `mark_replay` is false (cursor-based reconnect), delta events are forwarded without `_meta.isReplay`.
-    /// They are truly new events the client has not seen.
+    /// Enqueue replay notifications for updates appended after `from_offset`. Intentionally sync (not async) so no prompt task can make progress before the gate flips.
+    /// The delta tail is typically small (appends during the just-finished replay). Windowing would require `.await` here and would delay the gate flip; the caller drains the returned receivers before `LoadSessionResponse`.
+    /// When `mark_replay` is false (cursor-based reconnect), delta events are forwarded without `_meta.isReplay`. They are truly new events the client has not seen.
     pub(super) fn replay_session_updates_from_offset_enqueue(
         &self,
         session_id: &acp::SessionId,

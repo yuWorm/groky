@@ -2,7 +2,10 @@ use super::cache::{is_fresh, read_capped, write_private_atomic};
 use super::*;
 
 pub(crate) const SETTINGS_CACHE_FILE: &str = "settings_cache.json";
-pub(crate) const SETTINGS_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(300);
+/// 1h, matching codex's cloud-config bundle: an offline cold start can boot on
+/// the last good policy, while staleness stays bounded by the managed gate's
+/// own re-fetch and the per-session settings reapply.
+pub(crate) const SETTINGS_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(3600);
 const SETTINGS_CACHE_MAX_BYTES: u64 = 1 << 20;
 
 const SETTINGS_CACHE_HMAC_KEY: &[u8] =
@@ -49,7 +52,7 @@ impl SettingsCacheManager {
 
     pub(crate) fn load_or_fetch(
         &self,
-        auth: &crate::auth::GrokAuth,
+        auth: &xai_grok_login::GrokAuth,
         origin: &str,
         alpha_test_key: Option<&str>,
         fetch: impl FnOnce() -> Option<crate::util::config::RemoteSettings>,
@@ -79,13 +82,29 @@ impl SettingsCacheManager {
         (Some(fetched), Some(write))
     }
 
-    fn identity(auth: &crate::auth::GrokAuth, alpha_test_key: Option<&str>) -> String {
-        use std::hash::{Hash, Hasher};
-        let mut hasher = std::collections::hash_map::DefaultHasher::new();
-        auth.user_id.hash(&mut hasher);
-        auth.key.hash(&mut hasher);
-        alpha_test_key.hash(&mut hasher);
-        format!("{:016x}", hasher.finish())
+    /// Scope the cache to the stable account identity, not the rotating bearer token, so a token refresh between boots still hits the cache. `key` is a fallback only for keyless/API-key auth where `user_id` is empty. Hashed (SHA-256, stable across releases) so no credential lands on disk.
+    fn identity(auth: &xai_grok_login::GrokAuth, alpha_test_key: Option<&str>) -> String {
+        use sha2::{Digest, Sha256};
+        let principal = if auth.user_id.is_empty() {
+            auth.key.as_str()
+        } else {
+            auth.user_id.as_str()
+        };
+        let mut hasher = Sha256::new();
+        for part in [
+            principal,
+            auth.team_id.as_deref().unwrap_or(""),
+            auth.organization_id.as_deref().unwrap_or(""),
+            alpha_test_key.unwrap_or(""),
+        ] {
+            hasher.update(part.as_bytes());
+            hasher.update([0u8]);
+        }
+        hasher
+            .finalize()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect()
     }
 
     fn load_fresh(&self, identity: &str, origin: &str) -> Option<CachedSettings> {
@@ -163,6 +182,17 @@ impl SettingsCacheWrite {
         }
         .persist(&self.identity, &self.origin, &self.settings);
     }
+
+    #[cfg(test)]
+    pub(crate) fn for_tests(path: std::path::PathBuf) -> Self {
+        Self {
+            path,
+            ttl: SETTINGS_CACHE_TTL,
+            identity: "test-identity".to_string(),
+            origin: "https://proxy.example".to_string(),
+            settings: crate::util::config::RemoteSettings::default(),
+        }
+    }
 }
 
 type HmacSha256 = hmac::Hmac<sha2::Sha256>;
@@ -210,7 +240,7 @@ mod settings_cache_tests {
     #[test]
     fn load_or_fetch_skips_the_fetch_on_a_warm_hit() {
         let (_dir, manager) = temp_manager(SETTINGS_CACHE_TTL);
-        let auth = crate::auth::GrokAuth::test_default();
+        let auth = xai_grok_login::GrokAuth::test_default();
         let (cold, write) = manager.load_or_fetch(&auth, ORIGIN, None, || Some(settings()));
         write.unwrap().commit();
         let (warm, warm_write) =
@@ -223,7 +253,7 @@ mod settings_cache_tests {
     #[test]
     fn load_or_fetch_defers_the_write_until_commit() {
         let (dir, manager) = temp_manager(SETTINGS_CACHE_TTL);
-        let auth = crate::auth::GrokAuth::test_default();
+        let auth = xai_grok_login::GrokAuth::test_default();
         let (_settings, write) = manager.load_or_fetch(&auth, ORIGIN, None, || Some(settings()));
         assert!(!dir.path().join(SETTINGS_CACHE_FILE).exists());
         write.unwrap().commit();
@@ -233,7 +263,7 @@ mod settings_cache_tests {
     #[test]
     fn load_or_fetch_misses_on_a_different_alpha_test_key() {
         let (_dir, manager) = temp_manager(SETTINGS_CACHE_TTL);
-        let auth = crate::auth::GrokAuth::test_default();
+        let auth = xai_grok_login::GrokAuth::test_default();
         let (_a, write) =
             manager.load_or_fetch(&auth, ORIGIN, Some("alpha-a"), || Some(settings()));
         write.unwrap().commit();
@@ -249,7 +279,7 @@ mod settings_cache_tests {
     #[test]
     fn load_or_fetch_does_not_persist_a_failed_fetch() {
         let (dir, manager) = temp_manager(SETTINGS_CACHE_TTL);
-        let auth = crate::auth::GrokAuth::test_default();
+        let auth = xai_grok_login::GrokAuth::test_default();
         let (result, write) = manager.load_or_fetch(&auth, ORIGIN, None, || None);
         assert!(result.is_none());
         assert!(write.is_none());
@@ -267,6 +297,48 @@ mod settings_cache_tests {
             ttl: std::time::Duration::ZERO,
         };
         assert!(expired.load_fresh("id", ORIGIN).is_none());
+    }
+
+    #[test]
+    fn identity_survives_token_rotation_and_scopes_by_tenant() {
+        let mut base = xai_grok_login::GrokAuth::test_default();
+        base.user_id = "user-1".into();
+        base.key = "token-A".into();
+
+        let mut rotated = base.clone();
+        rotated.key = "token-B".into();
+        assert_eq!(
+            SettingsCacheManager::identity(&base, None),
+            SettingsCacheManager::identity(&rotated, None),
+            "identity must survive bearer-token rotation",
+        );
+
+        let mut other_team = base.clone();
+        other_team.team_id = Some("team-2".into());
+        assert_ne!(
+            SettingsCacheManager::identity(&base, None),
+            SettingsCacheManager::identity(&other_team, None),
+            "a different team must yield a different identity",
+        );
+        let mut other_org = base.clone();
+        other_org.organization_id = Some("org-2".into());
+        assert_ne!(
+            SettingsCacheManager::identity(&base, None),
+            SettingsCacheManager::identity(&other_org, None),
+            "a different organization must yield a different identity",
+        );
+
+        // Keyless (API-key) auth has no user_id, so the key is the principal.
+        let mut keyless_a = xai_grok_login::GrokAuth::test_default();
+        keyless_a.user_id = String::new();
+        keyless_a.key = "api-key-A".into();
+        let mut keyless_b = keyless_a.clone();
+        keyless_b.key = "api-key-B".into();
+        assert_ne!(
+            SettingsCacheManager::identity(&keyless_a, None),
+            SettingsCacheManager::identity(&keyless_b, None),
+            "with no user_id the key must discriminate identity",
+        );
     }
 
     fn cache_file(fetched_at: DateTime<Utc>) -> SettingsCache {

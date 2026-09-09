@@ -5,10 +5,9 @@ use super::common::*;
 const QUOTE_ALPHA: &str = "QUOTE_ALPHA";
 const QUOTE_OUTRO: &str = "QUOTE_OUTRO_RAW_DONE";
 
-/// PTY: per-entry raw mode (`r`) must show the source text byte for byte.
-/// Drag-copying a quote line in raw mode keeps the `>` marker; the rule that excludes the pretty-mode bar from copies must not leak into raw mode.
-///
-/// `SSH_CONNECTION` forces the OSC 52 clipboard route for readback, same as `recap_header_not_in_selection_pty`.
+/// PTY: per-entry raw mode (`r`) must show the source text byte for byte. Drag-copying a quote line
+/// in raw mode keeps the `>` marker; the rule that excludes the pretty-mode bar from copies must
+/// not leak into raw mode.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "PTY e2e; run the owning pty_e2e_* Cargo test with --ignored (see Cargo.toml)"]
 async fn quote_block_raw_mode_copy_keeps_source_pty() {

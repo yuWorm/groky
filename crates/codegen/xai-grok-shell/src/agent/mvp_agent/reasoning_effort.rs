@@ -6,23 +6,14 @@ use xai_grok_sampling_types::ReasoningEffort;
 
 use crate::agent::models::ModelsManager;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, strum::AsRefStr, strum::IntoStaticStr)]
+#[strum(serialize_all = "snake_case")]
 pub(crate) enum EffortTarget {
     NewSession,
     ModelSwitch,
+    #[strum(serialize = "summary")]
     SummaryClient,
 }
-
-impl EffortTarget {
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::NewSession => "new_session",
-            Self::ModelSwitch => "model_switch",
-            Self::SummaryClient => "summary",
-        }
-    }
-}
-
 impl ModelsManager {
     pub(crate) fn apply_supported_effort(
         &self,
@@ -60,7 +51,7 @@ impl ModelsManager {
                     session_id = %session_id.0,
                     model = %sampling.model,
                     effort = %effort,
-                    target = %target.as_str(),
+                    target = %target.as_ref(),
                     "reasoning_effort: applied effort"
                 )
             };

@@ -2,11 +2,8 @@
 #[allow(unused_imports)]
 use crate::common::*;
 
-/// Minimal full view: `/transcript` renders the WHOLE conversation fully expanded (reasoning in full, tool output uncapped) as ANSI to a temp file.
-/// It opens that file in `$PAGER`, suspending the inline TUI, then restores.
-/// We set `PAGER=cat` so the child dumps the transcript and exits immediately (no interactive `less` to drive).
-/// Proof the pager ran on the transcript: the turn's sentinel appears **twice**, once in the live conversation and once in the dumped transcript.
-/// The inline TUI restores to idle after.
+/// Minimal full view: `/transcript` renders the WHOLE conversation fully expanded (reasoning in
+/// full, tool output uncapped) as ANSI to a temp file.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore]
 async fn minimal_transcript_opens_in_pager() {

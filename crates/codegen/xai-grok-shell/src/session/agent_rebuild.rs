@@ -61,7 +61,6 @@ pub(crate) struct ResolvedToolParamsJson {
     pub ask_user_question: Option<serde_json::Map<String, serde_json::Value>>,
 }
 /// Cached recipe for building a session-scoped [`Agent`].
-///
 /// See module docs for the invariant: this is the only construction site for `Agent` in the shell crate.
 /// Cloning is intentionally not derived; the spec lives behind an [`Arc`] and is shared by cloning that `Arc`.
 pub(crate) struct AgentRebuildSpec {
@@ -121,9 +120,7 @@ pub(crate) struct AgentRebuildSpec {
     pub respect_gitignore: bool,
     pub path_not_found_hints: bool,
     /// Fire side of the scheduler mode.
-    /// The spawn copies the same resolution onto [`SpawnSnapshot::scheduler_background_loops`](crate::session::SpawnSnapshot), which clients read.
     /// Keep the two on one resolve.
-    pub scheduler_background_loops: bool,
     pub mcp_state: Arc<tokio::sync::Mutex<crate::session::mcp_servers::McpState>>,
     pub managed_gateway_tool_client:
         Option<xai_grok_tools::types::resources::ManagedGatewayToolClient>,
@@ -145,9 +142,7 @@ impl AgentRebuildSpec {
     }
     /// `persisted_skill_names`: restored into the `SkillManager` before `seed()` to prevent duplicate system-reminder injection on resume.
     /// `preloaded_skills`: parent-discovered skills passed to `AgentBuilder::with_preloaded_skills()` to bypass filesystem discovery in subagents.
-    /// Both are consumed once: the rebuild path (`build_agent`) passes `None` for both so zero-turn model switches get fresh discovery.
     /// Returns the built agent and the pure construction time (entry to `SB_BUILDER_DONE`, before the batched resource seed).
-    /// The caller can then attribute `AgentBuild` and `ToolSetup` phases to the same boundaries the waterfall marks use.
     pub(crate) async fn build_agent_with_initial_overrides(
         self: &Arc<Self>,
         definition: AgentDefinition,
@@ -216,7 +211,6 @@ impl AgentRebuildSpec {
             blocking_wait_depth,
             respect_gitignore,
             path_not_found_hints,
-            scheduler_background_loops,
             mcp_state,
             managed_gateway_tool_client,
             is_non_interactive,
@@ -280,6 +274,9 @@ impl AgentRebuildSpec {
         .with_persona_instructions(persona_instructions.clone())
         .with_skills_config(skills_config.clone())
         .with_compat_config(*compat)
+        .with_project_trusted(crate::agent::folder_trust::project_scope_allowed(
+            working_directory,
+        ))
         .with_context_window(*context_window_tokens)
         .with_mcp_max_output_bytes(
             crate::util::config::resolve_max_mcp_output_bytes_for_cwd(working_directory),
@@ -382,12 +379,6 @@ impl AgentRebuildSpec {
                     );
                 resources
                     .insert(
-                        xai_grok_tools::types::resources::SchedulerBackgroundLoops(
-                            *scheduler_background_loops,
-                        ),
-                    );
-                resources
-                    .insert(
                         xai_grok_tools::types::resources::PathNotFoundHints(
                             *path_not_found_hints,
                         ),
@@ -462,7 +453,6 @@ pub(crate) fn test_rebuild_spec_default() -> Arc<AgentRebuildSpec> {
         session_id_str: "test-session".to_string(),
         blocking_wait_depth: Arc::new(crate::tools::tool_context::BlockingWaitState::new()),
         respect_gitignore: false,
-        scheduler_background_loops: true,
         path_not_found_hints: false,
         mcp_state: Arc::new(tokio::sync::Mutex::new(
             crate::session::mcp_servers::McpState::new(vec![]),

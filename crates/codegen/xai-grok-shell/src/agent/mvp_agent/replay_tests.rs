@@ -205,7 +205,7 @@ fn build_agent_with_gateway() -> (
     tokio::sync::mpsc::UnboundedReceiver<AcpClientMessage>,
 ) {
     use crate::agent::config::Config as AgentConfig;
-    use crate::auth::{AuthManager, GrokComConfig};
+    use xai_grok_login::{AuthManager, GrokComConfig};
 
     let temp_dir = tempfile::tempdir().unwrap();
     let auth_manager =

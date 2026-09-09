@@ -27,10 +27,9 @@ static SQLITE_VEC_INIT: Once = Once::new();
 /// Register the sqlite-vec extension globally. Call it before any `MemoryIndex::open_or_create()`; repeat calls are safe (Once guard).
 pub fn init_sqlite_vec() {
     SQLITE_VEC_INIT.call_once(|| {
-        // SAFETY: sqlite_vec::sqlite3_vec_init has the C ABI signature expected by sqlite3_auto_extension
-        // The explicit type annotation on transmute makes this compiler-verified
-        // If sqlite-vec changes its init signature, the annotation will cause a compile error instead of silent UB
-        // We pin sqlite-vec to exact version =0.1.7-alpha.2; any bump must re-verify.
+        // SAFETY: sqlite_vec::sqlite3_vec_init has the C ABI signature expected by sqlite3_auto_extension The explicit type
+        // annotation on transmute makes this compiler-verified If sqlite-vec changes its init signature, the annotation will cause
+        // a compile error instead of silent UB We pin sqlite-vec to exact version =0.1.7-alpha.2; any bump must re-verify.
         unsafe {
             rusqlite::ffi::sqlite3_auto_extension(Some(std::mem::transmute::<
                 *const (),
@@ -90,7 +89,6 @@ pub struct MemoryIndex {
 
 impl MemoryIndex {
     /// Open or create the index database at `db_path`.
-    ///
     /// `dimensions` sets the embedding vector size for the `chunks_vec` table.
     /// If sqlite-vec failed to load (call `init_sqlite_vec()` first), the index gracefully degrades to FTS-only mode.
     pub fn open_or_create(
@@ -219,6 +217,12 @@ impl MemoryIndex {
         path: &Path,
         source: &str,
     ) -> Result<ReindexResult, rusqlite::Error> {
+        let span = tracing::info_span!(
+            "memory.reindex_file",
+            bytes = tracing::field::Empty,
+            chunk_count = tracing::field::Empty,
+        );
+        let _g = span.enter();
         let content = match std::fs::read_to_string(path) {
             Ok(c) => c,
             Err(e) => {
@@ -226,8 +230,10 @@ impl MemoryIndex {
                 return Ok(ReindexResult::default());
             }
         };
+        span.record("bytes", content.len() as i64);
 
         let new_chunks = chunk_markdown(&content, &self.chunk_config);
+        span.record("chunk_count", new_chunks.len() as i64);
         let path_str = path.to_string_lossy().to_string();
 
         let existing = self.get_chunks_for_path(&path_str)?;
@@ -347,7 +353,6 @@ impl MemoryIndex {
     // -----------------------------------------------------------------------
 
     /// FTS5 keyword search. Returns results ranked by BM25 score.
-    ///
     /// Applies stop word filtering to improve precision for conversational queries.
     /// When all words are stop words, it returns empty results; the caller (`hybrid_search`) falls back to the vector search path.
     pub fn search_fts_by_sources(
@@ -365,6 +370,7 @@ impl MemoryIndex {
             return Ok(vec![]);
         }
 
+        let _g = tracing::info_span!("memory.fts_search").entered();
         let placeholders: Vec<String> = sources
             .iter()
             .enumerate()
@@ -403,6 +409,7 @@ impl MemoryIndex {
             return Ok(vec![]);
         }
 
+        let _g = tracing::info_span!("memory.fts_search").entered();
         let mut stmt = self.db.prepare(
             "SELECT rowid, rank FROM chunks_fts WHERE chunks_fts MATCH ?1 \
              ORDER BY rank LIMIT ?2",
@@ -459,8 +466,6 @@ impl MemoryIndex {
         Ok(result)
     }
 
-    /// Return the current value of the reindex claim from meta.
-    ///
     /// An empty string means no claim is active.
     /// A non-empty claim means a session currently owns the reindex lock (or a crashed session left a stale one).
     /// `grok memory doctor` uses this to detect stuck states.
@@ -549,6 +554,11 @@ impl MemoryIndex {
         if !self.vec_available {
             return Ok(vec![]);
         }
+        let span = tracing::info_span!(
+            "memory.vector_search",
+            candidate_count = tracing::field::Empty
+        );
+        let _g = span.enter();
         let query_bytes: Vec<u8> = query_embedding
             .iter()
             .flat_map(|f| f.to_le_bytes())
@@ -562,6 +572,7 @@ impl MemoryIndex {
                 Ok((row.get::<_, String>(0)?, row.get::<_, f32>(1)?))
             })?
             .collect::<Result<Vec<_>, _>>()?;
+        span.record("candidate_count", results.len() as i64);
         Ok(results)
     }
 
@@ -570,9 +581,7 @@ impl MemoryIndex {
     // -----------------------------------------------------------------------
 
     /// Try to claim exclusive reindex rights using the `meta` table.
-    ///
     /// Uses an atomic UPDATE: succeeds only if unclaimed (empty) or stale (older than `stale_threshold_secs`).
-    /// Returns `true` if claimed.
     /// Under SQLite's serialized writer model, at most one agent wins.
     pub fn try_claim_reindex(&self, stale_threshold_secs: i64) -> bool {
         let pid = std::process::id();
@@ -610,10 +619,8 @@ impl MemoryIndex {
     // -----------------------------------------------------------------------
 
     /// Delete all indexed chunks for a given file path.
-    ///
     /// The watcher calls this on file-removal events so deleted memory files stop being searchable.
     /// Deletes from all three tables (`chunks`, `chunks_fts`, `chunks_vec`) in one transaction so the index stays consistent even on partial failure.
-    /// Returns the number of chunks removed, which is 0 when the path was not previously indexed (idempotent).
     pub fn delete_path(&mut self, path: &Path) -> Result<usize, rusqlite::Error> {
         let path_str = path.to_string_lossy().to_string();
         let existing = self.get_chunks_for_path(&path_str)?;
@@ -940,10 +947,7 @@ mod tests {
     // -----------------------------------------------------------------------
 
     /// Simulates the `/memory append` then immediate-reindex flow.
-    ///
-    /// The TUI's `AppendMemory` action once wrote the file and returned without reindexing.
     /// Appended content was then only searchable after a watcher-driven sync or the next session startup.
-    /// This test keeps that regression from silently returning.
     #[test]
     fn test_append_then_reindex_is_immediately_searchable() {
         let tmp = TempDir::new().unwrap();
@@ -1150,14 +1154,7 @@ mod tests {
     // reindex maintenance path regression tests
     // -----------------------------------------------------------------------
 
-    /// Regression test for the reindex maintenance flow:
-    ///
-    /// 1. Index a file.
-    /// 2. Delete the file from disk (simulates a user removing a session log).
-    /// 3. Run the same orphan-removal logic as `grok memory reindex`:
-    ///    compare `all_indexed_paths()` against current files and call `delete_path()` for paths that no longer exist.
-    /// 4. Verify the stale chunks are gone and are no longer searchable.
-    ///
+    /// Index a file; Delete the file from disk (simulates a user removing a session log); Run the same orphan-removal logic as `grok memory reindex`: compare `all_indexed_paths()` against current files and call `delete_path()` for paths that no longer exist; Verify the stale chunks are gone and are no longer searchable.
     /// This proves that `grok memory reindex`'s Phase 1 fixes the state that `grok memory doctor` warns about.
     #[test]
     fn test_reindex_maintenance_removes_orphaned_chunks() {
@@ -1197,7 +1194,6 @@ mod tests {
     }
 
     /// A fresh (non-stale) reindex claim blocks `try_claim_reindex`.
-    ///
     /// Verifies that `grok memory reindex` Phase 0 bails when a live session holds a fresh claim.
     /// The CLI cannot steal a live session's lock and then mutate the index concurrently.
     #[test]

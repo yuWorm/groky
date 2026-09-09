@@ -44,11 +44,9 @@ fn models_count(content: &ContentController) -> usize {
 /// Paid-only model id used to prove the post-unblock catalog actually replaced the free list in the picker (not merely that `/v1/models` was hit).
 const PAID_ONLY_MODEL: &str = "composer-paid-only";
 
-/// Minimal unsigned JWT with a `tier` claim matching [`PAID_TIER`].
-///
-/// Proto `prod_auth.SubscriptionTier`: 5 is `supergrok_heavy`, the live `/user` string `SuperGrokPro`.
-/// It must match `jwt_claim_matches_user_subscription_tier`.
-/// Otherwise the post-unblock catalog refresh treats the claim as stale and never re-fetches `/v1/models` within the test timeout.
+/// Minimal unsigned JWT with a `tier` claim matching [`PAID_TIER`]. It must match
+/// `jwt_claim_matches_user_subscription_tier`. Otherwise the post-unblock catalog refresh treats
+/// the claim as stale and never re-fetches `/v1/models` within the test timeout.
 fn paid_tier_jwt() -> String {
     use base64::Engine;
     let enc = |v: &serde_json::Value| {
@@ -59,11 +57,9 @@ fn paid_tier_jwt() -> String {
     format!("{header}.{payload}.sig")
 }
 
-/// Bind the fixed local-dev OIDC issuer (`http://localhost:22255`) and return a paid-tier JWT on refresh.
-/// Call AFTER free-tier watch polling so early checks still see connection-refused (hermetic free path).
-/// Only the post-upgrade refresh then succeeds with a paid token.
-///
-/// Minimal raw HTTP (no axum dep in this crate): discovery and token endpoints only.
+/// Bind the fixed local-dev OIDC issuer (`http://localhost:22255`) and return a paid-tier JWT on
+/// refresh. Only the post-upgrade refresh then succeeds with a paid token. Minimal raw HTTP (no
+/// axum dep in this crate): discovery and token endpoints only.
 async fn start_local_oidc_paid_refresh() -> tokio::task::JoinHandle<()> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -134,11 +130,8 @@ fn pump_until(
     }
 }
 
-/// Like [`seed_fake_oauth`], but under the `GROK_LOCAL_AUTH` dev issuer (`http://localhost:22255`). Two reasons:
-/// `is_xai_oauth2_issuer()` accepts the local issuer, so the subscription gate applies (an enterprise/unknown issuer bypasses it).
-/// The qualifying-tier JWT refresh then hits `localhost:22255`: instant connection-refused instead of a real network call to auth.x.ai.
-/// That keeps the test hermetic, with no CI-network flake.
-/// Pair with `GROK_LOCAL_AUTH=1` in the spawn env so the shell's scope-key lookup resolves this entry.
+/// The qualifying-tier JWT refresh then hits `localhost:22255`: instant connection-refused instead
+/// of a real network call to auth.x.ai.
 fn seed_fake_oauth_local_issuer(content: &ContentController, user: &str) {
     let grok_home = content.home().join(".grok");
     std::fs::create_dir_all(&grok_home).expect("create temp .grok");
@@ -207,10 +200,9 @@ fn spawn_subscription_session(
     harness
 }
 
-/// Watch cadence while free, upgrade detection, then dormancy once paid.
-///
-/// After the free-to-paid unblock the shell must refresh the model catalog with a paid JWT (mock IdP on `:22255`).
-/// The paid-only model id must appear in the `/model` picker, not merely `/v1/models` being called.
+/// Watch cadence while free, upgrade detection, then dormancy once paid. After the free-to-paid
+/// unblock the shell must refresh the model catalog with a paid JWT (mock IdP on `:22255`). The
+/// paid-only model id must appear in the `/model` picker, not merely `/v1/models` being called.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "PTY e2e; run the owning pty_e2e_* Cargo test with --ignored (see Cargo.toml)"]
 async fn subscription_watch_polls_free_tier_then_goes_dormant_after_upgrade() {
@@ -337,13 +329,9 @@ async fn startup_gate_shows_paywall_for_free_user_after_live_check() {
     harness.quit().expect("clean quit");
 }
 
-/// Verify-before-paywall: a user who ALREADY subscribed never sees a paywall flash when a stale gated settings snapshot reaches the client.
-///
-/// The stale snapshot is delivered via the `/new` settings refresh, the only active `/v1/settings` consumer at that point.
-/// (Watch disabled via env, announcements poll at its 5-min default, gate poll only runs while gated, startup fetches settled.)
-/// Queueing it at startup instead races the shell's concurrent startup fetches.
-/// A slow gated fetch landing after the verify check stores fresh settings can legitimately re-carry the gate.
-/// That is a time-travel artifact of the scripted one-shot, not a client bug (observed as a flake).
+/// Verify-before-paywall: a user who ALREADY subscribed never sees a paywall flash when a stale
+/// gated settings snapshot reaches the client. The stale snapshot is delivered via the `/new`
+/// settings refresh, the only active `/v1/settings` consumer at that point.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "PTY e2e; run the owning pty_e2e_* Cargo test with --ignored (see Cargo.toml)"]
 async fn stale_gate_push_never_flashes_paywall_for_subscribed_user() {

@@ -239,12 +239,8 @@ fn render_separator() -> BlockLine {
     .into()
 }
 
-/// Format:
-///   **pre_tool_use**
-///     \u2713 hook-name (12ms)
-///     \u2717 hook-name (3ms): error message
-///   **post_tool_use**
-///     \u2713 hook-name (5ms)
+/// Format: pre_tool_use. \u2713 hook-name (12ms). \u2717 hook-name (3ms): error message. post_tool_use. \u2713
+/// hook-name (5ms).
 fn render_hooks_expanded(event: &str, runs: &[HookRunEntry]) -> Vec<BlockLine> {
     let theme = Theme::current();
     let mut lines = Vec::new();

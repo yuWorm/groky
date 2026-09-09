@@ -4,24 +4,9 @@ use super::common::*;
 #[allow(unused_imports)]
 use super::scroll::*;
 
-// ── Env-forced scroll settings reach the live scroll config ───────────────
-//
-// The harness runs with `TERM_PROGRAM=zed` (Zed profile: ept=1, wheel_lines=3) plus `GROK_SCROLL_MODE=wheel` and `GROK_SCROLL_LINES=1`
-// Those overrides must price a 3-event burst at exactly 3 rows, one row per event:
-//
-//   desired = 3 events x (1 line / 1 ept) x speed 1.0 = 3
-//
-// Dropping either env var changes the priced rows:
-// - Without GROK_SCROLL_LINES=1, Zed's wheel profile prices the burst at 3 lines per event, 9 rows total
-// - Without GROK_SCROLL_MODE=wheel, Auto finalizes a 3-event ZERO-interval burst as Trackpad on ept=1 (event_count > 2)
-//   That reprices the burst at the normalized trackpad divisor (~1 row), and mid-burst timing jitter picks between the two outcomes
-//   Forcing wheel removes that classification variance, which makes an EXACT row assertion CI-safe
-//
-// Remaining determinism notes:
-// - Back-to-back PTY writes only compress arrival gaps (no mid-burst split over 80ms; see the driver contract in `scroll.rs`)
-// - The per-flush cap floor (6) exceeds the 3-line total
-// - The wheel path has no acceleration
-// - The harness's hermetic GROK_HOME pins scroll_speed at its default (50, a 1.0x multiplier)
+// Env-forced scroll settings reach the live scroll config. Those overrides must price a 3-event
+// burst at exactly 3 rows, one row per event. Without GROK_SCROLL_LINES=1, Zed's wheel profile
+// prices the burst at 3 lines per event, 9 rows total.
 
 /// 120 one-row markers overflow the 50-row PTY, so the early markers sit above the visible top.
 const MARKER_COUNT: usize = 120;

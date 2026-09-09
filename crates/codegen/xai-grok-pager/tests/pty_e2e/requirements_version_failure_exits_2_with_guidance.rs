@@ -29,11 +29,8 @@ async fn requirements_version_failure_exits_2_with_guidance() {
     .expect("spawn pager");
 
     let msg = "Update Grok to a version the policy allows";
-    // This single budget covers the child's cold exec (a ~680MB unoptimized debug binary), reaching `main()`, and running `validate_requirements`
-    // All of that happens before the runtime/TUI
-    // Under the ~60-way-parallel `pty_e2e` suite, spawning that many large binaries at once can delay a child's first write well past 30s
-    // The observed flake was an empty screen and empty raw output (the child had produced no bytes yet), not a wrong exit or guidance
-    // 120s matches the suite's other contention-sensitive budgets: a genuinely slow cold start still lands while a truly hung startup still fails
+    // The observed flake was an empty screen and empty raw output (the child had produced no bytes
+    // yet), not a wrong exit or guidance.
     let deadline = Instant::now() + Duration::from_secs(120);
     let mut exit_code = None;
     while Instant::now() < deadline {
@@ -59,11 +56,8 @@ async fn requirements_version_failure_exits_2_with_guidance() {
                 PtyExitPoll::Running | PtyExitPoll::PendingStatus => {}
             }
             if exit_code.is_some() {
-                // The child exited before the guidance reached our side
-                // It wrote the guidance to fd 2 just before exiting
-                // Keep draining until the PTY reader delivers those buffered bytes (it will, then hit EOF) instead of a single fixed window
-                // A one-shot post-exit drain can be starved under the ~60-way parallel suite, losing the bytes
-                // The observed flake was an empty screen and empty raw output
+                // The child exited before the guidance reached our side. Keep draining until the PTY reader
+                // delivers those buffered bytes (it will, then hit EOF) instead of a single fixed window.
                 let drain_deadline = Instant::now() + Duration::from_secs(10);
                 while !(harness.contains_text(msg)
                     || String::from_utf8_lossy(harness.raw_output()).contains(msg))

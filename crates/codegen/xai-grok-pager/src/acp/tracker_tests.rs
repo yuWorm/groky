@@ -324,7 +324,6 @@ fn empty_chunks_ignored() {
     assert_eq!(sb.len(), 0);
 }
 /// Regression test: two turns should create separate agent message entries.
-///
 /// Previously, handle_user_message() didn't reset current_agent_msg.
 /// The second turn's agent message chunks then got appended to the first turn's entry, producing concatenated text.
 #[test]
@@ -375,17 +374,9 @@ fn user_message_resets_tracking() {
         "user_message should reset current_thinking"
     );
 }
-/// Regression test: the exact real-world flow where send_prompt adds the user entry directly to scrollback (bypassing the tracker),
-/// then the tracker receives the echo and the response.
-///
-/// This matches what actually happens in the app:
-/// 1. send_prompt() pushes user entry and calls expect_user_echo()
-/// 2. ACP echoes user_message_chunk; the tracker skips it (no duplicate)
-/// 3. ACP streams thought_chunk, agent_message_chunk
-/// 4. User sends second prompt via send_prompt
-/// 5. ACP echoes and streams second turn
-///
-/// The critical invariant: exactly 1 user entry per turn, 2 separate agent messages.
+/// Regression test: the exact real-world flow where send_prompt adds the user entry directly to scrollback
+/// (bypassing the tracker), then the tracker receives the echo and the response. The critical invariant: exactly 1
+/// user entry per turn, 2 separate agent messages.
 #[test]
 fn real_flow_two_turns_via_send_prompt() {
     let mut sb = ScrollbackState::new();
@@ -1010,11 +1001,9 @@ fn tool_output_bash_serde_roundtrip() {
         _ => panic!("Expected ToolOutput::Bash"),
     }
 }
-/// End-to-end test mimicking the exact production notification sequence:
-/// 1. ToolCall (Pending) with raw_input containing BashTool
-/// 2. InProgress ToolCallUpdate with raw_output containing ToolOutput::Bash (sent by notification_bridge from LocalTerminalBackend)
-/// 3. Completed ToolCallUpdate with raw_output containing final ToolOutput::Bash
-/// 4. Second Completed ToolCallUpdate (from acp_session completion handler)
+/// End-to-end test mimicking the exact production notification sequence. ToolCall (Pending) with raw_input
+/// containing BashTool. Completed ToolCallUpdate with raw_output containing final ToolOutput::Bash. Second
+/// Completed ToolCallUpdate (from acp_session completion handler).
 #[test]
 fn production_execute_sequence() {
     use serde_json::json;
@@ -1201,12 +1190,8 @@ fn utf8_decoder_multiple_feeds() {
     assert_eq!(dec.decode("héllo\n".as_bytes()), "héllo\n");
     assert!(dec.buffer.is_empty());
 }
-/// Reproduce the exact ACP message flow for a grep search tool call:
-/// 1. ToolCall with kind=Other, title="grep" (initial, no metadata)
-/// 2. ToolCallUpdate in-progress with kind=search, title="fn main", rawInput
-/// 3. ToolCallUpdate completed with rawOutput containing GrepSearchOutput
-///
-/// This was broken: kind from in-progress update was lost, so the completed block rendered as "Other" with no search results.
+/// Reproduce the exact ACP message flow for a grep search tool call. This was broken: kind from in-progress update
+/// was lost, so the completed block rendered as "Other" with no search results.
 #[test]
 fn test_search_tool_call_flow() {
     use xai_grok_tools::types::output::{GrepFileMatch, GrepLineMatch, GrepSearchOutput};
@@ -1312,11 +1297,9 @@ fn pending_other_tool_call(tc_id: &Arc<str>) -> acp::SessionUpdate {
         .locations(vec![]),
     )
 }
-/// Regression test: upgrading an Other(Pending) entry in-place to an Edit block must reset the entry's `display_mode`.
-/// The reset target is the materialize policy's default (Collapsed by default, Expanded when `expanded_by_default` is set), not Other's default.
-///
-/// Also covers the fast path from Pending straight to Completed (no in-progress refinement).
-/// There Edit's `finished_display_mode()` returns `None`, and `finish_running` would otherwise leave a stale mode in place.
+/// Regression test: upgrading an Other(Pending) entry in-place to an Edit block must reset the entry's
+/// `display_mode`. There Edit's `finished_display_mode()` returns `None`, and `finish_running` would otherwise
+/// leave a stale mode in place.
 #[test]
 fn edit_tool_upgrade_resets_display_mode_to_default() {
     use crate::scrollback::types::DisplayMode;
@@ -1436,10 +1419,9 @@ fn edit_manual_expand_survives_completion() {
         "completion must not snap a user-expanded Edit back to Collapsed"
     );
 }
-/// A mid-run expand of an agent Execute must survive stdout progress (`replace_tool_block` then `set_execute_output`).
-/// It must also survive completion (`replace_tool_block` then `finish_running`).
-/// No pin / `respect_manual_folds` is required: this is the same-kind preserve, not the fold-pin system.
-/// The kind upgrade from Other to Execute still adopts Collapsed.
+/// A mid-run expand of an agent Execute must survive stdout progress (`replace_tool_block` then
+/// `set_execute_output`). It must also survive completion (`replace_tool_block` then `finish_running`). No pin /
+/// `respect_manual_folds` is required: this is the same-kind preserve, not the fold-pin system.
 #[test]
 fn execute_manual_expand_survives_progress_and_completion() {
     use crate::scrollback::types::DisplayMode;
@@ -2056,7 +2038,6 @@ fn meta_stream(stream_start: i64) -> NotificationMeta {
     }
 }
 /// Regression test: agent message (stream A), then thinking (stream B), then agent message (stream B).
-///
 /// Without stream_start_ms boundary detection, stream B's agent message chunks were appended to stream A's entry.
 /// The cause: handle_thought_chunk never resets current_agent_msg.
 #[test]
@@ -2798,10 +2779,9 @@ fn writing_tool_call_survives_bg_deferred_stdout_update() {
         "a deferred bg stdout update must not strip the writing label"
     );
 }
-/// The blocking bg-plumbing tools are kept out of scrollback but the turn IS blocked on them.
-/// `activity()` must name the wait instead of the old generic `None` (which rendered as "Waiting…").
-/// Task-output tools only advertise once raw_input proves them blocking (`timeout_ms > 0`).
-/// Before that the wait is not shown (display mirrors interject eligibility).
+/// The blocking bg-plumbing tools are kept out of scrollback but the turn IS blocked on them. `activity()` must
+/// name the wait instead of the old generic `None` (which rendered as "Waiting…"). Task-output tools only advertise
+/// once raw_input proves them blocking (`timeout_ms > 0`).
 #[test]
 fn activity_waiting_for_blocking_bg_plumbing_tools() {
     let cases = [
@@ -4552,6 +4532,69 @@ fn replay_malformed_skill_token_ranges_degrade_to_plain() {
         other => panic!("expected UserPrompt, got {:?}", other),
     }
 }
+/// A persisted interjection chunk as the shell writes it: the model-facing frame as text,
+/// the typed text in `displayText`, and the `interjection` chunk flag (wire literals pinned here).
+fn interjection_user_message(typed: &str) -> acp::SessionUpdate {
+    let mut chunk_meta = serde_json::Map::new();
+    chunk_meta.insert("modelId".into(), serde_json::json!("test-model"));
+    chunk_meta.insert("interjection".into(), serde_json::Value::Bool(true));
+    let mut text_meta = serde_json::Map::new();
+    text_meta.insert("displayText".into(), serde_json::json!(typed));
+    let framed = format!(
+        "The user sent a message while you were working:\n<user_query>\n{typed}\n</user_query>\nMake sure to complete any unfinished tasks from previous turns."
+    );
+    acp::SessionUpdate::UserMessageChunk(
+        acp::ContentChunk::new(acp::ContentBlock::Text(
+            acp::TextContent::new(framed).meta(Some(text_meta)),
+        ))
+        .meta(Some(chunk_meta)),
+    )
+}
+#[test]
+fn replay_interjection_chunk_renders_as_interjection_block() {
+    let mut sb = ScrollbackState::new();
+    let mut tracker = AcpUpdateTracker::new();
+    let replay = NotificationMeta {
+        is_replay: true,
+        ..Default::default()
+    };
+    assert!(tracker.handle_update(
+        interjection_user_message("ok run the stop for me"),
+        &replay,
+        &mut sb
+    ));
+    assert_eq!(sb.len(), 1);
+    match &sb.get(0).unwrap().block {
+        RenderBlock::UserPrompt(block) => {
+            assert_eq!(block.text, "ok run the stop for me");
+            assert!(
+                block.is_interjection,
+                "replayed interjection keeps interjection bookkeeping"
+            );
+            assert_eq!(
+                block.prompt_index, None,
+                "the shell never numbers interjections"
+            );
+            assert!(!block.is_cron && !block.is_bash);
+        }
+        other => panic!("expected UserPrompt, got {:?}", other),
+    }
+}
+/// A `/skill` sent mid-turn stays a plain interjection row, as live, not a skill prompt.
+#[test]
+fn replay_interjection_flag_outranks_slash_skill_fallback() {
+    let mut sb = ScrollbackState::new();
+    let mut tracker = AcpUpdateTracker::new();
+    assert!(tracker.handle_update(interjection_user_message("/commit now"), &meta(), &mut sb));
+    match &sb.get(0).unwrap().block {
+        RenderBlock::UserPrompt(block) => {
+            assert_eq!(block.text, "/commit now");
+            assert!(block.is_interjection);
+            assert!(block.skill_token_ranges.is_empty());
+        }
+        other => panic!("expected UserPrompt, got {:?}", other),
+    }
+}
 #[test]
 fn call_mcp_tool_coerced_to_use_tool_renders_block() {
     let tc = acp::ToolCall::new(acp::ToolCallId::new(Arc::from("mcp1")), "grafana__search")
@@ -4568,6 +4611,52 @@ fn call_mcp_tool_coerced_to_use_tool_renders_block() {
         panic!("expected UseTool block, got {block:?}");
     };
     assert_eq!(ut.tool_name, "grafana__search");
+}
+#[test]
+fn send_feedback_update_renders_feedback_drafted() {
+    let tool_call_id = acp::ToolCallId::new(Arc::from("feedback-draft"));
+    let tool_meta = serde_json::json!({
+        "version": 1,
+        "name": "send_feedback",
+        "kind": "feedback",
+        "namespace": "grok_build",
+        "label": "Feedback",
+        "read_only": false,
+    });
+    let pending = acp::ToolCall::new(tool_call_id.clone(), "send_feedback".to_owned())
+        .kind(acp::ToolKind::Other)
+        .status(acp::ToolCallStatus::Pending)
+        .meta(
+            serde_json::json!({xai_grok_tools::tool_taxonomy::TOOL_META_KEY: tool_meta})
+                .as_object()
+                .cloned(),
+        );
+    let completed = acp::SessionUpdate::ToolCallUpdate(acp::ToolCallUpdate::new(
+        tool_call_id,
+        acp::ToolCallUpdateFields::new()
+            .title(Some("Dynamic tool call".to_owned()))
+            .status(Some(acp::ToolCallStatus::Completed))
+            .raw_input(Some(serde_json::json!({"title": "Draft"}))),
+    ));
+    let mut tracker = AcpUpdateTracker::new();
+    let mut scrollback = ScrollbackState::new();
+    tracker.handle_update(
+        acp::SessionUpdate::ToolCall(pending),
+        &meta(),
+        &mut scrollback,
+    );
+    tracker.handle_update(completed, &meta(), &mut scrollback);
+    let block = &scrollback.get(0).expect("feedback block").block;
+    let RenderBlock::ToolCall(ToolCallBlock::Other(other)) = block else {
+        panic!("expected Other block, got {block:?}");
+    };
+    assert_eq!(other.name, "Feedback drafted");
+    assert!(
+        !block
+            .searchable_text()
+            .unwrap()
+            .contains("Dynamic tool call")
+    );
 }
 #[test]
 fn call_mcp_tool_no_raw_input_does_not_panic() {

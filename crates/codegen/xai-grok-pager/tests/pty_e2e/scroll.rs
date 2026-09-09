@@ -23,26 +23,9 @@ pub(crate) const WHEEL_ROW: u16 = 11;
 
 pub(crate) const WHEEL_COL: u16 = 39;
 
-/// Emit one SGR (DECSET 1006) wheel press report per entry of `btns` at 0-based (row,col) via [`sgr_mouse`].
-/// Entries are [`SGR_SCROLL_UP`] / [`SGR_SCROLL_DOWN`]; a mixed slice drives direction reversals mid-stream.
-/// Sleeps `interval` host-side (`std::thread::sleep`) BETWEEN writes, never before the first or after the last.
-///
-/// The pager classifies a scroll stream from inter-event ARRIVAL timing (constants in pager `src/input/mouse.rs`).
-/// The harness terminal (`TERM=xterm-256color`, `TERM_PROGRAM` stripped, hence `TerminalName::Unknown`) resolves to `events_per_tick = 3`.
-/// On terminals where ept is 2 or more, a stream promotes to Wheel only when the first 3 reports land within 12ms of the stream's start.
-/// That window is `DEFAULT_WHEEL_TICK_DETECT_MAX_MS`; anything slower finalizes as Trackpad once a `STREAM_GAP` above 80ms closes the stream.
-/// So under this harness `Duration::ZERO` (back-to-back reports) drives wheel clicks.
-/// A long run of spaced reports, even 40ms apart, is a trackpad stream.
-/// "Slow interval means wheel" holds only on ept=1 brands (iTerm2 / WezTerm / VS Code embeds, via `trackpad_detect_max_interval_ms` 30-60ms).
-/// 8ms is the acceleration fast band (`ACCEL_INTERVAL_FAST_MS`), not a classifier threshold.
-///
-/// `interval` only LOWER-BOUNDS each gap; sleep plus scheduler jitter can stretch a nominal 6ms past the 12ms promotion window under CI load.
-/// Tests asserting classification-dependent behavior must tolerate or detect stretched gaps.
-/// Prefer assertions that hold under either classification (scrolled at all, at least 1 frame, at most 1 frame per event).
-/// Deliberately dumb: no draining, no assertions; callers `update()` afterwards and assert on screen state / frame captures.
-///
-/// Harness mirror: the scroll-matrix runner (`xai-grok-pager-pty-harness/src/scroll_matrix/runner.rs`) ports this send loop onto `WheelStep` tables.
-/// Apply fixes there too.
+/// Emit one SGR (DECSET 1006) wheel press report per entry of `btns` at 0-based (row,col) via
+/// [`sgr_mouse`]. Sleeps `interval` host-side (`std::thread::sleep`) BETWEEN writes, never before
+/// the first or after the last.
 pub(crate) fn send_wheel_sequence(
     h: &mut PtyHarness,
     btns: &[u16],
@@ -81,10 +64,8 @@ pub(crate) fn marker_line(n: usize) -> String {
     format!("{MARKER_PREFIX}{n:04}")
 }
 
-/// A response of `count` numbered marker lines inside a fenced code block, so markdown renders exactly one row per marker with no soft-wrap reflow.
-/// Same trick as `tall_response` in `common.rs`.
-/// Feed to `content.set_response(..)`.
-/// Scroll tests then assert viewport movement via [`marker_screen_row`] / [`topmost_visible_marker`] deltas instead of fragile absolute positions.
+/// A response of `count` numbered marker lines inside a fenced code block, so markdown renders
+/// exactly one row per marker with no soft-wrap reflow.
 pub(crate) fn marker_response(sentinel: &str, count: usize) -> String {
     let mut s = String::with_capacity(count * 16 + 64);
     s.push_str("```\n");
@@ -113,22 +94,9 @@ pub(crate) fn topmost_visible_marker(h: &PtyHarness) -> Option<usize> {
     })
 }
 
-/// Spawn the pager over a `marker_count`-marker transcript and drive it to the primed scroll-test state.
-/// This is the shared preamble of every wheel pacing test, per the `drive_to_scrollback_with_turn` precedent.
-/// Primed means: response fully streamed, viewport bottom-pinned with the first marker off-screen-top, scrollback focused via Tab, then quiesced.
-/// Tab, not Esc: Esc would silently start the rewind picker, whose ~800ms expiry redraw lands a non-burst frame in the capture window.
-/// Wheel reports are position-routed regardless of focus.
-/// `reset_timing()` is applied last, so counted frames come only from what the caller does next.
-///
-/// Returns the harness, the controller (keep it alive: it owns the mock server), and the topmost visible marker index as the movement baseline.
-/// Panics with the screen contents on any setup violation.
-///
-/// Destructure the controller as `_content`, never `_`.
-/// A `_` binding drops it immediately, killing the mock server mid-test.
-/// That surfaces as a confusing 60s stream timeout instead of an obvious failure.
-///
-/// Harness mirror: `spawn_settled_marker_session` in `xai-grok-pager-pty-harness/src/scroll_matrix/session.rs` is a port of this preamble.
-/// Fixes must flow both ways.
+/// Spawn the pager over a `marker_count`-marker transcript and drive it to the primed scroll-test
+/// state. `reset_timing()` is applied last, so counted frames come only from what the caller does
+/// next. Destructure the controller as `_content`, never `_`. Fixes must flow both ways.
 pub(crate) async fn spawn_bottom_pinned_marker_scrollback(
     marker_count: usize,
 ) -> (PtyHarness, ContentController, usize) {
@@ -199,9 +167,6 @@ pub(crate) async fn spawn_bottom_pinned_marker_scrollback_with_env(
 pub(crate) const STREAM_END_SENTINEL: &str = "STREAMDONE";
 
 /// Turn text for [`spawn_streaming_marker_turn`].
-/// The whole fenced `marker_count`-marker block rides the FIRST delta, so scrollable content exists immediately.
-/// (The mock splits deltas on single spaces and the block contains none.)
-/// The space-separated `tail_words` tail then streams word-by-word, ending in [`STREAM_END_SENTINEL`].
 fn streaming_marker_turn_text(marker_count: usize, tail_words: usize) -> String {
     let mut s = marker_response(MOCK_RESPONSE_SENTINEL, marker_count);
     for i in 0..tail_words {
@@ -211,18 +176,9 @@ fn streaming_marker_turn_text(marker_count: usize, tail_words: usize) -> String 
     s
 }
 
-/// Spawn the pager onto a turn that is STILL STREAMING and provably cannot complete (the shared preamble of the mid-stream wheel tests).
-/// The marker block arrives on the first delta and the tail keeps deltas flowing at `chunk_delay` per SSE event.
-/// A matched expectation prevents terminal completion until released.
-/// `extra_env` is appended to the controller's pager env.
-/// Returns the harness, content controller, blocked turn, and the bottom-pinned topmost visible marker index.
-/// Setup asserts that marker zero is above the viewport and [`STREAM_END_SENTINEL`] has not arrived.
-///
-/// Destructure the controller into a live binding (`content` / `_content`), never `_`.
-/// A `_` binding drops it immediately, killing the mock server mid-test and surfacing as a confusing stream timeout.
-///
-/// Harness mirror: `spawn_streaming_marker_session` in `xai-grok-pager-pty-harness/src/scroll_matrix/session.rs` is a port of this preamble.
-/// Fixes must flow both ways.
+/// Spawn the pager onto a turn that is STILL STREAMING and provably cannot complete (the shared
+/// preamble of the mid-stream wheel tests). Destructure the controller into a live binding
+/// (`content` / `_content`), never `_`. Fixes must flow both ways.
 pub(crate) async fn spawn_streaming_marker_turn(
     marker_count: usize,
     tail_words: usize,

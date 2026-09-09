@@ -2,14 +2,9 @@
 #[allow(unused_imports)]
 use super::common::*;
 
-/// Regression test on the REAL macOS host pasteboard, exactly as reported.
-/// Only Otty (`TERM_PROGRAM=otty`) is known to deliver macOS IME commits as bracketed paste, so the test runs under it.
-/// With an image on the clipboard, an IME commit must not attach that image to the agent prompt.
-///
-/// With no usable clipboard the test prints a SKIP line and returns, so a CI runner without a pasteboard does not fail on environment.
-///
-/// WARNING: this test OVERWRITES the machine-global clipboard with an image.
-/// A prior TEXT clipboard is restored on exit; a prior IMAGE cannot be.
+/// Regression test on the REAL macOS host pasteboard, exactly as reported. Only Otty
+/// (`TERM_PROGRAM=otty`) is known to deliver macOS IME commits as bracketed paste, so the test runs
+/// under it. A prior TEXT clipboard is restored on exit; a prior IMAGE cannot be.
 #[cfg(target_os = "macos")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore]

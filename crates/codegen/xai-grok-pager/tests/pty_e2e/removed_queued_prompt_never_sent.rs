@@ -66,19 +66,16 @@ async fn removed_queued_prompt_never_sent() {
         harness.update(Duration::from_millis(100));
     }
 
-    // `queued alpha` vanished optimistically the instant `x` was handled
-    // Give the `x.ai/queue/remove` RPC time to reach the shell and mutate the authoritative queue before we let turn 1 complete
-    // Turn 1 stays gated throughout, so the removal always lands while `alpha` is still queued (never promoted)
-    // The survivor `bravo` is the only thing left to run
+    // `queued alpha` vanished optimistically the instant `x` was handled. Turn 1 stays gated
+    // throughout, so the removal always lands while `alpha` is still queued (never promoted). The
+    // survivor `bravo` is the only thing left to run.
     harness.update(Duration::from_millis(500));
 
     // Now let turn 1 finish: the sole survivor `queued bravo` promotes FIFO into turn 2
     turn_one.release();
 
-    // Assert promotion on the WIRE, not on scrollback text
-    // The auto-shown queue pane overlays the top of the scrollback, so the promoted turn's response can render behind it
-    // A `wait_for_text` on the response is a flaky observation, not a real failure
-    // The request bodies are the authoritative record of what was actually sent
+    // Assert promotion on the WIRE, not on scrollback text. A `wait_for_text` on the response is a
+    // flaky observation, not a real failure.
     let deadline = std::time::Instant::now() + Duration::from_secs(40);
     while !all_user_messages(&content)
         .iter()

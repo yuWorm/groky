@@ -57,12 +57,16 @@ async fn create_test_actor(
         vec![],
         xai_grok_sampling_types::SamplingConfig {
             base_url: "http://localhost".to_string(),
+            mtls_cert_dir: None,
             model: "test".to_string(),
             max_completion_tokens: None,
             temperature: None,
             top_p: None,
+            max_retries: None,
+            rate_limit_retry_threshold: None,
             api_backend: Default::default(),
             extra_headers: Default::default(),
+            conversation_group_id: None,
             query_params: Default::default(),
             env_http_headers: Default::default(),
             context_window: std::num::NonZeroU64::new(context_window)
@@ -164,6 +168,7 @@ async fn create_test_actor(
         },
         session_start: std::time::Instant::now(),
         inference_idle_timeout: std::time::Duration::from_secs(300),
+        uncharged_401_park_enabled: true,
         max_retries: 3,
         rate_limit_waits: crate::session::acp_session::RateLimitWaitConfig::default(),
         max_turns: None,
@@ -232,11 +237,13 @@ async fn create_test_actor(
         mcp_reminder_mode: McpReminderMode::Delta,
         mcp_reminder_dirty: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         mcp_connecting_reminder_injected: std::cell::Cell::new(false),
-        mcp_handshakes_done: Arc::new(tokio::sync::Notify::new()),
+        mcp_refresh_gate: Arc::new(tokio::sync::Mutex::new(())),
         user_input_generation: std::sync::atomic::AtomicU64::new(0),
         laziness_debug_log: None,
         last_live_orphan_reconcile: std::cell::Cell::new(None),
-        deferred_prefix: TaskSlot::new(),
+        deferred_prefix: DeferredPrefix::new(),
+        mcp_startup_waits: Default::default(),
+        mcp_init_tasks: Default::default(),
         extension_registry: xai_agent_lifecycle::LocalExtensionRegistry::default(),
         last_announced_local_date: std::cell::Cell::new(chrono::Local::now().date_naive()),
         prefix_carries_fallback_date: std::cell::Cell::new(false),
@@ -255,6 +262,7 @@ async fn create_test_actor(
         events: crate::session::events::EventTracker::new(std::path::Path::new("/tmp")),
         observability_bridge: noop_observability_bridge(),
         current_turn_number: std::cell::Cell::new(0),
+        turn_phases: std::sync::Arc::default(),
         last_recap_main_turn: std::cell::Cell::new(0),
         recap_in_flight: std::cell::Cell::new(false),
         recap_epoch: std::cell::Cell::new(0),
@@ -269,6 +277,8 @@ async fn create_test_actor(
         streaming_turn_capture: parking_lot::Mutex::new(
             crate::session::acp_session::StreamingTurnCapture::default(),
         ),
+        stream_apply_span: parking_lot::Mutex::new(None),
+        current_turn_span_id: parking_lot::Mutex::new(None),
         turn_stream_drained: parking_lot::Mutex::new(std::collections::HashMap::new()),
         pending_image_strip: parking_lot::Mutex::new(std::collections::HashMap::new()),
         image_strip_rewrite_barrier: ImageStripRewriteBarrier::new(),
@@ -395,10 +405,8 @@ async fn suppression_gates_prefire_two_pass() {
         })
         .await;
 }
-/// A model switch clears suppression the switch (or the fresh budget-driven
-/// trigger) can resolve — sticky size/schema and a stale per-turn `other` — so
-/// the gates re-evaluate against the new window. Account-state credit/auth is
-/// covered by `model_switch_keeps_account_state_suppression`.
+/// A model switch clears suppression the switch (or the fresh budget-driven trigger) can resolve — sticky size/schema and a stale per-turn `other` — so the gates re-evaluate against the new window.
+/// Account-state credit/auth is covered by `model_switch_keeps_account_state_suppression`.
 #[tokio::test(flavor = "current_thread")]
 async fn model_switch_clears_sticky_suppression() {
     use crate::session::compaction_config::{PreviousModelInfo, SUPPRESS_NONE};
@@ -1660,11 +1668,11 @@ fn classify_suppress_reason_maps_error_text() {
 /// Lock them so a rename can't break monitoring.
 #[test]
 fn suppress_reason_as_str_is_stable() {
-    assert_eq!(SuppressReason::CreditBlock.as_str(), "credit_block");
-    assert_eq!(SuppressReason::Size.as_str(), "size");
-    assert_eq!(SuppressReason::Auth.as_str(), "auth");
-    assert_eq!(SuppressReason::Schema.as_str(), "schema");
-    assert_eq!(SuppressReason::Other.as_str(), "other");
+    assert_eq!(SuppressReason::CreditBlock.as_ref(), "credit_block");
+    assert_eq!(SuppressReason::Size.as_ref(), "size");
+    assert_eq!(SuppressReason::Auth.as_ref(), "auth");
+    assert_eq!(SuppressReason::Schema.as_ref(), "schema");
+    assert_eq!(SuppressReason::Other.as_ref(), "other");
 }
 mod preserve_prefix {
     use super::super::preserve_inherited_prefix;

@@ -10,7 +10,6 @@ use xai_grok_tools::types::output::ImageContent as ToolsImageContent;
 
 /// Render an `ImageContent` produced by the read-file tool as a URL string suitable for an `image_url` content block.
 /// Passes the explicit `uri` through if present, otherwise builds a `data:<mime>;base64,<data>` URI.
-///
 /// Lives in the shell (rather than `xai-grok-sampling-types` or `xai-grok-tools`) so neither crate needs a dep on `agent-client-protocol`.
 pub fn get_image_content_url(image_content: &ToolsImageContent) -> String {
     if let Some(uri) = &image_content.uri {

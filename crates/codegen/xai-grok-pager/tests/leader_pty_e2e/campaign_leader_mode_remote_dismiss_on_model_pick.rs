@@ -2,16 +2,8 @@
 #[allow(unused_imports)]
 use super::common::*;
 
-/// **Leader mode: a `/model` pick in the TUI dismisses a remote campaign.**
-///
-/// `persist_user_choice`, the one place a dismissal is recorded, runs in the TUI process.
-/// In leader mode no in-process agent ever seeds the TUI's remote campaign cache.
-/// Only `app::run`'s own seed makes a remote campaign visible to `resolve_dismissable_campaigns`.
-/// Without that seed this test times out in the dismiss phase: the pick persists but no dismissal is recorded.
-/// The leader then re-nudges every new session over the user's explicit choice.
-///
-/// The TUI's settings prefetch is deliberately capped at 2s, so on a loaded runner a spawn can miss the fetch and start with an unseeded cache.
-/// The test retries with fresh TUI spawns (same leader) until a pick lands the dismissal, then proves it sticks.
+/// Only `app::run`'s own seed makes a remote campaign visible to `resolve_dismissable_campaigns`. Without that seed
+/// this test times out in the dismiss phase: the pick persists but no dismissal is recorded.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "PTY e2e; run with cargo test -p xai-grok-pager --test leader_pty_e2e -- --ignored --test-threads=1"]
 async fn campaign_leader_mode_remote_dismiss_on_model_pick() {
@@ -113,12 +105,9 @@ async fn campaign_leader_mode_remote_dismiss_on_model_pick() {
         "leader-mode TUI must record the remote campaign dismissal in {state_path:?}"
     );
 
-    // ── Phase 3: the dismissal is durable and the pick is persisted
-    // The user's choice must be in config.toml, and the campaign value must never be written there
-    // Every future resolution, leader or not, filters on the dismissed id on disk
-    // `dismissed_id_is_dropped_from_override` pins that filter; the sibling remote-settings e2e proves in-process that a reboot does not re-nudge
-    // A fresh client on the same leader socket is deliberately not asserted on-screen here
-    // Reattach paint timing is the one flaky piece, and it adds no coverage over the on-disk and sibling asserts
+    // ── Phase 3: the dismissal is durable and the pick is persisted. The user's choice must be in config.toml, and
+    // the campaign value must never be written there. A fresh client on the same leader socket is deliberately not
+    // asserted on-screen here.
     let config = std::fs::read_to_string(grok_home.join("config.toml")).expect("read config.toml");
     assert!(
         config.contains(&format!("default = \"{CONFIG_MODEL}\"")),

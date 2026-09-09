@@ -2,10 +2,8 @@
 #[allow(unused_imports)]
 use crate::common::*;
 
-/// Minimal mode has no shortcuts bar, so the double-press quit confirmation must show under the prompt instead.
-/// A first Ctrl+C on an empty, idle prompt arms the quit confirmation and shows "press Ctrl+c again to quit".
-/// A second Ctrl+C within the window exits.
-/// (Ctrl+Q / Ctrl+D arm the same way; the hint is rendered by `minimal::live::render_exit_hint`.)
+/// Minimal mode has no shortcuts bar, so the double-press quit confirmation must show under the
+/// prompt instead.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore]
 async fn minimal_ctrl_c_arms_and_quits() {

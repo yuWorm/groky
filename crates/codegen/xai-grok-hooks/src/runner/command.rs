@@ -35,6 +35,54 @@ pub(crate) const MAX_OUTPUT_BYTES: usize =
     CAPTURE_HEADROOM_OVER_REPLACEMENT * MAX_HOOK_OUTPUT_REPLACEMENT_CHARS;
 
 const GATE_EXIT_CODE: i32 = 2;
+const HOOK_GROUP_REAP: Duration = Duration::from_millis(500);
+
+tokio::task_local! {
+    static HOOK_GROUP_REAPS: std::cell::RefCell<Vec<tokio::task::JoinHandle<()>>>;
+}
+
+pub async fn join_hook_group_reaps<F: std::future::Future>(work: F) -> F::Output {
+    HOOK_GROUP_REAPS
+        .scope(std::cell::RefCell::new(Vec::new()), async {
+            let out = work.await;
+            let joins = HOOK_GROUP_REAPS.with(|slot| std::mem::take(&mut *slot.borrow_mut()));
+            if !joins.is_empty() {
+                let _ = tokio::time::timeout(HOOK_GROUP_REAP, async {
+                    for join in joins {
+                        let _ = join.await;
+                    }
+                })
+                .await;
+            }
+            out
+        })
+        .await
+}
+
+struct HookProcessGuard {
+    group: Option<Arc<ProcessGroup>>,
+}
+
+impl HookProcessGuard {
+    fn arm(group: Option<Arc<ProcessGroup>>) -> Self {
+        Self { group }
+    }
+
+    fn disarm(&mut self) {
+        self.group = None;
+    }
+}
+
+impl Drop for HookProcessGuard {
+    fn drop(&mut self) {
+        if let Some(group) = self.group.take() {
+            let _ = group.kill();
+            if let Some(join) = group.schedule_reap(HOOK_GROUP_REAP) {
+                let _ = HOOK_GROUP_REAPS.try_with(|slot| slot.borrow_mut().push(join));
+            }
+        }
+    }
+}
 
 // SECURITY: a process group lets session close killpg the whole tree; kill_on_drop would leak detached grandchildren.
 fn hook_process_group(child: &tokio::process::Child) -> Option<Arc<ProcessGroup>> {
@@ -189,19 +237,22 @@ pub async fn run_command_hook(
         }
     };
 
-    let mut hook_group = None;
-    if let Some(scope) = ctx.process_scope.as_ref()
-        && let Some(group) = hook_process_group(&child)
+    let hook_group = hook_process_group(&child);
+    if let (Some(scope), Some(group)) = (ctx.process_scope.as_ref(), hook_group.as_ref())
+        && !scope.register(group)
     {
-        if !scope.register(&group) {
-            return (
-                HookRunnerResult::Failed("session closed before the hook ran".to_string()),
-                start.elapsed(),
-                None,
-            );
+        let _ = group.kill();
+        if let Some(join) = group.schedule_reap(HOOK_GROUP_REAP) {
+            let _ = join.await;
         }
-        hook_group = Some(group);
+        drop(child);
+        return (
+            HookRunnerResult::Failed("session closed before the hook ran".to_string()),
+            start.elapsed(),
+            None,
+        );
     }
+    let mut reap = HookProcessGuard::arm(hook_group.clone());
 
     let stdin = child.stdin.take();
     let timeout = Duration::from_millis(spec.timeout_ms);
@@ -218,9 +269,9 @@ pub async fn run_command_hook(
 
     let elapsed = start.elapsed();
 
-    if !matches!(result, Ok(Ok(_)))
-        && let Some(group) = &hook_group
-    {
+    if matches!(result, Ok(Ok(_))) {
+        reap.disarm();
+    } else if let Some(group) = &hook_group {
         let _ = group.kill();
     }
 
@@ -2346,6 +2397,48 @@ mod tests {
         assert!(
             !marker.exists(),
             "grandchild outlived session close, so the group was not killpg'd"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn dropping_command_hook_kills_and_reaps_grandchild() {
+        let tmp = tempfile::tempdir().unwrap();
+        let marker = tmp.path().join("grandchild_alive");
+        let child_pid = tmp.path().join("child.pid");
+        let mut spec = make_shell_spec(&format!(
+            "sh -c 'echo $$ > \"{}\"; sleep 30; echo alive > \"{}\"' & wait",
+            child_pid.display(),
+            marker.display()
+        ));
+        spec.timeout_ms = 60_000;
+        let envelope = make_envelope();
+        let ctx = make_ctx();
+        let hook = tokio::spawn(async move {
+            run_command_hook(&spec, &envelope, &ctx, GateKind::Observe).await
+        });
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                if child_pid.exists() {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("grandchild pid");
+        hook.abort();
+        let _ = tokio::time::timeout(Duration::from_secs(2), hook).await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(!marker.exists(), "grandchild wrote after hook drop");
+        let pid: u32 = std::fs::read_to_string(&child_pid)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        assert!(
+            !std::path::Path::new(&format!("/proc/{pid}")).exists(),
+            "grandchild {pid} still live after hook drop"
         );
     }
 

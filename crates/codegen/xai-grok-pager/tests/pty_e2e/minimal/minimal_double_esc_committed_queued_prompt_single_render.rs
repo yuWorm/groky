@@ -2,11 +2,9 @@
 #[allow(unused_imports)]
 use crate::common::*;
 
-/// Minimal mode guards against rendering a committed queued prompt twice (the `in_flight_committed` case).
-/// A promoted queued prompt's "❯ " block commits (prints) into native scrollback immediately.
-/// Cancelling its turn before the first token arrives (via Ctrl+C here) must therefore SKIP the composer rewind.
-/// A rewind would leave the printed block on screen AND refill the composer, showing the prompt twice.
-/// Standard cancel instead: the block renders exactly once and the cancel marker is visible.
+/// Minimal mode guards against rendering a committed queued prompt twice (the `in_flight_committed`
+/// case). Cancelling its turn before the first token arrives (via. CtrlCtrl+C here) must therefore SKIP
+/// the composer rewind.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore]
 async fn minimal_double_esc_committed_queued_prompt_single_render() {

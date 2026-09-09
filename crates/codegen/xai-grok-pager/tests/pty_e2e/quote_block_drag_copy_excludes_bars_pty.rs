@@ -27,14 +27,8 @@ fn row_cells(lines: &[StyledLine], row: u16) -> Vec<(Option<String>, bool)> {
     cells
 }
 
-/// Drag-select copy across a rendered (pretty-mode) markdown quote block excludes the `│ ` bar prefix from the clipboard.
-/// That holds even when the drag starts on the bar cell itself.
-/// Exercises the real pager, mouse selection, and OSC 52.
-///
-/// `SSH_CONNECTION` is set deliberately: on macOS the clipboard route emits OSC 52 only when it believes the session is remote.
-/// The check lives in `resolve_clipboard_route`.
-/// The harness strips inherited SSH vars, so this test re-injects a dummy one for OSC 52 readback.
-/// `recap_header_not_in_selection_pty` uses the same pattern.
+/// `SSH_CONNECTION` is set deliberately: on macOS the clipboard route emits OSC 52 only when it
+/// believes the session is remote.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "PTY e2e; run the owning pty_e2e_* Cargo test with --ignored (see Cargo.toml)"]
 async fn quote_block_drag_copy_excludes_bars_pty() {

@@ -102,6 +102,25 @@ pub(crate) fn delivery_operation(operation: ActiveAgentMessageOperation) -> Oper
     }
 }
 
+#[derive(Clone, Copy)]
+pub(crate) enum ActiveMessagePrincipal {
+    Agent,
+    Human,
+}
+
+pub(crate) fn delivery_principal(
+    source: xai_grok_tools::implementations::grok_build::task::types::ActiveAgentMessageSource,
+) -> ActiveMessagePrincipal {
+    match source {
+        xai_grok_tools::implementations::grok_build::task::types::ActiveAgentMessageSource::Agent => {
+            ActiveMessagePrincipal::Agent
+        }
+        xai_grok_tools::implementations::grok_build::task::types::ActiveAgentMessageSource::Human => {
+            ActiveMessagePrincipal::Human
+        }
+    }
+}
+
 #[derive(Clone)]
 pub(crate) struct MessageDeliveryHandle {
     cmd_tx: mpsc::UnboundedSender<SessionCommand>,
@@ -177,6 +196,7 @@ impl MessageDeliveryHandle {
         if self
             .cmd_tx
             .send(SessionCommand::ParentAgentMessage {
+                principal: delivery_principal(delivery.source()),
                 delivery,
                 receipt_sink,
                 parent_telemetry_ctx,

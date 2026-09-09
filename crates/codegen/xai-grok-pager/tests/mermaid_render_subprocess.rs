@@ -113,11 +113,8 @@ fn invalid_diagram_is_contained() {
 #[test]
 #[ignore = "spawns the built pager binary; run with cargo test -- --ignored"]
 fn tight_timeout_kills_child_and_returns_err() {
-    // A 1 ms budget cannot cover spawning and rendering, so the parent must kill and reap the child and return Err
-    // It must return promptly, not block on the child finishing
-    // That the kill terminates the child's process group is asserted by the `xai_grok_mermaid::subprocess` `reap_terminates_the_process` unit test
-    // Here the loose ceiling guards against the parent blocking on a child that outlived its budget
-    // It tolerates slow-CI spawn of the real binary
+    // A 1 ms budget cannot cover spawning and rendering, so the parent must kill and reap the child and return Err. It
+    // must return promptly, not block on the child finishing.
     let bin = pager_binary().expect("resolve pager binary");
     let dir = tempfile::tempdir().expect("tempdir");
     let out = dir.path().join("slow.png");

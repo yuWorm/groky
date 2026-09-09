@@ -178,22 +178,15 @@ fn default_timeout_ms(event: crate::event::HookEventName) -> u64 {
 }
 
 /// The validated handler kind.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, strum::AsRefStr, strum::IntoStaticStr,
+)]
 #[serde(rename_all = "snake_case")]
+#[strum(serialize_all = "snake_case")]
 pub enum HandlerType {
     Command,
     Http,
 }
-
-impl HandlerType {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Command => "command",
-            Self::Http => "http",
-        }
-    }
-}
-
 impl std::str::FromStr for HandlerType {
     type Err = ();
 

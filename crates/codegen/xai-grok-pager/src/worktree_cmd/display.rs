@@ -31,7 +31,7 @@ pub fn print_table(records: &[WorktreeRecord], out: &mut impl Write) -> std::io:
         .clamp(5, 24);
     let type_width = records
         .iter()
-        .map(|r| UnicodeWidthStr::width(r.kind.as_str()))
+        .map(|r| UnicodeWidthStr::width(r.kind.as_ref()))
         .fold(UnicodeWidthStr::width("TYPE"), usize::max);
     writeln!(
         out,
@@ -53,7 +53,7 @@ pub fn print_table(records: &[WorktreeRecord], out: &mut impl Write) -> std::io:
             out,
             "  {} {} {} {} {} {:<AGE_WIDTH$} {}",
             pad_to_width(&rec.id, id_width),
-            cell(rec.kind.as_str(), type_width),
+            cell(rec.kind.as_ref(), type_width),
             cell(&rec.repo_name, REPO_WIDTH),
             cell(label, label_width),
             cell(branch, BRANCH_WIDTH),
@@ -66,7 +66,7 @@ pub fn print_table(records: &[WorktreeRecord], out: &mut impl Write) -> std::io:
         records
             .iter()
             .fold(std::collections::BTreeMap::new(), |mut m, r| {
-                *m.entry(r.kind.as_str()).or_default() += 1;
+                *m.entry(r.kind.as_ref()).or_default() += 1;
                 m
             });
     let breakdown: Vec<String> = by_kind.iter().map(|(k, v)| format!("{v} {k}")).collect();
@@ -79,7 +79,7 @@ pub fn print_json(records: &[WorktreeRecord], out: &mut impl Write) -> std::io::
 pub fn print_show(rec: &WorktreeRecord, out: &mut impl Write) -> std::io::Result<()> {
     writeln!(out, "  Path:           {}", rec.path.display())?;
     writeln!(out, "  ID:             {}", rec.id)?;
-    writeln!(out, "  Type:           {}", rec.kind.as_str())?;
+    writeln!(out, "  Type:           {}", rec.kind.as_ref())?;
     writeln!(out, "  Source Repo:    {}", rec.source_repo.display())?;
     writeln!(out, "  Creation Mode:  {}", rec.creation_mode)?;
     if let Some(ref git_ref) = rec.git_ref {
@@ -107,7 +107,7 @@ pub fn print_show(rec: &WorktreeRecord, out: &mut impl Write) -> std::io::Result
     if let Some(pid) = rec.creator_pid {
         writeln!(out, "  Creator PID:    {pid}")?;
     }
-    writeln!(out, "  Status:         {}", rec.status.as_str())?;
+    writeln!(out, "  Status:         {}", rec.status.as_ref())?;
     if let Some(label) = rec.label() {
         writeln!(out, "  Label:          {label}")?;
     }

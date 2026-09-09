@@ -120,13 +120,7 @@ impl OtherToolCallBlock {
         }
     }
 
-    /// Render collapsed line: **`Label`** `content` or **`Name`**.
-    ///
-    /// If the name contains `: `, splits into a bold label and muted/primary content (e.g. "Ask: What is your favorite language?").
-    /// Otherwise renders the full name in bold.
-    ///
-    /// When `muted` is true (collapsed state), all text uses dim styles to match other collapsed blocks.
-    /// The label ("Ask") stays bold.
+    /// Render collapsed line: `Label` `content` or `Name`. Otherwise renders the full name in bold.
     fn collapsed_line(&self, theme: &Theme, muted: bool, width: Option<usize>) -> Line<'static> {
         let text_style = if muted {
             theme.muted()
@@ -411,16 +405,9 @@ impl BlockContent for OtherToolCallBlock {
 
 // ── AskUserQuestion output parser ────────────────────────────────────
 
-/// Parse Q&A pairs from an AskUserQuestion tool result string.
-///
-/// Recognizes all three accepted output formats:
-///
-/// **Path A (accepted):** `User has answered your questions: "Q1"="A1", "Q2"="A2". You can now...`
-/// **Path D (cancelled):** `User declined to answer...`
-/// **Paths B/C (plan mode):** `- "Q1"\n  Answer: A1\n- "Q2"\n  (No answer provided)`
-///
-/// Returns `Vec<(question, answer)>`.
-/// An empty vec means the output is not a recognized Q&A format and should be rendered generically.
+/// Parse Q&A pairs from an AskUserQuestion tool result string. Recognizes all three accepted output formats. Path A
+/// (accepted): `User has answered your questions: "Q1"="A1", "Q2"="A2". You can now.`. Path D (cancelled): `User
+/// declined to answer.`. Paths B/C (plan mode): `- "Q1"\n Answer: A1\n- "Q2"\n (No answer provided)`.
 fn parse_ask_user_qa_pairs(output: &str) -> Vec<(String, String)> {
     // Path A: "User has answered your questions: "Q"="A", "Q"="A". You can now..."
     if let Some(rest) = output.strip_prefix("User has answered your questions: ") {

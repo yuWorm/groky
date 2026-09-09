@@ -2,11 +2,9 @@
 #[allow(unused_imports)]
 use super::common::*;
 
-/// Idle-input regression: after a turn completes and the session goes idle, a keystroke must echo promptly.
-/// The pager used to rely on an always-on `tracing_rx` animation tick to wake the parked event loop.
-/// Removing it exposed that crossterm's `EventStream` strands its waker when its `next()` future is dropped by a losing `select!` arm.
-/// Idle input was then not serviced until an unrelated poll timer fired (crossterm #936).
-/// Reading input on a dedicated thread behind a cancellation-safe channel fixes the wake; this test FAILS without that fix.
+/// Idle-input regression: after a turn completes and the session goes idle, a keystroke must echo
+/// promptly. The pager used to rely on an always-on `tracing_rx` animation tick to wake the parked
+/// event loop.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore]
 async fn input_echoes_at_idle_prompt() {

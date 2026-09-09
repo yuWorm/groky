@@ -34,10 +34,9 @@ async fn folder_trust_question_renders_and_accept_persists_grant() {
         "store must be empty before the user answers",
     );
 
-    // Regression: the global `Ctrl+N` shortcut bypasses the welcome interceptor
-    // (Its second press confirms a pending action, and that confirmation is consumed above the interceptor.)
-    // The dispatch chokepoint must still refuse to create a session while trust is Pending
-    // Two presses (NewSession requires confirmation) must leave us on the trust question, NOT in a session
+    // Regression: the global `Ctrl+N` shortcut bypasses the welcome interceptor. The dispatch
+    // chokepoint must still refuse to create a session while trust is Pending. Two presses (NewSession
+    // requires confirmation) must leave us on the trust question, NOT in a session.
     harness.inject_keys(b"\x0e").expect("inject Ctrl+N"); // first press
     harness.inject_keys(b"\x0e").expect("inject Ctrl+N"); // confirm
     harness.update(Duration::from_millis(400));

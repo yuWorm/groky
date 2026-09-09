@@ -11,10 +11,9 @@ const REASONING_SENTINEL: &str = "THOUGHTFOLDSENTINEL";
 /// Collapsed thought member/header text ("Thought for Xs").
 const THOUGHT_HEADER: &str = "Thought for";
 
-/// PTY: a thought folds into the verb-group run it precedes. The scripted turn thinks, then reads twice.
-/// While the reasoning streams, its live panel is on screen.
-/// Once the run settles the group shows only the tools-only "Read 2 files" header (the collapsed thought row folded away).
-/// Expanding the group reveals the thought as its own 1-row member.
+/// PTY: a thought folds into the verb-group run it precedes. The scripted turn thinks, then reads
+/// twice. Once the run settles the group shows only the tools-only "Read 2 files" header (the
+/// collapsed thought row folded away).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "PTY e2e; run the owning pty_e2e_* Cargo test with --ignored (see Cargo.toml)"]
 async fn verb_group_thinking_fold_pty() {

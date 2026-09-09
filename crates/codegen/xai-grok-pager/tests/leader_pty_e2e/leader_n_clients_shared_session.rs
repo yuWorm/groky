@@ -2,13 +2,9 @@
 #[allow(unused_imports)]
 use super::common::*;
 
-/// **Leader mode: N clients share one session.**
-/// Scales the multi-client fan-out to one driver plus `VIEWERS` viewers; bump `VIEWERS` to widen it.
-/// The driver spawns the leader and runs a turn; every viewer attaches through the SAME leader and must replay that turn exactly once.
-/// A later turn driven from the driver must stream live into ALL viewers exactly once.
-/// The leader and the viewers must survive the spawning client's exit.
-/// NOT a superset of `leader_two_clients_shared_session`, so that test must not be deleted as redundant.
-/// Only it drives a turn from a viewer back to the driver, and only it checks that every turn of a multi-turn scrollback appears exactly once.
+/// The leader and the viewers must survive the spawning client's exit. NOT a superset of
+/// `leader_two_clients_shared_session`, so that test must not be deleted as redundant. Only it drives a turn from a
+/// viewer back to the driver, and only it checks that every turn of a multi-turn scrollback appears exactly once.
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
 #[ignore = "PTY e2e; run with cargo test -p xai-grok-pager --test leader_pty_e2e -- --ignored --test-threads=1"]
 async fn leader_n_clients_shared_session() {

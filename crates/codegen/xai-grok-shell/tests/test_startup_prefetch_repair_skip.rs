@@ -11,12 +11,12 @@ fn prefetch_never_starts_while_policy_repair_is_pending() {
         let server = common::start_seeded_mock(home.path()).await;
         // A team principal with no serving managed policy: `ensure_managed_policy_present`
         // will run a session-start repair, so no prefetch may egress before it.
-        let scope = xai_grok_shell::auth::GrokComConfig::default().auth_scope();
+        let scope = xai_grok_login::GrokComConfig::default().auth_scope();
         let auth = serde_json::json!({
             scope: {
                 "key": "team-session-token",
                 "auth_mode": "oidc",
-                "oidc_issuer": xai_grok_shell::auth::xai_oauth2_issuer(),
+                "oidc_issuer": xai_grok_login::xai_oauth2_issuer(),
                 "create_time": "2026-01-01T00:00:00Z",
                 "expires_at": "2099-01-01T00:00:00Z",
                 "user_id": "test-user",

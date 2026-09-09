@@ -4,27 +4,9 @@ use super::common::*;
 #[allow(unused_imports)]
 use super::scroll::*;
 
-// ── A7: wheel overscroll at the bottom re-engages follow mode ─────────────
-//
-// User complaint: after wheeling up to read during a streaming turn, wheeling back down to the bottom left a "dead wheel tick" before follow resumed
-// `scroll_down` now re-engages follow on the first fully clamped wheel-down at the bottom (zero rows moved)
-// A scroll that merely lands at the bottom (real rows moved) still never engages
-//
-// The test drives the whole loop end-to-end mid-stream
-// Wheel up: follow exits and the viewport parks while deltas keep arriving
-// Wheel back down past the bottom (the overscroll): the viewport must follow the still-streaming tail
-// The final chunk becomes visible with no further input
-// With follow left disengaged, new rows accumulate below the parked viewport and the sentinel never enters the screen
-//
-// The down burst deliberately over-travels, so it contains many clamped events
-// A PTY cannot pin "exactly one clamped tick engages": any wheel journey back to the bottom lands before it clamps
-// The flag-setting approach the fix replaced also engaged within such a burst
-// The single-event behavior is pinned by the `scrollback::state::nav` unit tests; this test pins the user-visible contract on the real binary
-// Negative control: with the engage branch compiled out, this test fails (STREAMDONE never becomes visible)
-//
-// Determinism: `TERM_PROGRAM=zed`, `GROK_SCROLL_MODE=wheel`, and `GROK_SCROLL_LINES=1` make every SGR report scroll exactly one row
-// The forced wheel mode removes any variance in how events are classified (see `forced_wheel_mode_env_scrolls_exact_rows`)
-// The completion gate holds the turn's terminal SSE event, so every assertion below is provably mid-turn
+// A7: wheel overscroll at the bottom re-engages follow mode. A scroll that merely lands at the
+// bottom (real rows moved) still never engages. Wheel back down past the bottom (the overscroll):
+// the viewport must follow the still-streaming tail.
 
 /// 240 one-row markers dwarf the 50-row PTY: the up-burst can never clamp at the transcript top, and markers stay visible above the streamed tail.
 const MARKER_COUNT: usize = 240;

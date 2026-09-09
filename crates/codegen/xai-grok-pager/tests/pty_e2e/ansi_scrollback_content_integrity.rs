@@ -2,17 +2,9 @@
 #[allow(unused_imports)]
 use super::common::*;
 
-/// Regression guard for the `xai-ratatui-inline` rewrite (termwiz to anstyle-parse).
-/// Minimal mode commits finalized assistant blocks into the terminal's NATIVE scrollback through `xai_ratatui_inline::Terminal::insert_before`.
-/// That call is the rewritten crate's production entry point.
-/// A parsing or offset regression there shows up as truncated, duplicated, or corrupted committed content.
-///
-/// The response stresses rendered-ANSI output.
-/// It has a syntax-highlighted code block (SGR sequences interleave the text) and CJK and emoji wide characters (multi-byte UTF-8, width-2 cells).
-/// Enough unique code-block rows (which never markdown-reflow) overflow the 50-row screen and force the head of the block into scrollback.
-///
-/// Assertions read scrollback and screen after the commit: head/tail sentinels and every payload row present exactly once, wide-char markers intact.
-/// Dropped or doubled emissions change the count.
+/// Regression guard for the `xai-ratatui-inline` rewrite (termwiz to anstyle-parse). Enough unique
+/// code-block rows (which never markdown-reflow) overflow the 50-row screen and force the head of
+/// the block into scrollback.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore]
 async fn ansi_scrollback_content_integrity() {
@@ -42,8 +34,8 @@ async fn ansi_scrollback_content_integrity() {
         .inject_keys(format!("{PROMPT}\r").as_bytes())
         .expect("submit prompt");
 
-    // The block commits to native scrollback when the turn finalizes
-    // Poll until the head sentinel (which scrolled far above the live region) lands in scrollback
+    // The block commits to native scrollback when the turn finalizes.
+    // Poll until the head sentinel (which scrolled far above the live region) lands in scrollback.
     let deadline = Instant::now() + Duration::from_secs(40);
     while Instant::now() < deadline && !harness.scrollback_text().contains(HEAD) {
         harness.update(Duration::from_millis(100));

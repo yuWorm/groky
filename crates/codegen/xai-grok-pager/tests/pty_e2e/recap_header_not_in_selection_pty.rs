@@ -6,16 +6,9 @@ use super::common::*;
 /// "Recap" chrome label (or unrelated scrollback text).
 const RECAP_BODY_TOKEN: &str = "RECAP_BODY_SEL_TOKEN";
 
-/// PTY: drag-select on an expanded recap copies only the summary body, never the "Recap" header label.
-/// Mirrors Thinking-header / tool-label exclusion.
-///
-/// Flow: one agent turn (so recap_gate has a main turn), then `/recap`.
-/// The second mock inference response becomes the recap body; drag the body and read the OSC 52 payload.
-///
-/// `SSH_CONNECTION` is set deliberately.
-/// On macOS the clipboard route only emits OSC 52 when it believes the session is remote (see `resolve_clipboard_route`).
-/// The harness strips inherited SSH vars, so scripted scenarios and this test re-inject a dummy one for OSC 52 readback.
-/// Same pattern as `tests/scenarios/copy_selection.yaml`.
+/// PTY: drag-select on an expanded recap copies only the summary body, never the "Recap" header
+/// label. On macOS the clipboard route only emits OSC 52 when it believes the session is remote
+/// (see `resolve_clipboard_route`).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "PTY e2e; run the owning pty_e2e_* Cargo test with --ignored (see Cargo.toml)"]
 async fn recap_header_not_in_selection_pty() {

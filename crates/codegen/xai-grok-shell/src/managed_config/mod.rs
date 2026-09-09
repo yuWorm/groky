@@ -1,5 +1,5 @@
-//! Sync `managed_config.toml` + `requirements.toml` from the deployment-config endpoint per
-//! principal; evicted on identity switch and cleared on logout, so config never crosses principals.
+//! Sync `managed_config.toml` + `requirements.toml` from the deployment-config endpoint per principal;
+//! evicted on identity switch and logout so config never crosses principals (`GROK_MANAGED_CONFIG=0` skips the sweep).
 
 mod policy;
 mod response;
@@ -19,12 +19,27 @@ pub(crate) use supervisor::policy_repair_pending;
 #[doc(hidden)]
 pub use supervisor::{ManagedConfigRefresher, spawn_refresh_supervisor, take_refresh_supervisor};
 pub use supervisor::{
-    ManagedConfigSync, SetupOutcome, SetupReport, ensure_managed_policy_present,
-    fetch_setup_report, post_login_sync, run_setup, start_refresh_supervisor, sync,
+    ManagedConfigSync, SESSION_START_AUTH_DEADLINE, SESSION_START_SYNC_DEADLINE, SetupOutcome,
+    SetupReport, ensure_managed_policy_present, fetch_setup_report, post_login_sync, run_setup,
+    start_refresh_supervisor, sync,
 };
 
 /// Absorbs a healthy in-flight apply without letting a wedged holder stall start.
 const GATE_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LaunchProfile {
+    Personal,
+    Managed,
+}
+
+pub fn startup_profile() -> LaunchProfile {
+    if !cfg!(test) && store::managed_principal_present() {
+        LaunchProfile::Managed
+    } else {
+        LaunchProfile::Personal
+    }
+}
 
 /// Fail-closed session-start gate for managed principals.
 pub fn managed_policy_gate() -> Result<(), ManagedPolicyRefusal> {

@@ -19,7 +19,6 @@ use agent_client_protocol as acp;
 use serde::{Deserialize, Serialize};
 
 /// Record a structured telemetry event at the end of a code-nav handler call, once per request.
-///
 /// The fields separate first-use latency (newly spawned, high elapsed_ms) from reuse latency.
 /// They also attribute slowness to index startup vs query processing.
 fn log_code_nav_telemetry(
@@ -43,12 +42,8 @@ type ExtResult = Result<acp::ExtResponse, acp::Error>;
 
 // ========== Request Types ==========
 
-/// Position-based query request (for goto-definition, goto-references).
-/// Position parameters are 1-indexed (matching editor display).
-///
-/// **`sessionId` is required** for all code-nav requests.
-/// Per-client capability gating requires a valid session so eligibility is resolved correctly in both simple and leader modes.
-/// Requests without `sessionId` receive `reason: sessionRequired` in the error response.
+/// Position-based query request (for goto-definition, goto-references). Position parameters are 1-indexed (matching editor display). **`sessionId` is required** for all code-nav requests.
+/// Per-client capability gating requires a valid session so eligibility is resolved correctly in both simple and leader modes. Requests without `sessionId` receive `reason: sessionRequired` in the error response.
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct GotoRequest {
@@ -163,7 +158,6 @@ pub(crate) struct StatusResponse {
 // ========== Handler ==========
 
 /// Handle code navigation extension methods.
-///
 /// Routes through [`WorkspaceOps`].
 /// Eligibility checks still run in shell since they depend on agent-level config (client type, feature flags).
 #[tracing::instrument(name = "ext.code_nav", skip_all, fields(method = %args.method))]

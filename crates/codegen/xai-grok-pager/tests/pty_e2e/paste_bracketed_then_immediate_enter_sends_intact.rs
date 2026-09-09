@@ -2,22 +2,9 @@
 #[allow(unused_imports)]
 use super::common::*;
 
-/// Paste-then-send race guard, end to end.
-/// A bracketed paste with Enter in the SAME input burst (terminal auto-paste-and-run, fast users) must submit the full payload exactly ONCE.
-/// The payload must never be dropped or duplicated.
-///
-/// What each platform actually exercises: on Linux the paste path is fully synchronous (the clipboard probe block is cfg(macos/windows)).
-/// The Linux run therefore guards the plain paste-then-submit ordering.
-/// On macOS a send that arrives while the clipboard probe is still pending gets stashed.
-/// That stash path runs ONLY when the real host pasteboard happens to carry a raster.
-/// The snapshot gate skips the probe otherwise.
-/// The test stays hermetic and does not seed one; the stash itself is covered by unit tests (`agent_send_before_paste_probe_keeps_image`).
-///
-/// "Exactly once" is asserted on user messages, not HTTP requests.
-/// The shell may legitimately retry the SAME turn over a second endpoint (Responses to Chat Completions fallback against the mock).
-/// A dropped send leaves 0 payload-bearing user messages and a double-submit leaves 2 in one request's accumulated history.
-///
-/// On a macOS dev machine the real host clipboard may add an incidental image chip, so the asserts only check that the sentinels appear.
+/// Paste-then-send race guard, end to end. A bracketed paste with Enter in the SAME input burst
+/// (terminal auto-paste-and-run, fast users) must submit the full payload exactly ONCE. The payload
+/// must never be dropped or duplicated. The snapshot gate skips the probe otherwise.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore]
 async fn paste_bracketed_then_immediate_enter_sends_intact() {

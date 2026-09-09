@@ -132,7 +132,6 @@ fn synth_server_id(prompt_id: &str) -> u64 {
 pub fn kind_from_wire(kind: &str) -> QueueEntryKind {
     match kind {
         "bash" => QueueEntryKind::BashCommand,
-        "cron" => QueueEntryKind::Cron,
         "command" => QueueEntryKind::Command,
         _ => QueueEntryKind::Prompt,
     }
@@ -313,24 +312,6 @@ impl QueuedPromptEntry {
 
                 Line::from(spans)
             }
-            QueueEntryKind::Cron => {
-                let display_text = if let Some(max_w) = content_max_width {
-                    truncate_str(first_line, max_w.saturating_sub(2))
-                } else {
-                    first_line.to_string()
-                };
-
-                let mut spans = vec![
-                    Span::styled("\u{21BB}  ", Style::default().fg(theme.gray_dim)),
-                    Span::styled(display_text, Style::default().fg(theme.accent_user)),
-                ];
-
-                if extra_lines > 0 {
-                    spans.push(Span::styled(suffix, Style::default().fg(theme.gray)));
-                }
-
-                Line::from(spans)
-            }
         }
     }
 }
@@ -379,10 +360,9 @@ use crate::render::{PreviewConfig, PreviewStyle, render_preview_overlay};
 use super::list_pane::{ListPane, ListPaneConfig, ListPaneState, ListPaneStyle, WrapMode};
 use super::overlay::OverlayState;
 
-/// Event returned by [`QueuePane::handle_key`] signaling intent to the caller.
-///
-/// The queue pane never mutates business state (the prompt queue) directly.
-/// It signals intent via these events, and `AgentView::handle_queue_key` performs the actual mutation on `AgentSession::pending_prompts`.
+/// Event returned by [`QueuePane::handle_key`] signaling intent to the caller. The queue pane never
+/// mutates business state (the prompt queue) directly. It signals intent via these events, and
+/// `AgentView::handle_queue_key` performs the actual mutation on `AgentSession::pending_prompts`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum QueueEvent {
     /// Delete the selected prompt from the queue.
@@ -467,10 +447,9 @@ impl RowActionButton {
     }
 }
 
-/// Self-contained queue pane component.
-///
-/// Does NOT own the queue data: entries are rebuilt each frame from `AgentSession::pending_prompts`.
-/// Owns `ListPaneState` for scroll, selection, and rendering state.
+/// Self-contained queue pane component. Does NOT own the queue data: entries are rebuilt each frame
+/// from `AgentSession::pending_prompts`. Owns `ListPaneState` for scroll, selection, and rendering
+/// state.
 pub struct QueuePane {
     /// Styled entries for `ListPane` rendering.
     /// Rebuilt from the queue at the start of each `render()` call.
@@ -537,19 +516,9 @@ impl QueuePane {
 
     // -- Data management -----------------------------------------------------
 
-    /// Rebuild the queue rows from the **union** of the local drip-feed queue (`local`) and the server-authoritative shared queue (`server`).
-    /// Each row is tagged with its origin so edits route correctly.
-    ///
-    /// Merge ordering rule: **server rows first** (in their broadcast `position` order), then **local rows** (in `pending_prompts` order).
-    /// Server (plain) prompts were already accepted into the agent's authoritative FIFO.
-    /// Local rows (skill/image/bash/cron, or plain prompts queued before the session/turn was ready) wait behind them.
     /// This is only correct because every server-queued prompt is older than every local one.
-    /// `immediate_server_send_eligible` enforces that invariant.
-    /// A prompt may take the immediate-send (server) path only while the local queue is empty.
-    /// A newer prompt therefore can never sit on the server queue ahead of an older local prompt.
-    /// The two queues are disjoint by construction (plain-while-running routes to the server queue, everything else local), so no row is in both.
-    ///
-    /// `running_id` / `send_now_id` / `painted_pending` use [`visible_held_server_row`].
+    /// `immediate_server_send_eligible` enforces that invariant. A prompt may take the immediate-send
+    /// (server) path only while the local queue is empty.
     pub fn sync_from_merged(
         &mut self,
         local: &std::collections::VecDeque<QueuedPrompt>,
@@ -647,10 +616,8 @@ impl QueuePane {
         self.prev_len = 0;
     }
 
-    /// Desired height in lines for layout computation.
-    ///
-    /// Returns 0 when hidden or empty.
-    /// Otherwise: `min(queue.len(), MAX_QUEUE_HEIGHT)`.
+    /// Desired height in lines for layout computation. Returns 0 when hidden or empty. Otherwise:
+    /// `min(queue.len(), MAX_QUEUE_HEIGHT)`.
     pub fn desired_height(&self) -> u16 {
         if !self.is_visible() {
             return 0;
@@ -660,10 +627,9 @@ impl QueuePane {
 
     // -- Input handling ------------------------------------------------------
 
-    /// Handle a key event when the queue pane is focused.
-    ///
-    /// Returns `Some(QueueEvent)` for queue-specific actions (delete, edit, reorder).
-    /// Returns `None` if the key wasn't a queue action; the caller should then try `handle_navigation_key` for j/k/y etc.
+    /// Handle a key event when the queue pane is focused. Returns `Some(QueueEvent)` for queue-specific
+    /// actions (delete, edit, reorder). Returns `None` if the key wasn't a queue action; the caller
+    /// should then try `handle_navigation_key` for j/k/y etc.
     pub fn handle_key(
         &self,
         key: &KeyEvent,
@@ -873,14 +839,6 @@ impl QueuePane {
 
     // -- Rendering -----------------------------------------------------------
 
-    /// Compute the inner content area for the queue rows.
-    ///
-    /// Indents one column less than scrollback content (which uses `ACCENT + block_pad_left`).
-    /// The `#N` prefix then aligns with the turn-status loading indicator just below.
-    /// That indicator uses this exact `ACCENT + block_pad_left - 1` left indent (see `agent_view.rs`).
-    ///
-    /// The right edge is NOT inset: it extends to the full area width.
-    /// The row's right-aligned action buttons (`[cancel]`) and hover bg then line up with the turn-status line's `[stop]` button just below.
     /// That button is likewise right-aligned to the full width (it insets only on the left).
     fn content_area(area: Rect, layout_cfg: &LayoutConfig) -> Rect {
         use crate::scrollback::layout::HorizontalLayout;
@@ -903,12 +861,10 @@ impl QueuePane {
         focused: bool,
         layout_cfg: &LayoutConfig,
         overlay_area: Option<Rect>,
-        is_turn_running: bool,
+        can_send_now: bool,
     ) {
-        // Detect a theme switch and refresh the list style
-        // Its `selection_bg` (the focused-row highlight) is captured from the theme's `bg_highlight`
-        // Without this it would keep the theme active at construction (default GrokNight, dark) after the user switches
-        // That paints a dark band on a light GrokDay canvas
+        // Detect a theme switch and refresh the list style. Without this it would keep the theme active at
+        // construction (default GrokNight, dark) after the user switches.
         let current_theme = Theme::current_kind();
         if current_theme != self.last_theme {
             self.last_theme = current_theme;
@@ -1029,11 +985,20 @@ impl QueuePane {
                         .bind(Rect::new(cancel_x, screen_y, cancel_w, 1), entry.id);
                 }
 
-                // [edit] sits flush against [cancel] (no gap): a gap would let the queued message behind the row leak through the seam
-                // Unlike [Send now] it renders regardless of turn state; the keyboard `e` edit works either way
+                let interject_label = "[Send now]";
+                let interject_w = interject_label.len() as u16;
+                let show_send_now = can_send_now && entry.capabilities.can_send_now();
+
+                // [edit] renders regardless of turn state; the keyboard `e` edit
+                // works either way. Flush against its neighbours: a gap would let
+                // the queued message behind the row leak through the seam.
+                // A row that fits [Send now] but not [Send now][edit] drops
+                // [edit] so the time-sensitive button keeps its slot.
                 let edit_label = "[edit]";
                 let edit_w = edit_label.len() as u16;
+                let send_now_fits_alone = show_send_now && fits(right, interject_w).is_some();
                 if entry.capabilities.can_edit()
+                    && (!send_now_fits_alone || fits(right, interject_w + edit_w).is_some())
                     && let Some(edit_x) = fits(right, edit_w)
                 {
                     right = edit_x;
@@ -1047,27 +1012,16 @@ impl QueuePane {
                         .bind(Rect::new(edit_x, screen_y, edit_w, 1), entry.id);
                 }
 
-                if is_turn_running && entry.capabilities.can_send_now() {
-                    // The compact [Send now] label still hit-tests as force-interject
-                    // Leftmost in the chain, flush against [edit] for the same no-seam reason
-                    let interject_label = "[Send now]";
-                    let interject_w = interject_label.len() as u16;
-                    if let Some(interject_x) = fits(right, interject_w) {
-                        // Brighten the fg on hover (same hover color as the [Dashboard] button) so it reads as clickable
-                        let interject_style = if self.send_now.is_hovered_for(entry.id) {
-                            Style::default().fg(theme.text_primary)
-                        } else {
-                            btn_style
-                        };
-                        buf.set_string_safe(
-                            interject_x,
-                            screen_y,
-                            interject_label,
-                            interject_style,
-                        );
-                        self.send_now
-                            .bind(Rect::new(interject_x, screen_y, interject_w, 1), entry.id);
-                    }
+                if show_send_now && let Some(interject_x) = fits(right, interject_w) {
+                    // Brighten the fg on hover (same hover color as the [Dashboard] button) so it reads as clickable
+                    let interject_style = if self.send_now.is_hovered_for(entry.id) {
+                        Style::default().fg(theme.text_primary)
+                    } else {
+                        btn_style
+                    };
+                    buf.set_string_safe(interject_x, screen_y, interject_label, interject_style);
+                    self.send_now
+                        .bind(Rect::new(interject_x, screen_y, interject_w, 1), entry.id);
                 }
             }
         }
@@ -1674,40 +1628,6 @@ mod tests {
         assert!(text.contains("(+2 lines)"));
     }
 
-    // -- Cron queue pane tests --
-
-    #[test]
-    fn test_cron_has_recycle_prefix() {
-        let styled = QueuedPromptEntry::build_styled("check status", 1, QueueEntryKind::Cron, None);
-        let text: String = styled.spans.iter().map(|s| s.content.as_ref()).collect();
-        assert!(
-            text.starts_with("\u{21BB}  "),
-            "cron entry should start with \u{21BB}, got: {text}"
-        );
-        assert!(text.contains("check status"));
-    }
-
-    #[test]
-    fn test_cron_multiline_suffix() {
-        let styled =
-            QueuedPromptEntry::build_styled("/pr-babysit check", 4, QueueEntryKind::Cron, None);
-        let text: String = styled.spans.iter().map(|s| s.content.as_ref()).collect();
-        assert!(text.starts_with("\u{21BB}  "));
-        assert!(text.contains("(+3 lines)"));
-    }
-
-    #[test]
-    fn test_cron_truncation() {
-        let styled = QueuedPromptEntry::build_styled(
-            "very long scheduled prompt",
-            1,
-            QueueEntryKind::Cron,
-            Some(15),
-        );
-        let text: String = styled.spans.iter().map(|s| s.content.as_ref()).collect();
-        assert!(text.starts_with("\u{21BB}  "));
-    }
-
     #[test]
     fn test_bash_command_truncation() {
         let styled = QueuedPromptEntry::build_styled(
@@ -1740,7 +1660,6 @@ mod tests {
         let area = Rect::new(0, 0, 80, 1);
         let mut buf = Buffer::empty(area);
         let layout_cfg = crate::appearance::LayoutConfig::default();
-        // Focused with the turn running: all three buttons render for the selected row
         pane.render(area, &mut buf, true, &layout_cfg, None, true);
 
         let edit = pane.edit_button.rect.expect("edit button renders");
@@ -1749,7 +1668,7 @@ mod tests {
         assert_eq!(
             interject.x + interject.width,
             edit.x,
-            "[Interject] must sit flush against [edit] (no gap to leak through)"
+            "[Send now] must sit flush against [edit] (no gap to leak through)"
         );
         assert_eq!(
             edit.x + edit.width,
@@ -1758,10 +1677,8 @@ mod tests {
         );
     }
 
-    /// `[edit]` renders even when no turn is running (the keyboard `e` edit works regardless of turn state).
-    /// `[Send now]` stays hidden, and the chain stays flush: [edit][cancel].
     #[test]
-    fn edit_button_renders_when_turn_not_running() {
+    fn send_now_button_tracks_send_now_gate() {
         let mut pane = QueuePane::new();
         let mut local = std::collections::VecDeque::new();
         local.push_back(local_prompt(1, "msg"));
@@ -1772,24 +1689,58 @@ mod tests {
         let area = Rect::new(0, 0, 80, 1);
         let mut buf = Buffer::empty(area);
         let layout_cfg = crate::appearance::LayoutConfig::default();
-        // Focused with the turn NOT running: [edit] and [cancel], no [Send now]
         pane.render(area, &mut buf, true, &layout_cfg, None, false);
+        assert!(pane.send_now.rect.is_none());
 
-        assert!(
-            pane.send_now.rect.is_none(),
-            "[Send now] only renders mid-turn"
-        );
-        let edit = pane
-            .edit_button
-            .rect
-            .expect("edit button renders while idle");
+        pane.render(area, &mut buf, true, &layout_cfg, None, true);
+        let send_now = pane.send_now.rect.expect("send-now button renders");
+        let edit = pane.edit_button.rect.expect("edit button renders");
         let cancel = pane.delete_button.rect.expect("cancel button renders");
-        assert_eq!(pane.edit_button.entry_id, Some(ids[0]));
-        assert_eq!(
-            edit.x + edit.width,
-            cancel.x,
-            "[edit] must sit flush against [cancel] when [Send now] is hidden"
-        );
+        assert_eq!(pane.send_now.entry_id, Some(ids[0]));
+        assert_eq!(send_now.x + send_now.width, edit.x);
+        assert_eq!(edit.x + edit.width, cancel.x);
+    }
+
+    /// A row too narrow for the full chain drops `[edit]` before the
+    /// time-sensitive `[Send now]`; a row too narrow for `[Send now]` at all
+    /// still shows `[edit][cancel]`.
+    #[test]
+    fn narrow_pane_drops_edit_before_send_now() {
+        let layout_cfg = crate::appearance::LayoutConfig::default();
+        let mut pane = QueuePane::new();
+        let mut local = std::collections::VecDeque::new();
+        local.push_back(local_prompt(1, "msg"));
+        pane.sync_from_merged(&local, &[], None, None, &Default::default());
+        pane.list_state.select_by_id(pane.entry_ids()[0]);
+        let render = |pane: &mut QueuePane, inner_w: u16| {
+            let area = Rect::new(0, 0, 80, 1);
+            pane.render(
+                area,
+                &mut Buffer::empty(area),
+                true,
+                &layout_cfg,
+                None,
+                true,
+            );
+            let padding = area.width - pane.last_inner.expect("inner recorded").width;
+            let area = Rect::new(0, 0, padding + inner_w, 1);
+            pane.render(
+                area,
+                &mut Buffer::empty(area),
+                true,
+                &layout_cfg,
+                None,
+                true,
+            );
+        };
+
+        render(&mut pane, "[Send now][edit][cancel]".len() as u16 - 1);
+        assert!(pane.send_now.rect.is_some(), "[Send now] survives");
+        assert!(pane.edit_button.rect.is_none(), "[edit] is dropped first");
+
+        render(&mut pane, "[Send now][cancel]".len() as u16 - 1);
+        assert!(pane.send_now.rect.is_none(), "[Send now] can't fit");
+        assert!(pane.edit_button.rect.is_some(), "[edit] takes the space");
     }
 
     /// On panes too narrow for the full `[Send now][edit][cancel]` chain, a button that can't fit right of the content area's left edge is dropped.
@@ -1810,46 +1761,42 @@ mod tests {
             pane.last_inner.expect("inner recorded").x
         };
 
-        for is_running in [true, false] {
-            for width in (pad_left + 1)..=(pad_left + 26) {
-                let mut pane = QueuePane::new();
-                let mut local = std::collections::VecDeque::new();
-                local.push_back(local_prompt(1, "msg"));
-                pane.sync_from_merged(&local, &[], None, None, &Default::default());
-                let ids = pane.entry_ids();
-                pane.list_state.select_by_id(ids[0]);
+        for width in (pad_left + 1)..=(pad_left + 26) {
+            let mut pane = QueuePane::new();
+            let mut local = std::collections::VecDeque::new();
+            local.push_back(local_prompt(1, "msg"));
+            pane.sync_from_merged(&local, &[], None, None, &Default::default());
+            let ids = pane.entry_ids();
+            pane.list_state.select_by_id(ids[0]);
 
-                let area = Rect::new(0, 0, width, 1);
-                let mut buf = Buffer::empty(area);
-                pane.render(area, &mut buf, true, &layout_cfg, None, is_running);
+            let area = Rect::new(0, 0, width, 1);
+            let mut buf = Buffer::empty(area);
+            pane.render(area, &mut buf, true, &layout_cfg, None, true);
 
-                let inner = pane.last_inner.expect("inner recorded");
-                let rects = [
-                    ("edit", pane.edit_button.rect),
-                    ("send_now", pane.send_now.rect),
-                    ("cancel", pane.delete_button.rect),
-                ];
-                let mut placed: Vec<(&str, Rect)> = rects
-                    .iter()
-                    .filter_map(|&(name, rect)| rect.map(|r| (name, r)))
-                    .collect();
-                for (name, r) in &placed {
-                    assert!(
-                        r.x >= inner.x && r.x + r.width <= inner.x + inner.width,
-                        "{name} rect {r:?} must stay inside inner {inner:?} \
-                         at width {width} (running={is_running})"
-                    );
-                }
-                placed.sort_by_key(|(_, r)| r.x);
-                for pair in placed.windows(2) {
-                    let (an, a) = pair[0];
-                    let (bn, b) = pair[1];
-                    assert!(
-                        a.x + a.width <= b.x,
-                        "{an} and {bn} rects must not overlap at width {width} \
-                         (running={is_running}): {a:?} vs {b:?}"
-                    );
-                }
+            let inner = pane.last_inner.expect("inner recorded");
+            let rects = [
+                ("edit", pane.edit_button.rect),
+                ("send_now", pane.send_now.rect),
+                ("cancel", pane.delete_button.rect),
+            ];
+            let mut placed: Vec<(&str, Rect)> = rects
+                .iter()
+                .filter_map(|&(name, rect)| rect.map(|r| (name, r)))
+                .collect();
+            for (name, r) in &placed {
+                assert!(
+                    r.x >= inner.x && r.x + r.width <= inner.x + inner.width,
+                    "{name} rect {r:?} must stay inside inner {inner:?} at width {width}"
+                );
+            }
+            placed.sort_by_key(|(_, r)| r.x);
+            for pair in placed.windows(2) {
+                let (an, a) = pair[0];
+                let (bn, b) = pair[1];
+                assert!(
+                    a.x + a.width <= b.x,
+                    "{an} and {bn} rects must not overlap at width {width}: {a:?} vs {b:?}"
+                );
             }
         }
     }
@@ -1950,7 +1897,6 @@ mod tests {
         let layout_cfg = crate::appearance::LayoutConfig::default();
         let theme = Theme::current();
 
-        // Focused with the turn running: [Interject] renders for the selected row
         pane.render(area, &mut buf, true, &layout_cfg, None, true);
         let rect = pane.send_now.rect.expect("interject button renders");
         let non_hover_fg = buf[(rect.x, rect.y)].fg;

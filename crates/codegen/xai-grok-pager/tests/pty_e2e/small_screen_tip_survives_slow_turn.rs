@@ -2,12 +2,8 @@
 #[allow(unused_imports)]
 use super::common::*;
 
-// ── Small-screen tip must survive a submit into a slow turn ────────────────
-//
-// Real-usage repro: the tip shows on the welcome-to-agent promote, the user hits Enter under a second later, and the turn takes several seconds
-// The submit used to retire the tip (`clear_on_submit` cleared every tip), reducing it to a sub-second blink
-// The scripted scenarios miss this because the mock replies instantly
-// This test paces the mock stream (`set_chunk_delay`) so the turn genuinely outlives the ~3s TTL
+// Small-screen tip must survive a submit into a slow turn. The scripted scenarios miss this
+// because the mock replies instantly.
 
 /// Exact tip copy (also asserted char-for-char in the unit tests).
 const TIP_TEXT: &str = "Tight on space? Try /compact-mode";
@@ -37,11 +33,12 @@ async fn small_screen_tip_survives_slow_turn() {
     )
     .expect("spawn");
 
-    // The prompt marker paints at every height; the first char promotes the welcome prompt to the agent view, where the tip fires
+    // The prompt marker paints at every height; leave home so the tip fires on the agent view
     harness
         .wait_for_text("\u{276f}", WELCOME_TIMEOUT)
         .expect("prompt marker");
-    harness.inject_keys(b"hi").expect("promote to agent view");
+    leave_home(&mut harness);
+    harness.inject_keys(b"hi").expect("type into agent prompt");
     harness
         .wait_for_text(TIP_TEXT, Duration::from_secs(15))
         .expect("tip shows at the promote");

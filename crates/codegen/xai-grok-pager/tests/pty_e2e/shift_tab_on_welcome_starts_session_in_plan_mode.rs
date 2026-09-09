@@ -2,9 +2,8 @@
 #[allow(unused_imports)]
 use super::common::*;
 
-/// Pressing Shift+Tab (BackTab, `ESC [ Z`) before typing anything must leave the welcome screen, create a session, and cycle the mode.
-/// The transient "Switched to mode: Plan" banner proves both halves.
-/// The key started a new session (welcome to agent view), AND the forwarded BackTab resolved to `Action::CycleMode` before the session existed.
+/// Shift+Tab (BackTab, `ESC [ Z`) on the welcome screen must leave home for the optimistic
+/// session and cycle its mode. The "Switched to mode: Plan" banner proves both halves.
 /// With the auto gate on (the client default) the cycle runs Normal, Plan, Auto, and on around.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore]

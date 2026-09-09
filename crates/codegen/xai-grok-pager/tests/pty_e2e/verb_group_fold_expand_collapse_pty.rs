@@ -4,10 +4,8 @@ use super::common::*;
 
 const DONE_SENTINEL: &str = "VERB_GROUP_DONE";
 
-/// PTY: runs of consecutive reads/searches fold into one "Verb N noun" header row and an Edit stays a standalone separator.
-/// Double-click expands the group to individual rows, including member 0 below the header, with the selected slot acting as member 0.
-/// Right (Expand; `l` is its vim-mode alias) opens the member's own block.
-/// Left (Collapse; `h` in vim mode) closes it and then collapses the whole group.
+/// PTY: runs of consecutive reads/searches fold into one "Verb N noun" header row and an Edit stays
+/// a standalone separator.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "PTY e2e; run the owning pty_e2e_* Cargo test with --ignored (see Cargo.toml)"]
 async fn verb_group_fold_expand_collapse_pty() {
@@ -129,10 +127,8 @@ async fn verb_group_fold_expand_collapse_pty() {
         harness.screen_contents()
     );
 
-    // Focus scrollback with a single Tab, then wait for a scrollback-only footer hint to prove the scrollback owns keys
-    // Tab TOGGLES focus; polling the render avoids racing turn-finish redraws
-    // The thinking fold chord renders whenever the scrollback is focused, regardless of which row type is selected
-    // "Space:prompt" can instead be crowded out by higher-priority selection hints
+    // Focus scrollback with a single Tab, then wait for a scrollback-only footer hint to prove the
+    // scrollback owns keys.
     harness.inject_keys(b"\t").expect("focus scrollback");
     harness
         .wait_for_text("Ctrl+e:", Duration::from_secs(10))

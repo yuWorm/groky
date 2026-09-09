@@ -27,7 +27,7 @@ fn eligible_or_record_skip(
         if spec.is_managed_policy() {
             tracing::info!(
                 hook_name = %spec.name,
-                layer = spec.layer.as_str(),
+                layer = spec.layer.as_ref(),
                 "managed-policy hook cannot be disabled; running anyway"
             );
         } else {

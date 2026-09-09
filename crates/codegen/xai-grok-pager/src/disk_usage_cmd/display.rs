@@ -230,10 +230,10 @@ fn count_verb(n: u64) -> &'static str {
 
 fn kind_cell(wt: &WorktreeUsage) -> Cow<'static, str> {
     match &wt.registration {
-        Registration::Untracked => Cow::Owned(format!("untracked ({})", wt.kind.as_str())),
+        Registration::Untracked => Cow::Owned(format!("untracked ({})", wt.kind.as_ref())),
         Registration::Tracked(rec) => match rec.status {
-            WorktreeStatus::Dead => Cow::Owned(format!("{} (dead)", wt.kind.as_str())),
-            WorktreeStatus::Alive => Cow::Borrowed(wt.kind.as_str()),
+            WorktreeStatus::Dead => Cow::Owned(format!("{} (dead)", wt.kind.as_ref())),
+            WorktreeStatus::Alive => Cow::Borrowed(wt.kind.into()),
         },
     }
 }

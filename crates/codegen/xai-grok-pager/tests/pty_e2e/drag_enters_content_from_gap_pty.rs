@@ -66,12 +66,8 @@ fn wait_for_stable_gap_layout(harness: &mut PtyHarness) -> (u16, u16, u16) {
     }
 }
 
-/// PTY: a mouse-down on the blank gap below the conversation (between the turn marker and the prompt box) starts an anchor-less drag.
-/// Dead space is a valid drag start.
-/// The anchor appears at the first drag position that lands on selectable text: here a word inside the last message.
-/// The payload is the entry-to-release slice of that single line, not a snap to the text nearest the press, not a block copy.
-///
-/// `SSH_CONNECTION` forces the OSC 52 clipboard route for readback.
+/// The payload is the entry-to-release slice of that single line, not a snap to the text nearest
+/// the press, not a block copy.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "PTY e2e; run the owning pty_e2e_* Cargo test with --ignored (see Cargo.toml)"]
 async fn drag_enters_content_from_gap_pty() {
@@ -123,11 +119,7 @@ async fn drag_enters_content_from_gap_pty() {
 
     let (entry_row, entry_col, gap_row) = wait_for_stable_gap_layout(&mut harness);
 
-    // PRESS in the gap, then drag up into the message
-    // The motion samples jump the marker row deliberately (terminals coalesce motion)
-    // The column clamp within a row makes the marker's line hittable at any column of its row, so a sample there would anchor the drag on the marker
-    // That anchor would be correct (the first text entered wins), but it is not this test's subject
-    // First sample on the message anchors at the word's first column; then extend to its last column and release
+    // PRESS in the gap, then drag up into the message.
     let head_col = entry_col + ENTRY_WORD.len() as u16 - 1;
     let seen = decode_osc52_payloads(harness.raw_output()).len();
     let mut drag = String::new();

@@ -2,7 +2,6 @@
 //
 // An answer taller than the screen leaves the reader at its tail
 // The sticky header's gap row offers a clickable ▲ that snaps the answer's first line to the top
-// The click does what the K (previous response) key does
 // It is the discoverable fix for "grok doesn't show you its answer from the top, so you have to scroll a lot"
 #[allow(unused_imports)]
 use super::common::*;

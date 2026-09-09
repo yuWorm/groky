@@ -71,8 +71,8 @@ async fn mid_text_skill_token_echo_styled_pty() {
     harness
         .wait_for_text(WELCOME_SCREEN_SENTINEL, WELCOME_TIMEOUT)
         .expect("welcome text");
+    leave_home(&mut harness);
 
-    // The first char promotes the welcome prompt to a session.
     inject_keys_paced(&mut harness, TYPED.as_bytes());
     harness
         .wait_for_text(TYPED, Duration::from_secs(10))

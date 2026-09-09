@@ -2,15 +2,9 @@
 #[allow(unused_imports)]
 use super::common::*;
 
-/// Idle, empty prompt, conversation has a user turn: **Esc Esc opens the rewind picker**, and the **first Esc is silent**.
-/// Silent means no "press again" hint and no toast, unlike the idle clear arm.
-/// Proves the rewind arm of `try_handle_esc_policy` (gated on `scrollback.turn_count() > 0`) with a `label: None` silent pending, end-to-end.
-///
-/// Phase 2 repeats the gesture with the SCROLLBACK pane focused (Tab, footer shows "Space:prompt").
-/// The rewind arm works from either pane, so double-Esc must open the picker from there too, through the scrollback key routing.
-/// A bug that only wired the prompt pane would hide in that routing.
-///
-/// Uses [`spawn_esc_double_press_pager`] so a slow inter-press round-trip can't expire the arm.
+/// Proves the rewind arm of `try_handle_esc_policy` (gated on `scrollback.turn_count() > 0`) with a
+/// `label: None` silent pending, end-to-end. The rewind arm works from either pane, so double-Esc
+/// must open the picker from there too, through the scrollback key routing.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore]
 async fn esc_esc_opens_rewind_picker_silent_first_press() {

@@ -42,12 +42,12 @@ const COMPLETED_TASK_TTL: Duration = Duration::from_secs(300);
 /// SIGTERM → SIGKILL grace period.
 const SIGTERM_GRACE: Duration = Duration::from_secs(1);
 /// Max background task lifetime; 10 hours to support long monitor and bash runs.
-const BACKGROUND_MAX_RUNTIME: Duration = Duration::from_secs(36_000);
+pub(crate) const BACKGROUND_MAX_RUNTIME: Duration = Duration::from_secs(36_000);
 /// Max time an auto-backgroundable foreground command blocks the turn before it is
 /// backgrounded (never killed), independent of `timeout`. Env: `GROK_FOREGROUND_BLOCK_BUDGET_MS`.
-const FOREGROUND_BLOCK_BUDGET: Duration = Duration::from_secs(15);
+pub(crate) const FOREGROUND_BLOCK_BUDGET: Duration = Duration::from_secs(15);
 
-fn foreground_block_budget_from_env() -> Duration {
+pub(crate) fn foreground_block_budget_from_env() -> Duration {
     std::env::var("GROK_FOREGROUND_BLOCK_BUDGET_MS")
         .ok()
         .and_then(|s| s.parse::<u64>().ok())
@@ -428,6 +428,10 @@ impl ProcessState {
 
     fn is_complete(&self) -> bool {
         self.lifecycle.is_complete()
+    }
+
+    fn is_running(&self) -> bool {
+        !self.lifecycle.has_exited() && !self.draining
     }
 
     /// The output is not final until `finish_output`.
@@ -980,6 +984,9 @@ impl LocalTerminalActor {
                 // Background waits register in completion_waiters, not the
                 // foreground oneshot; deliver them now, not on the next sweep.
                 self.notify_completion_waiters().await;
+                if !already_exited {
+                    self.evict_if_foreground(&task_id);
+                }
             }
             TerminalCommand::Run { request, reply } => {
                 self.handle_run(request, reply).await;
@@ -1210,7 +1217,11 @@ impl LocalTerminalActor {
 
     async fn handle_kill(&mut self, terminal_id: &str, source: KillSource) -> KillOutcome {
         let Some(process) = self.processes.get_mut(terminal_id) else {
-            return KillOutcome::NotFound;
+            return if self.completed_task_snapshots.contains_key(terminal_id) {
+                KillOutcome::AlreadyExited
+            } else {
+                KillOutcome::NotFound
+            };
         };
 
         if process.lifecycle.has_exited() {
@@ -1437,7 +1448,7 @@ impl LocalTerminalActor {
             let newest_id = self
                 .processes
                 .iter()
-                .filter(|(_, p)| !p.lifecycle.has_exited())
+                .filter(|(_, p)| p.is_running())
                 .max_by_key(|(_, p)| p.start_time)
                 .map(|(id, _)| id.clone());
 
@@ -1464,8 +1475,8 @@ impl LocalTerminalActor {
             .processes
             .iter()
             .filter(|(_, p)| {
-                p.bg_status.is_backgrounded()
-                    && !p.lifecycle.has_exited()
+                p.is_running()
+                    && p.bg_status.is_backgrounded()
                     && p.start_time.elapsed() > BACKGROUND_MAX_RUNTIME
             })
             .map(|(id, _)| id.clone())
@@ -1490,7 +1501,7 @@ impl LocalTerminalActor {
         let size_exceeded: Vec<String> = self
             .processes
             .iter()
-            .filter(|(_, p)| !p.lifecycle.has_exited() && p.total_bytes as u64 > output_cap)
+            .filter(|(_, p)| p.is_running() && p.total_bytes as u64 > output_cap)
             .map(|(id, _)| id.clone())
             .collect();
 
@@ -1654,6 +1665,16 @@ impl LocalTerminalActor {
                 let snapshot = process.to_task_snapshot(&task_id).await;
                 process.notification_handle.send_task_complete(snapshot);
             }
+        }
+    }
+
+    fn evict_if_foreground(&mut self, task_id: &str) {
+        if self
+            .processes
+            .get(task_id)
+            .is_some_and(|p| !p.bg_status.is_backgrounded())
+        {
+            self.processes.remove(task_id);
         }
     }
 
@@ -2038,7 +2059,7 @@ impl LocalTerminalActor {
         let fg_ids: Vec<String> = self
             .processes
             .iter()
-            .filter(|(_, p)| !p.bg_status.is_backgrounded() && !p.lifecycle.has_exited())
+            .filter(|(_, p)| !p.bg_status.is_backgrounded() && p.is_running())
             .map(|(id, _)| id.clone())
             .collect();
 
@@ -2080,7 +2101,7 @@ impl LocalTerminalActor {
             .filter(|(_, p)| {
                 p.owner_session_id.as_deref() == Some(owner_session_id)
                     && !p.bg_status.is_backgrounded()
-                    && !p.lifecycle.has_exited()
+                    && p.is_running()
             })
             .map(|(id, _)| id.clone())
             .collect();
@@ -3146,10 +3167,9 @@ fn layer_login_path(
     }
 }
 
-/// Fixed layer order: policy base, login capture (filtered), grok control vars,
-/// request env (filtered), pager vars, login `PATH`, agent marker last. Applied
-/// incrementally, not via `env_clear`: the no-op-policy path must inherit grok's
-/// environment untouched (non-UTF-8 vars included).
+/// Fixed layer order: policy base, login capture (filtered), grok control vars, request env (filtered), pager vars,
+/// login `PATH`, agent marker last. Applied incrementally, not via `env_clear`: the no-op-policy path must inherit
+/// grok's environment untouched (non-UTF-8 vars included).
 #[cfg(unix)]
 fn apply_child_env(
     cmd: &mut tokio::process::Command,
@@ -3238,6 +3258,15 @@ fn spawn_shell_command(
         layer_request_env(&mut cmd, env, active_policy);
         cmd.envs(crate::util::pager_env());
         crate::util::apply_grok_agent_marker(&mut cmd);
+        // After the env layers so a policy PATH is prepended, not replaced. A
+        // policy base env replaced the inherited one; grok's own PATH must not
+        // come back through the prepend (`inherit = none`, an excluded PATH).
+        let path_base = if active_policy.is_some() {
+            xai_tty_utils::PathBase::ExplicitOnly
+        } else {
+            xai_tty_utils::PathBase::Process
+        };
+        xai_tty_utils::prepend_bundled_git_path(cmd.as_std_mut(), path_base);
 
         // Flags set inline: tokio's creation_flags is a SET, not OR, so the detach
         // helpers don't compose. CREATE_BREAKAWAY_FROM_JOB fails with os error 5 when
@@ -4348,6 +4377,28 @@ mod tests {
         assert!(
             result.combined_output.contains("done"),
             "Output should contain 'done', got: {:?}",
+            result.combined_output
+        );
+    }
+
+    #[tokio::test]
+    async fn draining_foreground_command_survives_a_kill() {
+        let backend = std::sync::Arc::new(LocalTerminalBackend::new_with_tick_interval(
+            Duration::from_millis(20),
+        ));
+        let run = tokio::spawn({
+            let backend = backend.clone();
+            async move { backend.run(make_request("sleep 5 &\necho done")).await }
+        });
+
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        backend.kill_foreground_commands().await;
+
+        let result = run.await.unwrap().expect("run returns a result");
+        assert_eq!(result.exit_code, Some(0), "signal={:?}", result.signal);
+        assert!(
+            result.combined_output.contains("done"),
+            "output={:?}",
             result.combined_output
         );
     }

@@ -72,9 +72,7 @@ pub enum PromptAudience {
 use xai_grok_tools::bridge::ToolBridge;
 use xai_grok_tools::types::template_renderer::TemplateRenderer;
 /// Agent-specific inputs for system prompt rendering.
-///
-/// Serializable (JSON/YAML) so users can dump it and inspect fields.
-/// Rendering goes through `ToolBridge::render_prompt()`.
+/// Serializable so users can dump and inspect fields. Rendering goes through `ToolBridge::render_prompt()`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PromptContext {
     /// Schema version for forward-compatible persistence.
@@ -199,10 +197,7 @@ impl PromptContext {
         self.format_agents_md_section()
     }
     /// Personas content for injection as a prepended user message.
-    ///
-    /// Returns a `<system-reminder>` block wrapping the `<personas>` section.
-    ///
-    /// - Subagents never get personas (`task` itself is a parent-only tool).
+    /// Returns a `<system-reminder>` wrapping the `<personas>` section. Subagents never get personas.
     pub fn personas_user_reminder(&self) -> Option<String> {
         if self.audience == PromptAudience::Subagent {
             return None;
@@ -233,13 +228,8 @@ impl PromptContext {
             "include_browser_verification": self.include_browser_verification,
         })
     }
-    /// Render the full system prompt via `ToolBridge`.
-    ///
-    /// Tool names (`${{ tools.by_kind.* }}`) are resolved by the `TemplateRenderer` inside the bridge.
-    /// Agent-specific fields (`memory_enabled`, `role_instructions`, etc.) are passed as placeholders.
-    ///
-    /// Both the base template AND the `prompt_body` are rendered through MiniJinja.
-    /// This lets `${{ tools.by_kind.* }}` variables resolve correctly regardless of prompt mode.
+    /// Render the full system prompt via `ToolBridge`. Tool names are resolved inside the bridge.
+    /// Both the base template and `prompt_body` go through MiniJinja so `${{ tools.by_kind.* }}` resolves regardless of prompt mode.
     pub async fn render(&self, tool_bridge: &ToolBridge) -> Option<String> {
         let renderer = tool_bridge.template_renderer_snapshot().await?;
         self.render_with_renderer(&renderer)

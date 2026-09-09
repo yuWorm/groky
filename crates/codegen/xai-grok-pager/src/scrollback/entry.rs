@@ -18,18 +18,12 @@ struct CachedOutput {
     rendered: RenderedBlockOutput,
 }
 
-/// Cached truncated-mode height: `(width, raw, theme, cwd, height)`.
-///
-/// Computing the truncated-mode height requires calling `block.output()` with the display mode forced to `Truncated`.
-/// For Edit blocks that triggers full syntect syntax highlighting; for Markdown blocks, a full word-wrap.
-/// During heavy streaming on a busy subagent, the layout cache is invalidated every time a new block is pushed.
-/// Without a per-entry cache the height would be recomputed for every entry on every redraw.
-/// We only need the line count, so this caches just the resulting `u16` height.
-/// `cwd` is keyed because Expanded/Truncated Edit/Read header wrap can change between absolute and relative paths.
+/// Caches truncated-mode line count so layout need not call `block.output()` (syntect or full wrap) on every redraw.
+/// Streaming invalidates the layout cache on each push; without this, every entry height is recomputed.
+/// `cwd` is keyed because Edit/Read header wrap can change between absolute and relative paths.
 type CachedTruncatedHeight = (u16, bool, ThemeKind, Option<PathBuf>, u16);
 
 /// Unique identifier for a scrollback entry.
-///
 /// EntryIds are stable across mutations: they won't become invalid if other entries are added or removed.
 /// Use this for external handles to entries (e.g., streaming tasks that need to push chunks to a specific block).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -37,7 +31,6 @@ pub struct EntryId(u64);
 
 impl EntryId {
     /// Create a new EntryId with a specific value.
-    ///
     /// For production use, prefer getting EntryId from `ScrollbackState::push()` which assigns IDs automatically.
     /// This is mainly for placeholders/testing.
     pub fn new(id: u64) -> Self {
@@ -75,7 +68,6 @@ pub struct ScrollbackEntry {
 
     /// Whether this entry is currently waiting on user input (permission prompt, ask-user-question, etc.).
     /// When true, the renderer replaces the wave "loading" animation with a pulsing-circle bullet to draw attention without implying active work.
-    ///
     /// Maintained by `AgentView` from `permission_queue` and `question_view` state via `ScrollbackState::set_pending_user_input`.
     pub is_pending_user_input: bool,
 
@@ -94,12 +86,9 @@ pub struct ScrollbackEntry {
     /// When this entry finished running (monotonic). Used by the renderer to flash the accent briefly after completion.
     pub finished_at: Option<std::time::Instant>,
 
-    /// Cached output and its render key.
-    /// Interior-mutable so EntryRenderer (which holds `&self`) can populate and read the cache without &mut self.
-    ///
-    /// The `is_selected` key is only meaningful for blocks whose output varies by selection state (currently only `UserPrompt`).
-    /// For all other blocks the stored value is always `false` regardless of actual selection, preventing cache misses on selection changes.
-    /// `cwd` is keyed so Expanded tool path paint (relative vs absolute) invalidates.
+    /// Interior-mutable so EntryRenderer (which holds `&self`) can populate and read the cache without &mut self. The
+    /// `is_selected` key is only meaningful for blocks whose output varies by selection state (currently only
+    /// `UserPrompt`). `cwd` is keyed so Expanded tool path paint (relative vs absolute) invalidates.
     cached_output: RefCell<Option<CachedOutput>>,
 
     /// Cached truncated-mode height. See [`CachedTruncatedHeight`] for why this needs its own cache separate from `cached_output`.
@@ -152,7 +141,6 @@ impl EffectiveOutput<'_> {
 
 impl ScrollbackEntry {
     /// Create a new entry with expanded display mode.
-    ///
     /// For production use, prefer `ScrollbackState::push()` which assigns the EntryId automatically.
     /// This constructor is mainly for testing.
     pub fn new(block: RenderBlock) -> Self {
@@ -183,7 +171,6 @@ impl ScrollbackEntry {
     }
 
     /// Create a new entry that is currently running.
-    ///
     /// For production use, prefer `ScrollbackState::push()` which assigns the EntryId automatically.
     /// This constructor is mainly for testing.
     pub fn running(block: RenderBlock) -> Self {
@@ -229,7 +216,6 @@ impl ScrollbackEntry {
     }
 
     /// Toggle between display modes.
-    ///
     /// Most blocks toggle between Collapsed and Expanded.
     /// Some blocks (like thinking) cycle through 3 modes.
     pub fn toggle_fold(&mut self) {
@@ -284,7 +270,6 @@ impl ScrollbackEntry {
 
     /// Drop the heavyweight cached render output (and the block's internal rebuildable caches) while KEEPING the cheap height caches.
     /// Layout (entry heights, scroll position) is untouched; re-rendering happens transparently if the entry scrolls back into view.
-    ///
     /// Returns `true` when something was actually dropped (for sweep stats).
     pub(crate) fn evict_render_cache(&self) -> bool {
         let had_output = self.cached_output.borrow().is_some();
@@ -309,7 +294,6 @@ impl ScrollbackEntry {
     }
 
     /// Cheap wrapped-line estimate for the block's source text at `content_width`.
-    ///
     /// An APPROXIMATION: it ignores word boundaries, and for a markdown block it reflects the last rendered view.
     /// On-screen entries are always measured exactly, so nothing depends on it being right.
     pub fn estimate_source_lines(&self, content_width: u16) -> u16 {
@@ -340,7 +324,6 @@ impl ScrollbackEntry {
     }
 
     /// Ensure the cache is populated for the given width/appearance/selection.
-    ///
     /// This works with `&self` (via RefCell) so `EntryRenderer` can call it without needing `&mut self`.
     /// After calling this, use `cached_output_ref()` to borrow the output.
     pub fn ensure_cached(
@@ -416,18 +399,8 @@ impl ScrollbackEntry {
         })
     }
 
-    /// Ensure the truncated-mode height cache is populated, returning the height.
-    ///
-    /// Returns the line count (including vpad) the entry would occupy if rendered in `DisplayMode::Truncated`.
-    /// Used by the layout cache to precompute sticky header heights for every entry.
-    ///
-    /// Without this cache, `block.output(&ctx)` runs uncached on every layout rebuild.
-    /// For Edit blocks that triggers full syntect highlighting; for Markdown blocks, a full word-wrap.
-    /// During heavy subagent streaming the layout cache is invalidated on every new block (see `ScrollbackState::push`).
-    /// That would otherwise re-highlight every entry on every redraw.
-    ///
-    /// The cache key is `(content_width, raw, theme, cwd)`.
-    /// `is_selected` is intentionally excluded because line count never depends on selection styling.
+    /// Without this cache, `block.output` runs uncached on every layout rebuild and re-highlights every entry on each streaming push.
+    /// Key is `(content_width, raw, theme, cwd)`; `is_selected` is excluded because line count never depends on selection.
     /// Cleared together with `cached_output` by `invalidate_cache`.
     pub fn ensure_truncated_height_cached(
         &self,
@@ -619,11 +592,8 @@ impl ScrollbackEntry {
         }
     }
 
-    /// This is used for rendering sticky headers where we want:
-    /// - Expanded content (not collapsed summary)
-    /// - But truncated to a specific number of lines
-    ///
-    /// This avoids mutating the entry's display_mode during render.
+    /// This is used for rendering sticky headers where we want. Expanded content (not collapsed summary). But truncated
+    /// to a specific number of lines. This avoids mutating the entry's display_mode during render.
     pub fn context_with_mode_and_budget(
         &self,
         width: u16,

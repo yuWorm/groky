@@ -7,12 +7,8 @@ const STRIPDEEP_LINE: &str = "STRIPDEEP alpha beta gamma delta epsilon";
 
 const ENTRY_WORD: &str = "epsilon";
 
-/// PTY: pressing the mouse on the strip directly above the prompt box (OUTSIDE the scrollback pane) starts a drag with no anchor yet.
-/// Dragging up into the last message anchors where the pointer first enters text, so the payload runs from that entry point to the release point.
-/// The blank prompt-gap row stands in for the whole strip, since every strip row shares the same press handling.
-/// The turn-status and banner rows need a live turn or watcher state the harness cannot stage while idle.
-///
-/// `SSH_CONNECTION` forces the OSC 52 clipboard route for readback.
+/// The turn-status and banner rows need a live turn or watcher state the harness cannot stage while
+/// idle.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "PTY e2e; run the owning pty_e2e_* Cargo test with --ignored (see Cargo.toml)"]
 async fn drag_from_above_prompt_strip_pty() {
@@ -80,11 +76,7 @@ async fn drag_from_above_prompt_strip_pty() {
         "setup: strip below the message\nscreen:\n{screen}"
     );
 
-    // PRESS on the strip, then drag up into the message
-    // The single motion sample jumps the turn-marker row deliberately (terminals coalesce motion)
-    // Columns clamp within a row, so any column of the marker's row would still hit the marker's line
-    // This test covers the strip-to-message path, not marker anchoring
-    // The first sample on the message anchors at the word's first column; then extend to its last column and release
+    // PRESS on the strip, then drag up into the message.
     let head_col = entry_col + ENTRY_WORD.len() as u16 - 1;
     let mut drag = String::new();
     drag.push_str(&sgr_mouse(0, strip_row, entry_col, 'M'));

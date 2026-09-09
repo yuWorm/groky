@@ -87,10 +87,10 @@ async fn wait_for_conversation(
 
 fn own_request(actor: &SessionActor, request_id: &RequestId) {
     let (tx, _rx) = tokio::sync::oneshot::channel();
-    actor
-        .turn_stream_drained
-        .lock()
-        .insert(request_id.clone(), Some(tx));
+    actor.turn_stream_drained.lock().insert(
+        request_id.clone(),
+        crate::session::acp_session::StreamOwnership::with_waiter(Some(tx)),
+    );
 }
 
 fn completed_event(request_id: &RequestId) -> SamplingEvent {
@@ -266,6 +266,7 @@ async fn timed_out_strip_survives_new_turn_until_late_completed() {
                 .lock()
                 .get_mut(&timed_out)
                 .expect("timed-out request remains owned")
+                .waiter
                 .take();
 
             // The next turn keeps only timeout-owned durable work, then clears ordinary stream ownership before registering its own request
@@ -344,6 +345,7 @@ async fn rewind_cancels_detached_image_strip_before_it_runs() {
                 .lock()
                 .get_mut(&timed_out)
                 .expect("timed-out request remains owned")
+                .waiter
                 .take();
             actor.retain_timed_out_image_strips_for_new_turn();
             actor.turn_stream_drained.lock().clear();

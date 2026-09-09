@@ -2,11 +2,8 @@
 #[allow(unused_imports)]
 use super::common::*;
 
-/// Cancelling a streaming turn must show the "Turn cancelled" marker exactly once.
-/// The turn end arrives via BOTH the PromptResponse RPC and the `prompt_complete` broadcast, which also covers a lost response.
-/// Finishing the turn on both paths would render two markers.
-/// The pane must stay usable afterwards: no `TurnCancelling` latch, the next typed prompt runs.
-/// Cancel is via Ctrl+C, which works in every mode.
+/// Cancelling a streaming turn must show the "Turn cancelled" marker exactly once. The pane must
+/// stay usable afterwards: no `TurnCancelling` latch, the next typed prompt runs.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore]
 async fn ctrl_c_cancel_during_stream_recovers_cleanly() {

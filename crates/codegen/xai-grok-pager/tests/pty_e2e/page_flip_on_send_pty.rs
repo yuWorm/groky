@@ -84,6 +84,63 @@ async fn send_page_flips_by_default() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore]
+async fn wheel_can_leave_and_restore_page_flipped_view() {
+    let content = ContentController::start().await.expect("start content");
+    let (mut harness, second_turn) = drive_to_second_send(&content).await;
+
+    assert!(!harness.contains_text(TAIL_SENTINEL));
+    let screen = harness.screen_contents();
+    let prompt_row = screen
+        .lines()
+        .enumerate()
+        .filter_map(|(row, line)| line.contains('❯').then_some(row))
+        .last()
+        .unwrap_or_else(|| panic!("prompt box not visible\nscreen:\n{screen}"))
+        as u16;
+    let wheel_up = sgr_mouse(64, prompt_row, DEFAULT_COLS / 2, 'M');
+    for _ in 0..40 {
+        harness
+            .inject_keys(wheel_up.as_bytes())
+            .expect("wheel up over prompt");
+    }
+    harness.update(Duration::from_millis(500));
+
+    assert!(
+        harness.contains_text(TAIL_SENTINEL),
+        "wheel over the prompt must scroll earlier fullscreen content into view\nscreen:\n{}",
+        harness.screen_contents()
+    );
+
+    let wheel_down = sgr_mouse(65, prompt_row, DEFAULT_COLS / 2, 'M');
+    for _ in 0..40 {
+        harness
+            .inject_keys(wheel_down.as_bytes())
+            .expect("wheel down over prompt");
+    }
+    harness.update(Duration::from_millis(500));
+
+    let screen = harness.screen_contents();
+    assert!(
+        !screen.contains(TAIL_SENTINEL),
+        "wheel down must return to the page-flipped view\nscreen:\n{screen}"
+    );
+    let restored_prompt_row = screen
+        .lines()
+        .position(|line| line.contains(SECOND_PROMPT))
+        .unwrap_or_else(|| {
+            panic!("second prompt not visible after scrolling back\nscreen:\n{screen}")
+        });
+    assert!(
+        restored_prompt_row < (DEFAULT_ROWS as usize) / 2,
+        "second prompt must return to the top half (row {restored_prompt_row})\nscreen:\n{screen}"
+    );
+
+    second_turn.release();
+    harness.quit().expect("clean quit");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
 async fn send_keeps_viewport_when_page_flip_disabled() {
     let content = ContentController::start().await.expect("start content");
     seed_ui_config(&content, "page_flip_on_send = false");

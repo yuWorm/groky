@@ -2,13 +2,8 @@
 #[allow(unused_imports)]
 use super::common::*;
 
-/// macOS-only, REAL host clipboard: Ctrl+V (raw 0x16) with plain TEXT on the pasteboard must echo fast.
-/// Before running the heavy `osascript` attachment probe, the paste path snapshots the native pasteboard.
-/// When that snapshot holds no raster the probe is skipped entirely, so the paste costs roughly one `pbpaste` read plus a frame.
-///
-/// WARNING: this test OVERWRITES the machine-global clipboard.
-/// The prior TEXT contents are restored best-effort on exit (drop guard, panic included).
-/// A prior IMAGE clipboard cannot be restored: `pbpaste` only reads text.
+/// Before running the heavy `osascript` attachment probe, the paste path snapshots the native
+/// pasteboard. A prior IMAGE clipboard cannot be restored: `pbpaste` only reads text.
 #[cfg(target_os = "macos")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore]

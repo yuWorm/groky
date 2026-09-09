@@ -22,6 +22,7 @@ async fn image_chip_preview_path_free_pty() {
     harness
         .wait_for_text(WELCOME_SCREEN_SENTINEL, WELCOME_TIMEOUT)
         .expect("welcome text");
+    leave_home(&mut harness);
 
     // Bracketed-paste the bare path alone so the drop classifier turns it into a chip
     harness

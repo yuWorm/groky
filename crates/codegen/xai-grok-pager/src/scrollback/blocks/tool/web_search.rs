@@ -89,11 +89,7 @@ impl WebSearchToolCallBlock {
         })
     }
 
-    /// Render the header line: **Web Search** `query` `(N sources)`
-    ///
-    /// In collapsed mode (`max_width` is `Some`), it reserves space for the source-count suffix and truncates the query to fit.
-    /// The suffix is therefore always visible.
-    /// In expanded mode (`None`), it renders the full query with no suffix.
+    /// Render the header line: Web Search `query` `(N sources)`. The suffix is therefore always visible.
     fn header_line(&self, theme: &Theme, muted: bool, max_width: Option<usize>) -> Line<'static> {
         let text_style = if muted {
             theme.muted()
@@ -174,7 +170,6 @@ impl WebSearchToolCallBlock {
     }
 
     /// Build the sources summary line from citations.
-    ///
     /// Extracts domain names from URLs and renders a compact one-liner:
     /// `Sources: stripe.com, react.dev, stackoverflow.com (+2 more)`
     fn sources_line(&self, theme: &Theme) -> Option<Line<'static>> {

@@ -2,10 +2,7 @@
 #[allow(unused_imports)]
 use super::common::*;
 
-/// 19. **Send-now chord delivers the composer text as its own next turn.**
-/// (Historical name: the chord used to interject into the SAME turn.)
-/// Ctrl+Enter with text mid-stream is cancel-and-send: the running turn is cancelled silently and the text runs as the next turn.
-/// That turn carries the interjection preamble, and turn-start adoption renders the text as a "❯ " user block.
+/// Send-now chord delivers the composer text as its own next turn.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore]
 async fn interjection_reaches_model_in_same_turn() {

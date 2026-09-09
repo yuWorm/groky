@@ -2,11 +2,9 @@
 #[allow(unused_imports)]
 use super::common::*;
 
-/// Regression, hermetic on Linux: bracketed text that did not come from the system clipboard must not attach the unrelated clipboard image.
-/// This only applies under Otty (`TERM_PROGRAM=otty`), the only terminal known to deliver macOS IME commits as bracketed paste.
-/// Any other terminal keeps the historical probe behavior, asserted here with a second spawn that has no TERM_PROGRAM.
-/// A fake `wl-paste`/`wl-copy` pair on `PATH` plays the clipboard.
-/// The sibling `bracketed_ime_paste_skips_clipboard_image_macos` covers the agent prompt, where the bug was reported, on a real pasteboard.
+/// Regression, hermetic on Linux: bracketed text that did not come from the system clipboard must
+/// not attach the unrelated clipboard image. This only applies under Otty (`TERM_PROGRAM=otty`),
+/// the only terminal known to deliver macOS IME commits as bracketed paste.
 #[cfg(target_os = "linux")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore]

@@ -13,13 +13,8 @@ use std::path::PathBuf;
 const CHANGELOG_BASE: &str = "https://x.ai/cli/changelogs";
 const FETCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
 
-/// A single structured changelog entry from the published JSON changelog.
-///
-/// Shape must match the output of `render_external_json` in `changelog.sh`:
-///   `{category, description, breaking_change}`
-/// If you change fields here, update `changelog.sh:render_external_json` too.
-///
-/// All fields use `#[serde(default)]` so a single malformed entry doesn't kill the entire array parse.
+/// A single structured changelog entry from the published JSON changelog. Shape must match the output of `render_external_json` in `changelog.sh`: `{category, description, breaking_change}`
+/// If you change fields here, update `changelog.sh:render_external_json` too. All fields use `#[serde(default)]` so a single malformed entry doesn't kill the entire array parse.
 /// Entries with an empty description are filtered out by `bullets_from_entries`.
 #[derive(Debug, Clone, serde::Deserialize)]
 pub struct ChangelogEntry {
@@ -43,7 +38,6 @@ pub struct Changelog {
 }
 
 /// Manages changelog retrieval from CDN with local disk caching.
-///
 /// Single entry point: `fetch()` returns both markdown and JSON in one `Changelog` struct.
 /// Each format is fetched independently with its own cache file, so a failure in one doesn't block the other.
 pub struct ChangelogManager {
@@ -77,22 +71,16 @@ impl ChangelogManager {
         }
     }
 
-    /// Fetch both markdown and JSON changelogs for the current version.
-    ///
-    /// Each format is fetched independently (CDN, 3 s timeout) and cached to disk, falling back to the cached copy on failure.
-    /// Either field may be `None` if offline with no cache.
-    /// When `GROK_CHANGELOG_OFFLINE` is set (PTY / integration tests), the CDN is skipped and only the disk cache is read.
+    /// Fetch both markdown and JSON changelogs for the current version. Each format is fetched independently (CDN, 3 s timeout) and cached to disk, falling back to the cached copy on failure.
+    /// Either field may be `None` if offline with no cache. When `GROK_CHANGELOG_OFFLINE` is set (PTY / integration tests), the CDN is skipped and only the disk cache is read.
     /// JSON is cached only after a successful parse; the markdown cache is write-through since it's consumed as raw text.
     pub fn fetch(&self) -> Changelog {
         // Always re-resolve from env so a caller holding an older manager (or a stale OnceLock) still reads the live harness home
         Self::from_env_home().fetch_with(changelog_offline(), CHANGELOG_BASE)
     }
 
-    /// Fetch using this manager's already-resolved cache paths, an explicit offline flag, and an explicit CDN base.
-    ///
-    /// Split out of [`fetch`] so unit tests can drive it against a temp home without touching process-global env.
-    /// Mutating `GROK_HOME` / `GROK_CHANGELOG_OFFLINE` races across the parallel test harness.
-    /// Passing an unreachable `base` forces a deterministic CDN miss instead of depending on whether the sandbox happens to block network.
+    /// Fetch using this manager's already-resolved cache paths, an explicit offline flag, and an explicit CDN base. Split out of [`fetch`] so unit tests can drive it against a temp home without touching process-global env.
+    /// Mutating `GROK_HOME` / `GROK_CHANGELOG_OFFLINE` races across the parallel test harness. Passing an unreachable `base` forces a deterministic CDN miss instead of depending on whether the sandbox happens to block network.
     /// Production callers always go through [`fetch`].
     fn fetch_with(&self, offline: bool, base: &str) -> Changelog {
         if offline {
@@ -194,7 +182,6 @@ fn strip_markdown_inline(s: &str) -> String {
 }
 
 /// Convert changelog entries to plain-text bullet strings.
-///
 /// Strips `**bold**` and backtick formatting from each description and returns at most `max` entries.
 /// Entries with an empty description (from tolerant deserialization) are skipped.
 pub fn bullets_from_entries(entries: &[ChangelogEntry], max: usize) -> Vec<String> {

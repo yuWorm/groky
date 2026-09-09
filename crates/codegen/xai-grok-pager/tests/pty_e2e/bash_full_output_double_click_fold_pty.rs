@@ -58,12 +58,9 @@ async fn bash_full_output_double_click_fold_pty() {
         .wait_for_text(MOCK_RESPONSE_SENTINEL, Duration::from_secs(30))
         .expect("session ready");
 
-    // 1. Success: 12 lines exceed the streaming window; all visible on finish.
-    //
-    // Truncated (default first=2, last=3) shows L01, L02, and L10 through L12
-    // A middle line (L06) appears only after expand-on-finish
-    // Do not gate on L01: that passes while still truncated and races the L03/L06/L09 asserts
-    // Wait for turn idle first so expand-on-finish has committed before we sample middle lines (suite load used to race wait_for_text("L06"))
+    // Success: 12 lines exceed the streaming window; all visible on finish. A middle line (L06)
+    // appears only after expand-on-finish. Do not gate on L01: that passes while still truncated and
+    // races the L03/L06/L09 asserts.
     harness
         .inject_keys(b"! printf 'L%02d\\n' $(seq 1 12)\r")
         .expect("submit bash-mode command");

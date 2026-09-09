@@ -2,15 +2,6 @@
 #[allow(unused_imports)]
 use super::common::*;
 
-/// macOS-only, REAL host clipboard: Ctrl+V (raw 0x16) with an IMAGE on the pasteboard must not block the UI thread.
-/// The clipboard read, image decode, and session persist all run off the event loop, so keys typed right after the chord echo immediately.
-/// The `[Image #N]` chip attaches later via a follow-up completion.
-///
-/// This FAILS on a pager that still runs the probe inline on the event loop.
-/// There the chip attached BEFORE the typed burst was even processed, and the burst echo stalled behind the ~0.5-1s osascript read and persist.
-///
-/// WARNING: this test OVERWRITES the machine-global clipboard with an image.
-/// The prior TEXT contents are restored best-effort on exit (drop guard).
 /// A prior IMAGE clipboard cannot be restored because `pbpaste` only reads text.
 #[cfg(target_os = "macos")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

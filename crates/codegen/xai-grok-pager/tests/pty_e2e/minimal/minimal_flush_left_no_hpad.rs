@@ -2,10 +2,8 @@
 #[allow(unused_imports)]
 use crate::common::*;
 
-/// Minimal mode paints the welcome card edge-to-edge (no outer horizontal pad).
-/// The live region's status, prompt, and info rows and the committed user and agent blocks must share that left edge.
-/// They previously sat at `block_pad_left + accent`, 3 columns of blank gutter, which looked misaligned against the welcome box.
-/// Assert every non-blank visible row either is welcome-card chrome (border or logo interior) or starts at column 0.
+/// Minimal mode paints the welcome card edge-to-edge (no outer horizontal pad). The live region's
+/// status, prompt, and info rows and the committed user and agent blocks must share that left edge.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore]
 async fn minimal_flush_left_no_hpad() {

@@ -277,12 +277,8 @@ pub(crate) async fn apply(
         .cloned(),
     ))
 }
-/// Apply a reasoning-effort change to a session's current model, without a model
-/// switch (see [`SessionCommand::SetReasoningEffort`]).
-///
-/// `value_id` is the selector the client picked; it is resolved under the config lock so the
-/// level is validated against the model the effort will actually run on, and the command goes
-/// to that model's live actor even if a switch or reload landed while this request was blocked.
+/// Apply a reasoning-effort change to a session's current model, without a model switch (see [`SessionCommand::SetReasoningEffort`]).
+/// `value_id` is the selector the client picked; it is resolved under the config lock so the level is validated against the model the effort will actually run on, and the command goes to that model's live actor even if a switch or reload landed while this request was blocked.
 pub(crate) async fn apply_reasoning_effort(
     agent: &MvpAgent,
     session_id: acp::SessionId,

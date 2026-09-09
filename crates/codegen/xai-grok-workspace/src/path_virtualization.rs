@@ -54,10 +54,8 @@ impl PathVirtualization {
         replace_path_prefix(path, &self.real_root, &self.visible_root)
     }
 
-    /// Inbound: rewrites a model path to the guest path.
-    /// `/workspace` and `/workspace/artifacts` both map to `real_root`; already-guest paths under `real_root` stay put.
-    /// A `..` walk that would leave `real_root` is clipped to `real_root`; passing it through would still resolve on the kernel to a sibling tree.
-    /// Absolute escapes such as `/tmp` and `/home` are left as-is.
+    /// Inbound: rewrite a model path to the guest path. `/workspace` and `/workspace/artifacts` map to `real_root`; paths already under it stay put.
+    /// A `..` walk that would leave `real_root` is clipped there; absolute escapes such as `/tmp` are left as-is.
     pub fn to_guest<'a>(&self, path: &'a str) -> Cow<'a, str> {
         let mapped = if path_prefix_match(path, &self.real_root).is_some() {
             Cow::Borrowed(path)

@@ -4,25 +4,9 @@ use super::common::*;
 #[allow(unused_imports)]
 use super::scroll::*;
 
-// ── Regression: streaming must not starve wheel input ─────────────────────
-//
-// The symptom: "can't scroll while it's streaming"
-// The event loop's `select!` is `biased` with the ACP arm above the input arm
-// The ACP arm drained every immediately-ready message before re-entering the select
-// During a token flood, wheel/key events therefore sat in `input_rx` until `acp_rx` momentarily emptied
-// The fix gates the ACP arm on `input_rx.is_empty()` and bounds its inner drain, so buffered input is serviced within one bounded ACP batch
-//
-// This test drives a turn that is still visibly streaming (paced deltas + a held completion gate) and wheels up mid-stream
-// It asserts the viewport moved BEFORE the turn completed
-// Determinism does not lean on wall-clock: the mock's completion gate holds the turn's terminal SSE event until the test releases it
-// So "the stream had not completed when movement was observed" is true by construction
-// The on-screen witnesses (status label, last-chunk sentinel) are content-ordering assertions on top of that
-//
-// Scope note: a PTY test cannot force `acp_rx` to be continuously non-empty at the exact instant wheel reports land
-// (That interleaving is scheduler-owned; paced chunks let even the old code service input between deltas.)
-// So this is the strongest deterministic approximation, not a discriminator of the starvation mechanism itself
-// It pins the user-visible contract deterministically, on any load
-// That contract: wheel input moves the viewport while ACP traffic is in flight and the turn is provably unfinished
+// Regression: streaming must not starve wheel input. The symptom: "can't scroll while it's
+// streaming". During a token flood, wheel/key events therefore sat in `input_rx` until `acp_rx`
+// momentarily emptied.
 
 /// 240 one-row markers, far more than the 50-row PTY: the up-burst can never clamp at the transcript top.
 /// (30 events at up to 3 lines each is about 90 lines, vs ~190 rows of headroom above the bottom-pinned viewport.)
@@ -41,10 +25,9 @@ const TAIL_WORDS: usize = 160;
 /// Per-SSE-event pacing so deltas keep arriving while the wheel burst runs.
 const CHUNK_DELAY: Duration = Duration::from_millis(30);
 
-/// **Input-fairness regression.**
-/// While a long response is still streaming (deltas paced, completion gated), a wheel-up burst must scroll the viewport before the turn completes.
-/// Scrolling means the topmost visible marker index strictly decreases.
-/// The turn must then complete cleanly on release.
+/// Input-fairness regression. While a long response is still streaming (deltas paced, completion
+/// gated), a wheel-up burst must scroll the viewport before the turn completes. Scrolling means the
+/// topmost visible marker index strictly decreases. The turn must then complete cleanly on release.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore]
 async fn wheel_scrolls_viewport_during_streaming_turn() {

@@ -5,8 +5,6 @@ use super::*;
 /// Regression for the leader-mode turn-end race: this client is briefly Idle while the server still has queued prompts.
 /// Idle here means `is_turn_running() == false` with `current_prompt_id` cleared; the server's queue is visible as a non-empty `shared_queue` mirror.
 /// A newly-sent prompt must route to the server (immediate-send), not drain locally as a phantom running turn.
-/// The failure mode: a `send_route_plain immediate=false is_turn_running=false shared_queue_len=5` path taking `local_drain`.
-/// That left the prompt shown running on the sender while it was actually queued behind the existing entries on the leader and every other client.
 #[test]
 fn send_while_idle_with_nonempty_shared_queue_routes_to_server() {
     let mut app = test_app_with_agent();
@@ -54,16 +52,9 @@ fn send_while_idle_with_nonempty_shared_queue_routes_to_server() {
     assert_eq!(q.last().map(|e| e.text.as_str()), Some("c"));
 }
 
-// ── coding_data_sharing dispatch tests ───
-//
+// coding data sharing dispatch tests
 // The dispatcher mutates optimistically and rolls back on failure, matching the `set_yolo_mode` pattern minus its toasts
-// The surfaces that change this setting show the result themselves. These tests pin the contract:
-//   - Guards (ZDR, non-admin team) toast and short-circuit; they are the only paths that still speak up, because nothing else on screen would
-//   - Idle unchanged opt-in skips the ACP write but still acks (rollout on).
-//   - Optimistic mutation flips `app.coding_data_retention_opt_out` before the Effect is emitted
-//   - `Effect::SetCodingDataSharing` carries `rollback_to_opted_in = previous_value`
-//   - `TaskResult::CodingDataSharingFailed` reverts the optimistic mutation
-//   - `TaskResult::CodingDataSharingUpdated` re-anchors to the server-confirmed value
+// Guards (ZDR, non-admin team) toast and short-circuit; they are the only paths that still speak up, because nothing else on screen would
 
 /// Idle unchanged opt-in skips ACP and still acks.
 /// Already-out is covered by `settings_opt_out_while_already_out_acks_without_write`.
@@ -796,7 +787,6 @@ fn privacy_banner_opt_out_acks_now_without_write() {
 
 /// A superseded reply must not touch state.
 /// Settings opt-out is write 1, the user opts in before it lands, and only then does the stale decline answer.
-/// Applying its success (`opted_in: false`) would flip the pager to opted-out while the server holds opted-in.
 /// That claims data isn't retained when it is. Its failure must not toast either.
 #[test]
 fn superseded_coding_data_reply_cannot_clobber_a_newer_write() {

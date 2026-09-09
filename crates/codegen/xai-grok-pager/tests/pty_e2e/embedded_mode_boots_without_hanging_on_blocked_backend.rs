@@ -2,11 +2,9 @@
 #[allow(unused_imports)]
 use super::common::*;
 
-/// 1a. **Embedded mode (`--no-leader`) boots without hanging on a blocked backend.**
-///
-/// Enterprise deployments set `[cli] use_leader = false` and point at their own backend, often with the grok.com proxy blocked.
-/// A TCP listener that accepts but never replies stands in for that endpoint, so every startup HTTP call stalls until the client's own timeout fires.
-/// The welcome screen must render anyway; a hang here means some boot path went unbounded.
+/// 1a. Embedded mode (`--no-leader`) boots without hanging on a blocked backend. A TCP listener
+/// that accepts but never replies stands in for that endpoint, so every startup HTTP call stalls
+/// until the client's own timeout fires.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore]
 async fn embedded_mode_boots_without_hanging_on_blocked_backend() {

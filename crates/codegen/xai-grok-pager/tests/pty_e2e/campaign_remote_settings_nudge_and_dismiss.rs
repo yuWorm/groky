@@ -2,14 +2,8 @@
 #[allow(unused_imports)]
 use super::common::*;
 
-/// **Campaign nudge via the real remote path.**
-/// The campaign arrives through `GET /v1/settings`: the response fills `RemoteSettings.campaigns` and seeds the process cache for apply and dismiss.
-/// The sibling test injects the campaign through `GROK_CAMPAIGNS_OVERRIDE` instead.
-///
-/// - Boot with a `[models].default` in config.toml plus a **server-served** campaign nudging a *different* model.
-///   A new session, possibly not the first (see [`wait_for_model_via_new_sessions`]), opens on the **campaign** model.
-/// - Pick the config model via `/model`. The remote campaign id is recorded dismissed in `campaigns_state.json`.
-/// - Reboot against the *same* server settings. The **config** model wins and stays winning across `/new`.
+/// Campaign nudge via the real remote path. A new session, possibly not the first (see
+/// [`wait_for_model_via_new_sessions`]), opens on the campaign model.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "PTY e2e; run the owning pty_e2e_* Cargo test with --ignored (see Cargo.toml)"]
 async fn campaign_remote_settings_nudge_and_dismiss() {

@@ -2,16 +2,9 @@
 #[allow(unused_imports)]
 use super::common::*;
 
-/// Windows twin of `paste_ctrl_v_image_keeps_ui_responsive_macos`, run by the temporary Windows CI workflow on PR branches.
-/// Ctrl+V (raw 0x16) with an IMAGE on the REAL clipboard must not block the UI thread.
-/// The clipboard read, image decode, and session persist all run off the event loop.
-/// So keys typed right after the chord echo promptly, and the `[Image #N]` chip attaches later via a follow-up completion.
-/// Ordering is proven by checking the chip is absent at echo time: a blocking inline probe would attach the chip before the burst is even processed.
-///
-/// The test skips loudly when the session has no usable clipboard: a CI runner without an interactive desktop cannot exercise the real paste path.
-///
-/// WARNING: this test OVERWRITES the machine-global clipboard with an image.
-/// The prior TEXT contents are restored best-effort on exit (drop guard); a prior IMAGE clipboard cannot be restored.
+/// Ctrl+V (raw 0x16) with an IMAGE on the REAL clipboard must not block the UI thread. The test
+/// skips loudly when the session has no usable clipboard: a CI runner without an interactive
+/// desktop cannot exercise the real paste path.
 #[cfg(target_os = "windows")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore]

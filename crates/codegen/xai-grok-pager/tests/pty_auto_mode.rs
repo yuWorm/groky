@@ -79,10 +79,9 @@ fn prepare_sandbox(sandbox: &mut TestSandbox, gate_on: bool) -> Vec<(String, Str
         ("TERM_PROGRAM".into(), "".into()),
         ("TMUX".into(), "".into()),
     ];
-    // Pin the feature gate explicitly so the cycle is deterministic regardless of the developer's shell
-    // `GROK_AUTO_PERMISSION_MODE` is the highest gate layer below requirements; "1" and "0" parse to on and off (`xai_grok_config::env_bool`)
-    // portable-pty merges this over the inherited environment, so a value exported in the shell can't flip the result
-    // Auto is in the ring with the gate on and skipped with it off
+    // `GROK_AUTO_PERMISSION_MODE` is the highest gate layer below requirements; "1" and "0" parse to on and off
+    // (`xai_grok_config::env_bool`) portable-pty merges this over the inherited environment, so a value exported in
+    // the shell can't flip the result.
     env.push((
         "GROK_AUTO_PERMISSION_MODE".into(),
         if gate_on { "1" } else { "0" }.into(),

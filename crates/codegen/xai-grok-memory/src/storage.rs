@@ -17,7 +17,6 @@ pub enum MemoryScope {
 }
 
 /// Handles file I/O for the memory storage layer.
-///
 /// Memory files are human-readable/editable Markdown stored under `~/.grok/memory/`.
 /// Workspace-scoped files live under a directory named `{project-slug}-{hash8}`, e.g. `~/.grok/memory/xai-a3f7b2c9/`.
 #[derive(Debug, Clone)]
@@ -34,7 +33,6 @@ pub struct MemoryStorage {
 
 impl MemoryStorage {
     /// Create a new `MemoryStorage` rooted at `~/.grok/memory/`.
-    ///
     /// The workspace directory name is `{slug}-{hash8}` where `slug` is the project directory name and `hash8` is 8 hex chars from blake3.
     /// Directories are created lazily on first write, not here.
     pub fn new(cwd: &Path, root_override: Option<&Path>) -> Self {
@@ -141,14 +139,8 @@ impl MemoryStorage {
     }
 
     /// Write a daily session log file.
-    ///
     /// File path: `~/.grok/memory/{project}-{hash8}/sessions/YYYY-MM-DD-{slug}-{sid8}.md`
-    ///
-    /// - `date`: e.g. `"2026-02-23"`
-    /// - `slug`: short slug derived from the first user message
-    /// - `session_id`: full session ID (first 8 chars used as suffix)
-    /// - `append`: when `true`, appends a timestamped section instead of overwriting.
-    ///   Each section is separated by `---` and a timestamp header so the chunker treats them as distinct entries.
+    /// `date`: e.g. `"2026-02-23"`; `slug`: short slug derived from the first user message; `session_id`: full session ID (first 8 chars used as suffix); `append`: when `true`, appends a timestamped section instead of overwriting. Each section is separated by `---` and a timestamp header so the chunker treats them as distinct entries.
     pub fn write_daily_log(
         &self,
         date: &str,
@@ -209,8 +201,6 @@ impl MemoryStorage {
     }
 
     /// Append content to the `MEMORY.md` for the given scope.
-    ///
-    /// The content is normalized via [`normalize_memory_content`], then appended with a blank-line separator from existing content.
     /// Creates parent directories and the file if they don't exist.
     /// Empty/whitespace-only content is silently ignored.
     pub fn append_to_memory(&self, scope: MemoryScope, content: &str) -> std::io::Result<()> {
@@ -252,10 +242,6 @@ impl MemoryStorage {
     }
 
     /// Read a memory file, optionally returning only a range of lines.
-    ///
-    /// - `from`: 0-based start line (default 0)
-    /// - `lines`: max number of lines to return (default: all)
-    ///
     /// The path must resolve (via `canonicalize`) to a location inside the memory directory tree.
     /// Both the path and the memory root must be canonicalizable; if either fails, the read is rejected.
     pub fn read_file(
@@ -392,10 +378,8 @@ impl MemoryStorage {
     }
 
     /// Remove the entire workspace-scoped memory directory.
-    ///
     /// Deletes MEMORY.md, sessions/, index.sqlite, and any other workspace files.
     /// The directory will be recreated on next session start via `ensure_initialized()`.
-    /// Returns `Ok(true)` if the directory existed and was removed, `Ok(false)` if it didn't exist.
     pub fn clear_workspace(&self) -> std::io::Result<bool> {
         match std::fs::remove_dir_all(&self.workspace_dir) {
             Ok(()) => {
@@ -408,10 +392,8 @@ impl MemoryStorage {
     }
 
     /// Remove the global MEMORY.md file.
-    ///
     /// Does not remove the global memory directory itself (other workspaces may have subdirectories there).
     /// The file will be recreated on next session start via `ensure_initialized()`.
-    /// Returns `Ok(true)` if the file existed and was removed, `Ok(false)` if it didn't exist.
     pub fn clear_global(&self) -> std::io::Result<bool> {
         let path = self.global_memory_file();
         match std::fs::remove_file(&path) {
@@ -425,13 +407,7 @@ impl MemoryStorage {
     }
 
     /// Remove orphaned workspace directories under the memory root.
-    ///
-    /// Deletion criteria (tiered):
-    /// 1. `tmp*` dirs: remove empty ones unconditionally; remove non-empty ones older than 7 days.
-    /// 2. Other workspaces with no session files: remove if older than `max_age_days`.
-    /// 3. Non-empty non-tmp workspaces: never touched.
-    ///
-    /// Returns the number of directories removed.
+    /// `tmp*` dirs: remove empty ones unconditionally; remove non-empty ones older than 7 days; Other workspaces with no session files: remove if older than `max_age_days`; Non-empty non-tmp workspaces: never touched.
     pub fn gc(&self, max_age_days: u64) -> std::io::Result<usize> {
         let entries = match std::fs::read_dir(&self.global_dir) {
             Ok(e) => e,
@@ -514,15 +490,7 @@ fn is_older_than(dir: &Path, days: u64) -> bool {
 }
 
 /// Ensure content has proper Markdown heading structure for the memory chunker.
-///
-/// The chunker splits on `## ` boundaries, and the search pipeline uses headings for section-level ranking.
-/// Raw text without headings produces low-quality chunks.
-///
-/// **Rules:**
-/// 1. Content that already starts with `#` is left as-is (user-provided structure).
-/// 2. Single-line content becomes `## {content}` (the note IS the heading).
-/// 3. Multi-line with a first line of 80 chars or fewer: the first line becomes `## {first_line}`, the rest becomes the body paragraph.
-/// 4. Multi-line with a longer first line: the heading is a generic `## Note` and the entire content becomes the body.
+/// Content that already starts with `#` is left as-is (user-provided structure); Single-line content becomes `## {content}` (the note IS the heading); Multi-line with a first line of 80 chars or fewer: the first line becomes `## {first_line}`, the rest becomes the body paragraph; Multi-line with a longer first line: the heading is a generic `## Note` and the entire content becomes the body.
 pub fn normalize_memory_content(raw: &str) -> String {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
@@ -553,7 +521,6 @@ pub fn normalize_memory_content(raw: &str) -> String {
 }
 
 /// Returns `true` if `cwd` resides under a system temp directory.
-///
 /// Subagent worktrees and other transient processes use temp-dir paths like `/tmp/…` or `/var/folders/…/T/…`.
 /// Creating persistent workspace memory for these paths is wasteful and produces orphan directories.
 fn is_ephemeral_cwd(cwd: &Path) -> bool {
@@ -574,12 +541,6 @@ fn is_ephemeral_cwd(cwd: &Path) -> bool {
 }
 
 /// Compute a human-friendly workspace directory name.
-///
-/// Format: `{slug}-{hash8}` where:
-/// - `slug` is the repo or directory name, slugified (max 40 chars)
-/// - `hash8` is 8 hex chars from blake3 for uniqueness
-///
-/// **Identity strategy:** the git remote `org/repo` is preferred, so every clone, worktree, and copy of a repository shares one memory directory.
 /// It falls back to the filesystem path when not inside a git repo or when no `origin` remote is configured.
 fn compute_workspace_hash(cwd: &Path) -> String {
     let identity = extract_repo_identity(cwd);
@@ -618,7 +579,6 @@ fn compute_workspace_hash(cwd: &Path) -> String {
 }
 
 /// Extract a normalized `org/repo` identifier from the git remote URL.
-///
 /// Uses `git2` to discover the repository from `cwd` and read the `origin` remote URL.
 /// Returns `None` if not a git repo, no `origin` remote, or the URL can't be normalized.
 pub(crate) fn extract_repo_identity(cwd: &Path) -> Option<String> {
@@ -629,11 +589,7 @@ pub(crate) fn extract_repo_identity(cwd: &Path) -> Option<String> {
 }
 
 /// Normalize a git remote URL to `org/repo` form.
-///
 /// Strips protocol prefix, host, and trailing `.git`:
-/// - `git@github.com:acme/widgets.git`       → `"acme/widgets"`
-/// - `https://github.com/acme/widgets.git`   → `"acme/widgets"`
-/// - `ssh://git@github.com/acme/widgets`     → `"acme/widgets"`
 fn normalize_remote_url(url: &str) -> Option<String> {
     let path = if let Some(colon_pos) = url.find(':') {
         // SSH format: git@github.com:org/repo.git
@@ -698,7 +654,6 @@ mod tests {
 
     /// Prepend the hermetic git binary (via `GIT_BIN_PATH`) to `PATH`.
     /// `Command::new("git")` and `git2`'s discovery then resolve to the hermetic static binary instead of system-installed git.
-    ///
     /// Safe to call multiple times; only the first call mutates `PATH`.
     fn ensure_hermetic_git_on_path() {
         use std::path::PathBuf;

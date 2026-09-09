@@ -1731,7 +1731,6 @@
     }
 
     /// The core reattach-finalization: a `TurnCompleted` seen during a load's replay window records its prompt id.
-    /// (The running turn isn't adopted yet.)
     /// The post-replay `SessionLoaded` adoption then SKIPS that same id.
     /// A viewer that re-attached after the turn ended does not re-strand on "Waiting…".
     #[test]
@@ -1765,7 +1764,6 @@
                 restore_summary: None,
                 restore_degree: None,
                 running_prompt_id: Some("p-run".to_string()),
-                scheduler_background_loops: None,
             }),
             &mut app,
         );
@@ -1781,11 +1779,9 @@
         );
     }
 
-    /// Regression pin for a BACKGROUND-tab driver (`is_active == false`).
     /// Arming the lost-RPC reconcile from a live `TurnCompleted` must STILL report a change.
     /// Otherwise `event_loop` skips `schedule_tick` and `reconcile_overdue_turn_ends` never fires, stranding the turn on "Waiting…".
     /// The reconcile-arm return must NOT be gated on `is_active`.
-    /// (This test fails if the live arm routes the arm through `changed && is_active`.)
     #[test]
     fn background_driver_live_turn_completed_arms_reconcile_and_reports_change() {
         let mut app = make_app_with_agent("sess-bg");
@@ -1851,7 +1847,7 @@
                 attempts: 1,
                 confirmed: false,
                 cancel_subagents: true,
-                trigger: crate::app::actions::CancelTrigger::Esc,
+                trigger: crate::app::actions::CancelTrigger::DashboardStop,
             });
         app.agents.get_mut(&id).unwrap().begin_session_reload(1);
         let agent = &app.agents[&id];

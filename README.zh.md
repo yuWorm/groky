@@ -8,7 +8,7 @@ agent、tools、MCP、ACP、TUI 与官方同一套，额外支持第三方模型
 
 命令行二进制是 **`groky`**，可以和官方 `grok` 并存。
 
-最新版本：[v0.1.13](https://github.com/yuWorm/groky/releases/tag/v0.1.13)
+最新版本：[v0.1.14](https://github.com/yuWorm/groky/releases/tag/v0.1.14)
 
 ## 安装
 

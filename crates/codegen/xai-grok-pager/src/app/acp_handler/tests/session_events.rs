@@ -907,9 +907,9 @@
         assert!(changed);
 
         let info = agent.subagent_sessions.get(child_sid).unwrap();
-        assert_eq!(info.tokens_used, Some(25000));
+        assert_eq!(info.attempt.tokens_used, Some(25000));
         // 25000 tokens of the default 131072 window rounds to 19 percent
-        assert_eq!(info.context_usage_pct, Some(19));
+        assert_eq!(info.attempt.context_usage_pct, Some(19));
 
         // The child view's context_state.used (context-bar numerator) must also be reset; see handle_child_session_notification
         let child_view = agent.subagent_views.get(child_sid).unwrap();
@@ -984,8 +984,8 @@
         assert!(!changed);
         // SubagentInfo is still updated for data correctness even though nothing redraws
         let info = agent.subagent_sessions.get(child_sid).unwrap();
-        assert_eq!(info.tokens_used, Some(25000));
-        assert_eq!(info.context_usage_pct, Some(19));
+        assert_eq!(info.attempt.tokens_used, Some(25000));
+        assert_eq!(info.attempt.context_usage_pct, Some(19));
     }
 
     #[test]
@@ -1490,9 +1490,7 @@
     }
 
     /// The `HooksChanged` push is the channel late-arriving hooks come through.
-    /// Driven end-to-end through `handle_session_notification`: an empty first
-    /// push must not finish group-collapse seeding, the first non-empty push
-    /// applies the collapsed default, and later pushes preserve expand state.
+    /// Driven end-to-end through `handle_session_notification`: an empty first push must not finish group-collapse seeding, the first non-empty push applies the collapsed default, and later pushes preserve expand state.
     #[test]
     fn hooks_changed_push_seeds_group_collapse_on_first_non_empty_delivery() {
         use crate::views::extensions_modal::{ExtensionsModalState, ExtensionsTab, TabDataState};

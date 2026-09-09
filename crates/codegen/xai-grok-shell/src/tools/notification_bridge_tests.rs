@@ -176,10 +176,8 @@ async fn bash_task_completed_injects_bash_task_completed_source() {
     }
 }
 
-/// While a goal loop is active, a completed background bash task must NOT fire the synthetic auto-wake prompt.
-/// An async "task completed" wake mid-goal derails a weak model.
-/// It must also NOT be marked reserved (so the `TaskCompletionReminder` is free to drain it).
-/// The pager's `x.ai/task_completed` notification still fires.
+/// While a goal loop is active, a completed background bash task must NOT fire the synthetic auto-wake prompt. An async "task completed" wake mid-goal derails a weak model.
+/// It must also NOT be marked reserved (so the `TaskCompletionReminder` is free to drain it). The pager's `x.ai/task_completed` notification still fires.
 #[tokio::test]
 async fn bash_task_completed_suppresses_auto_wake_during_goal_loop() {
     let (config, mut gateway_rx, _persistence_rx, mut cmd_rx) = make_test_config_full();

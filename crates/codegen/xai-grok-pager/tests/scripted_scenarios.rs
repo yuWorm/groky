@@ -106,10 +106,9 @@ async fn scripted_table_cell_selection() {
     run_scenario("table_cell_selection.yaml").await;
 }
 
-/// Type-to-find pickers carry vim-mode.
-/// With vim-mode on, the command palette opens in INPUT (a letter filters immediately).
-/// Esc clears the query, a second Esc drops to NAV (letters no longer filter), and `i` re-enters INPUT.
-/// The footer's `i search` hint is absent on open (input) and present in nav.
+/// Type-to-find pickers carry vim-mode. With vim-mode on, the command palette opens in INPUT (a letter filters
+/// immediately). Esc clears the query, a second Esc drops to NAV (letters no longer filter), and `i` re-enters
+/// INPUT. The footer's `i search` hint is absent on open (input) and present in nav.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "scripted scenario; run with cargo test -- --ignored"]
 async fn scripted_vim_modal_command_palette() {
@@ -179,10 +178,9 @@ async fn scripted_mermaid_affordances() {
     run_scenario("mermaid-affordances.yaml").await;
 }
 
-/// User report: a file path with a space (`Demo App.app`) must render fully.
-/// The ptyctl PTY stream must carry OSC 8 for the full path (`Demo%20App.app`), not a truncated link ending at `Demo`.
-/// Screen assertions live in `path_space_hyperlink.yaml`.
-/// This wrapper also checks `raw_output.bin` so CI has byte-level proof without relying only on the ignored `pty_e2e` test.
+/// User report: a file path with a space (`Demo App.app`) must render fully. The ptyctl PTY stream must carry OSC 8
+/// for the full path (`Demo%20App.app`), not a truncated link ending at `Demo`. This wrapper also checks
+/// `raw_output.bin` so CI has byte-level proof without relying only on the ignored `pty_e2e` test.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "scripted scenario; run with cargo test -- --ignored"]
 async fn scripted_path_space_hyperlink() {
@@ -464,10 +462,8 @@ async fn scripted_small_screen_tip_no_show_tiny() {
     run_scenario("small_screen_tip_no_show_tiny.yaml").await;
 }
 
-/// Inline edit-and-resubmit happy path: Enter on a selected previous prompt opens the in-place editor.
-/// Enter with changed text raises the confirm dialog.
-/// `y` rewinds the conversation and resubmits the edited text as a fresh turn, with no "Reverted conversation" note.
-/// Distinct per-turn mock sentinels prove the tail was truncated.
+/// Inline edit-and-resubmit happy path: Enter on a selected previous prompt opens the in-place editor. `y` rewinds
+/// the conversation and resubmits the edited text as a fresh turn, with no "Reverted conversation" note.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "scripted scenario; run with cargo test -- --ignored"]
 async fn scripted_inline_edit_resubmit() {

@@ -60,6 +60,10 @@ impl XaiProtoBuilder {
         self.map_builder(|b| paths.into_iter().fold(b, |b, path| b.bytes(path)))
     }
 
+    pub fn boxed(self, path: impl AsRef<str>) -> Self {
+        self.map_builder(|b| b.boxed(path))
+    }
+
     pub fn extern_path(self, proto_path: impl AsRef<str>, rust_path: impl AsRef<str>) -> Self {
         self.map_builder(|b| b.extern_path(proto_path, rust_path))
     }

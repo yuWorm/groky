@@ -322,7 +322,6 @@ mod tests {
             restore_summary: None,
             restore_degree: None,
             running_prompt_id: None,
-            scheduler_background_loops: None,
         }
     }
 

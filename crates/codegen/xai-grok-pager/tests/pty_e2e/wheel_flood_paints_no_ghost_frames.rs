@@ -4,31 +4,9 @@ use super::common::*;
 #[allow(unused_imports)]
 use super::scroll::*;
 
-// ── Regression: scroll pacing, one 16ms scroll clock, no ghost frames ────
-//
-// User complaint: "scroll is both laggy and too sensitive". Two coupled defects in the scroll pipeline:
-//
-// 1. Cadence-suppressed wheel events returned `InputOutcome::Changed` from `AppView::handle_input`.
-//    The event loop then ran a full draw for a frame in which NOTHING moved (a ghost frame)
-//    The suppressed motion landed later as a multi-line jump: per-event render work with none of the per-event movement
-// 2. Residual and finalize flushes were driven by the animation tick (default 30fps, roughly 33ms).
-//    The mouse state machine paces itself by the 16ms `REDRAW_CADENCE`, so these flushes arrived up to a slot late
-//
-// The fix adds a scroll clock to the event-loop select (`MouseScrollState::scroll_clock_deadline`: 16ms cadence flushes, 80ms stream-gap finalize)
-// It also makes suppressed events return `Unchanged`, so a draw happens exactly when lines were dispatched
-//
-// This test floods trackpad-like wheel-up reports at the scrollback pane and asserts on the harness's live frame capture:
-//   (a) the viewport moved: the topmost visible marker index strictly decreased;
-//   (b) no amplification: the frame count never exceeds the event count
-//       This holds under either wheel or trackpad classification and under jitter-stretched gaps;
-//   (c) no ghost frames: every captured frame paints at least `MOVEMENT_CHARS_FLOOR` printable chars
-//       Any shift of one line or more rewrites the unique digit cells of every visible `MARKER-nnnn` row, dozens of chars
-//       A no-movement frame diff is EMPTY, because the render path discards zero-diff frames entirely
-//       A counted `?2026h/l` pair with ~0 chars can therefore only be a reintroduced ghost draw
-//
-// Only byte-deterministic quantities are asserted: frame COUNT, per-frame CHARS, marker indices
-// Durations are never asserted; they are load-sensitive under the no-drain driver (see `scroll.rs`)
-// Wall-clock pacing of the 16ms slots is pinned by the synthetic-clock unit tests in `src/input/mouse.rs`
+// Regression: scroll pacing, one 16ms scroll clock, no ghost frames. (b) no amplification: the
+// frame count never exceeds the event count. (c) no ghost frames: every captured frame paints at
+// least `MOVEMENT_CHARS_FLOOR` printable chars.
 
 /// 240 one-row lines, far more than the 50-row PTY, so the burst can never clamp at the transcript top.
 /// 30 events at up to 3 lines each under max trackpad acceleration is about 90 lines; ~200 rows sit above the bottom-pinned viewport.

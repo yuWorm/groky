@@ -233,11 +233,14 @@ events only, never metrics.
 | `grok_code.tool.usage` | `{call}` | `tool_name`, `outcome` |
 | `grok_code.error.count` | `{error}` | `error_category`, `model` |
 | `grok_code.startup.total` | `ms` | `outcome` = `ok` \| `timeout` \| `error`; `auth_mode` |
+| `grok_code.startup.interactive` | `ms` | `auth_mode` |
 | `grok_code.startup.phase_duration` | `ms` | `phase`, `outcome`, `auth_mode` |
 | `grok_code.startup.timeout` | `{timeout}` | `stuck_in`, `auth_mode` |
 
 `startup.total` measures process start to a usable session, recorded once per
 process; `outcome` = `timeout` or `error` means startup ended without one.
+`startup.interactive` records process start to the first frame the live loop
+confirmed written, once per process.
 `phase_duration` breaks the connect attempt down by step (`config_load`,
 `managed_policy`, `bootstrap`, `model_catalog`, `worker_spawn`,
 `leader_connect`, `acp_initialize`, `eager_auth`); filter on its `outcome`

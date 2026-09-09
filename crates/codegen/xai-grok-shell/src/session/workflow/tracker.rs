@@ -3,8 +3,11 @@ use std::time::Instant;
 use serde::{Deserialize, Serialize};
 use xai_workflow::{PauseKind, PhaseMeta, WorkflowOutcome};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, strum::AsRefStr, strum::IntoStaticStr,
+)]
 #[serde(rename_all = "snake_case")]
+#[strum(serialize_all = "snake_case")]
 pub enum WorkflowRunStatus {
     Active,
     UserPaused,
@@ -20,22 +23,6 @@ pub enum WorkflowRunStatus {
 }
 
 impl WorkflowRunStatus {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Active => "active",
-            Self::UserPaused => "user_paused",
-            Self::BackOffPaused => "back_off_paused",
-            Self::NoProgressPaused => "no_progress_paused",
-            Self::InfraPaused => "infra_paused",
-            Self::Blocked => "blocked",
-            Self::BudgetLimited => "budget_limited",
-            Self::Interrupted => "interrupted",
-            Self::Complete => "complete",
-            Self::Failed => "failed",
-            Self::Cancelled => "cancelled",
-        }
-    }
-
     pub fn is_terminal(self) -> bool {
         matches!(
             self,
@@ -509,7 +496,7 @@ impl WorkflowTracker {
                 Some(format!(
                     "ignored {} while status is {}",
                     outcome_kind(outcome),
-                    run.state.status.as_str()
+                    run.state.status.as_ref()
                 )),
             );
             return Some(run.state.clone());
@@ -524,7 +511,7 @@ impl WorkflowTracker {
                 run.state.status = WorkflowRunStatus::from_pause(*kind);
                 run.state.pause_message = Some(capped_pause_message(message.clone()));
                 run.state
-                    .record_event("workflow_paused", Some(kind.as_str().to_string()));
+                    .record_event("workflow_paused", Some(kind.as_ref().to_string()));
             }
             WorkflowOutcome::BudgetExceeded { message } => {
                 run.state.status = WorkflowRunStatus::BudgetLimited;

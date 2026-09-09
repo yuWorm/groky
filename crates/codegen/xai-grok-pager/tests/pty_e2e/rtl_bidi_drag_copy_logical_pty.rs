@@ -10,11 +10,8 @@ const FA_LOGICAL: &str = "خوب";
 /// Its visual (reversed) form: what an app-reordered row paints.
 const FA_VISUAL: &str = "بوخ";
 
-/// PTY: with `[scrollback.display] rtl_bidi = true`, a mixed LTR and Persian row paints the Persian in visual (reversed) order.
-/// A drag-copy over those painted cells puts the *logical* order on the clipboard.
-/// This is the end-to-end guard for the selection/paint contract: cells are visual, the clipboard is logical.
-///
-/// `SSH_CONNECTION` is set so the macOS clipboard route emits OSC 52 for readback (same pattern as `quote_block_drag_copy_excludes_bars_pty`).
+/// PTY: with `[scrollback.display] rtl_bidi = true`, a mixed LTR and Persian row paints the Persian
+/// in visual (reversed) order.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "PTY e2e; run the owning pty_e2e_* Cargo test with --ignored (see Cargo.toml)"]
 async fn rtl_bidi_drag_copy_logical_pty() {

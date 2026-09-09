@@ -44,7 +44,6 @@ use crate::scrollback::types::{
 use std::fmt;
 
 /// Shared selection-range id for tool-call header lines.
-///
 /// Headers are single logical selection targets (path/query/url/command);
 /// using one id across tool kinds keeps multi-line drag/copy grouping simple.
 pub(crate) const TOOL_HEADER_RANGE: u16 = 0;
@@ -70,9 +69,8 @@ impl fmt::Display for LineRange {
     }
 }
 
-/// Names what a verb-groupable (non-destructive) run member touched.
-/// A folded run of consecutive rows renders as "Read 3 files" or "Searched 4 patterns".
-/// Most kinds classify tool blocks via [`ToolCallBlock::verb_group_kind`].
+/// Names what a verb-groupable (non-destructive) run member touched. A folded run of consecutive rows renders as
+/// "Read 3 files" or "Searched 4 patterns". Most kinds classify tool blocks via [`ToolCallBlock::verb_group_kind`].
 /// `Subagent` classifies subagent lifecycle render blocks, which are not tool calls.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum VerbGroupKind {
@@ -286,7 +284,6 @@ impl BlockContent for ToolCallBlock {
 
 impl ToolCallBlock {
     /// Transfer timing data from another block of the same variant.
-    ///
     /// Used when a running block is replaced with its completed version (e.g., in the `handle_tool_call_update` completion path).
     /// The new block inherits `started_at` from the old block so `finish()` can compute real elapsed time.
     pub fn transfer_timing_from(&mut self, old: &ToolCallBlock) {
@@ -368,7 +365,6 @@ impl ToolCallBlock {
     }
 
     /// Set `started_at` on the inner variant block.
-    ///
     /// Unlike `transfer_timing_from`, this works across variant boundaries.
     /// For example, it can set `started_at` on a `Search` block from a value captured when the block was still `Other`.
     pub fn set_started_at(&mut self, instant: std::time::Instant) {
@@ -391,11 +387,8 @@ impl ToolCallBlock {
         }
     }
 
-    /// Start timing for this block (sets `started_at = now`).
-    ///
-    /// Called when a block enters running UI state.
-    /// Only blocks that actually run in the UI get meaningful timing.
-    /// Pre-completed blocks keep `started_at = None` and show no timing data.
+    /// Start timing for this block (sets `started_at = now`). Only blocks that actually run in the UI get meaningful
+    /// timing.
     pub fn start_timing(&mut self) {
         match self {
             ToolCallBlock::Execute(b) => {
@@ -497,7 +490,6 @@ impl ToolCallBlock {
     }
 
     /// Full stored SOURCE text of this tool call for full-text scrollback search.
-    ///
     /// Reads stored source fields and the `copy_text` accessors that read source data.
     /// It never lays out (`output()`, word-wrap) or syntax-highlights, so indexing stays cheap.
     pub(crate) fn searchable_text(&self) -> Option<String> {
@@ -597,10 +589,8 @@ impl ToolCallBlock {
         }
     }
 
-    /// The bucket a row falls into for aggregated header LABELS; a superset of [`Self::verb_group_kind`].
-    /// The action kinds excluded from eager verb folding still get a bucket when a truncation header describes the rows it hides.
-    /// `None` is returned only for lifecycle rows, which are never worth labeling.
-    /// Variants are listed explicitly so a new `ToolCallBlock` variant must decide here too.
+    /// The bucket a row falls into for aggregated header LABELS. `None` is returned only for lifecycle rows, which are
+    /// never worth labeling. Variants are listed explicitly so a new `ToolCallBlock` variant must decide here too.
     pub fn label_kind(&self) -> Option<VerbGroupKind> {
         match self {
             ToolCallBlock::Execute(_) => Some(VerbGroupKind::Command),

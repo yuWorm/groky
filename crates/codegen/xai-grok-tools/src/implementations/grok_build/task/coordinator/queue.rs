@@ -4,6 +4,7 @@ use std::collections::VecDeque;
 
 use tokio::sync::oneshot;
 
+use super::super::coordinator_state::DisplacedCompletedChild;
 use super::super::types::{SubagentRequest, SubagentResult};
 
 use super::{ChildRunner, SubagentCoordinator};
@@ -57,12 +58,17 @@ impl SpawnQueue {
     }
 }
 
-/// A spawn parked at the session concurrent limit.
 pub(super) struct QueuedSpawn {
     pub(super) request: Box<SubagentRequest>,
     /// Tokio clock so paused-clock tests can assert the wait.
     pub(super) queued_at: tokio::time::Instant,
     pub(super) caller: QueuedCaller,
+    pub(super) agent_address: Option<super::super::types::AgentAddress>,
+    pub(super) spawner_session_id: Option<String>,
+    pub(super) wake_agent_id: Option<String>,
+    pub(super) wake_message_source: Option<super::super::types::ActiveAgentMessageSource>,
+    pub(super) wake_message_id: Option<String>,
+    pub(super) wake: Option<DisplacedCompletedChild>,
 }
 
 pub(super) enum QueuedCaller {
@@ -131,6 +137,12 @@ impl<R: ChildRunner> SubagentCoordinator<R> {
                     request,
                     queued_at,
                     caller,
+                    agent_address,
+                    spawner_session_id,
+                    wake_agent_id,
+                    wake_message_source,
+                    wake_message_id,
+                    wake,
                 } = queued;
                 let (spawn_reply, deadline) = match caller {
                     QueuedCaller::Awaiting {
@@ -147,6 +159,12 @@ impl<R: ChildRunner> SubagentCoordinator<R> {
                         queued_for: queued_at.elapsed(),
                         deadline,
                     },
+                    agent_address,
+                    spawner_session_id,
+                    wake_agent_id,
+                    wake_message_source,
+                    wake_message_id,
+                    wake,
                 );
             } else {
                 kept.push_back(queued);
@@ -170,23 +188,25 @@ impl<R: ChildRunner> SubagentCoordinator<R> {
         let count = removed.len();
         for queued in removed {
             let id = queued.request.id.clone();
-            self.reject_spawn_ready_messages(
-                &id,
-                crate::implementations::grok_build::task::types::ActiveAgentMessageOutcome::NotActiveOrFinalizing,
-            );
+            self.reject_spawn_ready_ids(&[id]);
             self.finish_cancelled_queued(queued);
         }
         count
     }
 
-    /// Resolve a spawn cancelled while still queued: waiters resolve instead
-    /// of timing out and the id stays queryable as a cancelled record.
+    /// Resolve a queued spawn without stranding its waiters.
     fn finish_cancelled_queued(&mut self, queued: QueuedSpawn) {
         let QueuedSpawn {
             request,
             caller,
             queued_at,
+            wake,
+            ..
         } = queued;
+        if let Some(wake) = wake {
+            self.restore_displaced_completion(wake);
+            return;
+        }
         // Token observers must see command-path cancels too.
         request.cancel_token.cancel();
         let result = cancelled_while_queued_result(&request);

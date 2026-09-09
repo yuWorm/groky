@@ -1,4 +1,5 @@
 use super::*;
+use crate::managed_config::LaunchProfile;
 use crate::remote::{ModelSource, active_model_source};
 
 // ── Fetch ───────────────────────────────────────────────────────────────────
@@ -13,6 +14,7 @@ pub(crate) fn build_prefetched_map(
         let info = config::ModelInfo::from_config(&m);
         let entry = ModelEntry {
             info,
+            mtls_cert_dir: None,
             api_key: None,
             env_key: None,
             auth_provider: None,
@@ -37,17 +39,25 @@ pub(crate) fn prefetch_models_blocking(
     )
 }
 
+/// Whether the startup settings fetch ran and what it produced. Separates a
+/// skipped fetch (no session auth) from a real failure so a no-auth boot is not
+/// misclassified as a degraded start.
+pub(in crate::agent::models) enum SettingsPrefetch {
+    /// Boxed because `RemoteSettings` is large and the other variants are unit-sized.
+    Fetched(Box<crate::util::config::RemoteSettings>),
+    /// A fetch ran but yielded no settings (rejected/transient/exhausted).
+    Failed,
+    /// No fetch ran (no session auth or remote fetch disabled): not degraded.
+    Skipped,
+}
+
 /// Fetch models + settings without touching disk; the cache write is returned
 /// for the caller to commit.
 fn prefetch_uncommitted(
     endpoints: &config::EndpointsConfig,
     auth: Option<&GrokAuth>,
     fetch_auth: ModelFetchAuth,
-) -> (
-    ModelsPrefetch,
-    Option<crate::util::config::RemoteSettings>,
-    Option<SettingsCacheWrite>,
-) {
+) -> (ModelsPrefetch, SettingsPrefetch, Option<SettingsCacheWrite>) {
     // Resolved once so both fetches see the same policy.
     let remote_fetch_enabled = crate::util::config::resolve_remote_fetch_enabled();
     let models = {
@@ -58,12 +68,20 @@ fn prefetch_uncommitted(
         Some(auth) if remote_fetch_enabled => {
             let origin = endpoints.proxy_url();
             let alpha_test_key = endpoints.alpha_test_key.as_deref();
-            SettingsCacheManager::new().load_or_fetch(auth, &origin, alpha_test_key, || {
-                let _timer = crate::instrumentation_timer!("startup.early_settings_fetch");
-                crate::remote::fetch_settings_blocking(&origin, auth, alpha_test_key).into_option()
-            })
+            let (settings, settings_write) =
+                SettingsCacheManager::new().load_or_fetch(auth, &origin, alpha_test_key, || {
+                    let _timer = crate::instrumentation_timer!("startup.early_settings_fetch");
+                    crate::remote::fetch_settings_blocking(&origin, auth, alpha_test_key)
+                        .into_option()
+                });
+            // A real attempt yielding nothing is a failure, not a skip.
+            let settings = match settings {
+                Some(settings) => SettingsPrefetch::Fetched(Box::new(settings)),
+                None => SettingsPrefetch::Failed,
+            };
+            (settings, settings_write)
         }
-        _ => (None, None),
+        _ => (SettingsPrefetch::Skipped, None),
     };
     (models, settings, settings_write)
 }
@@ -226,18 +244,58 @@ pub(in crate::agent::models) fn resolve_disk_auth(
     grok_com_config: Option<GrokComConfig>,
 ) -> Option<GrokAuth> {
     let grok_home = crate::util::grok_home::grok_home();
-    AuthManager::new(&grok_home, grok_com_config.unwrap_or_default()).current()
+    AuthManager::new_with_proxy_base_url(
+        &grok_home,
+        grok_com_config.unwrap_or_default(),
+        crate::agent::config::EndpointsConfig::from_effective_config().proxy_url(),
+    )
+    .current()
 }
 
 pub(in crate::agent::models) fn run_prefetch(
     env: PrefetchEnv,
-) -> (
-    ModelsPrefetch,
-    Option<crate::util::config::RemoteSettings>,
-    Option<SettingsCacheWrite>,
-) {
+) -> (ModelsPrefetch, SettingsPrefetch, Option<SettingsCacheWrite>) {
     let mut timer = crate::instrumentation_timer!("startup.early_prefetch");
     let proxy_endpoint = env.endpoints.proxy_url();
     timer.with_field("endpoint", proxy_endpoint.as_str());
     prefetch_uncommitted(&env.endpoints, env.auth.as_ref(), env.model_fetch_auth)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, strum::AsRefStr, strum::IntoStaticStr)]
+pub(crate) enum DegradedStartCause {
+    #[strum(serialize = "settings fetch failed")]
+    FetchFailed,
+    #[strum(serialize = "deadline missed")]
+    DeadlineMissed,
+    #[strum(serialize = "prefetch thread died")]
+    ThreadDied,
+}
+
+pub(crate) fn record_degraded_start(
+    cause: DegradedStartCause,
+    profile: LaunchProfile,
+    deadline: std::time::Duration,
+    wait: std::time::Duration,
+) {
+    xai_grok_telemetry::unified_log::emit(
+        degraded_log_level(profile),
+        "startup proceeding without remote settings",
+        None,
+        Some(serde_json::json!({
+            "cause": cause.as_ref(),
+            "deadline_ms": deadline.as_millis() as u64,
+            "wait_ms": wait.as_millis() as u64,
+            "outcome": "settings unavailable at gate time",
+        })),
+    );
+}
+
+pub(crate) fn degraded_log_level(
+    profile: LaunchProfile,
+) -> xai_grok_telemetry::unified_log::LogLevel {
+    use xai_grok_telemetry::unified_log::LogLevel;
+    match profile {
+        LaunchProfile::Managed => LogLevel::Warn,
+        LaunchProfile::Personal => LogLevel::Debug,
+    }
 }

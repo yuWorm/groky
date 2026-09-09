@@ -1,9 +1,7 @@
-// Per-test-case module for the `pty_e2e` integration test crate.
 #[allow(unused_imports)]
 use super::common::*;
 
-/// After queuing a follow-up mid-turn, the ephemeral tip advertises send-now (`… to send now`).
-/// Opt into contextual hints explicitly so the tip cannot be soft-disabled by remote defaults in CI.
+/// Opt into contextual hints so remote defaults in CI cannot hide this tip.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore]
 async fn send_now_tip_after_mid_turn_queue() {

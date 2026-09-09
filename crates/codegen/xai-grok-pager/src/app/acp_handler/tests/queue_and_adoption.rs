@@ -278,7 +278,6 @@
     }
 
     /// Rapid double-Enter on a queued bash command: the parked send-now fires when the confirming broadcast lands.
-    /// It fires with the row's authoritative (broadcast) version.
     /// Firing it early no-opped shell-side and dropped the send-now.
     /// The cancel expectation it set hid the still-queued row, so the command looked like it disappeared.
     #[test]
@@ -542,12 +541,9 @@
         }
     }
 
-    /// Regression: a finished background task makes the shell promote its auto-wake prompt (synthetic id `task-completed-…`) to the running turn.
-    /// The shell then broadcasts `x.ai/queue/changed` carrying that synthetic id as `runningPromptId`.
     /// The pager must NOT adopt it via the turn-start shim: those turns run inside the actor and emit no `prompt_complete` or `PromptResponse`.
     /// `start_turn()` here would strand the pager on "Responding…" forever.
     /// That was the reported bug: the spinner never stopped after a background task finished.
-    /// The agent stays Idle; content still renders via the live-delta path, which no longer claims `current_prompt_id` for a driver.
     #[test]
     fn queue_changed_does_not_adopt_server_initiated_running_prompt() {
         let mut app = make_app_with_agent("sess-1");
@@ -602,11 +598,8 @@
     }
 
     /// Regression: the terminal-aware adoption guard must hold on the `queue/changed` turn-start path, not only the load paths.
-    /// A load records each finished turn in `replayed_terminal_prompts`.
     /// A later `queue/changed` that re-reports the same, already-ended `runningPromptId` must NOT re-adopt it.
     /// The pid is user-driven, so it passes the pid-only synthetic guard.
-    /// Only the agent-aware `should_adopt_running_prompt`, which consults `replayed_terminal_prompts`, stops the viewer re-stranding on "Waiting…".
-    /// This mirrors the `SessionLoaded` and reconnect adoption.
     #[test]
     fn queue_changed_does_not_readopt_terminal_in_replay_running_prompt() {
         let mut app = make_app_with_agent("sess-1");
@@ -675,8 +668,6 @@
     /// Regression (live-delta path): the auto-wake turn streams its reply as a `session/update` stamped with its synthetic promptId.
     /// On a driver (not a viewer) the content must render, but the turn must NOT be claimed: no role flip, no `current_prompt_id`, no `TurnRunning`.
     /// Claiming it would strand the turn-status and poison the slot, so later real turns' PromptResponses get discarded.
-    /// This pairs with the `handle_queue_changed` skip above.
-    /// Together they keep synthetic auto-wake turns out of the running slot on BOTH the queue-broadcast and streaming-delta paths.
     #[test]
     fn synthetic_auto_wake_delta_renders_without_claiming_turn() {
         let mut app = make_app_with_agent("sess-1");
@@ -871,14 +862,9 @@
         );
     }
 
-    /// Regression (viewer scrollback): a queued prompt can drain via the FIFO-handoff race on a VIEWER (a client watching another client's turn).
     /// The viewer never runs the deferred turn-start shim: its turn-end is `prompt_complete`, which does not apply the stashed adoption.
     /// Only the driver's `PromptResponse` applies it.
-    /// Setting `expect_user_echo` at stash time would then swallow the leader's authoritative user-echo.
-    /// The drained prompt's user block would vanish from the viewer's scrollback entirely.
     /// The stash branch must set the echo-skip ONLY when this client drives the current turn (`!attached_as_viewer`).
-    /// A viewer must let the server echo render the block.
-    /// This is the counterpart to the driver-side `fifo_handoff_user_echo_not_duplicated` above.
     #[test]
     fn viewer_drained_prompt_renders_user_block_from_echo() {
         // Live user-echo as the leader emits it: a text block, no `promptId`.
@@ -953,11 +939,7 @@
 
     /// Regression: a client can be `attached_as_viewer` on ANOTHER client's turn yet immediate-send (self-originate) a queued prompt of its own.
     /// When that prompt drains via the FIFO-handoff race, the viewer still won't run the deferred shim.
-    /// It ends the viewed turn via `prompt_complete`, which clears the stash.
     /// The echo-skip guard must therefore NOT key on origination: keying on `is_self_originated` here set the skip and dropped the block.
-    /// Keying on `!attached_as_viewer` keeps the echo and renders the block.
-    /// This test sets `current_prompt_id` to another client's turn AND marks the drained prompt self-originated.
-    /// That is the exact combination the prior guard mishandled.
     #[test]
     fn viewer_self_originated_drained_prompt_renders_from_echo() {
         fn user_echo(app: &mut AppView, text: &str) {
@@ -1061,9 +1043,7 @@
 
     /// Multi-client mid-turn load (leader mode): a client opens a session while ANOTHER client drives an in-flight turn.
     /// It subscribes AFTER the turn-start `queue/changed`, so it never adopts via `handle_queue_changed` and its `current_prompt_id` stays `None`.
-    /// The server conveys the running prompt id in the `SessionLoaded` response meta.
     /// The loader must adopt it (set `current_prompt_id`, enter `TurnRunning`) WITHOUT re-rendering the user block (replay already rendered it).
-    /// Subsequent live `session/update` deltas for that prompt then pass the gate and render live.
     #[test]
     fn session_loaded_with_running_prompt_id_adopts_and_passes_live_gate() {
         use crate::app::dispatch::dispatch;
@@ -1084,7 +1064,6 @@
                 restore_summary: None,
                 restore_degree: None,
                 running_prompt_id: Some("p-run".to_string()),
-                scheduler_background_loops: None,
             }),
             &mut app,
         );
@@ -1166,9 +1145,7 @@
 
     /// A `SessionLoaded` conveying a SYNTHETIC non-scheduler `running_prompt_id` (auto-wake, subagent-completion) must NOT be adopted.
     /// Those actor-run turns emit no `prompt_complete`, so adopting one would strand the viewer in `TurnRunning` forever.
-    /// The agent stays `Idle`, and the preserve arg is gated on the same predicate so the running turn's buffered follow-up chips are NOT preserved.
     /// Adoption is the only thing that flushes them; it is skipped here, so preserving them would orphan them.
-    /// The ADOPTABLE-id preserve contrast is covered by `reload_preserves_running_turn_follow_ups_and_renders_on_adoption`.
     #[test]
     fn session_loaded_with_synthetic_running_prompt_id_stays_idle() {
         use crate::app::dispatch::dispatch;
@@ -1201,7 +1178,6 @@
                 restore_summary: None,
                 restore_degree: None,
                 running_prompt_id: Some("task-completed-abc-123".to_string()),
-                scheduler_background_loops: None,
             }),
             &mut app,
         );
@@ -1241,7 +1217,6 @@
                 restore_summary: None,
                 restore_degree: None,
                 running_prompt_id: Some(pid.to_string()),
-                scheduler_background_loops: None,
             }),
             &mut app,
         );
@@ -1278,7 +1253,6 @@
                 restore_summary: None,
                 restore_degree: None,
                 running_prompt_id: Some("p-run".to_string()),
-                scheduler_background_loops: None,
             }),
             &mut app,
         );
@@ -1311,7 +1285,6 @@
                 restore_summary: None,
                 restore_degree: None,
                 running_prompt_id: None,
-                scheduler_background_loops: None,
             }),
             &mut app,
         );
@@ -1334,7 +1307,6 @@
     /// Multi-client load-window gap (leader mode): a viewer (`attached_as_viewer`) that subscribed mid-turn receives the driver's live deltas.
     /// They arrive WHILE its `session/load` replay is still in flight, so `current_prompt_id == None` and `loading_replay == true`.
     /// Before the fix the gate dropped every such delta and the viewer froze at its load snapshot.
-    /// Now the viewer ADOPTS the incoming prompt id and the delta renders into scrollback, recovering progress streamed during the load window.
     #[test]
     fn viewer_adopts_live_delta_during_load_window_instead_of_dropping() {
         let mut app = make_app_with_agent("sess-1");
@@ -1446,9 +1418,7 @@
     }
 
     /// Multi-client mirroring after this pane has driven a turn (the sticky-flag bug).
-    /// A pane that already sent a prompt has `attached_as_viewer == false` and a self-originated prompt id.
     /// When ANOTHER pane then drives a normal turn, the live deltas carry a foreign (non-server-initiated) prompt id this pane never originated.
-    /// With the old one-way latch the gate dropped them and the pane rendered nothing.
     /// Now the gate re-derives viewer status from prompt-id ownership, so the foreign turn is adopted and rendered and the flag flips back to true.
     #[test]
     fn pane_that_drove_a_turn_still_mirrors_another_clients_turn() {
@@ -2003,16 +1973,28 @@
         agent.last_seen_event_id = Some("sess-a-7".into());
         agent.last_applied_event_seq = Some(7);
         agent.last_applied_xai_event_seq = Some(8);
-        agent.deferred_subagent_finishes.insert(
-            "child-stale".into(),
-            crate::app::agent_view::DeferredSubagentFinish {
-                notification: xai_grok_shell::extensions::notification::SessionNotification {
-                    session_id: acp::SessionId::new("sess-a"),
-                    update: test_subagent_finished("child-stale"),
-                    meta: None,
-                },
-                inserted_at: std::time::Instant::now(),
+        let lifecycle = {
+            let reduction = crate::app::subagent::SubagentLifecycleState::default().reduce(
+                crate::app::subagent::SubagentLifecycleTransition::Finished,
+                Some("at1.stale"),
+                Some(1),
+            );
+            let crate::app::subagent::SubagentLifecycleReduction::Accepted(accepted) = reduction
+            else {
+                unreachable!();
+            };
+            accepted.into_state()
+        };
+        agent.deferred_subagent_finishes.defer(
+            "child-stale",
+            crate::app::subagent::SubagentAttemptKey::from_wire(Some("at1.stale")),
+            lifecycle,
+            xai_grok_shell::extensions::notification::SessionNotification {
+                session_id: acp::SessionId::new("sess-a"),
+                update: test_subagent_finished_for_attempt("child-stale", Some("at1.stale")),
+                meta: None,
             },
+            std::time::Instant::now(),
         );
 
         let epoch = agent.session_binding_epoch;
@@ -2057,7 +2039,6 @@
     fn viewer_adopting_live_delta_enters_turn_running_and_timer_is_monotonic() {
         // A viewer (attached_as_viewer) watching the driver's turn starts Idle.
         // Adopting the first live delta must flip it to TurnRunning and stamp `turn_started_at`
-        // That renders the turn-in-progress chrome (status line, elapsed timer, cancel/interject footer hints, all gated on TurnRunning)
         // A second chunk must NOT reset `turn_started_at`
         let mut app = make_app_with_agent("sess-view");
         {
@@ -2137,11 +2118,7 @@
 
     #[test]
     fn viewer_mid_turn_reattach_shows_running_chrome_after_replay_window() {
-        // Reproduces the MID-TURN reattach ordering that left a viewer stuck Idle (no "Responding…" or cancel chrome) during the driver's live turn:
-        //   (1) the viewer subscribes on its load request, so it receives a LIVE delta DURING its replay window (loading_replay = true)
-        //       It adopts the driver's promptId, but the TurnRunning transition is (correctly) suppressed while replaying
-        //   (2) SessionLoaded clears loading_replay, modeled here WITHOUT a runningPromptId conveyance (the worst case)
-        //   (3) subsequent LIVE deltas carry the SAME (already-adopted) promptId, so they MATCH current_prompt_id and skip the adopt block
+        // (1) the viewer subscribes on its load request, so it receives a LIVE delta DURING its replay window (loading_replay = true)
         // Before the fix, step (3) never flipped the viewer to TurnRunning: the TurnRunning entry lived inside the mismatch-only adopt block
         // The chrome never appeared. It must now.
         let mut app = make_app_with_agent("sess-view");
@@ -2203,10 +2180,7 @@
 
     #[test]
     fn viewer_does_not_enter_turn_running_for_server_initiated_turn() {
-        // A server-initiated auto-wake turn runs inside the actor and emits NO `x.ai/session/prompt_complete`
-        // Its prompt id is synthetic, e.g. `task-completed-…` from a background subagent or task completion.
         // If a viewer entered TurnRunning for it, nothing would ever finish the turn and the viewer would be stuck "Responding…" forever
-        // That was the bug where one dashboard showed "Worked for" while the other was stuck responding
         // The driver also declines to show chrome for these (its server-initiated adopt path never calls start_turn)
         // The viewer must mirror that: adopt the id (so content renders) but stay Idle (no running chrome)
         let mut app = make_app_with_agent("sess-view");
@@ -2559,7 +2533,6 @@
                 restore_summary: None,
                 restore_degree: None,
                 running_prompt_id: Some("p-run".to_string()),
-                scheduler_background_loops: None,
             }),
             &mut app,
         );

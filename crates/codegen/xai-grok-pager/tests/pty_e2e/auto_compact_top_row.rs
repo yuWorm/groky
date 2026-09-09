@@ -2,14 +2,9 @@
 #[allow(unused_imports)]
 use super::common::*;
 
-// ── Auto-compact: the top padding row disappears on tiny terminals ─────────
-//
-// The default layout reserves a blank top padding row (`outer_vpad`) above the status bar
-// At `AUTO_COMPACT_MAX_ROWS` (20) rows or shorter the compact render value is derived on and the padding goes away, so the status bar moves to row 0
-// Growing the terminal back restores the padding; the user's persisted compact setting never changes
-//
-// A YAML scenario cannot assert on-screen positions, so this test reads the first non-blank screen row directly
-// A blank row 0 means the padding is present; a populated row 0 (the status bar) means auto-compact engaged
+// Auto-compact: the top padding row disappears on tiny terminals. Growing the terminal back
+// restores the padding; the user's persisted compact setting never changes. A YAML scenario cannot
+// assert on-screen positions, so this test reads the first non-blank screen row directly.
 
 /// A height short enough to engage auto-compact.
 /// It is above `SHORT_TERMINAL_ROWS` (16) but at most `AUTO_COMPACT_MAX_ROWS` (20), so it pins the auto-compact derivation, not the layout trims.
@@ -24,10 +19,9 @@ fn first_content_row(harness: &PtyHarness, when: &str) -> u16 {
         .unwrap_or_else(|| panic!("{when}: screen is entirely blank\nscreen:\n{screen}")) as u16
 }
 
-/// **Auto-compact drops the top padding row on tiny terminals.**
-/// Tall: row 0 is the blank top padding row (first content below it).
-/// At `SHORT_ROWS`: auto-compact removes the padding and the status bar lands on row 0.
-/// Back tall: the padding (and the blank row 0) comes back.
+/// Auto-compact drops the top padding row on tiny terminals. Tall: row 0 is the blank top padding
+/// row (first content below it). At `SHORT_ROWS`: auto-compact removes the padding and the status
+/// bar lands on row 0. Back tall: the padding (and the blank row 0) comes back.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore]
 async fn auto_compact_top_row() {

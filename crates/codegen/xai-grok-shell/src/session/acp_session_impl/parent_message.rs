@@ -14,6 +14,7 @@ use xai_message_delivery_core::{
 #[derive(Clone)]
 pub(super) struct ParentAgentSource {
     sender_session_id: String,
+    principal: crate::session::message_delivery::ActiveMessagePrincipal,
 }
 
 #[derive(Clone)]
@@ -122,12 +123,27 @@ impl PendingParentAgentMessage {
             artifact_tracker: None,
             client_identifier: None,
             screen_mode: None,
-            verbatim: false,
+            verbatim: matches!(
+                source.principal,
+                crate::session::message_delivery::ActiveMessagePrincipal::Human
+            ),
             json_schema: None,
-            input_origin: InputOrigin::new(super::PromptOrigin::ParentAgentMessage {
-                message_id: self.message_id,
-                sender_session_id: source.sender_session_id,
-            }),
+            input_origin: InputOrigin::new(
+                if matches!(
+                    source.principal,
+                    crate::session::message_delivery::ActiveMessagePrincipal::Human
+                ) {
+                    super::PromptOrigin::ParentHumanMessage {
+                        message_id: self.message_id,
+                        sender_session_id: source.sender_session_id,
+                    }
+                } else {
+                    super::PromptOrigin::ParentAgentMessage {
+                        message_id: self.message_id,
+                        sender_session_id: source.sender_session_id,
+                    }
+                },
+            ),
             task_wake_fallback: None,
             tool_overrides_update: None,
             respond_to,
@@ -150,7 +166,9 @@ fn contains_queued_identity(state: &State, identity: &str) -> bool {
     state.pending_inputs.iter().any(|item| {
         matches!(
             item.input_origin.as_prompt_origin(),
-            PromptOrigin::ParentAgentMessage { message_id, .. } if message_id == identity
+            PromptOrigin::ParentAgentMessage { message_id, .. }
+            | PromptOrigin::ParentHumanMessage { message_id, .. }
+                if message_id == identity
         )
     })
 }
@@ -158,6 +176,7 @@ fn contains_queued_identity(state: &State, identity: &str) -> bool {
 impl SessionActor {
     pub(super) async fn admit_parent_agent_message(
         self: &Arc<Self>,
+        principal: crate::session::message_delivery::ActiveMessagePrincipal,
         delivery: ActiveAgentMessageDelivery,
         receipt_sink: mpsc::Sender<crate::agent::subagent::PromptTurnReceipt>,
         parent_telemetry_ctx: xai_grok_telemetry::TelemetryCtx,
@@ -168,6 +187,7 @@ impl SessionActor {
         let requested = delivery.operation();
         self.admit_parent_agent_message_inner(
             Some(delivery),
+            principal,
             message,
             requested,
             receipt_sink,
@@ -181,6 +201,7 @@ impl SessionActor {
     async fn admit_parent_agent_message_inner(
         self: &Arc<Self>,
         delivery: Option<ActiveAgentMessageDelivery>,
+        principal: crate::session::message_delivery::ActiveMessagePrincipal,
         message: ActiveAgentMessage,
         requested: ActiveAgentMessageOperation,
         receipt_sink: mpsc::Sender<crate::agent::subagent::PromptTurnReceipt>,
@@ -238,6 +259,7 @@ impl SessionActor {
         };
         let source = ParentAgentSource {
             sender_session_id: message.sender_session_id,
+            principal,
         };
         let commit = || match effective {
             ActiveAgentMessageOperation::Queue => {
@@ -326,10 +348,7 @@ impl SessionActor {
             );
             return false;
         }
-        // Persist and push only inside the commit under the state lock: teardown
-        // settlement transitions slots under the same lock, so a slot settled
-        // during the barrier yields no projecting messages here and its text never
-        // reaches updates.jsonl or chat state after the parent was told failure.
+        // Persist and push only inside the commit under the state lock: teardown settlement transitions slots under the same lock, so a slot settled during the barrier yields no projecting messages here and its text never.
         let mut state = self.state.lock().await;
         let committed = state
             .message_delivery
@@ -458,6 +477,7 @@ impl SessionActor {
     ) {
         self.admit_parent_agent_message_inner(
             None,
+            crate::session::message_delivery::ActiveMessagePrincipal::Agent,
             message,
             operation,
             receipt_sink,

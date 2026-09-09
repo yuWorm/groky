@@ -40,14 +40,13 @@ impl SessionActor {
                             from_mode: Some(from_mode.to_owned()),
                         },
                     );
-                    tracing::info_span!(
+                    xai_grok_telemetry::event_span!(
                         "session.permission_mode_changed",
                         from_mode = crate::session::telemetry::permission_mode_label(was),
                         to_mode = crate::session::telemetry::permission_mode_label(actual),
                         trigger = "slash_command",
                         enabled = actual,
-                    )
-                    .in_scope(|| {});
+                    );
                 }
                 let status = if actual { "enabled" } else { "disabled" };
                 tracing::info!(
@@ -402,7 +401,7 @@ impl SessionActor {
                         }
                     };
                     let path_str = resolved.to_string_lossy().to_string();
-                    match crate::config::add_plugin_path(&path_str) {
+                    match crate::config::run_add_plugin_path(path_str.clone()).await {
                         Ok(()) => {
                             xai_grok_telemetry::session_ctx::log_event(
                                 xai_grok_telemetry::events::PluginAdded {
@@ -450,7 +449,7 @@ impl SessionActor {
                         }
                     };
                     let path_str = resolved.to_string_lossy().to_string();
-                    match crate::config::remove_plugin_path(&path_str) {
+                    match crate::config::run_remove_plugin_path(path_str.clone()).await {
                         Ok(()) => {
                             xai_grok_telemetry::session_ctx::log_event(
                                 xai_grok_telemetry::events::PluginRemoved { success: true },
@@ -521,7 +520,24 @@ impl SessionActor {
                         ))
                         .await;
                     } else {
-                        match crate::plugin::install_plugin(&source, cwd) {
+                        // Registry flock (bounded 30s poll) + clone — never on the LocalSet (invariant: plugin/acquire.rs).
+                        let installed = match tokio::task::spawn_blocking({
+                            let source = source.clone();
+                            let cwd = cwd.to_path_buf();
+                            move || crate::plugin::install_plugin(&source, &cwd)
+                        })
+                        .await
+                        {
+                            Ok(result) => result,
+                            Err(e) => {
+                                self.send_host_turn_slash_command_output(&format!(
+                                    "Install task failed: {e}"
+                                ))
+                                .await;
+                                return ok_end_turn(0, None);
+                            }
+                        };
+                        match installed {
                             Ok(outcome) => {
                                 for w in &outcome.warnings {
                                     tracing::warn!("{w}");
@@ -539,14 +555,13 @@ impl SessionActor {
                                         error_category: None,
                                     },
                                 );
-                                tracing::info_span!(
+                                xai_grok_telemetry::event_span!(
                                     "plugin.installed",
                                     success = true,
-                                    install_kind = kind.as_str(),
+                                    install_kind = kind.as_ref(),
                                     plugin_count = outcome.plugin_names.len() as i64,
                                     plugin_name = %outcome.plugin_names.join(","),
-                                )
-                                .in_scope(|| {});
+                                );
                                 self.send_host_turn_slash_command_output(&format!(
                                     "Installed {} plugin(s) from {source}: {}\n\
                                      Run /plugins reload to activate.",
@@ -556,19 +571,18 @@ impl SessionActor {
                                 .await;
                             }
                             Err(e) => {
-                                let error_category = Self::classify_install_error(&e);
+                                let error_category = e.category();
                                 let kind = if crate::plugin::install_source_is_local(&source, cwd) {
                                     xai_grok_telemetry::events::InstallKind::Local
                                 } else {
                                     xai_grok_telemetry::events::InstallKind::Git
                                 };
-                                tracing::info_span!(
+                                xai_grok_telemetry::event_span!(
                                     "plugin.installed",
                                     success = false,
-                                    install_kind = kind.as_str(),
+                                    install_kind = kind.as_ref(),
                                     error_category = %error_category,
-                                )
-                                .in_scope(|| {});
+                                );
                                 xai_grok_telemetry::session_ctx::log_event(
                                     xai_grok_telemetry::events::PluginInstalled {
                                         install_kind: kind,
@@ -596,7 +610,24 @@ impl SessionActor {
                     .await;
                 } else {
                     use crate::plugin::UninstallError;
-                    match crate::plugin::uninstall_plugin(&name, confirm, false) {
+                    // Takes the registry flock + removes directories — never
+                    // on the LocalSet (invariant: plugin/acquire.rs).
+                    let uninstalled = match tokio::task::spawn_blocking({
+                        let name = name.clone();
+                        move || crate::plugin::uninstall_plugin(&name, confirm, false)
+                    })
+                    .await
+                    {
+                        Ok(result) => result,
+                        Err(e) => {
+                            self.send_host_turn_slash_command_output(&format!(
+                                "Uninstall task failed: {e}"
+                            ))
+                            .await;
+                            return ok_end_turn(0, None);
+                        }
+                    };
+                    match uninstalled {
                         Ok(outcome) => {
                             xai_grok_telemetry::session_ctx::log_event(
                                 xai_grok_telemetry::events::PluginUninstalled {
@@ -639,6 +670,16 @@ impl SessionActor {
                             ))
                             .await;
                         }
+                        Err(UninstallError::RegistryLock { detail }) => {
+                            self.send_host_turn_slash_command_output(&format!(
+                                "Another plugin operation is in progress: {detail}"
+                            ))
+                            .await;
+                        }
+                        Err(e @ UninstallError::RegistrySave { .. }) => {
+                            self.send_host_turn_slash_command_output(&e.to_string())
+                                .await;
+                        }
                     }
                 }
                 ok_end_turn(0, None)
@@ -646,7 +687,23 @@ impl SessionActor {
             BuiltinAction::PluginsUpdate { name } => {
                 use crate::plugin::RepoUpdateOutcome;
 
-                match crate::plugin::update_plugins(name.as_deref()) {
+                // Sync git fetches never run on the session actor's LocalSet
+                // (invariant: plugin/acquire.rs).
+                let update_result = match tokio::task::spawn_blocking(move || {
+                    crate::plugin::update_plugins(name.as_deref())
+                })
+                .await
+                {
+                    Ok(result) => result,
+                    Err(e) => {
+                        self.send_host_turn_slash_command_output(&format!(
+                            "Plugin update task failed: {e}"
+                        ))
+                        .await;
+                        return ok_end_turn(0, None);
+                    }
+                };
+                match update_result {
                     Ok(outcomes) if outcomes.is_empty() => {
                         self.send_host_turn_slash_command_output("No installed plugins to update.")
                             .await;

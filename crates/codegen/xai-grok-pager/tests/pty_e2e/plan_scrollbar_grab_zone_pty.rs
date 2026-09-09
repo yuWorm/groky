@@ -4,12 +4,9 @@ use super::common::*;
 const TAG: &str = "SBGRAB";
 const PLAN_LINES: usize = 120;
 
-/// PTY: presses, wheels, and drags on the modal border column next to the scrollbar track must scroll the plan.
-/// Users read the thumb and border as one two-column scrollbar and press the border half (reported on macOS Terminal.app and ghostty over SSH).
-/// That press used to fall into the click-outside-modal path.
-///
-/// Also pins the thumb contract `bg == fg`.
-/// Terminal.app leaves line-gap pixels unpainted under a foreground-only `█`, striping the thumb with dark bars.
+/// PTY: presses, wheels, and drags on the modal border column next to the scrollbar track must
+/// scroll the plan. Terminal.app leaves line-gap pixels unpainted under a foreground-only `█`,
+/// striping the thumb with dark bars.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "PTY e2e; run the owning pty_e2e_* Cargo test with --ignored (see Cargo.toml)"]
 async fn plan_scrollbar_grab_zone_pty() {

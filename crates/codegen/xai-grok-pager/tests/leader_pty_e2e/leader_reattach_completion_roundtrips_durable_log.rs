@@ -2,12 +2,9 @@
 #[allow(unused_imports)]
 use super::common::*;
 
-/// 24. **Leader reattach: completion round-trips through the durable log.**
-/// A turn driven on the leader-electing client A completes; the leader must persist a replayable `turn_completed` record.
-/// If the leader never writes that record, the test fails right there, before any replay.
-/// A FRESH client that re-attaches after A exits must then replay the completed transcript exactly once through the same leader.
-/// It must land clean: running, no panic, and not stranded on the active-turn "Waiting" spinner.
-/// A keep-alive viewer holds the leader up across A's exit (the leader stops with its last client).
+/// the leader must persist a replayable `turn_completed` record. If the leader never writes that record, the test
+/// fails right there, before any replay. It must land clean: running, no panic, and not stranded on the active-turn
+/// "Waiting" spinner.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "PTY e2e; run with cargo test -p xai-grok-pager --test leader_pty_e2e -- --ignored --test-threads=1"]
 async fn leader_reattach_completion_roundtrips_durable_log() {
@@ -55,11 +52,9 @@ async fn leader_reattach_completion_roundtrips_durable_log() {
     c.wait_for_text(&turn_sentinel(1), LEADER_TIMEOUT)
         .expect("C replayed the completed transcript");
 
-    // A finished turn clears the leader's prompt slot, so a fresh reattach lands Idle even without the guard in the replaying client
-    // The "Waiting" check therefore guards against a regression rather than proving the feature
-    // Matching the bare "Waiting" substring is stable: the full spinner label carries a trailing `…`
-    // Nothing else renders "Waiting" in a settled reattached session
-    // The wait is bounded rather than a fixed sleep, which could flake under load
+    // A finished turn clears the leader's prompt slot, so a fresh reattach lands Idle even without the guard in the
+    // replaying client. The "Waiting" check therefore guards against a regression rather than proving the feature. The
+    // wait is bounded rather than a fixed sleep, which could flake under load.
     wait_for_labels_absent(&mut c, &["Waiting"], Duration::from_secs(5));
 
     assert!(

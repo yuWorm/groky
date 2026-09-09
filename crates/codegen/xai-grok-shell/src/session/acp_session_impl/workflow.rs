@@ -148,13 +148,13 @@ impl SessionActor {
             many => {
                 let rows: Vec<String> = many
                     .iter()
-                    .map(|(_, status, name)| format!("  {name} ({})", status.as_str()))
+                    .map(|(_, status, name)| format!("  {name} ({})", status.as_ref()))
                     .collect();
                 return format!(
                     "Several runs could be '{}' — pick one by name:\n{}\n(/workflow {} <name>)",
-                    op.as_str(),
+                    op.as_ref(),
                     rows.join("\n"),
-                    op.as_str(),
+                    op.as_ref(),
                 );
             }
         };
@@ -163,7 +163,7 @@ impl SessionActor {
         match op {
             ManageOp::Pause => {
                 if status != WorkflowRunStatus::Active {
-                    return format!("Run '{name}' is not active (status: {}).", status.as_str());
+                    return format!("Run '{name}' is not active (status: {}).", status.as_ref());
                 }
                 self.workflow_manager.lock().await.pause(&full_id);
                 format!("Paused {name}. /workflow resume{id_suffix} to continue.")
@@ -172,7 +172,7 @@ impl SessionActor {
                 if status.is_terminal() {
                     return format!(
                         "Run '{name}' is already finished (status: {}).",
-                        status.as_str()
+                        status.as_ref()
                     );
                 }
                 self.workflow_manager.lock().await.cancel(&full_id);
@@ -185,7 +185,7 @@ impl SessionActor {
                 if !status.is_resumable() {
                     return format!(
                         "Run '{name}' cannot be resumed (status: {}). Start a new run instead.",
-                        status.as_str()
+                        status.as_ref()
                     );
                 }
                 if status == WorkflowRunStatus::BudgetLimited {
@@ -341,7 +341,7 @@ fn format_workflow_runs_overview(
             out,
             "- '{}' — {}",
             run.name,
-            run.status.as_str().replace('_', " ")
+            run.status.as_ref().replace('_', " ")
         );
         if let Some(line) = super::reminders::workflow_phase_line(run) {
             let _ = write!(out, "\n  {line}");
@@ -375,7 +375,8 @@ fn format_workflow_runs_overview(
     out
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, strum::AsRefStr, strum::IntoStaticStr)]
+#[strum(serialize_all = "snake_case")]
 enum ManageOp {
     Pause,
     Resume,
@@ -391,15 +392,6 @@ impl ManageOp {
             "stop" => Some(Self::Stop),
             "save" => Some(Self::Save),
             _ => None,
-        }
-    }
-
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::Pause => "pause",
-            Self::Resume => "resume",
-            Self::Stop => "stop",
-            Self::Save => "save",
         }
     }
 }
@@ -434,17 +426,17 @@ fn format_manage_needs_name(
         })
         .collect();
     if applicable.is_empty() {
-        return format!("No runs to {}.", op.as_str());
+        return format!("No runs to {}.", op.as_ref());
     }
     let rows: Vec<String> = applicable
         .iter()
-        .map(|run| format!("  {} ({})", run.name, run.status.as_str().replace('_', " ")))
+        .map(|run| format!("  {} ({})", run.name, run.status.as_ref().replace('_', " ")))
         .collect();
     format!(
         "Say which run to {}:\n{}\n(/workflow {} <name>)",
-        op.as_str(),
+        op.as_ref(),
         rows.join("\n"),
-        op.as_str(),
+        op.as_ref(),
     )
 }
 

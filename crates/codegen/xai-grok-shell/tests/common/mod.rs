@@ -313,12 +313,12 @@ pub async fn start_seeded_mock(
         .await
         .expect("start mock server");
     std::fs::write(home.join("agent_id"), "test-agent-id").expect("seed agent_id");
-    let scope = xai_grok_shell::auth::GrokComConfig::default().auth_scope();
+    let scope = xai_grok_login::GrokComConfig::default().auth_scope();
     let auth = serde_json::json!({
         scope: {
             "key": "test-session-token",
             "auth_mode": "oidc",
-            "oidc_issuer": xai_grok_shell::auth::xai_oauth2_issuer(),
+            "oidc_issuer": xai_grok_login::xai_oauth2_issuer(),
             "create_time": "2026-01-01T00:00:00Z",
             "expires_at": "2099-01-01T00:00:00Z",
             "user_id": "test-user",
@@ -377,6 +377,7 @@ pub fn test_sampler_config(
     SamplerConfig {
         api_key: Some("test-api-key".to_string()),
         base_url: base_url.to_string(),
+        mtls_cert_dir: None,
         model: "test-model".to_string(),
         max_completion_tokens: Some(1000),
         temperature: Some(0.7),
@@ -394,12 +395,14 @@ pub fn test_sampler_config(
         client_version: None,
         force_http1: false,
         max_retries: None,
+        rate_limit_retry_threshold: None,
         stream_tool_calls: false,
         idle_timeout_secs: None,
         client_identifier: None,
         reasoning_effort: None,
         deployment_id: None,
         user_id: None,
+        conversation_group_id: None,
         origin_client: None,
         attribution_callback: None,
         bearer_resolver: None,

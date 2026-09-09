@@ -21,7 +21,6 @@ pub(super) struct MemoryFlushSnapshot {
 }
 
 /// Build first-turn injection backend params without mutating the shared session params.
-///
 /// Clones the session-wide params so tool-search and compaction-recovery backends keep their original `search_source` and search thresholds.
 /// The returned effective min score keeps the historical first-turn default of `0.0` unless the injection config explicitly overrides it.
 pub(super) fn build_initial_injection_backend_params(
@@ -42,8 +41,6 @@ pub(super) fn build_initial_injection_backend_params(
 
 impl SessionActor {
     /// Re-register `memory_search` and `memory_get` tools on the tool bridge.
-    ///
-    /// Used when re-enabling memory mid-session (`/memory on`).
     /// The dynamic `register_mcp_tools` path puts the tools in the `LocalRegistry` for dispatch.
     /// The memory backend itself is already in `Resources`, inserted by the caller before this method.
     pub(super) async fn register_memory_tools(
@@ -60,7 +57,6 @@ impl SessionActor {
                 xai_grok_tools::implementations::memory::search_tool::MemorySearchImpl,
                 None,
             )
-            .await
             .map_err(|e| format!("failed to register memory_search: {e}"))?;
         bridge
             .register_mcp_tools(
@@ -68,7 +64,6 @@ impl SessionActor {
                 xai_grok_tools::implementations::memory::get_tool::MemoryGetImpl,
                 None,
             )
-            .await
             .map_err(|e| format!("failed to register memory_get: {e}"))?;
         Ok(())
     }
@@ -289,13 +284,9 @@ impl SessionActor {
         }
     }
 
-    /// Shared dream execution: acquire the lock, re-check the gate under it, build the message,
+    /// Shared dream execution: acquire the lock, re-check the gate under it, build the message,.
     /// call the model, execute, and record the result.
-    ///
-    /// `recheck_sid8` is `Some` for the gated (auto) path: the gate is re-evaluated while holding the
-    /// lock, so a waiter that passed the pre-check cannot run a second dream on a stale snapshot after
-    /// the winner commits. `None` is the `/dream` slash path, which bypasses gates and consolidates
-    /// the caller-supplied `sessions`.
+    /// `recheck_sid8` is `Some` for the gated (auto) path: the gate is re-evaluated while holding the.
     async fn run_dream_inner(
         &self,
         storage: &crate::session::memory::MemoryStorage,
@@ -503,9 +494,6 @@ impl SessionActor {
 
     /// Run a memory flush turn that summarizes recent conversation into a session log.
     /// Sets `is_flushing` to suppress auto-compact during the call.
-    ///
-    /// Flush failure is non-fatal; compaction proceeds regardless.
-    ///
     /// Returns `true` if a flush was executed, `false` if skipped because another flush is already in progress.
     pub(super) async fn run_memory_flush(
         &self,

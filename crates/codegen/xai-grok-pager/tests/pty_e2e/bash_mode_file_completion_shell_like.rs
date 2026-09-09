@@ -6,10 +6,9 @@ use super::common::*;
 /// That proves the inserted quoting parses as a valid command in the real shell.
 const INNER_SENTINEL: &str = "INNER-NOTE-SENTINEL-4173";
 
-/// There is NO env flag for this: Tab completion in bash mode is always on, and this test is the acceptance proof.
-/// `GROK_SUGGESTIONS=0` pins the as-you-type suggestion pipeline OFF.
-/// The PTY child inherits the parent env, so a dev shell exporting that flag must not turn suggestions on here.
-/// `HISTFILE` points at a nonexistent file so file completions are the ONLY dropdown source.
+/// There is NO env flag for this: Tab completion in bash mode is always on, and this test is the
+/// acceptance proof. The PTY child inherits the parent env, so a dev shell exporting that flag must
+/// not turn suggestions on here.
 fn suggestions_env(content: &ContentController) -> Vec<(String, String)> {
     vec![
         ("SHELL".into(), "/bin/bash".into()),
@@ -25,10 +24,8 @@ fn suggestions_env(content: &ContentController) -> Vec<(String, String)> {
     ]
 }
 
-/// Seed the session cwd the file provider lists:
-/// - `alpha_one.txt` and `alpha_two.txt`: the pair whose shared prefix Tab fills;
-/// - `notes.md` and `Notes Archive/inner_note.txt`: exact and case-insensitive candidates, a spaced directory to drill into, and the file to run;
-/// - `script.sh`: unrelated noise that must never match either prefix.
+/// Seed the session cwd the file provider lists. `script.sh`: unrelated noise that must never match
+/// either prefix.
 fn seed_cwd(cwd: &Path) {
     std::fs::create_dir_all(cwd.join(".git")).expect("create .git");
     std::fs::write(cwd.join("alpha_one.txt"), "").expect("seed alpha_one");
@@ -46,13 +43,7 @@ async fn settle() {
     tokio::time::sleep(Duration::from_millis(1500)).await;
 }
 
-/// **Bash-mode file completion behaves like a real shell, with NO env flag.**
-/// In a seeded sandbox cwd:
-/// - `!cat al` then Tab fills the shared prefix `alpha_` in place (no dropdown flash); the next Tab opens the dropdown listing both candidates;
-/// - `cat "no` then Tab opens the dropdown (exact `notes.md` above the case-insensitive `Notes Archive/`);
-///   Down+Tab accepts the directory, preserving the open quote for drill-down;
-/// - the next Tab finds exactly one candidate inside the directory and accepts it immediately, closing the quote;
-/// - Enter runs the completed command through the real shell; the sentinel content reaching the scrollback proves the quoting produced a valid command.
+/// Bash-mode file completion behaves like a real shell, with NO env flag.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore]
 #[cfg(unix)]

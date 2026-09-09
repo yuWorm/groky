@@ -24,10 +24,9 @@ pub(crate) const PROMPT: &str = "go";
 /// Response sentinel the mock server streams back.
 pub(crate) const MOCK_RESPONSE_SENTINEL: &str = "MOCKRESPONSE";
 
-/// Cold leader-client bring-up budget.
-/// History: 60s, then 120s, then 240s while these cases ran interleaved with the full `pty_e2e` suite.
-/// Each leader case spawns multiple full pager processes; suite-wide contention pushed cold bring-up past two minutes.
-/// Now that the leader cases run in their own serialized target, the budget can come back down after a week of green runs.
+/// Cold leader-client bring-up budget. History: 60s, then 120s, then 240s while these cases ran interleaved with
+/// the full `pty_e2e` suite. Each leader case spawns multiple full pager processes. suite-wide contention pushed
+/// cold bring-up past two minutes.
 pub(crate) const LEADER_TIMEOUT: Duration = Duration::from_secs(240);
 
 /// Streamed-turn deadline in leader mode (same contention rationale).

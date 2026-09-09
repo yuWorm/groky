@@ -4,10 +4,9 @@ use super::common::*;
 #[allow(unused_imports)]
 use super::scroll::*;
 
-/// PTY: drag-autoscroll must not bounce.
-/// Over tall content scrolled off the bottom, a drag held past the pane's bottom edge autoscrolls down.
-/// The topmost visible marker, sampled every ~100ms, must never regress to an earlier marker (no direction flip, no offset jitter).
-/// It must settle back at the bottom clamp.
+/// PTY: drag-autoscroll must not bounce. The topmost visible marker, sampled every ~100ms, must
+/// never regress to an earlier marker (no direction flip, no offset jitter). It must settle back at
+/// the bottom clamp.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "PTY e2e; run the owning pty_e2e_* Cargo test with --ignored (see Cargo.toml)"]
 async fn drag_autoscroll_no_bounce_pty() {

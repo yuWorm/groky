@@ -2,12 +2,7 @@
 #[allow(unused_imports)]
 use crate::common::*;
 
-/// Minimal mode's core contract: a finalized assistant block is printed once into the terminal's NATIVE scrollback (via `insert_before`).
-/// It is not redrawn in the pinned live region.
-/// We force the commit above the viewport by streaming a response taller than the screen.
-/// The head line scrolls off the top into history; we assert it is readable via the harness scrollback helpers.
-/// Short responses stay on the visible static band above the live region (the content-anchored live region keeps them on screen).
-/// Only a response genuinely taller than the screen proves content reaches *scrollback* specifically.
+/// Only a response genuinely taller than the screen proves content reaches scrollback specifically.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore]
 async fn minimal_commits_response_to_scrollback() {

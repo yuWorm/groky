@@ -2,10 +2,9 @@
 #[allow(unused_imports)]
 use super::common::*;
 
-/// Folder-trust Case 2, cwd IS `$HOME` (a git repo): no prompt, no re-prompt
-/// loop. `$HOME` (and its default `~/.grok`) can never be recorded by the trust
-/// store, so `decide` resolves Trusted rather than prompting on a key that could never persist.
-/// The pager boots straight to the normal welcome; the trust question would otherwise render (and re-appear every session).
+/// Folder-trust Case 2, cwd IS `$HOME` (a git repo): no prompt, no re-prompt loop. `$HOME` (and its
+/// default `~/.grok`) can never be recorded by the trust store, so `decide` resolves Trusted rather
+/// than prompting on a key that could never persist.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore]
 async fn folder_trust_cwd_is_home_git_repo_no_prompt() {

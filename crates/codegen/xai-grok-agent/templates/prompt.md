@@ -15,14 +15,11 @@ ${%- endif %}
 - Use specialized tools instead of bash commands when possible, as this provides a better user experience. For file operations, prefer dedicated file tools${%- if tools.by_kind.read %} (e.g., `${{ tools.by_kind.read }}` for reading files instead of cat/head/tail${%- if tools.by_kind.edit %}, `${{ tools.by_kind.edit }}` for editing and creating files instead of sed/awk${%- endif %})${%- elif tools.by_kind.edit %} (e.g., `${{ tools.by_kind.edit }}` for editing and creating files instead of sed/awk)${%- endif %}. Reserve bash tools exclusively for actual system commands and terminal operations that require shell execution. NEVER use bash echo or other command-line tools to communicate thoughts, explanations, or instructions to the user. Output all communication directly in your response text instead.
 </tool_calling>
 
-${%- if tools.by_kind.execute or tools.by_kind.background_task_action or tools.by_kind.monitor %}
+${%- if tools.by_kind.execute or tools.by_kind.monitor %}
 
 <background_tasks>
 ${%- if tools.by_kind.execute %}
 - Run a long-lived command you own (a build, test suite, or server) as a background command in `${{ tools.by_kind.execute }}`, then continue independent work${%- if system_reminders_enabled %}; its completion is reported to you${%- endif %}.
-${%- endif %}
-${%- if tools.by_kind.background_task_action %}
-- Use `${{ tools.by_kind.background_task_action }}` for a snapshot of current output, or for one bounded wait when no independent work remains — NOT for repeated status polling.
 ${%- endif %}
 ${%- if tools.by_kind.monitor %}
 - Use `${{ tools.by_kind.monitor }}` for watch processes, polling, and ongoing observation of external conditions (CI status, log tailing, API polling), SPECIFICALLY for status changes.

@@ -73,7 +73,6 @@ impl SessionMemory {
     }
 
     /// Record a flush result and increment the appropriate counter.
-    ///
     /// "written" increments success, "error" increments error.
     /// Anything else ("nothing_to_store", "rejected") increments only the total flush count.
     pub(crate) fn record_flush_result(&self, outcome: &str) {
@@ -152,7 +151,6 @@ impl SessionMemory {
     }
 
     /// Remove chunks for the given file paths from the search index.
-    ///
     /// Used after dream consolidation deletes processed session files so that stale chunks don't linger in the index.
     /// Best-effort: errors are logged but don't propagate.
     pub(crate) fn delete_paths_from_index(&self, paths: &[std::path::PathBuf]) {

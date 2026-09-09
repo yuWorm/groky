@@ -43,11 +43,6 @@ pub use storage::{MemoryScope, MemoryStorage};
 pub(crate) const MEMORY_LOG_TARGET: &str = "xai_memory";
 
 /// Embed all chunks that don't have embeddings yet.
-///
-/// Queries the index for unembedded chunks, batches them through the embedding provider, and upserts the results.
-/// Logs progress.
-///
-/// This is the async glue between the sync `MemoryIndex` and the async `EmbeddingProvider`.
 /// Call after reindex, flush writes, or session-end writes.
 pub async fn embed_missing_chunks(
     index: &MemoryIndex,

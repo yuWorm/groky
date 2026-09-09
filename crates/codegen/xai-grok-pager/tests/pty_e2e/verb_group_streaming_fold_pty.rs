@@ -4,11 +4,9 @@ use super::common::*;
 
 const DONE_SENTINEL: &str = "VERB_GROUP_STREAM_DONE";
 
-/// PTY: verb-group folding happens IN PLACE while the run is still streaming.
-/// Three scripted read turns are paced by `set_chunk_delay`, which scripted SSE honors.
-/// The header exists from the FIRST read on: a singleton run already folds, so nothing jumps in when the second read arrives.
-/// The "Read 2 files" label must be on screen while the third turn is still streaming, before the 3-file label or the final completion exists.
-/// The settled transcript then shows the final "Read 3 files".
+/// PTY: verb-group folding happens IN PLACE while the run is still streaming. The "Read 2 files"
+/// label must be on screen while the third turn is still streaming, before the 3-file label or the
+/// final completion exists.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "PTY e2e; run the owning pty_e2e_* Cargo test with --ignored (see Cargo.toml)"]
 async fn verb_group_streaming_fold_pty() {

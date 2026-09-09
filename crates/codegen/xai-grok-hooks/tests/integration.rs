@@ -611,8 +611,6 @@ async fn direct_exec_command_with_env_var_resolves_at_load_time() {
 
 /// Regression: an HTTP hook whose `url` references `${VAR}` from the per-hook `env` map must reach the HTTP runner with the post-expansion URL.
 /// We can't make a real network call from CI.
-/// Pointing at a blocked private IP proves the runner sees the expanded URL: the SSRF block message references the post-expansion address.
-/// Pairs with the unit test `run_http_hook_uses_post_expansion_url_for_ssrf`.
 #[tokio::test]
 async fn http_hook_url_env_expansion_end_to_end() {
     let dir = tempfile::tempdir().unwrap();

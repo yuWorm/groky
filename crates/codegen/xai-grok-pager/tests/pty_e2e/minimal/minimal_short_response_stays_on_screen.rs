@@ -2,15 +2,8 @@
 #[allow(unused_imports)]
 use crate::common::*;
 
-/// Content-anchored live region: a response that FITS on the screen stays on the visible static band with the prompt directly after it.
-/// It is NOT force-pushed to the bottom of the screen.
-/// The earlier bottom-pin behavior left a large blank gap *above* a short conversation.
-/// (The reported regression: "you see a big gap … input snapped to the bottom".)
-///
-/// Discriminating signals (all robust to how the emulator pads blank rows):
-/// - the response stays on the visible screen, and is NOT pushed into native scrollback (a response that fits never needs to scroll);
-/// - the always-focused prompt (the cursor) sits HIGH on the screen, directly after the short conversation, the rest of the window blank below it;
-///   bottom-pin would instead put the cursor near the last row.
+/// Content-anchored live region: a response that FITS on the screen stays on the visible static
+/// band with the prompt directly after it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore]
 async fn minimal_short_response_stays_on_screen() {
@@ -50,10 +43,7 @@ async fn minimal_short_response_stays_on_screen() {
         harness.scrollback_text()
     );
 
-    // 3) The prompt sits directly after the (short) conversation, HIGH on the screen, with the rest of the window left blank below it
-    //    It is NOT pinned to the bottom with a big gap above (the regression)
-    //    The cursor is always on the focused prompt, so its row is the robust signal
-    //    Bottom-pin puts it near `rows - 1`; content-anchored keeps it in the upper portion
+    // The cursor is always on the focused prompt, so its row is the robust signal.
     let (cursor_row, _cursor_col) = harness.cursor_position();
     assert!(
         cursor_row < rows - 12,

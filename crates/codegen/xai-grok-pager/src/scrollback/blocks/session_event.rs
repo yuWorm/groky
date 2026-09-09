@@ -8,6 +8,7 @@ use ratatui::style::Modifier;
 use ratatui::text::{Line, Span};
 
 use super::tool::HookRunEntry;
+use crate::app::actions::PermissionLabel;
 use crate::appearance::AppearanceConfig;
 use crate::render::wrapping::word_wrap_lines;
 use crate::scrollback::block::BlockContent;
@@ -16,12 +17,12 @@ use crate::scrollback::types::{
 };
 use crate::theme::Theme;
 use crate::util::format_duration;
+use crate::views::plan_approval_view::PlanReviewOutcome;
 
 /// Shared text-selection range id for recap body lines (header is excluded).
 const RECAP_BODY_RANGE: u16 = 0;
 
 /// A session-level event with structured data.
-///
 /// Each variant carries the information needed to render a concise, informational message in the scrollback.
 /// These are non-interactive: unselectable, unfoldable, no accent.
 #[derive(Debug, Clone)]
@@ -146,6 +147,12 @@ pub enum SessionEvent {
         summary: String,
         /// `true` for the automatic return-from-away recap, `false` for `/recap`.
         auto: bool,
+    },
+    /// Not persisted: a resumed session shows only the `Plan: Enter` tool row.
+    PlanModeEnteredByAgent { permission: PermissionLabel },
+    PlanReviewClosed {
+        outcome: PlanReviewOutcome,
+        permission: PermissionLabel,
     },
 }
 
@@ -276,11 +283,25 @@ impl SessionEvent {
                 // Always "Recap:" (manual `/recap` and auto return-from-away).
                 format!("Recap: {summary}")
             }
+            SessionEvent::PlanModeEnteredByAgent { permission } => {
+                format!(
+                    "Agent entered plan mode · active permission mode: {permission} · file edits outside session plan.md blocked until plan mode exits"
+                )
+            }
+            SessionEvent::PlanReviewClosed {
+                outcome,
+                permission,
+            } => {
+                let verdict = match outcome {
+                    PlanReviewOutcome::Approved => "approved",
+                    PlanReviewOutcome::Abandoned => "abandoned",
+                };
+                format!("Plan {verdict} · plan mode off · active permission mode: {permission}")
+            }
         }
     }
 
     /// The recap summary text when this is a [`SessionEvent::Recap`].
-    ///
     /// Recap events render in the tool-call visual style (bullet, bold "Recap" header, muted body); other variants stay plain informational lines.
     /// This accessor is the single branch point the `SessionEventBlock` trait methods use to opt the recap into that style.
     fn recap_summary(&self) -> Option<&str> {
@@ -304,12 +325,9 @@ impl SessionEvent {
         )
     }
 
-    /// Whether this event marks the end of an agent turn (the "Turn completed/cancelled/failed" markers).
-    /// These are the only events that can carry the turn's stop-family hook runs inline.
-    ///
-    /// [`SessionEvent::RequestFailed`] is intentionally excluded, same as [`SessionEvent::ReAuthRequired`].
-    /// RetryState may push it before PromptResponse; treating it as terminal would change stop-hook attribution.
-    /// Dedicated banners skip the TurnFailed marker and flush hooks standalone.
+    /// Whether this event marks the end of an agent turn (the "Turn completed/cancelled/failed" markers). These are the
+    /// only events that can carry the turn's stop-family hook runs inline. treating it as terminal would change
+    /// stop-hook attribution.
     pub fn is_turn_terminal(&self) -> bool {
         matches!(
             self,
@@ -386,11 +404,9 @@ impl SessionEventBlock {
             .is_some_and(|s| !s.trim().is_empty())
     }
 
-    /// Merge the stop-hook runs into the marker's output: a right-justified `stop  [hooks: N]` summary plus per-hook detail lines when expanded.
-    /// The summary lands on the marker line, or on its own right-justified line when the marker text leaves no room or wraps.
-    ///
-    /// The summary spans are decoration: [`Selectable::Spans`] keeps drag-copy on the marker text only.
-    /// A copied "Worked for 4.4s" never drags the padding and hook counts along.
+    /// Merge the stop-hook runs into the marker's output: a right-justified `stop [hooks: N]` summary plus per-hook
+    /// detail lines when expanded. The summary spans are decoration: [`Selectable::Spans`] keeps drag-copy on the
+    /// marker text only. A copied "Worked for 4.4s" never drags the padding and hook counts along.
     fn append_stop_hooks(&self, lines: &mut Vec<BlockLine>, ctx: &BlockContext) {
         use super::tool::hook::{render_hooks_for_mode, render_stop_hooks_summary};
 
@@ -444,17 +460,9 @@ impl SessionEventBlock {
         }
     }
 
-    /// Render a recap event in the tool-call visual style.
-    ///
-    /// Mirrors [`OtherToolCallBlock`](super::OtherToolCallBlock): a bold "Recap" header with the summary as muted body text below when expanded.
-    /// The dot bullet is prepended later by `RenderBlock::output` via [`has_bullet`](BlockContent::has_bullet).
-    /// When collapsed, the summary's first line trails the header as a preview.
-    ///
-    /// While the recap is still being generated the entry is `is_running`, so only the header is shown.
-    /// The animated accent sidebar (see [`accent`](BlockContent::accent)) signals progress.
-    ///
-    /// Text selection mirrors [`ThinkingBlock`](super::ThinkingBlock): the "Recap" label (and the blank separator under it) are decoration.
-    /// [`BlockLine::separator`] / [`Selectable::None`] keep drag-highlight and copy on the summary body, never the chrome label.
+    /// Render a recap event in the tool-call visual style. While the recap is still being generated the entry is
+    /// `is_running`, so only the header is shown. [`BlockLine::separator`] / [`Selectable::None`] keep drag-highlight
+    /// and copy on the summary body, never the chrome label.
     fn recap_output(&self, ctx: &BlockContext, summary: &str) -> BlockOutput {
         let theme = Theme::current();
         let muted_collapsed =
@@ -929,6 +937,35 @@ mod tests {
         let msg = event.message();
         assert!(msg.starts_with("Memory saved (flush)"));
         assert!(msg.contains("/memory to view"));
+    }
+
+    #[test]
+    fn plan_mode_row_messages() {
+        let cases = [
+            (
+                SessionEvent::PlanModeEnteredByAgent {
+                    permission: PermissionLabel::Ask,
+                },
+                "Agent entered plan mode · active permission mode: ask · file edits outside session plan.md blocked until plan mode exits",
+            ),
+            (
+                SessionEvent::PlanReviewClosed {
+                    outcome: PlanReviewOutcome::Approved,
+                    permission: PermissionLabel::Auto,
+                },
+                "Plan approved · plan mode off · active permission mode: auto",
+            ),
+            (
+                SessionEvent::PlanReviewClosed {
+                    outcome: PlanReviewOutcome::Abandoned,
+                    permission: PermissionLabel::AlwaysApprove,
+                },
+                "Plan abandoned · plan mode off · active permission mode: always-approve",
+            ),
+        ];
+        for (event, expected) in cases {
+            assert_eq!(event.message(), expected);
+        }
     }
 
     #[test]

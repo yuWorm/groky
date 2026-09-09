@@ -52,7 +52,6 @@ pub const EDIT_HL_MAX_LINES: usize = 50_000;
 pub type EditLineStyles = Vec<(Style, String)>;
 
 /// Progressive syntax-highlight state for an edit block.
-///
 /// `HunkOnly` / `Pending` use per-hunk syntect; `FileScoped` maps full-file FG styles onto Equal/Insert hunk text (Deletes keep per-hunk syntect).
 /// Clone via [`Arc`].
 #[derive(Debug, Clone, Default)]
@@ -145,10 +144,8 @@ pub fn render_diff_hunks_highlighted(
     render_diff_hunks_core(hunks, path, None, theme, width, config)
 }
 
-/// The single hunk walker behind both public fronts.
-/// Gutters, backgrounds, separators, and wrap behavior are therefore identical across highlight phases by construction.
-/// Every line renders its per-hunk syntect spans, keeping the highlighter state exactly as in the hunk-only phase.
-/// When `by_new_line` is given, matching Equal/Insert lines swap in the full-file styles.
+/// The single hunk walker behind both public fronts. Every line renders its per-hunk syntect spans, keeping the
+/// highlighter state exactly as in the hunk-only phase.
 fn render_diff_hunks_core(
     hunks: &[DiffHunk],
     path: &Path,
@@ -231,12 +228,8 @@ fn render_diff_hunks_core(
     lines
 }
 
-/// Unchanged new-file lines hidden between two hunks, when computable.
-///
-/// Uses the `ln` of the new-file lines (Equal/Insert) bordering the gap.
-/// `None` (a hunk with no new-file lines, or a non-positive gap) keeps the bare separator.
-/// Non-monotonic `ln` happens on coalesced multi-call blocks whose later edit landed above an earlier one.
-/// Each call's hunks are numbered against its own file snapshot, so a count would be wrong there.
+/// Unchanged new-file lines hidden between two hunks, when computable. Each call's hunks are numbered against its
+/// own file snapshot, so a count would be wrong there.
 fn hunk_gap_lines(prev: &DiffHunk, next: &DiffHunk) -> Option<usize> {
     let prev_last = prev.iter().rev().find(|l| l.tag != ChangeTag::Delete)?.ln;
     let next_first = next.iter().find(|l| l.tag != ChangeTag::Delete)?.ln;
@@ -276,13 +269,9 @@ pub fn file_text_within_hl_caps(file_text: &str) -> bool {
     lines <= EDIT_HL_MAX_LINES
 }
 
-/// Full-file HL once; keep new-side lines referenced by `hunks`.
-///
-/// Production upgrade path (edit-HL worker): one syntect walk over `file_text` up to the last hunk line.
-/// Only Equal/Insert lines present in `hunks` are retained. Expands tabs before HL (same as cold paint).
-/// Returns `None` if any needed disk line differs from hunk text (so upgrade never rewrites displayed content).
-/// That refusal is also expected for multi-edit blocks whose earlier hunks' `ln` were shifted by a later edit above them, not a missed upgrade.
-/// Caller enforces caps ([`file_text_within_hl_caps`]) and UTF-8.
+/// Full-file HL once; keep new-side lines referenced by `hunks`. Only Equal/Insert lines present in `hunks` are
+/// retained. Returns `None` if any needed disk line differs from hunk text (so upgrade never rewrites displayed
+/// content).
 pub fn compute_file_scoped_styles(
     path: &Path,
     file_text: &str,
@@ -337,10 +326,7 @@ pub fn compute_file_scoped_styles(
     Some(out)
 }
 
-/// Render hunks with precomputed full-file styles (FileScoped).
-/// A thin front over [`render_diff_hunks_core`].
-/// Gutters, BG, wrap, and the Delete lines' per-hunk syntect paint match [`render_diff_hunks_highlighted`] by construction.
-/// The map only overrides Equal/Insert foregrounds.
+/// Render hunks with precomputed full-file styles (FileScoped). The map only overrides Equal/Insert foregrounds.
 pub fn render_diff_hunks_with_styles(
     hunks: &[DiffHunk],
     path: &Path,
@@ -352,10 +338,9 @@ pub fn render_diff_hunks_with_styles(
     render_diff_hunks_core(hunks, path, Some(by_new_line), theme, width, config)
 }
 
-/// Full-file map spans for one line, when they may override the cold spans.
-/// Equal always; Insert only on banded themes (bandless paints changed lines with a solid line FG).
-/// Delete never: it keeps the per-hunk syntect paint the user already saw.
-/// `None` (missing line, text drift, or nothing visible) keeps the cold spans.
+/// Full-file map spans for one line, when they may override the cold spans. Equal always; Insert only on banded
+/// themes (bandless paints changed lines with a solid line FG). Delete never: it keeps the per-hunk syntect paint
+/// the user already saw.
 fn map_spans_for_line(
     line: &xai_grok_pager_diff::DiffLine,
     expanded: &str,
@@ -527,11 +512,8 @@ fn wrap_text(text: &str, max_width: usize) -> Vec<String> {
     lines
 }
 
-/// Project precomputed content-span styles onto [`wrap_text`] segments.
-///
-/// Walks the source spans with a monotonic cursor, splitting only at existing span edges or wrap edges.
-/// Each whole [`Style`] is copied onto owned substrings, so the concat of every returned row's text equals its wrap segment.
-/// Returns `None` when the span text and the segments do not partition the same bytes (the caller keeps its solid-FG wrap path).
+/// Walks the source spans with a monotonic cursor, splitting only at existing span edges or wrap edges. Each whole
+/// [`Style`] is copied onto owned substrings, so the concat of every returned row's text equals its wrap segment.
 fn project_styles_onto_wrap_segments(
     content_spans: &[Span<'static>],
     wrapped_segments: &[String],
@@ -946,11 +928,9 @@ impl EditToolCallBlock {
 
         let prefix = self.prefix;
 
-        // Build the suffix spans first so we can reserve space for them.
-        // The suffix (diffstat / "(N edits)") renders only on the collapsed one-liner
-        // Expanded and fullscreen surfaces show the hunks, so their headers stay bare
-        // Diffstat counts keep their diff colors even when the header is muted
-        // Untrusted summaries (multi-file, title-fallback path) never show counts that would only describe the first diff
+        // Build the suffix spans first so we can reserve space for them. The suffix (diffstat / "(N edits)") renders only
+        // on the collapsed one-liner. Untrusted summaries (multi-file, title-fallback path) never show counts that would
+        // only describe the first diff.
         let collapsed = matches!(
             surface,
             crate::render::tool_paths::ToolPathSurface::Collapsed
@@ -2711,7 +2691,6 @@ mod tests {
     }
 
     // ── Edit syntax-highlight harness (triple-quote spill) ──
-    //
     // Asserts use **raw syntect RGB** (not ratatui FG after quantize)
     // Under `NO_COLOR` quantize maps every RGB to Reset, which would make keyword vs string asserts tautological / false
 

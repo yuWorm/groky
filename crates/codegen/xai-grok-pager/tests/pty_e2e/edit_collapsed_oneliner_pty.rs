@@ -8,12 +8,8 @@ const DONE_SENTINEL: &str = "EDIT_COLLAPSED_DONE";
 /// It separates the collapsed one-liner from the expanded view.
 const BODY_MARKER: &str = "EXPANDED_BODY_MARKER";
 
-/// PTY: with the `collapsed_edit_blocks` flag enabled, an Edit tool call lands as a collapsed one-liner.
-/// The flag comes from the config tier here; production sets it via remote settings/managed.
-/// The one-liner is the header with the colored `+N/-M` diffstat and no diff body; a double-click on the header expands it to the full diff.
-/// (The keyboard fold keys operate on the scrollback selection, which this test does not exercise.)
-/// With the flag off (the legacy default), `edit_hl_inplace_refresh_pty` covers the end-to-end path; it relies on diffs that arrive expanded.
-/// Doubles as the demo-cast generator via `GROK_PTY_CAST_DIR`.
+/// PTY: with the `collapsed_edit_blocks` flag enabled, an Edit tool call lands as a collapsed
+/// one-liner.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "PTY e2e; run the owning pty_e2e_* Cargo test with --ignored (see Cargo.toml)"]
 async fn edit_collapsed_oneliner_pty() {

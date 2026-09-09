@@ -10,10 +10,10 @@ use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use indexmap::IndexMap;
 
 use crate::agent::config::{self, ModelEntry, resolve_credentials, sampling_config_for_model};
-use crate::auth::{AuthManager, GrokAuth, GrokComConfig};
 use crate::remote::{FetchModelsResult, ModelSource, active_model_source};
 use crate::sampling::SamplerConfig as SamplingConfig;
 use globset::{Glob, GlobSet, GlobSetBuilder};
+use xai_grok_login::{AuthManager, GrokAuth, GrokComConfig};
 use xai_grok_sampling_types::{ReasoningEffort, ReasoningEffortOption};
 
 // ── Auth method for model fetching ──────────────────────────────────────────
@@ -205,7 +205,11 @@ impl Drop for FetchAttemptGuard {
 impl Default for ModelsManager {
     fn default() -> Self {
         let grok_home = crate::util::grok_home::grok_home();
-        let auth_manager = Arc::new(AuthManager::new(&grok_home, GrokComConfig::default()));
+        let auth_manager = Arc::new(AuthManager::new_with_proxy_base_url(
+            &grok_home,
+            GrokComConfig::default(),
+            crate::agent::config::EndpointsConfig::from_effective_config().proxy_url(),
+        ));
         Self::new(
             None,
             IndexMap::new(),
@@ -336,10 +340,7 @@ impl ModelsManager {
         let has_prefetched = prefetched_models.is_some();
         let catalog = resolve_model_catalog(cfg, prefetched_models.clone());
 
-        // Only against a real catalog. A fleet pin on built-ins-only (custom
-        // endpoint, cold cache) would reject a valid policy before the first
-        // fetch. The catalog still marks unselectable entries; this check
-        // runs after prefetch / cache.
+        // Only against a real catalog. A fleet pin on built-ins-only (custom endpoint, cold cache) would reject a valid policy before the first fetch. The catalog still marks unselectable entries; this check runs after prefetch / cache.
         if has_prefetched {
             validate_selectable(cfg, &catalog)?;
         }

@@ -2,18 +2,9 @@
 #[allow(unused_imports)]
 use super::common::*;
 
-/// 25. **Leader reattach: cancellation round-trips through the durable log.**
-/// A turn driven on leader client A is Ctrl+C-cancelled mid-stream.
-/// The leader must persist a `turn_completed` terminal with `stop_reason == cancelled`.
-/// A fresh client must replay the cancelled transcript through the same leader and land clean.
-/// Clean means running, no panic, and no stranded "Waiting" or "Cancelling" spinner.
-/// It must still hold that transcript after A, the original driver, exits.
-/// A keep-alive viewer holds the leader up across A's exit, because the leader stops with its last client.
-///
-/// C attaches *before* A is dropped, because `PtyHarness` Drop SIGKILLs the child.
-/// Under full-suite contention, a cold `--resume` handshake racing that teardown flakes with an empty screen for the whole `LEADER_TIMEOUT`.
-/// That flake showed up as the "C replayed the cancelled transcript" timeout.
-/// Replaying while A is still up, then proving C survives A's exit, covers the durable-log replay and the multi-client survival without that race.
+/// The leader must persist a `turn_completed` terminal with `stop_reason == cancelled`. A fresh client must replay
+/// the cancelled transcript through the same leader and land clean. It must still hold that transcript after A, the
+/// original driver, exits. C attaches *before* A is dropped, because `PtyHarness` Drop SIGKILLs the child.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "PTY e2e; run with cargo test -p xai-grok-pager --test leader_pty_e2e -- --ignored --test-threads=1"]
 async fn leader_reattach_cancellation_roundtrips_durable_log() {

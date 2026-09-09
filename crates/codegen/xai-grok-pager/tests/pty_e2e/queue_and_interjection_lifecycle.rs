@@ -2,10 +2,8 @@
 #[allow(unused_imports)]
 use super::common::*;
 
-/// 21. **Queue and send-now lifecycle.**
-/// One realistic journey: turn 1 streams; queue P1 and P2; remove P1; send I1 now via the chord; P2 promotes as the following turn.
-/// The chord is cancel-and-send: turn 1 is cancelled silently and I1 runs as its own turn.
-/// The final request's user-message sequence must be exactly [prompt, I1 (with the interjection preamble), P2] with P1 absent everywhere.
+/// Queue and send-now lifecycle. The final request's user-message sequence must be exactly [prompt,
+/// I1 (with the interjection preamble), P2] with P1 absent everywhere.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore]
 async fn queue_and_interjection_lifecycle() {
@@ -77,11 +75,8 @@ async fn queue_and_interjection_lifecycle() {
         .expect("type send-now message");
     harness.inject_keys(CTRL_ENTER).expect("send-now chord");
     turn_one.release();
-    // Cancel-and-send: turn 1 is cancelled silently; I1 commits as a standard "❯ " prompt block and runs as its own turn
-    // I1 (send-now) then P2 drain back-to-back
-    // The "❯ lifecycle i-one" promotion and the intermediate STEPTWO reply scroll above the viewport at P2's start-adoption
-    // That happens before a 100ms poll can observe them
-    // So gate on the FINAL reply (stable at the viewport head) and prove the [prompt, I1, P2] order and send-now silence via the recorded wire below
+    // Cancel-and-send: turn 1 is cancelled silently; I1 commits as a standard "❯ " prompt block and
+    // runs as its own turn.
     harness
         .wait_for_text("STEPTHREE", Duration::from_secs(90))
         .expect("steps 5-7: I1 then P2 drained through to the final reply");

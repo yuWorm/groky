@@ -2,11 +2,9 @@
 #[allow(unused_imports)]
 use super::common::*;
 
-/// The logo uses Unicode Braille Pattern characters (U+2800-U+28FF).
-/// A writer-thread regression (`WriteFile` instead of `WriteConsoleW` on Windows, or a missing `SetConsoleOutputCP(65001)`) garbles the output.
-/// Such a writer misinterprets the multi-byte UTF-8 characters as individual legacy code-page bytes.
-///
-/// This test asserts that specific Braille characters from the logo appear intact in the PTY screen buffer.
+/// The logo uses Unicode Braille Pattern characters (U+2800-U+28FF). A writer-thread regression
+/// (`WriteFile` instead of `WriteConsoleW` on Windows, or a missing `SetConsoleOutputCP(65001)`)
+/// garbles the output.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore]
 async fn welcome_screen_braille_logo_renders_correctly() {
@@ -24,11 +22,8 @@ async fn welcome_screen_braille_logo_renders_correctly() {
 
     let screen = harness.screen_contents();
 
-    // The logo contains distinctive Braille characters
-    // A writer thread sending raw UTF-8 through a code-page-dependent API mangles each 3-byte character into 3 single-byte ones (e.g. Cyrillic).
-    // Check for a few that only appear in the logo, not in any ASCII menu label
-    //
-    // From logo07.txt line 2: ⣠⣾⠿⠛
+    // The logo contains distinctive Braille characters. Check for a few that only appear in the logo,
+    // not in any ASCII menu label.
     assert!(
         screen.contains('⣾'),
         "Braille character ⣾ (U+28FE) not found in screen — \

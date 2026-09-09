@@ -267,9 +267,10 @@ async fn idle_steer_queues_one_protected_row() {
     let local = tokio::task::LocalSet::new();
     await_with_timeout(local.run_until(async {
         let (actor, _) = await_with_timeout(super::super::support::build_actor()).await;
-        actor.deferred_prefix.arm(tokio::task::spawn_local(async {
-            "PARENT_PREFIX_READY".to_owned()
-        }));
+        actor.deferred_prefix.arm(
+            tokio::task::spawn_local(async { "PARENT_PREFIX_READY".to_owned() }),
+            false,
+        );
         actor.state.lock().await.arm_hook_block_hold();
         let (completion_tx, _completion_rx) = mpsc::unbounded_channel();
         let (receipt_sink, _receipt_rx) = mpsc::channel(1);
@@ -750,6 +751,10 @@ async fn delivered_message_is_durable_in_updates_and_chat_history_before_shutdow
             acp::ModelId::new("test-model"),
             sampling_client,
             "test-model".to_owned(),
+            crate::session::persistence::ExplicitSessionOpen::New {
+                identity: None,
+                next_trace_turn: None,
+            },
         )
         .await
         .expect("persistence actor");
@@ -825,9 +830,10 @@ async fn committed_delivery_queues_protected_fifo_row_with_typed_receipt_identit
     let local = tokio::task::LocalSet::new();
     await_with_timeout(local.run_until(async {
         let (actor, _) = await_with_timeout(super::super::support::build_actor()).await;
-        actor.deferred_prefix.arm(tokio::task::spawn_local(async {
-            "PARENT_PREFIX_READY".to_string()
-        }));
+        actor.deferred_prefix.arm(
+            tokio::task::spawn_local(async { "PARENT_PREFIX_READY".to_string() }),
+            false,
+        );
         let (completion_tx, _completion_rx) = mpsc::unbounded_channel();
         {
             let mut state = await_with_timeout(actor.state.lock()).await;
@@ -869,6 +875,7 @@ async fn committed_delivery_queues_protected_fifo_row_with_typed_receipt_identit
             PromptOrigin::ParentAgentMessage {
                 message_id,
                 sender_session_id,
+                ..
             } if message_id == "queued" && sender_session_id == "root-session"
         ));
         drop(state);

@@ -2,14 +2,9 @@
 #[allow(unused_imports)]
 use super::common::*;
 
-/// Windows twin of `paste_ctrl_v_text_echoes_fast_macos`, exercised by the temporary PR-branch Windows smoke workflow.
-/// Ctrl+V (raw 0x16) with plain TEXT on the REAL clipboard must echo in the prompt.
-/// The bound is generous (10s): what matters on this platform is that the paste echoes at all and nothing panics, not the latency figure.
-///
-/// Skips (loudly) when the session has no usable clipboard: a CI runner without an interactive desktop can't exercise the real paste path.
-///
-/// WARNING: this test OVERWRITES the machine-global clipboard.
-/// The prior TEXT contents are restored best-effort on exit (drop guard, panic included); a prior IMAGE clipboard cannot be restored.
+/// Ctrl+V (raw 0x16) with plain TEXT on the REAL clipboard must echo in the prompt. The bound is
+/// generous (10s): what matters on this platform is that the paste echoes at all and nothing
+/// panics, not the latency figure.
 #[cfg(target_os = "windows")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore]

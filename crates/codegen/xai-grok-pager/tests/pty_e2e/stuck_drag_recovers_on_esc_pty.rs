@@ -26,12 +26,9 @@ fn differing_cells(base: &[(Option<String>, bool)], other: &[(Option<String>, bo
         .count()
 }
 
-/// PTY: a scrollback drag whose `Up(Left)` is lost latches the selection; Esc must clear it so later motion can't keep extending it.
-/// Drives the real binary: SGR press and drag bytes with no release `m`, then Esc and more motion.
-/// Without the recovery guard the post-Esc motion re-extends the latched selection and the final assert fails.
-///
-/// Lost mouseups happen in the wild: xterm.js, VS Code's terminal, only delivers the mouseup when it lands on the terminal element.
-/// See xtermjs/xterm.js#4781 and the VS Code tracking issue microsoft/vscode#192518.
+/// PTY: a scrollback drag whose `Up(Left)` is lost latches the selection; Esc must clear it so
+/// later motion can't keep extending it. Without the recovery guard the post-Esc motion re-extends
+/// the latched selection and the final assert fails.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "PTY e2e; run the owning pty_e2e_* Cargo test with --ignored (see Cargo.toml)"]
 async fn stuck_drag_recovers_on_esc_pty() {

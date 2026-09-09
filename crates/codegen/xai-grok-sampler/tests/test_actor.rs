@@ -71,6 +71,7 @@ fn test_config(base_url: String, model: &str) -> SamplerConfig {
     SamplerConfig {
         api_key: Some("test-key".into()),
         base_url,
+        mtls_cert_dir: None,
         model: model.into(),
         max_completion_tokens: Some(1024),
         temperature: None,
@@ -85,6 +86,7 @@ fn test_config(base_url: String, model: &str) -> SamplerConfig {
         force_http1: false,
         // Keep retries minimal so tests don't take forever.
         max_retries: Some(2),
+        rate_limit_retry_threshold: None,
         stream_tool_calls: false,
         idle_timeout_secs: Some(30),
         reasoning_effort: None,
@@ -92,6 +94,7 @@ fn test_config(base_url: String, model: &str) -> SamplerConfig {
         client_identifier: None,
         deployment_id: None,
         user_id: None,
+        conversation_group_id: None,
         client_version: None,
         attribution_callback: None,
         bearer_resolver: None,
@@ -874,11 +877,11 @@ async fn connect_failure_does_not_emit_images_stripped() {
 }
 
 // ---------------------------------------------------------------------------
-// Rate limit exhausts threshold
+// Rate-limit thresholds
 // ---------------------------------------------------------------------------
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn rate_limit_exhausts_at_threshold_and_yields_failed() {
+async fn rate_limit_exhausts_at_default_threshold_and_yields_failed() {
     let counter = Arc::new(AtomicU32::new(0));
     let counter_handler = Arc::clone(&counter);
     let app = Router::new().route(
@@ -906,6 +909,53 @@ async fn rate_limit_exhausts_at_threshold_and_yields_failed() {
     let cfg = test_config(server.base_url(), "test-model");
     let handle = SamplerActor::spawn(cfg, RetryPolicy::default(), event_tx);
 
+    let rid = RequestId::from("req-429-default");
+    handle.submit(rid, user_request("hi"));
+
+    let events = drain_until_terminal(&mut event_rx, Duration::from_secs(60)).await;
+    server.shutdown();
+
+    match events.last().unwrap() {
+        SamplingEvent::Failed { error, .. } => {
+            assert_eq!(error.kind, SamplingErrorKind::RateLimited);
+            assert_eq!(error.status_code, Some(429));
+        }
+        other => panic!("expected Failed(RateLimited), got {other:?}"),
+    }
+
+    // The request task awaits and classifies each wire attempt before starting the next, so scheduling cannot add another request.
+    assert_eq!(
+        counter.load(Ordering::SeqCst),
+        2,
+        "the default threshold permits one retry after the initial request"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn configured_rate_limit_threshold_controls_total_wire_attempts() {
+    let counter = Arc::new(AtomicU32::new(0));
+    let counter_handler = Arc::clone(&counter);
+    let app = Router::new().route(
+        "/v1/chat/completions",
+        post(move || {
+            let counter = Arc::clone(&counter_handler);
+            async move {
+                counter.fetch_add(1, Ordering::SeqCst);
+                (
+                    StatusCode::TOO_MANY_REQUESTS,
+                    [("retry-after", "0")],
+                    json!({ "error": { "message": "slow down" } }).to_string(),
+                )
+            }
+        }),
+    );
+    let server = MockServer::spawn(app).await;
+    let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+    let mut cfg = test_config(server.base_url(), "test-model");
+    cfg.max_retries = Some(6);
+    cfg.rate_limit_retry_threshold = Some(4);
+    let handle = SamplerActor::spawn(cfg, RetryPolicy::default(), event_tx);
+
     let rid = RequestId::from("req-429");
     handle.submit(rid.clone(), user_request("hi"));
 
@@ -921,9 +971,10 @@ async fn rate_limit_exhausts_at_threshold_and_yields_failed() {
     }
 
     let hits = counter.load(Ordering::SeqCst);
-    // RATE_LIMIT_RETRY_THRESHOLD is 2, so the actor stops after two attempts: the first attempt and one retry that also 429s
-    // Allow a small slack in case scheduling fires a third attempt before the threshold check
-    assert!((1..=3).contains(&hits), "expected 1-3 hits, got {hits}");
+    assert_eq!(
+        hits, 4,
+        "the configured threshold is a total-attempt ceiling and must override the policy default of 2"
+    );
 }
 
 // ---------------------------------------------------------------------------

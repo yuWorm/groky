@@ -2,10 +2,8 @@
 #[allow(unused_imports)]
 use crate::common::*;
 
-/// Resize hazard: minimal mode never re-emits committed history (`resize_purge_rerender` and `emit_to_scrollback` are forbidden).
-/// The terminal itself reflows committed scrollback on resize.
-/// This test commits a tall response into native scrollback, then shrinks the terminal in both rows and cols.
-/// It asserts the committed content survives (not wiped, not double-printed), the pager does not panic or exit, and the prompt still works.
+/// Resize hazard: minimal mode never re-emits committed history (`resize_purge_rerender` and
+/// `emit_to_scrollback` are forbidden).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore]
 async fn minimal_resize_preserves_committed_scrollback() {

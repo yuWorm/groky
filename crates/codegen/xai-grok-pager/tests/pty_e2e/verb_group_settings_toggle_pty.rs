@@ -69,18 +69,15 @@ fn toggle_group_tool_calls(harness: &mut PtyHarness, want_on: bool) {
     }
 }
 
-/// PTY: the settings-modal "Group tool calls" toggle re-lays-out the LIVE transcript.
-/// Turning it OFF unfolds an existing "Read 3 files" group into individual Read rows immediately, no `/new` needed.
-/// The toggle path must invalidate cached entry heights.
-/// Turning it back ON refolds them.
+/// PTY: the settings-modal "Group tool calls" toggle re-lays-out the LIVE transcript. Turning it
+/// OFF unfolds an existing "Read 3 files" group into individual Read rows immediately, no `/new`
+/// needed. The toggle path must invalidate cached entry heights. Turning it back ON refolds them.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "PTY e2e; run the owning pty_e2e_* Cargo test with --ignored (see Cargo.toml)"]
 async fn verb_group_settings_toggle_pty() {
     let content = ContentController::start().await.expect("start content");
-    // Pin ON via the CONFIG tier, not the env var
-    // Env outranks config in the resolve chain
-    // An env pin could not be overridden by the modal's config write if anything re-resolves the full chain mid-test (e.g. a settings update).
-    // The config seed keeps the modal toggle in control of the effective value on every path
+    // Pin ON via the CONFIG tier, not the env var. An env pin could not be overridden by the modal's
+    // config write if anything re-resolves the full chain mid-test (e.g. a settings update).
     seed_ui_config(&content, "group_tool_verbs = true");
 
     // Seed real files under the isolated HOME so the reads succeed.

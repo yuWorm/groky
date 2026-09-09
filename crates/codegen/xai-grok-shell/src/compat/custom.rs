@@ -602,6 +602,7 @@ pub fn merge_one(resolved: &mut IndexMap<String, ModelEntry>, provider: &CustomP
             key,
             ModelEntry {
                 info,
+                mtls_cert_dir: None,
                 api_key: None,
                 env_key: None,
                 auth_provider: None,

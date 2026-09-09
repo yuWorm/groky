@@ -531,11 +531,8 @@ impl TerminalBackend for AcpTerminalAdapter {
         match start {
             WaitStart::Immediate => return self.get_task(task_id).await,
             WaitStart::ProbeThenMaybeBlock => {
-                // Not tracked as running: one output probe
-                // A dead or unknown terminal must not burn the wait budget on WaitForTerminalExit
-                // Match kill's untracked probe: `get_task` maps every TerminalOutput error to None
-                // So a transport/channel blip on a still-live resumed terminal must not look like not-found
-                // Only a client that answered and disowned the id is a definitive miss
+                // Not tracked as running: one output probe A dead or unknown terminal must not burn the wait budget on WaitForTerminalExit Match kill's untracked probe: `get_task` maps every TerminalOutput error to None
+                // So a transport/channel blip on a still-live resumed terminal must not look like not-found Only a client that answered and disowned the id is a definitive miss
                 let probe = self
                     .gateway
                     .send(acp::TerminalOutputRequest::new(

@@ -36,14 +36,9 @@ pub(crate) enum RunStep {
     Break,
 }
 
-/// Classify one entry for run walking, the single source of truth shared by the layout fold scan, `verb_group_range_of`, and the label walk.
-///
-/// Members are collapsed verb-groupable tool calls and subagent lifecycle rows.
-/// Pending-user-input rows stay standalone so their prompt remains visible.
-/// Hook-decorated members still join: the group header summarizes their runs while expanded members keep compact per-member suffixes.
-/// A manually-opened member is [`RunStep::Transparent`] and keeps its own rows without splitting the run.
-/// Thinking never breaks a run: a finished collapsed thought without prompt or hook chrome folds in as [`RunStep::ThoughtMember`].
-/// Hidden, still-streaming, opened, or chrome-carrying thinking is transparent.
+/// A manually-opened member is [`RunStep::Transparent`] and keeps its own rows without splitting the run. Thinking
+/// never breaks a run: a finished collapsed thought without prompt or hook chrome folds in as
+/// [`RunStep::ThoughtMember`].
 pub(crate) fn run_step(entry: &ScrollbackEntry, show_thinking: bool) -> RunStep {
     let is_claimable_thinking = entry.display_mode == DisplayMode::Collapsed
         && !entry.is_pending_user_input
@@ -99,23 +94,17 @@ pub(crate) struct RunScan {
 }
 
 impl RunScan {
-    /// Whether the run folds into a verb-group header row.
-    /// One member is enough: the compact label beats the member's own row.
-    /// A header that appears with the first streaming call also avoids a jump when the second call folds in.
-    /// Thought members never count, so a pure-thought run (whose label would be empty) never folds.
-    /// The layout fold and `verb_group_range_of` share this predicate so the two can't drift.
+    /// Whether the run folds into a verb-group header row. Thought members never count, so a pure-thought run (whose
+    /// label would be empty) never folds. The layout fold and `verb_group_range_of` share this predicate so the two
+    /// can't drift.
     pub(crate) fn folds(&self) -> bool {
         self.members >= 1
     }
 }
 
-/// Walk a run forward from `start` until a breaking entry or the end of the entries, and report the run's shape.
-/// Returns `None` when the entry at `start` is missing or cannot anchor a run.
-/// Members and thought members can anchor; transparent and breaking entries cannot.
-/// Anchor eligibility lives in this function's matches, not in caller pre-checks, so a returned scan always has `end > start` and `stop > start`.
-/// `members` may be 0 for a thought-anchored walk with no members.
-/// The layout fold scan and `verb_group_range_of` share this walk so both agree on the exact run shape.
-/// The label walk needs per-member block data and stays its own loop, kept in sync by its exhaustive `RunStep` match.
+/// Returns `None` when the entry at `start` is missing or cannot anchor a run. Members and thought members can
+/// anchor; transparent and breaking entries cannot. Anchor eligibility lives in this function's matches, not in
+/// caller pre-checks, so a returned scan always has `end > start` and `stop > start`.
 pub(crate) fn scan_run_forward<'e>(
     entry_at: impl Fn(usize) -> Option<&'e ScrollbackEntry>,
     start: usize,
@@ -160,10 +149,8 @@ pub struct VerbGroupHeaderLabel {
     pub failed: bool,
 }
 
-/// The single channel that carries a group-header row's aggregated label, mirroring the fold families of `groups::GroupKind`.
-/// A header row belongs to exactly one fold, so a row carries at most one label; the exclusivity is structural.
-/// The variant picks the header chrome: verb-run headers get run-state accents, truncation headers keep the dimmed fold chrome.
-/// The label payload is shared.
+/// The single channel that carries a group-header row's aggregated label, mirroring the fold families of
+/// `groups::GroupKind`. A header row belongs to exactly one fold, so a row carries at most one label.
 pub enum GroupHeaderLabel {
     /// Verb-group run header ("Read 3 files, Searched 2 patterns").
     VerbRun(VerbGroupHeaderLabel),
@@ -191,13 +178,9 @@ struct Bucket<'e> {
     sources: std::collections::HashSet<&'e str>,
 }
 
-/// Walk the verb-group run starting at `header_idx` and build the aggregated label.
-/// The walk follows the same [`run_step`] rules as the layout fold: thinking and hidden entries are skipped, anything else ends the run.
-/// The label counts members only: folded thoughts contribute nothing here and appear as their own member rows only when the group is expanded.
-///
-/// `end` is the run's exclusive upper bound in `entries` indices.
-/// Callers with the fold's span (see `state::groups`) pass its exact end so the label counts precisely the entries the fold claimed.
-/// Callers without one pass `entries.len()` and rely on the [`RunStep::Break`] arm, which stops in bounds either way.
+/// The label counts members only: folded thoughts contribute nothing here and appear as their own member rows only
+/// when the group is expanded. Callers with the fold's span pass its exact end so the label counts precisely the
+/// entries the fold claimed.
 pub fn verb_group_header_label(
     entries: &[&ScrollbackEntry],
     header_idx: usize,
@@ -220,16 +203,9 @@ pub fn verb_group_header_label(
     acc.into_label(theme)
 }
 
-/// Aggregated label for a truncation ("N more") header: "Ran 6 commands, Read 2 files".
-/// It describes the hidden rows through the same bucket vocabulary as verb-group headers.
-///
-/// Walks the span's participants from `range.start`, skipping hidden thinking exactly like the fold's projection.
-/// With a `limit` the walk stops after that many participants: the collapsed header describes only its hidden prefix.
-/// The expanded collapse header passes `None` and describes the whole run.
 /// Thoughts occupy participant slots but are never bucketed: like verb-group labels, group labels stay tools-only.
-/// Returns `None` when nothing was bucketed or when a walked participant has no bucket; the caller then keeps the plain "N more" count.
-/// A pure-thought prefix buckets nothing; System and SessionEvent rows and lifecycle chrome have no bucket.
-/// Thoughts are the only participants a label may silently omit; anything else would make the label under-describe what the fold conceals.
+/// Thoughts are the only participants a label may silently omit. anything else would make the label under-describe
+/// what the fold conceals.
 pub fn truncation_header_label(
     entries: &[&ScrollbackEntry],
     range: std::ops::Range<usize>,

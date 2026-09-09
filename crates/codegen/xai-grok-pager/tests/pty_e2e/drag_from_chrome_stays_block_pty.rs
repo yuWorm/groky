@@ -7,11 +7,9 @@ const CHROMEHOLD_TOP: &str = "CHROMEHOLD_TOP";
 
 const CHROMEHOLD_BOTTOM: &str = "CHROMEHOLD_BOTTOM";
 
-/// PTY: a mouse-down on a blank row INSIDE a block's area whose drag never touches selectable text stays a whole-block drag.
-/// Release copies the whole message (both paragraphs).
-/// Text-drag anchoring waits until the pointer enters selectable text; this pins the case where the pointer never does.
-///
-/// `SSH_CONNECTION` forces the OSC 52 clipboard route for readback.
+/// PTY: a mouse-down on a blank row INSIDE a block's area whose drag never touches selectable text
+/// stays a whole-block drag. Text-drag anchoring waits until the pointer enters selectable text;
+/// this pins the case where the pointer never does.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "PTY e2e; run the owning pty_e2e_* Cargo test with --ignored (see Cargo.toml)"]
 async fn drag_from_chrome_stays_block_pty() {

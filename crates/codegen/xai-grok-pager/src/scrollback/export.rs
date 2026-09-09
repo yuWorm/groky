@@ -7,15 +7,9 @@
 
 use super::{RenderBlock, ToolCallBlock};
 
-/// The output is a document meant for saving to a file or the clipboard:
-/// - `## User` for user prompts (raw text)
-/// - `## Assistant` for agent responses (prefers raw source Markdown via `copy_text(true)`)
-/// - `## Tools` section with one-line summaries for every tool call kind
-///
-/// Consecutive assistant messages are coalesced under a single header.
-/// Thinking / system / subagent / credit / etc. blocks are skipped.
-///
-/// Pure function; unit tests feed it synthetic blocks (including `Stub`).
+/// The output is a document meant for saving to a file or the clipboard. `User` for user prompts (raw text).
+/// `Tools` section with one-line summaries for every tool call kind. Consecutive assistant messages are coalesced
+/// under a single header. Thinking / system / subagent / credit / etc. blocks are skipped.
 pub fn render_blocks_to_markdown<'a>(blocks: impl IntoIterator<Item = &'a RenderBlock>) -> String {
     let mut out = String::new();
     let mut last_was_agent = false;

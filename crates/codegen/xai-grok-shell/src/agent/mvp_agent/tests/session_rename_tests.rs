@@ -356,9 +356,9 @@ async fn rename_rejects_title_over_max_bytes_before_strip() {
 #[serial_test::serial]
 async fn rename_fanout_stamps_title_is_manual_meta() {
     use crate::agent::config::Config as AgentConfig;
-    use crate::auth::{AuthManager, GrokComConfig};
     use crate::extensions::notification::TITLE_IS_MANUAL_META_KEY;
     use xai_acp_lib::{AcpAgentGatewaySender as GatewaySender, AcpClientMessage};
+    use xai_grok_login::{AuthManager, GrokComConfig};
 
     let _home = isolate_grok_home();
     let cwd = "/tmp/rename-fanout-meta";
@@ -612,9 +612,9 @@ async fn reset_rejects_chat_kind() {
 #[serial_test::serial]
 async fn reset_fanout_stamps_title_is_manual_false() {
     use crate::agent::config::Config as AgentConfig;
-    use crate::auth::{AuthManager, GrokComConfig};
     use crate::extensions::notification::TITLE_IS_MANUAL_META_KEY;
     use xai_acp_lib::{AcpAgentGatewaySender as GatewaySender, AcpClientMessage};
+    use xai_grok_login::{AuthManager, GrokComConfig};
 
     let _home = isolate_grok_home();
     let cwd = "/tmp/reset-fanout";
@@ -701,9 +701,9 @@ async fn reset_fanout_stamps_title_is_manual_false() {
 #[serial_test::serial]
 async fn reset_already_auto_is_idempotent_and_skips_persistence_msg() {
     use crate::agent::config::Config as AgentConfig;
-    use crate::auth::{AuthManager, GrokComConfig};
     use crate::extensions::notification::TITLE_IS_MANUAL_META_KEY;
     use xai_acp_lib::{AcpAgentGatewaySender as GatewaySender, AcpClientMessage};
+    use xai_grok_login::{AuthManager, GrokComConfig};
 
     let _home = isolate_grok_home();
     let cwd = "/tmp/reset-idempotent";

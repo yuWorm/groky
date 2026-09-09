@@ -377,10 +377,9 @@ fn gc_dry_run_missing_and_expired_counted_once() {
     );
 }
 
-/// A path that is no repository and will not remove either. Retrying it
-/// every pass only grows the candidate set, so the record goes and the
-/// bytes stay where they are, which is the one outcome that leaves both
-/// halves behind.
+/// A path that is not a repo and will not remove. Retrying only grows the
+/// candidate set, so the record goes and the bytes stay — both halves left
+/// behind.
 #[test]
 fn expired_path_that_will_not_remove_loses_its_record_and_keeps_its_bytes() {
     let fx = crate::db::GrokHomeFixture::new();
@@ -562,10 +561,9 @@ fn gc_asks_the_source_repository_about_a_standalone_worktree() {
     assert!(!dir.exists());
 }
 
-/// True if a record with `path` exists in the DB (assert on our own
-/// record rather than total count: other tests may write to the same
-/// open_default DB concurrently). Matches `register_worktree`'s
-/// canonical path storage (/var vs /private/var on macOS).
+/// True if our record exists. Assert on our path, not total count: other
+/// tests may write the same open_default DB. Matches `register_worktree`'s
+/// canonical path (/var vs /private/var on macOS).
 fn record_present(db: &WorktreeDb, path: &std::path::Path) -> bool {
     let canon = dunce::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
     db.list(&ListFilter::default())
@@ -663,11 +661,9 @@ fn db_record_removed_after_successful_removal() {
 
 #[test]
 fn gc_with_delegate_removes_expired_and_unregisters() {
-    // gc_worktrees_with_delegate threads the delegate through the expired
-    // path and, on a successful removal, counts it and drops the record.
-    // (The delegate's btrfs fallback only fires on a real btrfs-delete
-    // failure, which needs a btrfs host; here the plain-dir fast path
-    // succeeds, so the mock's delete_snapshot is not called.)
+    // Delegate is threaded through the expired path; a successful removal
+    // counts and drops the record. Btrfs fallback needs a real delete failure,
+    // so the mock's delete_snapshot is not called on this plain-dir path.
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     // GROK_HOME == the gc DB dir so remove_worktree's open_default
@@ -940,11 +936,8 @@ fn gc_never_expire_manual_age_only_not_dead() {
     assert!(dir2.exists());
 }
 
-/// End-to-end survivors for the per-kind age cutoff: each row registers
-/// real worktree dirs of the given kinds, runs gc, and asserts which
-/// dirs survive plus `expired_removed`. The reclaimability logic itself
-/// is unit-tested in `classify_covers_expiry_guards_and_kind_ttls`
-/// and `effective_max_age_precedence`; this pins the disk effect.
+/// Pins the disk effect of the per-kind age cutoff (which dirs survive and
+/// `expired_removed`). Reclaimability itself is unit-tested elsewhere.
 #[test]
 fn per_kind_age_expiry_reclaims_listed_kinds_and_keeps_the_rest() {
     const HOUR: i64 = 3600;

@@ -2,11 +2,9 @@
 #[allow(unused_imports)]
 use super::common::*;
 
-/// 16. **Per-session count reset.**
-/// The seen count is in-memory (not persisted), so each pager run starts at 0.
-/// Run 1 drives the count to its cap (3 TTL-spaced shows) and confirms a 4th wipe is then gated.
-/// Run 2 reuses the SAME `$HOME` and does ONE wipe: the tip MUST appear, which only holds if the count reset to 0.
-/// A persisted count sitting at the cap would suppress Run 2.
+/// Per-session count reset. Run 1 drives the count to its cap (3 TTL-spaced shows) and confirms a
+/// 4th wipe is then gated. Run 2 reuses the SAME `$HOME` and does ONE wipe: the tip MUST appear,
+/// which only holds if the count reset to 0.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore]
 async fn undo_tip_resets_each_new_session() {

@@ -15,12 +15,8 @@ const WHEEL_NOTCHES: usize = 16;
 /// The pre-wheel span was 2 rows.
 const MIN_EXTEND_LINES: usize = 12;
 
-/// PTY: wheel-scrolling mid-drag extends the selection.
-/// The next draw rebuilds the model and re-snaps the head to the held pointer, so lines revealed by the wheel land in the copy.
-///
-/// The wheel reports and the one-cell motion ride ONE write, so the motion resolves against the pre-wheel model.
-/// Only the post-render reclamp can extend the head to the revealed rows.
-/// `SSH_CONNECTION` forces the OSC 52 clipboard route for readback.
+/// PTY: wheel-scrolling mid-drag extends the selection. Only the post-render reclamp can extend the
+/// head to the revealed rows.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "PTY e2e; run the owning pty_e2e_* Cargo test with --ignored (see Cargo.toml)"]
 async fn drag_select_wheel_scroll_extends_pty() {

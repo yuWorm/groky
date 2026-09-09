@@ -2,24 +2,16 @@
 #[allow(unused_imports)]
 use super::common::*;
 
-/// Regression e2e for the orphaned invisible `EditConfirm`.
-/// Interjecting (Ctrl+Enter) a DIRTY edit of a LOCAL queue row that is also the LAST visible row empties the queue mid-flow.
-/// The pane auto-hide used to switch panes while still in `EditingQueued`, leaving a confirm modal that never renders but consumes every later key.
-/// The interjection itself still went out (toast and drain both looked healthy), so only an after-the-fact liveness probe catches the dead TUI.
-/// On a broken binary the probe text never echoes and step 7 times out.
-///
-/// The queued message carries a pasted image (as in the original report), which is what forces it onto the LOCAL queue.
-/// Mid-turn plain text takes the server-authoritative immediate-send path instead (`immediate_server_send_eligible`) and never reaches the code path under test.
+/// Regression e2e for the orphaned invisible `EditConfirm`. The pane auto-hide used to switch panes
+/// while still in `EditingQueued`, leaving a confirm modal that never renders but consumes every
+/// later key. On a broken binary the probe text never echoes and step 7 times out.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore]
 async fn edit_interject_lone_queued_row_keeps_tui_alive() {
     let content = ContentController::start().await.expect("start content");
     content.set_chunk_delay(Some(Duration::from_millis(150)));
-    // Turn 1 must stay open long enough for the ENTIRE mid-turn setup to land WHILE it is still streaming
-    // That setup: type the queued text, paste the image path, queue it, focus the queue pane, enter edit, dirty it, Ctrl+Enter
-    // Only then does the edit-interject drain into turn 1 (STEPTWO)
-    // Under the ~60-way-parallel suite a short stream can collapse before the interject lands (the lifecycle test documents the same flake)
-    // So stream ~150 tokens (~22s), while STEPTWO still drains well inside its 40s wait below
+    // Turn 1 must stay open long enough for the ENTIRE mid-turn setup to land WHILE it is still
+    // streaming. Only then does the edit-interject drain into turn 1 (STEPTWO).
     let step_one = {
         let mut s = String::from("STEPONE");
         for i in 0..150 {
@@ -57,12 +49,9 @@ async fn edit_interject_lone_queued_row_keeps_tui_alive() {
         .wait_for_text("STEPONE", Duration::from_secs(30))
         .expect("step 1: turn streaming");
 
-    // Queue ONE image-bearing message, the lone LOCAL queue row
-    // The prose and the path must reach the pager as SEPARATE events
-    // Back-to-back injects can land in one EventStream batch and get coalesced into one paste, merging the prose into the paste payload
-    // The paste pipeline takes the whole payload or none of it (`try_read_dropped_paths`)
-    // A payload mixing prose and a path therefore falls back to plain text instead of a chip
-    // So wait for the typed prose to render before pasting the bare path alone
+    // Queue ONE image-bearing message, the lone LOCAL queue row. The prose and the path must reach the
+    // pager as SEPARATE events. A payload mixing prose and a path therefore falls back to plain text
+    // instead of a chip.
     harness
         .inject_keys(b"brick repro payload ")
         .expect("type queued text");
@@ -102,11 +91,8 @@ async fn edit_interject_lone_queued_row_keeps_tui_alive() {
         .wait_for_text("STEPTWO", Duration::from_secs(40))
         .expect("step 6: interjection drained into turn 1");
 
-    // THE regression assertion: the liveness probe
-    // Both prior steps pass on a broken binary too, since the agent modal does not gate the interjection dispatch
-    // What breaks is everything AFTER: the orphaned EditConfirm eats all input
-    // Space first: the queue-pane auto-hide left focus on the scrollback, where Space focuses the prompt
-    // On a broken binary the modal eats the Space as well, so the probe below never echoes
+    // THE regression assertion: the liveness probe. On a broken binary the modal eats the Space as
+    // well, so the probe below never echoes.
     harness
         .inject_keys(b" ")
         .expect("focus prompt from scrollback");
@@ -199,10 +185,9 @@ fn contains_image_part(value: &serde_json::Value) -> bool {
     }
 }
 
-/// Valid 32×32 8-bit grayscale PNG (signature, IHDR, IDAT, IEND; CRCs correct; the IDAT zlib round-trips).
-/// Hardcoded rather than encoded via the `image` dep so the fixture is byte-stable and encoder-independent.
-/// 32×32 = 1024 total pixels clears the API/client 512-total-pixel floor (`MIN_VISION_TOTAL_PX`).
-/// Clearing it means the image reaches the wire with the interjection instead of being replaced by an `image_dropped_notice`.
+/// Valid 32×32 8-bit grayscale PNG (signature, IHDR, IDAT, IEND; CRCs correct; the IDAT zlib
+/// round-trips). Hardcoded rather than encoded via the `image` dep so the fixture is byte-stable
+/// and encoder-independent.
 const PNG_32X32_GRAY: &[u8] = &[
     0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x48, 0x44, 0x52,
     0x00, 0x00, 0x00, 0x20, 0x00, 0x00, 0x00, 0x20, 0x08, 0x00, 0x00, 0x00, 0x00, 0x56, 0x11, 0x25,

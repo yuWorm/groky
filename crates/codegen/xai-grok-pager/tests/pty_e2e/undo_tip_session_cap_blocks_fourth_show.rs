@@ -2,11 +2,9 @@
 #[allow(unused_imports)]
 use super::common::*;
 
-/// 18. **Per-session cap: the 4th show is gated.**
-/// Within one session the tip shows up to its cap of 3.
-/// Re-showing a tip that is still visible under the same key only refreshes its TTL and does not re-count.
-/// The slot must therefore clear via TTL expiry between shows, so each fresh show increments the in-memory count.
-/// The 4th wipe is then gated and shows no banner.
+/// Per-session cap: the 4th show is gated. Re-showing a tip that is still visible under the same
+/// key only refreshes its TTL and does not re-count. The slot must therefore clear via TTL expiry
+/// between shows, so each fresh show increments the in-memory count.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore]
 async fn undo_tip_session_cap_blocks_fourth_show() {

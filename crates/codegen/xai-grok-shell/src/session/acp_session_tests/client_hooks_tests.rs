@@ -517,7 +517,6 @@ async fn mcp_error_result_fires_only_failure_and_delivers_original_output() {
                     McpErrorResultTool,
                     Some(serde_json::json!({ "type": "object" })),
                 )
-                .await
                 .expect("stub tool registration must succeed");
 
             let mut client_hooks = crate::extensions::hooks::ClientHooks::new();

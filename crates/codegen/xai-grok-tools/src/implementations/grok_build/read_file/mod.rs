@@ -32,10 +32,8 @@ pub struct ReadFileParams {
     pub cursor_rules_on_read: bool,
 }
 crate::register_resource!("grok_build", "ReadFile", ReadFileParams);
-/// Internal version discriminant for read_file.
-///
-/// `read_file` has cross-cutting version divergence: gitignore enforcement
-/// and error mapping. If extracting into version modules, this tool is the
+/// Internal version discriminant for read_file. `read_file` has cross-cutting version divergence:
+/// gitignore enforcement and error mapping. If extracting into version modules, this tool is the
 /// highest-risk candidate.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ReadFileVersion {
@@ -91,10 +89,8 @@ async fn handle_pptx(
     )
     .await
 }
-/// Extract text from a PPTX file (zip + DrawingML text runs).
-///
-/// Returns line-numbered text via the shared `raw_text_to_file_content`
-/// helper.
+/// Extract text from a PPTX file (zip + DrawingML text runs). Returns line-numbered text via the
+/// shared `raw_text_to_file_content` helper.
 fn extract_pptx_text(file_bytes: Vec<u8>) -> Result<ReadFileOutput, String> {
     let text = crate::implementations::read_file::pptx::extract_pptx_text_from_bytes(&file_bytes)
         .map_err(|e| format!("Failed to extract text from PPTX: {e}"))?;
@@ -153,12 +149,9 @@ async fn cursor_rules_on_read_enabled(resources: &SharedResources) -> bool {
     res.get::<Params<ReadFileParams>>()
         .is_some_and(|p| p.0.cursor_rules_on_read)
 }
-/// Harness-compatible negative offset resolution (1-indexed start line).
-///
-/// Negatives use the reference `split('\n')` field count plus a phantom field when
-/// the file is non-empty and has no trailing `\n`. Extraction still uses
-/// `split_inclusive`, so a start that lands on the phantom-only field yields
-/// an empty window (harness-aligned; not a Grok-line clamp).
+/// Harness-compatible negative offset resolution (1-indexed start line). Negatives use the reference `split('\n')` field count plus a phantom
+/// field when the file is non-empty and has no trailing `\n`. Extraction still uses `split_inclusive`, so a start that lands on the
+/// phantom-only field yields an empty window (harness-aligned; not a Grok-line clamp).
 fn resolve_read_start_line(file_content: &str, offset: Option<i64>) -> usize {
     let offset_raw = offset.unwrap_or(1);
     if offset_raw == 0 {
@@ -180,13 +173,9 @@ fn resolve_read_start_line(file_content: &str, offset: Option<i64>) -> usize {
 fn stored_read_offset(offset: Option<i64>) -> Option<usize> {
     offset.filter(|&o| o >= 0).map(|o| o as usize)
 }
-/// Files read in full (no line/token cap): any file named exactly `SKILL.md`,
-/// plus any Markdown file with a `skills` path component so docs a `SKILL.md`
-/// references are never silently truncated. `.`/`..` are folded lexically
-/// (symlinks are not resolved). Intentionally broader than
-/// skill discovery's dir check — matches any `skills` segment
-/// (plugin/bundled/user roots), and matches it exactly (not case-folded) so
-/// near-misses like `skills-cursor` do not qualify.
+/// Files read in full (no line/token cap): any file named exactly `SKILL.md`, plus any Markdown file with a `skills` path component so docs a
+/// `SKILL.md` references are never silently truncated. Intentionally broader than skill discovery's dir check — matches any `skills` segment
+/// (plugin/bundled/user roots), and matches it exactly (not case-folded) so near-misses like `skills-cursor` do not qualify.
 fn is_skill_markdown(path: &std::path::Path) -> bool {
     if path.file_name().is_some_and(|n| n == "SKILL.md") {
         return true;
@@ -325,11 +314,9 @@ pub fn extract_file_content_lines(
         extracted_images,
     }
 }
-/// Core read-file logic shared by `ReadFileTool` and `ReadFileConciseTool`.
-///
-/// Always uses the padded `content` field. Concise post-processing
-/// (swapping in `content_concise`) is done by `ReadFileConciseTool` after this
-/// returns.
+/// Core read-file logic shared by `ReadFileTool` and `ReadFileConciseTool`. Always uses the padded
+/// `content` field. Concise post-processing (swapping in `content_concise`) is done by
+/// `ReadFileConciseTool` after this returns.
 pub(crate) async fn run_read_file(
     input: ReadFileInput,
     cwd_override: Option<std::path::PathBuf>,
@@ -592,11 +579,8 @@ pub(crate) async fn run_read_file(
         extracted_images,
     }))
 }
-/// New-architecture `ReadFile` tool.
-///
-/// Params: `()` — no per-tool configuration.
-///
-/// Notifications: Emits `FileRead` via `NotificationHandle`.
+/// New-architecture `ReadFile` tool. Params: `()` — no per-tool configuration. Notifications: Emits
+/// `FileRead` via `NotificationHandle`.
 #[derive(Default, Debug)]
 pub struct ReadFileTool;
 impl crate::types::tool_metadata::ToolMetadata for ReadFileTool {
@@ -631,10 +615,9 @@ impl xai_tool_runtime::Tool for ReadFileTool {
     fn capabilities(&self) -> xai_tool_protocol::ToolCapabilities {
         READ_FILE_CAPABILITIES.clone()
     }
-    /// Streaming entry point. Only the line-oriented text path streams: the
-    /// final `content` is replayed as char-aligned deltas whose concatenation
-    /// reproduces the card byte-for-byte; image/PDF/PPTX stay terminal-only.
-    /// Gated by `WorkspaceViewerContext::stream_tool_progress`.
+    /// Streaming entry point. Only the line-oriented text path streams: the final `content` is
+    /// replayed as char-aligned deltas whose concatenation reproduces the card byte-for-byte;
+    /// image/PDF/PPTX stay terminal-only. Gated by `WorkspaceViewerContext::stream_tool_progress`.
     async fn execute(
         &self,
         ctx: xai_tool_runtime::ToolCallContext,
@@ -1283,10 +1266,9 @@ mod tests {
         assert_eq!(extracted.content_concise, "1→1\n2\n3\n");
         assert_eq!(extracted.raw_output, "1\n2\r\n3\n");
     }
-    /// Regression: a long single-line base64 URI used to be cut
-    /// mid-payload by the (since-removed) per-line clip and re-emitted as
-    /// a corrupt vision token. Pin that the full payload is captured
-    /// byte-equal.
+    /// Regression: a long single-line base64 URI used to be cut mid-payload by the (since-removed)
+    /// per-line clip and re-emitted as a corrupt vision token. Pin that the full payload is
+    /// captured byte-equal.
     #[test]
     fn extract_captures_long_inline_base64_image_before_truncation() {
         let payload = "A".repeat(50_000);
@@ -2401,11 +2383,9 @@ pub fn verify(req: &HttpRequest) -> Result<Claims, Error> {
             other => panic!("expected FileContent, got {other:?}"),
         }
     }
-    /// Regression for the "death spiral" incident: a single-line
-    /// ~49.5KB JSON payload must be readable in full with default config.
-    /// The old 2000-char per-line clip made such files unreadable by
-    /// construction (bash output and MCP results are byte-capped too), so the
-    /// model could never load a payload it needed to re-emit as tool input.
+    /// Regression for the "death spiral" incident: a single-line ~49.5KB JSON payload must be readable in full with default
+    /// config. The old 2000-char per-line clip made such files unreadable by construction (bash output and MCP results are
+    /// byte-capped too), so the model could never load a payload it needed to re-emit as tool input.
     #[tokio::test]
     async fn single_line_payload_reads_in_full_by_default() {
         let tmp = TempDir::new().unwrap();

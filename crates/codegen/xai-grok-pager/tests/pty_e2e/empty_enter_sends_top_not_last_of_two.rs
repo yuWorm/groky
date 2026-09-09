@@ -55,11 +55,9 @@ async fn empty_enter_sends_top_not_last_of_two() {
         .inject_keys(b"\r")
         .expect("empty Enter send-now top");
     turn_one.release();
-    // Alpha (the promoted TOP row) then bravo drain back-to-back after the completion release
-    // Each promoted "❯ …" block and every reply, including the final TURNTHREE, can scroll above the viewport before a 100ms poll observes it
-    // Waiting on any on-screen marker is thus racy: a flaky observation, not a real failure, same rationale as `removed_queued_prompt_never_sent`
-    // Wait on the wire instead: bravo's sent request is the authoritative record that both queued rows drained in order
-    // Pump the event loop while waiting so the queued rows actually promote
+    // Alpha (the promoted TOP row) then bravo drain back-to-back after the completion release. Waiting
+    // on any on-screen marker is thus racy: a flaky observation, not a real failure, same rationale as
+    // `removed_queued_prompt_never_sent`.
     let deadline = std::time::Instant::now() + Duration::from_secs(90);
     while !all_user_messages(&content)
         .iter()

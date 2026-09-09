@@ -4,31 +4,9 @@ use super::common::*;
 #[allow(unused_imports)]
 use super::scroll::*;
 
-// ── Regression: wheel-path cap (a misclassified flood must not teleport) ──
-//
-// The parent capped only confirmed-trackpad flushes
-// Wheel and Unknown streams flushed their whole backlog in one 16ms slot, assuming "wheel desired is bounded by physical notches"
-// That assumption fails under misclassification (a trackpad the brand table prices as ept=3 that never promotes)
-// It also fails under terminal-generated momentum bursts
-// One flush teleported the viewport by hundreds of rows
-// The fix routes every stream kind through the proportional cap (max(6, viewport/2) per flush) with the excess carried into later cadence slots
-//
-// Driver shape: 60 back-to-back wheel-up reports (`Duration::ZERO`, no host sleeps) at GROK_SCROLL_SPEED=100
-// The 6x speed is the existing user setting acting as a demand amplifier
-// Under the harness terminal (`TerminalName::Unknown`, ept=3) the first 3 events land within microseconds, promoting the stream to Wheel
-// Desired travel = 60 x (3/3) x 6.0 = 360 rows
-// Determinism: the writer finishes in microseconds and the reports queue in the PTY buffer
-// Reader-side delays therefore only COMPRESS arrival timing (per the driver contract in `scroll.rs`)
-// A mid-burst >80ms arrival gap (stream split) is impossible, and promotion jitter is irrelevant because Unknown prices identically on ept=3
-//
-// The teleport guard asserts rows-per-painted-frame, which is timing independent:
-// - New code: every flush (the promotion flush included) passes through the per-flush cap, <= viewport/2 <= 25 rows on the 50-row PTY
-//   Travel/frames therefore stays <= 25 in every flush pacing/stall regime
-// - Parent: the uncapped backlog lands in the promotion frame plus one or two catch-up flushes (finalize was uncapped too)
-//   That is ~360 rows over 2-4 frames, a ratio >= ~90. Verified against a parent-built binary.
-//
-// Only byte-deterministic quantities are asserted (marker indices, frame count from the preamble's reset_timing() capture)
-// Per-flush cap math is pinned by the synthetic-clock unit tests in `src/input/mouse.rs`
+// Regression: wheel-path cap (a misclassified flood must not teleport). The parent capped only
+// confirmed-trackpad flushes. That assumption fails under misclassification (a trackpad the brand
+// table prices as ept=3 that never promotes).
 
 /// Marker count: tall enough that even the parent's uncapped 360-row jump cannot clamp at the transcript top (which would mask its teleport).
 const MARKER_COUNT: usize = 700;

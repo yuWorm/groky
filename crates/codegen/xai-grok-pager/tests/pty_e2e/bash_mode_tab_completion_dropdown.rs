@@ -14,10 +14,9 @@ const HISTORY_SENTINEL: &str = "SUGGESTHISTROW";
 /// That prefix is exactly their LCP, so the first Tab opens the dropdown instead of prefix-filling.
 const TYPED_PREFIX: &str = "!cat SUGGEST";
 
-/// Env: NO suggestion flag; Tab completion in bash mode is always on, and this test is the acceptance proof.
-/// `GROK_SUGGESTIONS=0` pins the as-you-type pipeline OFF.
-/// The PTY child inherits the parent env, so a dev shell exporting the flag must not turn it on here.
-/// The shell-history tier is pinned to the seeded file.
+/// Env: NO suggestion flag; Tab completion in bash mode is always on, and this test is the
+/// acceptance proof. The PTY child inherits the parent env, so a dev shell exporting the flag must
+/// not turn it on here.
 fn suggestions_env(histfile: &Path) -> Vec<(String, String)> {
     vec![
         ("SHELL".into(), "/bin/bash".into()),
@@ -32,14 +31,9 @@ fn seed_history(content: &ContentController) -> std::path::PathBuf {
     histfile
 }
 
-/// **Bash-mode completion acceptance with NO env flag: Tab fetches token-only candidates, opens the dropdown, and accepts the selection in place.**
-/// In a real session with a seeded cwd and history, typing `!cat SUGGEST`:
-/// - nothing completes before Tab (no as-you-type pipeline without the env flag);
-/// - Tab fires the deterministic fetch.
-///   When its candidates land, the dropdown opens with BOTH file rows (their LCP equals the typed token, so no fill).
-///   The prefix-matching history line stays out (Tab fetches run only the token providers);
-/// - Down + Tab accepts the second item into the prompt without clobbering it.
-///   A trailing typed char composes with the spliced token, and the other candidate vanishes with the closed dropdown.
+/// Bash-mode completion acceptance with NO env flag: Tab fetches token-only candidates, opens the
+/// dropdown, and accepts the selection in place. The prefix-matching history line stays out (Tab
+/// fetches run only the token providers).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore]
 #[cfg(unix)]

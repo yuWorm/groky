@@ -116,7 +116,10 @@ async fn reload_skills(
     compat: CompatConfig,
 ) -> Vec<SkillInfo> {
     let config = cli_config::load_config().await.skills;
-    let discovery = list_skills_with_plugins(Some(cwd), &config, plugin_registry, compat);
+    let project_trusted =
+        crate::agent::folder_trust::project_scope_allowed(std::path::Path::new(cwd));
+    let discovery =
+        list_skills_with_plugins(Some(cwd), &config, plugin_registry, compat, project_trusted);
     match tokio::time::timeout(std::time::Duration::from_secs(5), discovery).await {
         Ok(skills) => skills,
         Err(_) => {
@@ -390,6 +393,9 @@ pub async fn handle(
         "x.ai/skills/list" => {
             let req: SkillsListRequest = serde_json::from_str(args.params.get())?;
             let skills = reload_skills(&req.cwd, plugin_registry, compat).await;
+            // Sessions otherwise learn about disk changes only from inotify,
+            // which misses writes made through another NFS client.
+            agent.refresh_skill_baseline_for_all_sessions();
             super::to_ext_response(Ok(SkillsListResponse { skills }))
         }
 

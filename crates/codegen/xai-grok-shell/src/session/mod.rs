@@ -10,6 +10,7 @@ pub(crate) mod message_delivery;
 pub mod notifications;
 pub mod pending_interaction;
 pub mod prompt_queue;
+pub(crate) mod resume_status;
 pub mod two_pass;
 pub mod visibility;
 pub use self::acp_session::*;
@@ -19,7 +20,7 @@ pub use self::fork::{ForkSessionRequest, ForkSessionResponse, fork_session};
 pub use self::handle::*;
 pub use self::persistence::{
     LocalFeedbackEntry, UserFeedbackEntry, find_local_child_for_remote, resolve_local_session,
-    resolve_local_session_any_cwd, session_exists_for_cwd,
+    resolve_local_session_any_cwd, resolve_local_session_ids_any_cwd, session_exists_for_cwd,
 };
 pub use self::result::{Empty, ExtMethodResult};
 pub use self::share::{ShareSessionRequest, ShareSessionResponse};
@@ -78,7 +79,7 @@ pub(crate) fn image_blocks(
 }
 pub use xai_agent_lifecycle::{
     AnalyticsClass, CompactionClass, InputAuthority, InputPolicy, QueuePolicy, ShutdownPolicy,
-    TurnBoundary,
+    SlashAuthority, TurnBoundary,
 };
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PromptOrigin {
@@ -93,8 +94,13 @@ pub enum PromptOrigin {
         /// The subagent ID (without the `subagent-completed-` prefix).
         subagent_id: String,
     },
-    /// Model-authored context sent by the owning root session.
+    /// Model-authored context from the owning root session.
     ParentAgentMessage {
+        message_id: String,
+        sender_session_id: String,
+    },
+    /// Human text from the owning parent. Slash-inert; `@file` stays closed.
+    ParentHumanMessage {
         message_id: String,
         sender_session_id: String,
     },
@@ -126,8 +132,13 @@ impl PromptOrigin {
             Self::SubagentCompleted {
                 subagent_id: subagent_id.to_string(),
             }
-        } else if let Some(parent_message_id) = prompt_id.strip_prefix("parent-message-") {
+        } else if let Some(parent_message_id) = prompt_id.strip_prefix("parent-agent-message-") {
             Self::ParentAgentMessage {
+                message_id: parent_message_id.to_string(),
+                sender_session_id: String::new(),
+            }
+        } else if let Some(parent_message_id) = prompt_id.strip_prefix("parent-message-") {
+            Self::ParentHumanMessage {
                 message_id: parent_message_id.to_string(),
                 sender_session_id: String::new(),
             }
@@ -149,10 +160,11 @@ impl PromptOrigin {
             Self::User
         }
     }
-    pub fn policy(&self) -> InputPolicy {
+    pub const fn policy(&self) -> InputPolicy {
         match self {
             Self::User => InputPolicy {
                 authority: InputAuthority::HumanIntent,
+                slash: SlashAuthority::HumanCatalog,
                 turn_boundary: TurnBoundary::Conversational,
                 analytics: AnalyticsClass::HumanPrompt,
                 compaction: CompactionClass::HumanAnchor,
@@ -161,6 +173,16 @@ impl PromptOrigin {
             },
             Self::ParentAgentMessage { .. } => InputPolicy {
                 authority: InputAuthority::ModelAuthoredUntrusted,
+                slash: SlashAuthority::ModelAuthored,
+                turn_boundary: TurnBoundary::Conversational,
+                analytics: AnalyticsClass::AgentMessage,
+                compaction: CompactionClass::ConversationalAgentAnchor,
+                queue: QueuePolicy::VisibleProtected,
+                shutdown: ShutdownPolicy::Drain,
+            },
+            Self::ParentHumanMessage { .. } => InputPolicy {
+                authority: InputAuthority::ModelAuthoredUntrusted,
+                slash: SlashAuthority::Inert,
                 turn_boundary: TurnBoundary::Conversational,
                 analytics: AnalyticsClass::AgentMessage,
                 compaction: CompactionClass::ConversationalAgentAnchor,
@@ -172,6 +194,7 @@ impl PromptOrigin {
             | Self::WorkflowCompleted { .. }
             | Self::SchedulerFired => InputPolicy {
                 authority: InputAuthority::RuntimeControl,
+                slash: SlashAuthority::Inert,
                 turn_boundary: TurnBoundary::Conversational,
                 analytics: AnalyticsClass::RuntimeWake,
                 compaction: CompactionClass::RuntimeEphemera,
@@ -183,6 +206,7 @@ impl PromptOrigin {
             | Self::GoalClassifierNudge
             | Self::PlanResume => InputPolicy {
                 authority: InputAuthority::RuntimeControl,
+                slash: SlashAuthority::Inert,
                 turn_boundary: TurnBoundary::Conversational,
                 analytics: AnalyticsClass::RuntimeWake,
                 compaction: CompactionClass::RuntimeEphemera,
@@ -204,6 +228,7 @@ impl PromptOrigin {
                 | Self::SubagentCompleted { .. }
                 | Self::WorkflowCompleted { .. }
                 | Self::ParentAgentMessage { .. }
+                | Self::ParentHumanMessage { .. }
                 | Self::NotificationDrain
         )
     }
@@ -213,6 +238,7 @@ impl PromptOrigin {
         match self {
             Self::User
             | Self::ParentAgentMessage { .. }
+            | Self::ParentHumanMessage { .. }
             | Self::SchedulerFired
             | Self::PlanResume => false,
             Self::TaskCompleted { .. }
@@ -230,6 +256,7 @@ impl PromptOrigin {
             Self::WorkflowCompleted { completion_id } => Some(completion_id),
             Self::User
             | Self::ParentAgentMessage { .. }
+            | Self::ParentHumanMessage { .. }
             | Self::NotificationDrain
             | Self::GoalSummary
             | Self::GoalClassifierNudge
@@ -268,12 +295,43 @@ mod tests {
         let origin = PromptOrigin::from_prompt_id("parent-message-msg-123");
         assert_eq!(
             origin,
-            PromptOrigin::ParentAgentMessage {
+            PromptOrigin::ParentHumanMessage {
                 message_id: "msg-123".into(),
                 sender_session_id: String::new(),
             }
         );
+        assert_eq!(origin.policy().slash, crate::session::SlashAuthority::Inert);
         assert!(origin.is_synthetic());
+    }
+    #[test]
+    fn wake_compact_slash_preserves_parent_authority() {
+        for (prompt_id, expected, slash) in [
+            (
+                "parent-agent-message-wake",
+                PromptOrigin::ParentAgentMessage {
+                    message_id: "wake".into(),
+                    sender_session_id: String::new(),
+                },
+                crate::session::SlashAuthority::ModelAuthored,
+            ),
+            (
+                "parent-message-wake",
+                PromptOrigin::ParentHumanMessage {
+                    message_id: "wake".into(),
+                    sender_session_id: String::new(),
+                },
+                crate::session::SlashAuthority::Inert,
+            ),
+        ] {
+            let origin = PromptOrigin::from_prompt_id(prompt_id);
+            assert_eq!(origin, expected);
+            assert_ne!(
+                origin.policy().authority,
+                crate::session::InputAuthority::HumanIntent,
+                "/compact must not enter the human command path",
+            );
+            assert_eq!(origin.policy().slash, slash);
+        }
     }
     #[test]
     fn from_prompt_id_subagent_completed() {
@@ -359,6 +417,13 @@ mod tests {
                 QueuePolicy::VisibleProtected,
             ),
             (
+                PromptOrigin::ParentHumanMessage {
+                    message_id: "h".into(),
+                    sender_session_id: "root".into(),
+                },
+                QueuePolicy::VisibleProtected,
+            ),
+            (
                 PromptOrigin::WorkflowCompleted {
                     completion_id: "w".into(),
                 },
@@ -380,6 +445,13 @@ mod tests {
         assert!(
             !PromptOrigin::ParentAgentMessage {
                 message_id: "m".into(),
+                sender_session_id: "root".into(),
+            }
+            .hide_user_echo_from_scrollback()
+        );
+        assert!(
+            !PromptOrigin::ParentHumanMessage {
+                message_id: "h".into(),
                 sender_session_id: "root".into(),
             }
             .hide_user_echo_from_scrollback()
@@ -499,7 +571,7 @@ pub(crate) mod telemetry;
 #[cfg(feature = "test-support")]
 pub mod testkit;
 pub mod tool_index;
-pub(crate) mod turn_completion;
+pub mod turn_completion;
 pub mod unified_list;
 pub(crate) mod user_message;
 pub(crate) mod wire_tags;

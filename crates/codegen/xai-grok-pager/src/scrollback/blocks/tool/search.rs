@@ -146,10 +146,6 @@ impl SearchToolCallBlock {
     }
 
     /// Build the match summary string, adapted by output mode.
-    ///
-    /// - `Content`:            `(3 matches in 2 files)` / `(1 match)` / `(no matches)`
-    /// - `FilesWithMatches`:   `(3 files)` / `(1 file)` / `(no matches)`
-    /// - `Count`:              `(42 matches across 5 files)` / `(no matches)`
     fn match_summary(&self) -> String {
         if self.match_count == 0 {
             return match self.meta.output_mode {
@@ -194,12 +190,8 @@ impl SearchToolCallBlock {
         self.pattern.is_empty() || self.pattern == "."
     }
 
-    /// Three cases:
-    /// 1. Trivial pattern + glob → `Search glob in path (summary)`
-    ///    glob is string-styled without quotes (it IS the search term).
-    /// 2. Real pattern + glob → `Search "pattern" in glob in path (summary)`
-    ///    glob shown as path scope after first "in".
-    /// 3. No glob → `Search "pattern" in path (summary)`
+    /// Trivial pattern + glob → `Search glob in path (summary)` glob is string-styled without quotes (it IS the search
+    /// term). No glob → `Search "pattern" in path (summary)`.
     fn header_line(
         &self,
         theme: &Theme,
@@ -302,7 +294,6 @@ impl SearchToolCallBlock {
     }
 
     /// Header line with only the search term span selectable (exclude "Search " prefix).
-    ///
     /// Span 0 is always the label; span 1 is the pattern/glob.
     /// Later "in path" and summary spans stay non-selectable so copy yields the search term.
     fn header_block_line(&self, line: Line<'static>) -> BlockLine {
@@ -316,11 +307,8 @@ impl SearchToolCallBlock {
         }
     }
 
-    /// Build a single comma-separated metadata line.
-    ///
-    /// Always present (at minimum shows `mode: pattern`).
-    /// Glob is never shown here (always inline in header).
-    /// All flags use `key: value` form, with values in the primary fg and keys muted.
+    /// Build a single comma-separated metadata line. Always present (at minimum shows `mode: pattern`). Glob is never
+    /// shown here (always inline in header).
     fn metadata_line(&self, theme: &Theme) -> Line<'static> {
         let label_style = theme.muted();
         let value_style = theme.primary();

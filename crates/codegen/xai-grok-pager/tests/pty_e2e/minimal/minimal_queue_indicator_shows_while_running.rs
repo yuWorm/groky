@@ -2,11 +2,8 @@
 #[allow(unused_imports)]
 use crate::common::*;
 
-/// Pressing Enter with a draft while a turn is running queues the prompt, and the minimal status line reports "N queued" with a `/queue` hint.
-/// Minimal has no interactive queue pane, so without the hint the count is a dead end.
-/// Running `/queue` mid-turn commits a read-only snapshot listing the queued text.
-/// This runs standalone with no leader, so the queue is the client's own list of pending prompts.
-/// The queued prompt promotes and runs once the first turn finishes.
+/// Minimal has no interactive queue pane, so without the hint the count is a dead end. Running
+/// `/queue` mid-turn commits a read-only snapshot listing the queued text.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore]
 async fn minimal_queue_indicator_shows_while_running() {

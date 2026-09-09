@@ -41,7 +41,6 @@ pub(super) enum ListPanel {
 }
 
 /// Detect an active below-prompt list panel, or `None`.
-///
 /// Only the session picker and the MCP-servers tab are hosted as simple lists; every other modal keeps its existing (centered) rendering.
 /// Callers must check this *before* `overlay::app_modal_active`, since `SessionPicker` is also an `active_modal`.
 pub(super) fn active(agent: &AgentView) -> Option<ListPanel> {
@@ -372,7 +371,14 @@ fn render_mcps(
                             exp[i] = s.mcps_tools_expanded.contains(&si);
                             if let Some(srv) = servers.get(si) {
                                 if !srv.enabled {
-                                    b[i] = "disabled".to_string();
+                                    // Policy-blocked rows also carry `enabled = false`; the verdict outranks
+                                    // the personal-disable badge, as in the full modal
+                                    b[i] = if srv.blocked_reason.is_some() {
+                                        "blocked by policy"
+                                    } else {
+                                        "disabled"
+                                    }
+                                    .to_string();
                                     bc[i] = Some(theme.accent_error);
                                 } else {
                                     b[i] = minimal_api::mcp_status_label(&srv.status).to_string();
@@ -555,6 +561,7 @@ mod tests {
             setup_values: std::collections::HashMap::new(),
             tools: Vec::new(),
             enabled: true,
+            blocked_reason: None,
             source: "local".to_string(),
             wire_source: McpWireSource::Local,
             plugin_name: None,
@@ -681,6 +688,41 @@ mod tests {
             "two selectable server rows map to catalog indices"
         );
         assert_eq!(s.entry_non_selectable.len(), 3);
+    }
+
+    #[test]
+    fn mcps_panel_badges_policy_block_over_disabled() {
+        let mut denied = mcp_server("denied-srv", McpServerDisplayStatus::Unavailable, 0);
+        denied.enabled = false;
+        denied.blocked_reason = Some("matches deniedMcpServers".into());
+        let mut manual = mcp_server("manual-srv", McpServerDisplayStatus::Ready, 2);
+        manual.enabled = false;
+        let mut a = with_mcps(vec![denied, manual]);
+        let theme = Theme::current();
+        let area = Rect::new(0, 0, 80, 24);
+        let mut buf = Buffer::empty(area);
+        render(&mut buf, area, &mut a, ListPanel::Mcps, &theme);
+
+        let text = buffer_text(&buf);
+        let row = |name: &str| {
+            text.lines()
+                .find(|l| l.contains(name))
+                .map(str::to_string)
+                .unwrap_or_else(|| panic!("no row for {name}:\n{text}"))
+        };
+        let denied_row = row("denied-srv");
+        assert!(
+            denied_row.contains("blocked by policy"),
+            "policy verdict must win:\n{denied_row}"
+        );
+        assert!(
+            !denied_row.contains("disabled"),
+            "policy-blocked row must not read as a personal disable:\n{denied_row}"
+        );
+        assert!(
+            row("manual-srv").contains("disabled"),
+            "personal disable keeps its badge:\n{text}"
+        );
     }
 
     #[test]

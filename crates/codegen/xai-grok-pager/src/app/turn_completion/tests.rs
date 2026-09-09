@@ -350,6 +350,27 @@ fn hook_denied_signal<'a>(context: Option<&'a serde_json::Value>) -> TerminalSig
 }
 
 #[test]
+fn hook_denied_finalize_displaces_feedback_before_opening_the_card() {
+    let mut agent = running_viewer("p1");
+    stash_in_flight(&mut agent);
+    agent.feedback_modal = Some(crate::views::feedback_modal::FeedbackModalState::new(
+        crate::views::feedback_modal::OpenFeedbackModal {
+            text: Some("draft feedback".to_string()),
+            ..Default::default()
+        },
+    ));
+
+    let _ = finalize_turn_from_terminal(&mut agent, "s1", hook_denied_signal(None));
+
+    assert!(agent.feedback_modal.is_none());
+    assert!(agent.question_view.is_some());
+    assert!(
+        agent.scrollback.len() > 1,
+        "displacement notice must be visible"
+    );
+}
+
+#[test]
 fn hook_denied_finalize_requeues_blocked_prompt_and_opens_card() {
     use crate::views::question_view::LocalQuestionKind;
 
@@ -564,7 +585,7 @@ fn blocked_prompt_card_refuses_skip() {
 
     // The focused card's footer must not advertise the refused dismissal.
     let labels: Vec<String> = agent
-        .current_shortcut_hints(&crate::actions::ActionRegistry::defaults(), false)
+        .current_shortcut_hints(&crate::actions::ActionRegistry::defaults())
         .iter()
         .map(|hint| hint.label.to_string())
         .collect();
@@ -788,61 +809,6 @@ fn deferred_card_reopens_when_other_question_closes() {
         .question_view
         .as_ref()
         .expect("the blocked-prompt card reopens");
-    assert!(
-        matches!(qv.local_kind, Some(LocalQuestionKind::PromptBlocked { row_id: r }) if r == row_id)
-    );
-}
-
-/// The `/feedback` report stage tears down through its own pane path (`submit_feedback_pane`), not the generic card teardown.
-/// Skipping it must also bring the deferred blocked-prompt card back.
-#[test]
-fn deferred_card_reopens_when_feedback_report_closes() {
-    use crate::views::question_view::{LocalQuestionKind, QuestionViewState};
-    use xai_grok_tools::implementations::grok_build::ask_user_question::{
-        Question, QuestionOption,
-    };
-
-    let mut agent = running_viewer("p1");
-    stash_in_flight(&mut agent);
-    let stashed = agent.prompt.stash();
-    agent.question_view = Some(
-        QuestionViewState::new(
-            "feedback".into(),
-            vec![Question {
-                question: "feedback?".into(),
-                id: None,
-                options: vec![QuestionOption {
-                    label: "Send".into(),
-                    description: String::new(),
-                    preview: None,
-                    id: None,
-                }],
-                multi_select: Some(false),
-            }],
-            stashed,
-        )
-        .with_local_kind(LocalQuestionKind::Feedback),
-    );
-
-    let _ = finalize_turn_from_terminal(&mut agent, "s1", hook_denied_signal(None));
-    let row_id = agent.session.pending_prompts.front().map(|p| p.id).unwrap();
-    assert!(
-        agent
-            .question_view
-            .as_ref()
-            .is_some_and(|q| q.is_feedback_report()),
-        "the block card defers while the report pane is open"
-    );
-
-    let ctrl_c = crossterm::event::KeyEvent::new(
-        crossterm::event::KeyCode::Char('c'),
-        crossterm::event::KeyModifiers::CONTROL,
-    );
-    let _ = agent.handle_question_key_for_test(&ctrl_c);
-    let qv = agent
-        .question_view
-        .as_ref()
-        .expect("the blocked-prompt card reopens after the report pane closes");
     assert!(
         matches!(qv.local_kind, Some(LocalQuestionKind::PromptBlocked { row_id: r }) if r == row_id)
     );

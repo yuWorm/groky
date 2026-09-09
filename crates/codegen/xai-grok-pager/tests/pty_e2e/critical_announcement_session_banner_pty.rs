@@ -538,10 +538,8 @@ async fn hidden_critical_does_not_suppress_new_critical_id() {
     harness.quit().expect("clean quit");
 }
 
-/// A promo pushed mid-session (poll flip) paints the 1-line promo row: the `[label]` button and both hide affordances on ONE row.
-/// The message is NOT painted on the banner; it lives on the welcome hero.
-/// The push also opens the `/announcements` slash gate.
-/// A critical published mid-promo takes over the single banner slot (promo row gone, red critical up).
+/// A promo pushed mid-session (poll flip) paints the 1-line promo row: the `[label]` button and
+/// both hide affordances on ONE row.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "PTY e2e; run the owning pty_e2e_* Cargo test with --ignored (see Cargo.toml)"]
 async fn promo_announcement_banner_slash_gate_and_critical_preemption() {
@@ -612,10 +610,7 @@ async fn promo_announcement_banner_slash_gate_and_critical_preemption() {
                 harness.screen_contents()
             )
         });
-    // Crossterm may hold a lone ESC briefly to disambiguate CSI sequences
-    // A fixed 200ms pump races the dismiss paint under remote CI (same class as minimal_slash_dropdown_dismisses_with_esc)
-    // Wait for the sentinel to leave, clear the residual `/announ` draft, then re-sync the promo row
-    // The preemption wait then starts from a known banner state
+    // Crossterm may hold a lone ESC briefly to disambiguate CSI sequences.
     harness.inject_keys(keys::ESC).expect("esc dropdown");
     harness
         .wait_for_text_absent(SLASH_DESC, Duration::from_secs(10))
@@ -655,10 +650,8 @@ async fn promo_announcement_banner_slash_gate_and_critical_preemption() {
     harness.quit().expect("clean quit");
 }
 
-/// Clicking the promo `[label]` button dispatches the open action through the safe-open path and does NOT hide the row.
-/// The URL lands in the `GROK_TEST_OPEN_URL_FILE` file; no real browser opens.
-/// The raw PTY stream also carries the CTA URL as OSC 8 (WezTerm pin), the fallback when the mouse is off or under tmux.
-/// Then the promo hide roundtrip: `/announcements hide` clears the row, `show` restores.
+/// Clicking the promo `[label]` button dispatches the open action through the safe-open path and
+/// does NOT hide the row.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "PTY e2e; run the owning pty_e2e_* Cargo test with --ignored (see Cargo.toml)"]
 async fn promo_cta_click_opens_link_and_hide_roundtrip() {
@@ -897,9 +890,6 @@ fn spawn_with_announcements_and_env(
 }
 
 /// Free-tier multi-surface upgrade CTA.
-/// A pinned promo shows the `[label]` button, with no `[hide]`, on the welcome hero, the in-session top header, and the above-prompt banner.
-/// `Ctrl+O` opens the url via the URL file.
-/// The dashboard button and the "Ctrl+O toggles YOLO when no pinned CTA" fallback are covered by colocated unit tests.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "PTY e2e; run the owning pty_e2e_* Cargo test with --ignored (see Cargo.toml)"]
 async fn pinned_promo_multi_surface_and_ctrl_o_open() {

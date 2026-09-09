@@ -13,12 +13,14 @@ mod agent_response;
 mod auto_compact_top_row;
 #[path = "pty_e2e/connect_ui_timeout_env_override.rs"]
 mod connect_ui_timeout_env_override;
+#[path = "pty_e2e/dock_crowded_sections.rs"]
+mod dock_crowded_sections;
+#[path = "pty_e2e/dock_hover_stop_background_task.rs"]
+mod dock_hover_stop_background_task;
 #[path = "pty_e2e/doubled_lines_out_of_band_repro.rs"]
 mod doubled_lines_out_of_band_repro;
 #[path = "pty_e2e/embedded_mode_boots_without_hanging_on_blocked_backend.rs"]
 mod embedded_mode_boots_without_hanging_on_blocked_backend;
-#[path = "pty_e2e/feedback_slash_opens_descriptive_pane.rs"]
-mod feedback_slash_opens_descriptive_pane;
 #[path = "pty_e2e/fullscreen_external_editor_round_trip.rs"]
 mod fullscreen_external_editor_round_trip;
 #[path = "pty_e2e/initial_prompt_positional_auto_submits.rs"]
@@ -67,3 +69,5 @@ mod wrap_osc52_sink_env_advertised_through_shell;
 mod wrap_sigterm_restores_terminal_and_exit_code;
 #[path = "pty_e2e/wrap_single_string_routes_via_shell.rs"]
 mod wrap_single_string_routes_via_shell;
+#[path = "pty_e2e/writer_blocked_tty_keeps_loop_alive.rs"]
+mod writer_blocked_tty_keeps_loop_alive;

@@ -511,11 +511,8 @@ mod tests {
         assert_eq!(a, b, "Subagent template rendering must be deterministic");
     }
 
-    // ── Task completion discipline ─────────────────────────────────
-    //
-    // The `<task_completion_discipline>` block was removed from both base and subagent templates
-    // These tests pin the deletion so the block doesn't accidentally come back
-    // They also keep the runtime TodoGate from firing reminders that reference a non-existent block
+    // The `<task_completion_discipline>` block was removed from both templates.
+    // These tests pin the deletion so it does not come back, and so TodoGate does not remind about a missing block.
 
     #[test]
     fn task_completion_discipline_block_is_not_rendered() {
@@ -556,10 +553,9 @@ mod tests {
         assert_template_size_under(&prompt, "subagent");
     }
 
-    // ── Guard invariant ─────────────────────────────────────────────
     // Every `${{ tools.by_kind.X }}` must sit inside a `${%- if ... %}` whose condition requires X.
-    // The condition must contain `tools.by_kind.X` at a word boundary, with no top-level ` or `
-    // If violated, X could render as empty string at runtime
+    // The condition must contain `tools.by_kind.X` at a word boundary, with no top-level ` or `.
+    // If violated, X could render as an empty string at runtime.
 
     fn word_bounded(hay: &str, needle: &str) -> bool {
         let mut s = 0;
@@ -647,10 +643,9 @@ mod tests {
     // Renders the base template across tool-kind subsets and asserts no raw template tokens leak
     // The static guard test above is the authoritative check; this one catches syntax drift
 
-    // ── is_non_interactive gating ──────────────────────────────────
-    // Headless / SDK / stdio / generic-ACP sessions have no human typing into a TUI prompt
-    // The `! <command>` shell-prefix tip and the `<user_guide>` TUI pointer are noise there
-    // Those sections must drop out when `is_non_interactive=true` and remain when it's false
+    // Headless / SDK / stdio sessions have no human typing into a TUI prompt.
+    // The shell-prefix tip and `<user_guide>` pointer are noise there.
+    // Those sections must drop out when `is_non_interactive=true` and remain when false.
 
     #[test]
     fn interactive_renders_shell_prefix_tip_and_user_guide() {

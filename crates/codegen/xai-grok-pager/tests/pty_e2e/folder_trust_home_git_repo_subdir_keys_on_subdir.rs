@@ -31,10 +31,9 @@ async fn folder_trust_home_git_repo_subdir_keys_on_subdir() {
     )
     .expect("spawn pager");
 
-    // Check the trust store directly, not via `folder_is_trusted`
-    // That helper re-derives `workspace_key` in the test process, whose `$HOME` is not `content.home()`
-    // Its home guard never fires there, so it resolves the wrong key
-    // `TrustStore::is_trusted` canonicalizes and matches ancestor prefixes internally, so the raw path works regardless of `$HOME`
+    // Check the trust store directly, not via `folder_is_trusted`. Its home guard never fires there,
+    // so it resolves the wrong key `TrustStore::is_trusted` canonicalizes and matches ancestor
+    // prefixes internally, so the raw path works regardless of `$HOME`.
     let store_path = content.home().join(".grok").join(TRUST_FILE_NAME);
 
     // The question renders (keyed on the subdir), and the store is empty first.

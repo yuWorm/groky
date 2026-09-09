@@ -47,12 +47,8 @@ fn edit_header_rows(screen: &str) -> usize {
         .count()
 }
 
-/// PTY: with `collapsed_edit_blocks` enabled, three sequential same-file edits coalesce into ONE Edit row whose header sums the diffstat (`+3/-3`).
-/// Expanding it shows every hunk with `… N unchanged lines` gap markers between them.
-/// A fourth edit arriving after intervening agent text stays a separate second Edit row.
-/// It is counted after wheeling back above the second submit's page-flip.
-/// The page-flip pins the new prompt to the pane top and scrolls turn 1 out of view by design.
-/// (Flag off, coalescing is disabled entirely; pinned by the tracker unit test.)
+/// PTY: with `collapsed_edit_blocks` enabled, three sequential same-file edits coalesce into ONE
+/// Edit row whose header sums the diffstat (`+3/-3`).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "PTY e2e; run with cargo test -p xai-grok-pager --test pty_e2e -- --ignored"]
 async fn edit_merge_sequential_pty() {

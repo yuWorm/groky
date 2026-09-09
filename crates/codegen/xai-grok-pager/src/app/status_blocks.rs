@@ -9,7 +9,6 @@ use crate::app::subagent::format_subagent_label;
 use crate::util::{format_duration, group_thousands};
 
 /// `/queue` body: a read-only list of the queued prompts.
-///
 /// Rows from the server's shared queue (minus the prompt already running) come first in broadcast order, then the local queue (`pending_prompts`).
 /// This matches [`crate::views::queue_pane::QueuePane::sync_from_merged`]'s ordering.
 pub(crate) fn queue_block_text(agent: &AgentView) -> String {
@@ -82,22 +81,22 @@ pub(crate) fn tasks_block_text(agent: &AgentView) -> String {
     let mut subs: Vec<_> = agent
         .subagent_sessions
         .values()
-        .filter(|s| s.workflow_run_id.is_none())
+        .filter(|s| s.attempt.workflow_run_id.is_none())
         .collect();
     subs.sort_by(|a, b| {
         b.is_running()
             .cmp(&a.is_running())
-            .then(b.started_at.cmp(&a.started_at))
+            .then(b.attempt.started_at.cmp(&a.attempt.started_at))
             .then(a.child_session_id.cmp(&b.child_session_id))
     });
     for info in subs {
         let (type_label, desc) = format_subagent_label(info);
-        let status = if info.pending_kill {
+        let status = if info.attempt.pending_kill {
             "stopping"
         } else if info.is_running() {
             "running"
         } else {
-            info.status.as_deref().unwrap_or("done")
+            info.attempt.status.as_deref().unwrap_or("done")
         };
         let label = if desc.is_empty() {
             type_label

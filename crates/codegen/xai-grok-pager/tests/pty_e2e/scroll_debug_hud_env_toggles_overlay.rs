@@ -6,17 +6,8 @@ use super::scroll::*;
 
 use std::time::Duration;
 
-// ── Scroll-debug HUD e2e (`GROK_SCROLL_DEBUG`) ─────────────────────────────
-//
-// The HUD is a release-compiled overlay gated at runtime, so the stock harness binary must show it with the env var set and nothing without it
-// Determinism notes:
-//
-// - `GROK_SCROLL_MODE=trackpad` pins classification (the env var feeds the live config)
-//   Every finalized stream records a `last:trackpad` breadcrumb no matter how CI jitter splits the burst, so the assert cannot race the timing
-//   Asserting `mode:trackpad` also proves the configured mode reaches the HUD
-// - The pager repaints only when scroll lines land; finalizing a stream that moved zero lines does not draw
-//   After the flood settles, a single follow-up notch forces a fresh frame, and that frame paints the flood's finalized breadcrumb
-//   The notch always applies at least one line, because trackpad mode prices one event at a whole line at default speed
+// Scroll-debug HUD e2e (`GROK_SCROLL_DEBUG`). The HUD is a release-compiled overlay gated at
+// runtime, so the stock harness binary must show it with the env var set and nothing without it.
 
 /// 120 one-row markers overflow the 50-row PTY, so the early markers sit above the visible screen.
 const MARKER_COUNT: usize = 120;
@@ -114,10 +105,9 @@ async fn scroll_debug_hud_absent_without_env() {
 
 // ── `/debug scroll` e2e ─────────────────────────────────────────────────────
 
-/// **Command-toggle e2e.** `/debug scroll` typed in the prompt must flip the HUD on without the env var, and a second invocation must flip it off.
-/// The test works against debug and release harness binaries: `/debug` is registered everywhere; only its dropdown listing is debug-gated.
-/// Enter with the dropdown open accepts the exact-match arg and then sends, the same submit either way.
-/// Dispatch `trim()`s leading text, so the Space that refocuses the prompt is harmless even if it were to land as a character.
+/// Command-toggle e2e. `/debug scroll` typed in the prompt must flip the HUD on without the env
+/// var, and a second invocation must flip it off. The test works against debug and release harness
+/// binaries: `/debug` is registered everywhere; only its dropdown listing is debug-gated.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore]
 async fn debug_scroll_command_toggles_hud_live() {

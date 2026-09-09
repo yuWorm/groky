@@ -116,7 +116,7 @@ pub(crate) async fn run_request_task(
         &client.auth_info(),
     );
     if let Some(eff) = config.reasoning_effort {
-        sampling_span.record("reasoning_effort", eff.as_str());
+        sampling_span.record("reasoning_effort", eff.as_ref());
     }
 
     let mut request = request;
@@ -131,6 +131,10 @@ pub(crate) async fn run_request_task(
     let replay_unsafe = Arc::new(AtomicBool::new(false));
 
     loop {
+        sampling_span.record(
+            "total_attempts",
+            (retry_count + doom_retry_count + 1) as i64,
+        );
         if cancel_token.is_cancelled() {
             handle_cancellation(&event_tx, &request_id, &mut completion);
             return request_id;
@@ -214,7 +218,7 @@ pub(crate) async fn run_request_task(
                 tracing::warn!(
                     target: crate::sampling_log::TARGET,
                     empty_response = true,
-                    empty_reason = context.reason.as_str(),
+                    empty_reason = context.reason.as_ref(),
                     had_reasoning = context.had_reasoning,
                     content_len = context.content_len,
                     tool_call_count = context.tool_call_count,
@@ -239,6 +243,7 @@ pub(crate) async fn run_request_task(
                     &config,
                     &cancel_token,
                     &mut completion,
+                    &sampling_span,
                 )
                 .await
                 {
@@ -293,7 +298,9 @@ pub(crate) async fn run_request_task(
                         doom_max_retries,
                         &error,
                     );
-                    if sleep_or_cancel(backoff, &cancel_token).await {
+                    if sleep_or_cancel(backoff, &cancel_token, doom_retry_count, &sampling_span)
+                        .await
+                    {
                         continue;
                     }
                     handle_cancellation(&event_tx, &request_id, &mut completion);
@@ -311,6 +318,7 @@ pub(crate) async fn run_request_task(
                     &config,
                     &cancel_token,
                     &mut completion,
+                    &sampling_span,
                 )
                 .await
                 {
@@ -334,6 +342,7 @@ pub(crate) async fn run_request_task(
                     &config,
                     &cancel_token,
                     &mut completion,
+                    &sampling_span,
                 )
                 .await
                 {
@@ -359,17 +368,15 @@ async fn apply_retry_decision(
     config: &SamplerConfig,
     cancel_token: &CancellationToken,
     completion: &mut CompletionState,
+    parent: &tracing::Span,
 ) -> bool {
-    let rate_limit_threshold = if retry_policy.rate_limit_retry_threshold == 0 {
-        retry_mod::RATE_LIMIT_RETRY_THRESHOLD
-    } else {
-        retry_policy.rate_limit_retry_threshold
-    };
+    let rate_limit_threshold = config
+        .rate_limit_retry_threshold
+        .unwrap_or(retry_policy.rate_limit_retry_threshold);
     let decision = classify_error(err, *retry_count, max_retries, rate_limit_threshold);
 
     // Connection-reset / broken-pipe on body upload often means nginx rejected an oversized payload before responding 413
     // Strip images proactively before any retry of those errors so we don't burn budget re-uploading the same large body
-    // Only run when the decision retries
     // A Fatal (budget exhausted) must not mutate the request or tell the user images were "left out of the retry"
     let will_retry = matches!(
         decision,
@@ -398,7 +405,7 @@ async fn apply_retry_decision(
         RetryDecision::Retry { backoff } => {
             *retry_count += 1;
             emit_retrying(event_tx, request_id, *retry_count, max_retries, err);
-            if sleep_or_cancel(backoff, cancel_token).await {
+            if sleep_or_cancel(backoff, cancel_token, *retry_count, parent).await {
                 true
             } else {
                 handle_cancellation(event_tx, request_id, completion);
@@ -408,7 +415,7 @@ async fn apply_retry_decision(
         RetryDecision::RetryWithBackoff { backoff, .. } => {
             *retry_count += 1;
             emit_retrying(event_tx, request_id, *retry_count, max_retries, err);
-            if sleep_or_cancel(backoff, cancel_token).await {
+            if sleep_or_cancel(backoff, cancel_token, *retry_count, parent).await {
                 true
             } else {
                 handle_cancellation(event_tx, request_id, completion);
@@ -425,7 +432,6 @@ async fn apply_retry_decision(
             }
             // Only the deterministic signal (a 400 stamped with the invalid-image code) is a server rejection
             // Everything else that reaches this arm is a heuristic that must stay request-local
-            // That covers 413 body-size verdicts, proxy-wrapped 500s, the legacy phrase match, and coded mid-stream errors
             // Exhaustive: a new error variant must choose its strip label here instead of silently landing on the heuristic branch
             let reason = match err {
                 SamplingError::Api {
@@ -437,6 +443,7 @@ async fn apply_retry_decision(
                 | SamplingError::StreamError { .. }
                 | SamplingError::Auth { .. }
                 | SamplingError::InvalidConfiguration(_)
+                | SamplingError::MtlsConfiguration(_)
                 | SamplingError::Http(_)
                 | SamplingError::Serialization(_)
                 | SamplingError::EventStreamError(_)
@@ -447,7 +454,7 @@ async fn apply_retry_decision(
             };
             tracing::warn!(
                 stripped = stripped_urls.len(),
-                reason = reason.as_str(),
+                reason = reason.as_ref(),
                 error = %err,
                 "stripped {} image(s) after an image-related error; retrying without them",
                 stripped_urls.len()
@@ -460,7 +467,7 @@ async fn apply_retry_decision(
         RetryDecision::RetryWithClientRebuild { backoff } => {
             *retry_count += 1;
             emit_retrying(event_tx, request_id, *retry_count, max_retries, err);
-            if !sleep_or_cancel(backoff, cancel_token).await {
+            if !sleep_or_cancel(backoff, cancel_token, *retry_count, parent).await {
                 handle_cancellation(event_tx, request_id, completion);
                 return false;
             }
@@ -523,7 +530,18 @@ async fn apply_retry_decision(
     }
 }
 
-async fn sleep_or_cancel(duration: Duration, cancel_token: &CancellationToken) -> bool {
+async fn sleep_or_cancel(
+    duration: Duration,
+    cancel_token: &CancellationToken,
+    attempt: u32,
+    parent: &tracing::Span,
+) -> bool {
+    let _backoff = crate::span_timing::Region::from_span(tracing::info_span!(
+        parent: parent,
+        "sampling.retry_backoff",
+        attempt = attempt as i64,
+        backoff_ms = duration.as_millis() as i64,
+    ));
     tokio::select! {
         biased;
         _ = cancel_token.cancelled() => false,
@@ -532,9 +550,6 @@ async fn sleep_or_cancel(duration: Duration, cancel_token: &CancellationToken) -
 }
 
 /// Run a single attempt: build the raw stream, drive it through the matching L2 transform, and forward all non-terminal events to `event_tx`.
-/// Captures the rich `SamplingError` from the underlying raw stream so the retry loop can classify it accurately.
-///
-/// `doom_check` is the doom-loop policy while the resample budget lasts.
 /// `None` disarms the mid-stream abort and the terminal confidence check so the attempt completes and its response can be accepted.
 #[allow(clippy::too_many_arguments)]
 async fn run_one_attempt(
@@ -665,9 +680,7 @@ fn tee_errors<'a, T: Send + 'a>(
 }
 
 /// Drive an L2 event stream: forward non-terminal events to `event_tx` and watch `cancel_token`.
-/// The returned `AttemptOutcome` comes from the terminal event (or cancellation).
 /// `doom_check`, when set, turns a completed response carrying confident doom-loop signals into a retryable failure.
-/// This is a second check behind the mid-stream abort.
 #[allow(clippy::too_many_arguments)]
 async fn drive_l2(
     l2: impl futures_util::Stream<Item = SamplingEvent>,
@@ -885,7 +898,7 @@ fn build_empty_context(
         None => (0, 0, String::new(), false),
     };
 
-    let finish_reason = response.stop_reason.map(|sr| sr.as_str().to_owned());
+    let finish_reason = response.stop_reason.map(|sr| sr.as_ref().to_owned());
     let (completion_tokens, reasoning_tokens, prompt_tokens) = response
         .usage
         .as_ref()
@@ -1420,7 +1433,8 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn retry_sleep_returns_immediately_on_cancellation() {
         let cancel_token = CancellationToken::new();
-        let sleeper = sleep_or_cancel(Duration::from_secs(120), &cancel_token);
+        let parent = tracing::Span::none();
+        let sleeper = sleep_or_cancel(Duration::from_secs(120), &cancel_token, 1, &parent);
         tokio::pin!(sleeper);
 
         cancel_token.cancel();
@@ -1456,6 +1470,7 @@ mod tests {
             &config,
             &cancel_token,
             &mut completion,
+            &tracing::Span::none(),
         )
         .await;
 

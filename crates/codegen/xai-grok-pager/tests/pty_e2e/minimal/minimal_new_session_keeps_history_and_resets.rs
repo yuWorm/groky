@@ -2,14 +2,9 @@
 #[allow(unused_imports)]
 use crate::common::*;
 
-/// `/new` in minimal mode starts a fresh session: it commits a second welcome card and resets the committed frontier.
-/// The prior turn's committed lines stay in the terminal's native scrollback (we cannot, and must not, un-print them).
-/// After `/new` a fresh turn streams normally.
-///
-/// The first turn is genuinely taller than the screen (a fenced code block, not reflowable prose).
-/// The first welcome card and the turn's head therefore scroll into *native scrollback* before `/new`.
-/// The robust "new session" signal is then a *second* welcome card (two `Grok Build` banners across scrollback and screen).
-/// That signal is independent of exactly how content scrolled.
+/// The prior turn's committed lines stay in the terminal's native scrollback (we cannot, and must
+/// not, un-print them). The first welcome card and the turn's head therefore scroll into native
+/// scrollback before `/new`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore]
 async fn minimal_new_session_keeps_history_and_resets() {

@@ -7,8 +7,6 @@ const EDIT_DONE: &str = "HOOK_EDIT_AFTER_ALLOW";
 const CHIME: &str = "permission_prompt_chime";
 
 fn seed_permission_prompt_hook(content: &ContentController, log: &Path) {
-    let hooks_dir = content.home().join(".grok").join("hooks");
-    std::fs::create_dir_all(&hooks_dir).expect("create ~/.grok/hooks");
     let command = format!("printf '{CHIME}\\n' >> {}", log.display());
     let spec = json!({
         "hooks": {
@@ -18,11 +16,7 @@ fn seed_permission_prompt_hook(content: &ContentController, log: &Path) {
             }]
         }
     });
-    std::fs::write(
-        hooks_dir.join("permission_prompt.json"),
-        serde_json::to_vec_pretty(&spec).expect("serialize hook spec"),
-    )
-    .expect("write hook spec");
+    seed_hook_spec(content, "permission_prompt.json", &spec);
 }
 
 fn hook_log_chimed(log: &Path) -> bool {

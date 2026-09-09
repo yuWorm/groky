@@ -2,12 +2,9 @@
 #[allow(unused_imports)]
 use super::common::*;
 
-/// Esc double-press policy (idle, non-empty prompt): the **first Esc shows "press again to clear"** and the **second Esc clears the prompt**.
-/// The cleared text goes to the stash, which the border caption reports.
-/// The draft was never sent, so the Up-arrow history panel must not list it.
-/// Proves `try_handle_esc_policy`'s idle clear arm and `dispatch_clear_prompt` end-to-end on the real binary.
-///
-/// Uses [`spawn_esc_double_press_pager`] so a slow inter-press round-trip can't expire the pending clear.
+/// The draft was never sent, so the Up-arrow history panel must not list it. Uses
+/// [`spawn_esc_double_press_pager`] so a slow inter-press round-trip can't expire the pending
+/// clear.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore]
 async fn esc_esc_clears_idle_prompt_into_the_stash() {

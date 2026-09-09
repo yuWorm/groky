@@ -36,11 +36,9 @@ async fn idle_session() -> (ContentController, PtyHarness) {
     (content, harness)
 }
 
-/// Type text, apply a selection sequence, type over it, and wait for the result.
-///
-/// `wiped` is the substring that must disappear.
-/// `wait_for_text` alone can false-pass when the chord only moved the caret and the replacement string is a substring of the unreplaced draft.
-/// Example: "hello X" inside "hello Xworld".
+/// Type text, apply a selection sequence, type over it, and wait for the result. `wiped` is the
+/// substring that must disappear. `wait_for_text` alone can false-pass when the chord only moved
+/// the caret and the replacement string is a substring of the unreplaced draft.
 fn select_and_type_over(
     harness: &mut PtyHarness,
     typed: &str,

@@ -22,13 +22,8 @@ pub(crate) const DEFAULT_COLS: u16 = 120;
 pub(crate) const WELCOME_TIMEOUT: Duration = Duration::from_secs(20);
 
 /// Wait budget for a `--continue` / resume to replay the prior transcript back into scrollback.
-/// Resume is strictly heavier than a cold start.
-/// It runs `session/load` (MCP startup, git chores, a full `updates.jsonl` replay, and session spawn) on the agent's single-threaded runtime.
-/// The client-side `acp_send` has no timeout.
-/// Under the fully-parallel pty_e2e suite the starved agent thread can push this well past the 20s `WELCOME_TIMEOUT`.
-/// That leaves the "Loading session…" placeholder up.
-/// A prior 60s budget still timed out under CI load with the same stuck-loading signature.
-/// Match [`WRAP_TIMEOUT`] (120s) for the same contention reason, not because resume is slow when run alone.
+/// Match [`WRAP_TIMEOUT`] (120s) for the same contention reason, not because resume is slow when
+/// run alone.
 pub(crate) const RESUME_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// Substring we wait for on the welcome screen.
@@ -45,9 +40,6 @@ pub(crate) const PROMPT: &str = "go";
 pub(crate) const MOCK_RESPONSE_SENTINEL: &str = "MOCKRESPONSE";
 
 /// The sandbox's unified log (shell-written; forwarded pager entries land here too).
-/// No cross-process helper exists to reuse whole.
-/// `xai_grok_telemetry::unified_log::path()` resolves the calling process's own grok home and the file-name const is private.
-/// So this composes the sandbox grok home with the exported `LOG_DIR`.
 pub(crate) fn unified_log_path(content: &ContentController) -> PathBuf {
     content
         .sandbox()
@@ -62,15 +54,28 @@ pub(crate) fn unified_log_path(content: &ContentController) -> PathBuf {
 /// Asserting only the suffix keeps the check independent of which chord the banner names.
 pub(crate) const UNDO_TIP_SENTINEL: &str = "to undo";
 
+pub(crate) const SEND_NOW_TIP_SENTINEL: &str = "to send now";
+
 /// A draft of FIRE_PEAK_LEN (20) or more chars.
-/// The first char promotes the welcome prompt to a real (routed) agent session; the rest accumulate into the draft.
+/// The first keystroke (or Ctrl+N) leaves Welcome; the rest lands in the agent composer.
 pub(crate) const SUBSTANTIAL_DRAFT: &[u8] = b"aaaaaaaaaaaaaaaaaaaaaaaaa";
 
-/// Type a substantial draft, wait for it to render in the promoted agent prompt, then wipe it with Ctrl+U (0x15, kill-to-BOL).
-/// That wipe is substantial and recoverable, so it triggers the undo tip.
-/// Typing and the kill are injected separately (with a settle in between) to avoid racing the async welcome-to-session promotion.
-/// The scripted scenarios use the same shape.
+/// Leave the optimistic home screen via Ctrl+N so the rest of the test runs
+/// in the agent composer (stash, undo tip, image chips, F2 settings).
+pub(crate) fn leave_home(harness: &mut PtyHarness) {
+    harness
+        .inject_keys(keys::CTRL_N)
+        .expect("Ctrl+N leave home");
+    // Agent chrome; "New worktree" can linger in other copy.
+    harness
+        .wait_for_text("Shift+Tab", Duration::from_secs(20))
+        .expect("left the welcome home screen");
+}
+
+/// Typing and the kill are injected separately (with a settle in between) to avoid racing the async
+/// welcome-to-session promotion.
 pub(crate) fn wipe_substantial_draft(harness: &mut PtyHarness) {
+    leave_home(harness);
     harness
         .inject_keys(SUBSTANTIAL_DRAFT)
         .expect("type substantial draft");
@@ -120,17 +125,9 @@ pub(crate) fn long_response(sentinel: &str, lines: usize) -> String {
     s
 }
 
-/// A response that renders to **at least `rows` terminal rows**.
-/// `sentinel` sits on the first row so it is the first line to scroll into native scrollback.
-///
-/// Unlike [`long_response`], each source line is wrapped in a fenced code block so markdown does **not** reflow them into one soft-wrapped paragraph.
-/// Each `line N` becomes exactly one rendered row.
-/// This is what makes the block genuinely taller than the screen.
-/// A 60-*line* prose paragraph reflows to only ~30 rows at typical widths and fits on screen, so it would *not* overflow into scrollback.
-/// The content-anchored live region keeps it visible.
-///
-/// Use this for the commit-to-scrollback contract tests.
-/// They need the block's own head to scroll above the pinned viewport into the terminal's native history.
+/// A response that renders to at least `rows` terminal rows. Each `line N` becomes exactly one
+/// rendered row. A 60-line prose paragraph reflows to only ~30 rows at typical widths and fits on
+/// screen, so it would not overflow into scrollback.
 pub(crate) fn tall_response(sentinel: &str, rows: usize) -> String {
     let mut s = String::with_capacity(rows * 24);
     s.push_str("```\n");
@@ -146,11 +143,9 @@ pub(crate) fn tall_response(sentinel: &str, rows: usize) -> String {
 // ── Fake session-auth (OAuth) seeding ───────────────────────────────────
 // `seed_fake_oauth` / `oauth_credential_ops` live in `xai_grok_pager_pty_harness::flows` (re-exported above)
 
-/// Spawn a pager with fake session (OAuth) auth and a 1s announcements poll, then drive it into a live session (welcome, prompt, mock response).
-/// Session auth matters: the settings poll requires `auth_manager.auth()`.
-/// The harness's default `XAI_API_KEY` (ApiKey/BYOK mode, no auth.json entry) would never fetch `/v1/settings`.
-/// Spawns WITHOUT `GROK_ANNOUNCEMENTS_OVERRIDE` (the env override beats pushed lists in the pager and would mask updates).
-/// Call `content.set_response(..)` BEFORE this so the entry prompt streams.
+/// The harness's default `XAI_API_KEY` (ApiKey/BYOK mode, no auth.json entry) would never fetch
+/// `/v1/settings`. Spawns WITHOUT `GROK_ANNOUNCEMENTS_OVERRIDE` (the env override beats pushed
+/// lists in the pager and would mask updates).
 pub(crate) fn spawn_polling_session(content: &ContentController, oauth_user: &str) -> PtyHarness {
     spawn_polling_session_with_env(content, oauth_user, &[])
 }
@@ -237,10 +232,9 @@ pub(crate) fn folder_is_trusted(content: &ContentController, repo: &std::path::P
     store.is_trusted(&xai_grok_workspace::trust::workspace_key(repo))
 }
 
-// ── Leader mode e2e ─────────────────────────────────────────────────────
-// The leader cluster cases moved to the dedicated `tests/leader_pty_e2e` target
-// Their LEADER_TIMEOUT/STREAM_TIMEOUT/submit_turn/inference_request_count helpers moved with them
-// Only the helpers non-leader tests still use remain here
+// Leader mode e2e. The leader cluster cases moved to the dedicated `tests/leader_pty_e2e` target.
+// Their LEADER_TIMEOUT/STREAM_TIMEOUT/submit_turn/inference_request_count helpers moved with them.
+// Only the helpers non-leader tests still use remain here.
 
 /// Sentinel for turn `n`, short enough to never wrap at 120 cols (wrapping would break the exactly-once occurrence counts).
 pub(crate) fn turn_sentinel(n: u8) -> String {
@@ -270,6 +264,21 @@ pub(crate) fn seed_mcp_server_config(content: &ContentController) {
         "[mcp_servers.{MCP_TEST_SERVER}]\ncommand = \"{command}\"\nargs = []\nstartup_timeout_sec = 2\n"
     );
     std::fs::write(grok_home.join("config.toml"), config).expect("write config.toml");
+}
+
+/// Write one hooks spec file under the sandbox's `~/.grok/hooks/` (`spec` is the file's JSON body).
+pub(crate) fn seed_hook_spec(
+    content: &ContentController,
+    file_name: &str,
+    spec: &serde_json::Value,
+) {
+    let hooks_dir = content.home().join(".grok").join("hooks");
+    std::fs::create_dir_all(&hooks_dir).expect("create ~/.grok/hooks");
+    std::fs::write(
+        hooks_dir.join(file_name),
+        serde_json::to_vec_pretty(spec).expect("serialize hook spec"),
+    )
+    .expect("write hook spec");
 }
 
 /// Spawn the pager in `cwd`, open `/mcps`, wait for the seeded server.
@@ -375,10 +384,6 @@ pub(crate) const CTRL_L: &[u8] = b"\x0c";
 /// On Apple Terminal this is the InterjectPrompt / send-now chord.
 /// In minimal mode it also doubles as the transcript-pager remap when interject would no-op.
 pub(crate) const CTRL_O: &[u8] = b"\x0f";
-
-/// Suffix of the mid-turn send-now tip: `Queued · Enter to send now` (or the interject chord in multiline).
-/// Chord-agnostic like [`UNDO_TIP_SENTINEL`].
-pub(crate) const SEND_NOW_TIP_SENTINEL: &str = "to send now";
 
 // NOTE: There is no SessionStart hook exactly-once e2e test
 // Deduplication in load_hooks_from_sources is covered by unit tests in xai-grok-hooks::discovery::tests
@@ -678,9 +683,6 @@ pub(crate) fn mouse_drag_line(row: u16, from_col: u16, to_col: u16) -> String {
 }
 
 /// SGR mouse press and drag from (row,from_col) to (row,to_col) inclusive with no final release.
-/// Reproduces a lost `Up(Left)` so the drag stays latched.
-/// Real terminals drop the release this way when the mouseup lands off the terminal element (or is coalesced/dropped over Remote-SSH).
-/// xtermjs/xterm.js#4781 ("It works if mouseup occurs outside the terminal element"), microsoft/vscode#192518.
 pub(crate) fn mouse_drag_no_release(row: u16, from_col: u16, to_col: u16) -> String {
     let mut out = String::new();
     out.push_str(&sgr_mouse(0, row, from_col, 'M')); // press
@@ -950,12 +952,8 @@ pub(crate) fn spawn_minimal(content: &ContentController) -> PtyHarness {
     spawn_minimal_sized(content, DEFAULT_ROWS, DEFAULT_COLS)
 }
 
-/// Spawn minimal at an explicit terminal size.
-/// A short terminal forces committed blocks into native scrollback sooner (less static space above the pinned live region).
-///
-/// Response forwarding is enabled so the inline viewport's startup cursor-position query is answered.
-/// Without it, `--minimal` silently downgrades to full-screen inline (the probe times out).
-/// These tests would then assert against the wrong render path.
+/// Spawn minimal at an explicit terminal size. Without it, `--minimal` silently downgrades to
+/// full-screen inline (the probe times out).
 pub(crate) fn spawn_minimal_sized(content: &ContentController, rows: u16, cols: u16) -> PtyHarness {
     let binary = pager_binary().expect("resolve pager binary");
     let mut harness = PtyHarness::spawn_with_content(&binary, rows, cols, content, MINIMAL_ARGS)
@@ -964,10 +962,8 @@ pub(crate) fn spawn_minimal_sized(content: &ContentController, rows: u16, cols: 
     harness
 }
 
-/// Spawn minimal in an explicit project dir, appending `extra_args` to [`MINIMAL_ARGS`] (e.g. `--continue`).
-/// Sessions are keyed by cwd, so resume / new-session tests need a stable directory across runs.
-/// Query forwarding is enabled (as in [`spawn_minimal_sized`]) so the inline-viewport probe completes.
-/// Minimal then does not silently downgrade to full-screen inline.
+/// Spawn minimal in an explicit project dir, appending `extra_args` to [`MINIMAL_ARGS`] (e.g.
+/// `--continue`).
 pub(crate) fn spawn_minimal_in_dir(
     content: &ContentController,
     rows: u16,
@@ -998,11 +994,9 @@ pub(crate) fn wait_minimal_ready(harness: &mut PtyHarness) {
         });
 }
 
-/// Quit minimal cleanly.
-/// The prompt is always focused (a bare `q` would type into it), so quit is Ctrl+Q pressed twice (it requires confirmation).
-/// Falls back to the harness kill path if the chord doesn't take.
-/// Give the confirm chord and process exit enough time under suite load.
-/// A SIGKILL must not cut off the agent mid-`updates.jsonl` flush, which breaks a subsequent `--continue` resume.
+/// Quit minimal cleanly. The prompt is always focused (a bare `q` would type into it), so quit is
+/// Ctrl+Q pressed twice (it requires confirmation). Falls back to the harness kill path if the
+/// chord doesn't take.
 pub(crate) fn quit_minimal(harness: &mut PtyHarness) {
     let _ = harness.inject_keys(b"\x11"); // Ctrl+Q, first press (quit needs confirmation)
     harness.update(Duration::from_millis(200));
@@ -1260,10 +1254,9 @@ pub(crate) fn write_screen_dump_if_requested(harness: &PtyHarness, file_stem: &s
 
 // ── Clipboard paste e2e tests ───────────────────────────────────────────
 
-/// Serialized `content` of every user message across recorded requests, in order.
-/// Like [`all_user_messages`] but multimodal-tolerant: array-form content serializes to its JSON string instead of vanishing.
-/// That keeps contains-style sentinel asserts working.
-/// (E.g. text plus an image block attached from a macOS dev machine's real clipboard during a paste test.)
+/// Serialized `content` of every user message across recorded requests, in order. Like
+/// [`all_user_messages`] but multimodal-tolerant: array-form content serializes to its JSON string
+/// instead of vanishing.
 pub(crate) fn all_user_message_blobs(content: &ContentController) -> Vec<String> {
     content
         .request_bodies()

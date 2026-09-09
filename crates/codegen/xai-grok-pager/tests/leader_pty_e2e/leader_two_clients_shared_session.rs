@@ -2,12 +2,9 @@
 #[allow(unused_imports)]
 use super::common::*;
 
-/// 12. **Leader mode: two clients share one session.**
-/// The two-terminal flow: pager A starts with `--leader` on an isolated socket (spawning the leader) and runs a turn.
-/// Pager B starts with the same socket and `--resume`, attaching to A's session through the SAME leader.
-/// B must render A's transcript exactly once; duplicated replay history and an empty or stuck pane both fail.
-/// Later turns must stream live into BOTH panes regardless of which client drives.
-/// The leader and viewer must survive the spawning client's exit.
+/// B must render A's transcript exactly once. duplicated replay history and an empty or stuck pane both fail. Later
+/// turns must stream live into BOTH panes regardless of which client drives. The leader and viewer must survive the
+/// spawning client's exit.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "PTY e2e; run with cargo test -p xai-grok-pager --test leader_pty_e2e -- --ignored --test-threads=1"]
 async fn leader_two_clients_shared_session() {
@@ -57,14 +54,9 @@ async fn leader_two_clients_shared_session() {
     a.wait_for_text(&turn_sentinel(3), STREAM_TIMEOUT)
         .expect("A received B's live turn");
 
-    // Each submitted prompt top-anchors its turn, scrolling earlier turns above the viewport
-    // Grow the viewport and wheel-scroll to the top so the whole 3-turn transcript is on screen
-    // The scroll uses wheel events because the focused input box captures the keyboard scroll keys
-    // Then count every sentinel exactly once on each pane: a duplicated replay or a dropped turn both fail here
-    //
-    // Non-dev builds no longer wake on a steady tracing_rx tick
-    // Scroll finalize runs on has_active_stream ticks, and a wheel the cadence suppresses must still schedule a tick (handle_input returns Changed)
-    // Bazel on linux amd64 is slower than a local macOS run, so retry wheel bursts until every turn sentinel is visible or the deadline passes
+    // Grow the viewport and wheel-scroll to the top so the whole 3-turn transcript is on screen. The scroll uses wheel
+    // events because the focused input box captures the keyboard scroll keys. Then count every sentinel exactly once
+    // on each pane: a duplicated replay or a dropped turn both fail here.
     fn wheel_scroll_to_top(h: &mut PtyHarness) {
         for burst in 0..4 {
             for _ in 0..50 {

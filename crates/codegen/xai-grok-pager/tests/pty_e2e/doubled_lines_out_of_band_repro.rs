@@ -53,10 +53,8 @@ async fn out_of_band_stale_row_heals_on_focus_gained() {
         "marker must be absent before injection"
     );
 
-    // Simulate the out-of-band reflow: write a stale row straight into the virtual screen at col 1
-    // Col 1 is the static left margin grok's diff renderer doesn't repaint during the logo shimmer
-    // The heal is a full clear, so removal is reliable
-    // `\x1b[<row>;<col>H` is 1-based cursor positioning
+    // Simulate the out-of-band reflow: write a stale row straight into the virtual screen at col 1.
+    // Col 1 is the static left margin grok's diff renderer doesn't repaint during the logo shimmer.
     h.feed_screen(format!("\x1b[6;1H{STALE_MARKER}").as_bytes());
     assert!(
         h.contains_text(STALE_MARKER),

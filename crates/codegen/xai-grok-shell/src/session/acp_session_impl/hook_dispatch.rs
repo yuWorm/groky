@@ -5,7 +5,7 @@ pub(super) fn turn_result_to_hook_outcome(
 ) -> xai_tool_protocol::turn_hook::TurnHookOutcome {
     use xai_tool_protocol::turn_hook::TurnHookOutcome;
     match result {
-        Ok(TurnOutcome::Completed { .. }) | Ok(TurnOutcome::StationarityEnded { .. }) => {
+        Ok(TurnOutcome::Completed { .. }) | Ok(TurnOutcome::StationarityEnded) => {
             TurnHookOutcome::Completed
         }
         Ok(TurnOutcome::Cancelled { .. }) | Ok(TurnOutcome::MaxTurnsReached { .. }) => {
@@ -45,8 +45,6 @@ pub(super) fn map_tool_outcome(
 }
 
 /// Returns `(notification_type, message, title, level)` when this update should trigger a vendor-compatible `Notification` hook.
-///
-/// Internal and high-frequency updates (hook scrollback, retry progress, config changes) are excluded.
 /// Migrated hooks fire only on updates that need the user's attention.
 /// `DiffReview` always waits on the user, so it is safe to fire `permission_prompt` here.
 #[allow(clippy::type_complexity)]
@@ -356,10 +354,9 @@ impl SessionActor {
         .await
     }
 
-    /// Dispatch a `PostToolUseFailure` event: fire observe-only client hooks,
-    /// then run the on-disk registry's context-only failure path. Returns the
-    /// aggregated `additionalContext` notes for the caller to deliver after the
-    /// failed tool result. Context-only — no block or output replacement.
+    /// Dispatch a `PostToolUseFailure` event: fire observe-only client hooks, then run the on-disk registry's context-only failure path.
+    /// Returns the aggregated `additionalContext` notes for the caller to deliver after the failed tool result.
+    /// Context-only — no block or output replacement.
     async fn dispatch_post_tool_use_failure_hook(
         &self,
         payload: xai_grok_hooks::event::HookPayload,
