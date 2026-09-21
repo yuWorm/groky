@@ -3,7 +3,10 @@
 # https://github.com/yuWorm/groky
 #
 #   irm https://raw.githubusercontent.com/yuWorm/groky/main/scripts/install-groky.ps1 | iex
-#   $env:GROKY_VERSION="0.1.0"; irm ... | iex
+#   $env:GROKY_VERSION="0.1.15"; irm ... | iex
+#
+# A pinned GROKY_VERSION downloads github.com/releases/download directly
+# (no api.github.com). Unpinned still hits /releases/latest.
 #
 
 param(
@@ -27,26 +30,23 @@ if ($token) { $headers['Authorization'] = "Bearer $token" }
 
 if ($Version) {
     $tag = if ($Version.StartsWith('v')) { $Version } else { "v$Version" }
-    $api = "https://api.github.com/repos/$Repo/releases/tags/$tag"
+    Write-Host "Fetching groky $tag from $Repo (direct download, no GitHub API)..."
 } else {
     Write-Host "Fetching latest groky release from $Repo..."
     $api = "https://api.github.com/repos/$Repo/releases/latest"
+    $release = Invoke-RestMethod -Uri $api -Headers $headers
+    $tag = $release.tag_name
 }
 
-$release = Invoke-RestMethod -Uri $api -Headers $headers
-$tag = $release.tag_name
 $ver = $tag.TrimStart('v')
 $assetName = "groky-$ver-windows-x86_64.exe"
-$asset = $release.assets | Where-Object { $_.name -eq $assetName } | Select-Object -First 1
-if (-not $asset) {
-    throw "Release $tag has no asset $assetName"
-}
+$url = "https://github.com/$Repo/releases/download/$tag/$assetName"
 
 New-Item -ItemType Directory -Force -Path $BinDir | Out-Null
 $dest = Join-Path $BinDir 'groky.exe'
 $tmp = Join-Path $BinDir 'groky.exe.tmp'
 Write-Host "  Downloading $assetName..."
-Invoke-WebRequest -Uri $asset.browser_download_url -OutFile $tmp -UseBasicParsing
+Invoke-WebRequest -Uri $url -OutFile $tmp -UseBasicParsing
 if (Test-Path $dest) {
     Move-Item -Force $dest (Join-Path $BinDir 'groky.exe.old') -ErrorAction SilentlyContinue
 }

@@ -24,7 +24,19 @@ Windows PowerShell:
 irm https://raw.githubusercontent.com/yuWorm/groky/main/scripts/install-groky.ps1 | iex
 ```
 
-Pin a version: `bash -s 0.1.0` or `$env:GROKY_VERSION="0.1.0"`.
+Pin a version (downloads `github.com/.../releases/download/...` and does
+**not** call `api.github.com` — useful behind a shared VPN IP):
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/yuWorm/groky/main/scripts/install-groky.sh | bash -s 0.1.15
+groky update --version 0.1.15
+```
+
+PowerShell: `$env:GROKY_VERSION="0.1.15"; irm ... | iex`
+
+Unpinned `groky update` / the installer without a version still query
+`/releases/latest`. A `GROKY_GITHUB_TOKEN` (or `GITHUB_TOKEN`) raises that
+API quota.
 
 Re-run the same command to upgrade.
 

@@ -42,14 +42,6 @@ struct CacheFile {
 #[derive(Debug, Deserialize)]
 struct GithubRelease {
     tag_name: String,
-    #[serde(default)]
-    assets: Vec<GithubAsset>,
-}
-
-#[derive(Debug, Deserialize)]
-struct GithubAsset {
-    name: String,
-    browser_download_url: String,
 }
 
 /// Injected once from the binary (`GROKY_VERSION`). Empty / unset = dev build.
@@ -203,13 +195,11 @@ pub async fn install(target: Option<&str>, force: bool) -> Result<Option<String>
     }
 
     let asset = platform_asset(&latest)?;
-    let release = fetch_release(&format!("v{latest}")).await?;
-    let url = asset_url(&release, &asset).ok_or_else(|| {
-        SelfUpdateError::Message(format!(
-            "release v{latest} has no asset {asset} for this platform"
-        ))
-    })?;
-    let sha_url = asset_url(&release, &format!("{asset}.sha256"));
+    // Asset names are deterministic (`groky-{ver}-{os}-{arch}`). Skip
+    // `/releases/tags` so a pinned `groky update --version` does not spend
+    // the unauthenticated GitHub API quota (shared VPN IPs in CN burn it).
+    let url = tagged_download_url(&latest, &asset);
+    let sha_url = tagged_download_url(&latest, &format!("{asset}.sha256"));
 
     let dest = managed_bin();
     if let Some(parent) = dest.parent() {
@@ -223,19 +213,17 @@ pub async fn install(target: Option<&str>, force: bool) -> Result<Option<String>
     download_file(&url, &tmp).await?;
     // HTTP download does not keep the Release asset's +x; chmod before exec.
     chmod_unix_exec(&tmp)?;
-    if let Some(sha_url) = sha_url {
-        let expected = download_text(&sha_url)
-            .await
-            .ok()
-            .and_then(|s| parse_sha256(&s));
-        if let Some(expected) = expected {
-            let actual = sha256_file(&tmp)?;
-            if actual != expected {
-                let _ = fs::remove_file(&tmp);
-                return Err(SelfUpdateError::Message(format!(
-                    "sha256 mismatch for {asset} (got {actual}, expected {expected})"
-                )));
-            }
+    if let Some(expected) = download_text(&sha_url)
+        .await
+        .ok()
+        .and_then(|s| parse_sha256(&s))
+    {
+        let actual = sha256_file(&tmp)?;
+        if actual != expected {
+            let _ = fs::remove_file(&tmp);
+            return Err(SelfUpdateError::Message(format!(
+                "sha256 mismatch for {asset} (got {actual}, expected {expected})"
+            )));
         }
     }
     smoke_test(&tmp)?;
@@ -408,34 +396,17 @@ async fn fetch_latest() -> Result<String, SelfUpdateError> {
     Ok(parse_tag(&release.tag_name))
 }
 
-async fn fetch_release(tag: &str) -> Result<GithubRelease, SelfUpdateError> {
-    let url = format!(
-        "https://api.github.com/repos/{}/releases/tags/{tag}",
-        repo()
-    );
-    let resp = github_get(&url).await?;
-    let status = resp.status();
-    let body = resp.text().await.unwrap_or_default();
-    if !status.is_success() {
-        return Err(SelfUpdateError::Message(format!(
-            "GitHub release {tag} {status}: {}",
-            body.chars().take(180).collect::<String>()
-        )));
-    }
-    serde_json::from_str(&body)
-        .map_err(|e| SelfUpdateError::Message(format!("GitHub release JSON: {e}")))
-}
-
 fn parse_tag(tag: &str) -> String {
     tag.trim().trim_start_matches('v').to_owned()
 }
 
-fn asset_url(release: &GithubRelease, name: &str) -> Option<String> {
-    release
-        .assets
-        .iter()
-        .find(|a| a.name == name)
-        .map(|a| a.browser_download_url.clone())
+pub(crate) fn release_download_url(repo: &str, tag: &str, asset: &str) -> String {
+    format!("https://github.com/{repo}/releases/download/{tag}/{asset}")
+}
+
+fn tagged_download_url(version: &str, asset: &str) -> String {
+    let tag = format!("v{}", version.trim().trim_start_matches('v'));
+    release_download_url(&repo(), &tag, asset)
 }
 
 async fn download_file(url: &str, dest: &Path) -> Result<(), SelfUpdateError> {
@@ -574,21 +545,35 @@ mod tests {
     }
 
     #[test]
-    fn github_json_picks_asset() {
-        let release: GithubRelease = serde_json::from_str(
-            r#"{
-              "tag_name": "v0.1.5",
-              "assets": [
-                {"name": "groky-0.1.5-macos-aarch64", "browser_download_url": "https://example/bin"},
-                {"name": "groky-0.1.5-macos-aarch64.sha256", "browser_download_url": "https://example/sum"}
-              ]
-            }"#,
-        )
-        .unwrap();
+    fn github_json_reads_latest_tag() {
+        let release: GithubRelease = serde_json::from_str(r#"{"tag_name": "v0.1.5"}"#).unwrap();
         assert_eq!(parse_tag(&release.tag_name), "0.1.5");
-        assert_eq!(
-            asset_url(&release, "groky-0.1.5-macos-aarch64").as_deref(),
-            Some("https://example/bin")
+    }
+
+    #[test]
+    fn pinned_version_uses_releases_download_not_api() {
+        let url = release_download_url(
+            "yuWorm/groky",
+            "v0.1.15",
+            "groky-0.1.15-macos-aarch64",
         );
+        assert_eq!(
+            url,
+            "https://github.com/yuWorm/groky/releases/download/v0.1.15/groky-0.1.15-macos-aarch64"
+        );
+        assert!(
+            !url.contains("api.github.com"),
+            "pinned downloads must not use the rate-limited GitHub API: {url}"
+        );
+    }
+
+    #[test]
+    fn tagged_download_url_accepts_v_prefix() {
+        let asset = "groky-0.1.15-linux-x86_64";
+        assert_eq!(
+            tagged_download_url("0.1.15", asset),
+            tagged_download_url("v0.1.15", asset)
+        );
+        assert!(tagged_download_url("0.1.15", asset).contains("/v0.1.15/"));
     }
 }

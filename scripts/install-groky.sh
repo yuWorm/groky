@@ -7,11 +7,14 @@
 #
 # Usage:
 #   curl -fsSL https://raw.githubusercontent.com/yuWorm/groky/main/scripts/install-groky.sh | bash
-#   curl -fsSL ... | bash -s 0.1.0
-#   GROKY_VERSION=0.1.0 GROKY_BIN_DIR=$HOME/.local/bin bash scripts/install-groky.sh
+#   curl -fsSL ... | bash -s 0.1.15
+#   GROKY_VERSION=0.1.15 GROKY_BIN_DIR=$HOME/.local/bin bash scripts/install-groky.sh
+#
+# A pinned version downloads github.com/releases/download directly (no
+# api.github.com). Unpinned still hits /releases/latest.
 #
 # Env: GROKY_REPO (default yuWorm/groky), GROKY_VERSION, GROKY_BIN_DIR,
-#      GROKY_GITHUB_TOKEN (optional; raises API rate limit)
+#      GROKY_GITHUB_TOKEN (optional; raises the latest-release API rate limit)
 
 set -euo pipefail
 
@@ -73,8 +76,7 @@ if [[ -z "$TARGET" ]]; then
 else
   tag="$TARGET"
   [[ "$tag" == v* ]] || tag="v$tag"
-  echo "Fetching groky ${tag} from ${REPO}..." >&2
-  json="$(api "https://api.github.com/repos/${REPO}/releases/tags/${tag}")"
+  echo "Fetching groky ${tag} from ${REPO} (direct download, no GitHub API)..." >&2
 fi
 
 if [[ -z "$tag" ]]; then
@@ -86,11 +88,8 @@ version="${tag#v}"
 asset="${BIN_NAME}-${version}-${os}-${arch}"
 [[ "$os" == "windows" ]] && asset="${asset}.exe"
 
-# Prefer the browser_download_url whose name matches the asset.
-url="$(printf '%s' "$json" | tr '"' '\n' | grep -E "/${asset}$" | grep 'https://' | head -1 || true)"
-if [[ -z "$url" ]]; then
-  url="https://github.com/${REPO}/releases/download/${tag}/${asset}"
-fi
+# Deterministic asset URL. Pinning a version never calls api.github.com.
+url="https://github.com/${REPO}/releases/download/${tag}/${asset}"
 
 tmp="$(mktemp)"
 trap 'rm -f "$tmp"' EXIT
