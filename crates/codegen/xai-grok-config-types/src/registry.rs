@@ -43,9 +43,10 @@ pub enum Feature {
     AutoWake,
     /// Save a finished subagent's working copy into the repo as a git ref, restored on resume.
     SubagentWorktreeSnapshot,
+    /// Hide the subagent `model` argument when every eligible catalog entry is an xAI model.
+    SubagentModelInheritance,
     /// Send model-authored follow-ups to an owned active descendant.
     ActiveAgentMessages,
-    RepoStatusInSystemPrompt,
     /// Consolidated panel dock above the prompt (Subagents / Tasks / Watchers / Queued).
     Dock,
     /// The terminal-native `terminal` color theme (staged rollout).
@@ -216,20 +217,20 @@ pub const FEATURES: &[FeatureSpec] = &[
         remote: Some(|settings| settings.subagent_worktree_snapshot_enabled),
     },
     FeatureSpec {
+        id: Feature::SubagentModelInheritance,
+        key: "subagent_model_inheritance",
+        path: "features.subagent_model_inheritance",
+        env: "GROK_SUBAGENT_MODEL_INHERITANCE",
+        default_enabled: false,
+        remote: Some(|settings| settings.subagent_model_inheritance_enabled),
+    },
+    FeatureSpec {
         id: Feature::ActiveAgentMessages,
         key: "active_agent_messages",
         path: "features.active_agent_messages",
         env: "GROK_ACTIVE_AGENT_MESSAGES",
         default_enabled: false,
         remote: Some(|settings| settings.active_agent_messages_enabled),
-    },
-    FeatureSpec {
-        id: Feature::RepoStatusInSystemPrompt,
-        key: "repo_status_in_system_prompt",
-        path: "features.repo_status_in_system_prompt",
-        env: "GROK_REPO_STATUS_IN_SYSTEM_PROMPT",
-        default_enabled: true,
-        remote: Some(|settings| settings.repo_status_in_system_prompt),
     },
     FeatureSpec {
         id: Feature::Dock,

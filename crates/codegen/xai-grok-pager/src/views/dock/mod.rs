@@ -22,8 +22,9 @@ pub use layout::{DockLayout, MaxRows, SectionSlots, desired_height, is_show_all_
 pub const MAX_DOCK_ROWS: u16 = 8;
 
 const HEADER_INDENT: &str = " ";
-const ROW_INDENT: &str = "   ";
-const MORE_INDENT: &str = "     ";
+/// Same gutter as the header chevron, so a one-item section is not nested.
+const ROW_INDENT: &str = " ";
+const MORE_INDENT: &str = "   ";
 /// Lines the queue body's `#N` markers up with the column its header's title
 /// starts in. The header spends three columns on its chevron and the queue pane
 /// already insets its own content by two, so the dock adds the last one.
@@ -63,7 +64,7 @@ pub struct DockRow {
     pub kind: String,
     pub description: String,
     pub activity: Option<String>,
-    /// Right-aligned meta column, e.g. `grok-4.5 2m14s` or `every 5m`.
+    /// Right-aligned meta column, e.g. `grok-4.5 2m14s` or `every 5m (next in 2m)`.
     pub meta: String,
     pub killable: bool,
     /// Loops only paint `[↗]` when a linked child still exists to open.
@@ -75,6 +76,7 @@ pub struct DockRow {
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Section {
+    Workflows,
     Subagents,
     Tasks,
     Watchers,
@@ -85,15 +87,17 @@ impl Section {
     /// Slot in the per-section values of [`SectionSlots`]; `Queued` has none.
     pub(crate) fn slot(self) -> Option<usize> {
         match self {
-            Section::Subagents => Some(0),
-            Section::Tasks => Some(1),
-            Section::Watchers => Some(2),
+            Section::Workflows => Some(0),
+            Section::Subagents => Some(1),
+            Section::Tasks => Some(2),
+            Section::Watchers => Some(3),
             Section::Queued => None,
         }
     }
 
     fn label(self) -> &'static str {
         match self {
+            Section::Workflows => "Workflows",
             Section::Subagents => "Subagents",
             Section::Tasks => "Tasks",
             Section::Watchers => "Watchers",
@@ -101,20 +105,14 @@ impl Section {
         }
     }
 
-    pub(crate) fn tab_hint(self) -> &'static str {
-        match self {
-            Section::Subagents => "subagents",
-            Section::Tasks => "tasks",
-            Section::Watchers => "watchers",
-            Section::Queued => "queued",
-        }
-    }
-
-    /// Subagents reuse the Tasks pane `[x]`; everything else keeps `[stop]`.
+    /// Every killable dock row paints `[stop]`, including subagents.
     pub fn kill_label(self) -> &'static str {
         match self {
-            Section::Subagents => crate::glyphs::ballot_x_button(),
-            Section::Tasks | Section::Watchers | Section::Queued => STOP_LABEL,
+            Section::Workflows
+            | Section::Subagents
+            | Section::Tasks
+            | Section::Watchers
+            | Section::Queued => STOP_LABEL,
         }
     }
 }
@@ -139,13 +137,16 @@ pub struct DockStopHit {
 /// [`DockLayout`], so they cannot drift apart.
 #[derive(Default, Clone, Copy)]
 pub struct DockCounts {
+    pub workflows: usize,
     pub subagents: usize,
     pub tasks: usize,
     pub watchers: usize,
     pub queued: usize,
+    pub workflows_expanded: bool,
     pub subagents_expanded: bool,
     pub tasks_expanded: bool,
     pub watchers_expanded: bool,
+    pub workflows_show_all: bool,
     pub subagents_show_all: bool,
     pub tasks_show_all: bool,
     pub watchers_show_all: bool,
@@ -160,13 +161,16 @@ pub struct DockCounts {
 
 #[derive(Default)]
 pub struct DockData {
+    pub workflows: Vec<DockRow>,
     pub subagents: Vec<DockRow>,
     pub tasks: Vec<DockRow>,
     pub watchers: Vec<DockRow>,
     pub queued: usize,
+    pub workflows_expanded: bool,
     pub subagents_expanded: bool,
     pub tasks_expanded: bool,
     pub watchers_expanded: bool,
+    pub workflows_show_all: bool,
     pub subagents_show_all: bool,
     pub tasks_show_all: bool,
     pub watchers_show_all: bool,
@@ -191,13 +195,16 @@ pub struct DockData {
 impl DockData {
     pub fn counts(&self) -> DockCounts {
         DockCounts {
+            workflows: self.workflows.len(),
             subagents: self.subagents.len(),
             tasks: self.tasks.len(),
             watchers: self.watchers.len(),
             queued: self.queued,
+            workflows_expanded: self.workflows_expanded,
             subagents_expanded: self.subagents_expanded,
             tasks_expanded: self.tasks_expanded,
             watchers_expanded: self.watchers_expanded,
+            workflows_show_all: self.workflows_show_all,
             subagents_show_all: self.subagents_show_all,
             tasks_show_all: self.tasks_show_all,
             watchers_show_all: self.watchers_show_all,
@@ -209,6 +216,7 @@ impl DockData {
 
     fn rows(&self, section: Section) -> &[DockRow] {
         match section {
+            Section::Workflows => &self.workflows,
             Section::Subagents => &self.subagents,
             Section::Tasks => &self.tasks,
             Section::Watchers => &self.watchers,
@@ -223,14 +231,6 @@ pub fn items(counts: &DockCounts) -> Vec<DockItem> {
 
 pub fn visible_items(data: &DockData) -> Vec<DockItem> {
     items(&data.counts())
-}
-
-pub fn next_header_index(items: &[DockItem], cursor: usize) -> Option<usize> {
-    items
-        .iter()
-        .enumerate()
-        .skip(cursor.saturating_add(1))
-        .find_map(|(idx, item)| matches!(item, DockItem::Header(_)).then_some(idx))
 }
 
 /// Clips with the dock so headers never hit-test as `Queue`.
@@ -268,7 +268,7 @@ pub fn render(buf: &mut Buffer, area: Rect, theme: &Theme, data: &DockData) {
         if selected {
             highlight_row(buf, area, y, theme.bg_highlight);
         } else if hovered {
-            highlight_row(buf, area, y, theme.bg_hover);
+            highlight_row(buf, area, y, theme.row_hover_bg());
         }
     };
 
@@ -279,6 +279,7 @@ pub fn render(buf: &mut Buffer, area: Rect, theme: &Theme, data: &DockData) {
         match item {
             DockItem::Header(section) => {
                 let (count, expanded) = match section {
+                    Section::Workflows => (counts.workflows, counts.workflows_expanded),
                     Section::Subagents => (counts.subagents, counts.subagents_expanded),
                     Section::Tasks => (counts.tasks, counts.tasks_expanded),
                     Section::Watchers => (counts.watchers, counts.watchers_expanded),
@@ -298,12 +299,15 @@ pub fn render(buf: &mut Buffer, area: Rect, theme: &Theme, data: &DockData) {
                 let hovered = data.hovered == Some(DockItem::Row(section, i));
                 let show_actions = action_item == Some(DockItem::Row(section, i));
                 let kill_hovered = show_actions && data.stop_hovered;
+                let Some(row) = data.rows(section).get(i) else {
+                    continue;
+                };
                 paint_row(
                     buf,
                     area,
                     y,
                     theme,
-                    &data.rows(section)[i],
+                    row,
                     show_actions,
                     kill_hovered,
                     data.spinner_tick,
@@ -320,7 +324,10 @@ pub fn render(buf: &mut Buffer, area: Rect, theme: &Theme, data: &DockData) {
                 let arrow = crate::glyphs::disclosure_open();
                 let indent_len = MORE_INDENT.len().min(area.width.saturating_sub(1) as usize);
                 let line = Line::from(Span::styled(
-                    format!("{}{arrow} show {hidden} more", &MORE_INDENT[..indent_len]),
+                    format!(
+                        "{}{arrow} show {hidden} more",
+                        MORE_INDENT.get(..indent_len).unwrap_or(MORE_INDENT)
+                    ),
                     Style::default().fg(theme.gray),
                 ));
                 buf.set_line(area.x, y, &line, area.width);
@@ -338,7 +345,9 @@ pub fn render(buf: &mut Buffer, area: Rect, theme: &Theme, data: &DockData) {
 
 fn highlight_row(buf: &mut Buffer, area: Rect, y: u16, bg: ratatui::style::Color) {
     for x in area.x..area.x + area.width {
-        buf[(x, y)].set_bg(bg);
+        if let Some(cell) = buf.cell_mut((x, y)) {
+            cell.set_bg(bg);
+        }
     }
 }
 
@@ -360,9 +369,7 @@ fn section_header(
 ) -> Line<'static> {
     let indent = if width > 1 { HEADER_INDENT } else { "" };
     let chevron = header_chevron(expanded);
-    let count_text = format!(" {count} ");
-    let used = indent.width() + chevron.width() + label.width() + count_text.width();
-    let fill = (width as usize).saturating_sub(used);
+    // Title and count only. A trailing rule made one-item sections look like a panel.
     Line::from(vec![
         Span::raw(indent),
         Span::styled(chevron, Style::default().fg(theme.gray)),
@@ -372,8 +379,7 @@ fn section_header(
                 .fg(theme.gray_bright)
                 .add_modifier(Modifier::BOLD),
         ),
-        Span::styled(count_text, Style::default().fg(theme.gray)),
-        Span::styled("─".repeat(fill), Style::default().fg(theme.gray_dim)),
+        Span::styled(format!(" {count}"), Style::default().fg(theme.gray)),
     ])
 }
 
@@ -396,7 +402,10 @@ fn paint_row(
     };
     let icon = if row.spinning {
         let frames = crate::glyphs::dot_spinner_frames();
-        frames[(spinner_tick / SPINNER_DIVISOR) as usize % frames.len()]
+        frames
+            .get((spinner_tick / SPINNER_DIVISOR) as usize % frames.len())
+            .copied()
+            .unwrap_or("")
     } else {
         crate::glyphs::diamond_filled()
     };
@@ -494,11 +503,7 @@ pub fn hovered_stop_button_rect(area: Rect, data: &DockData) -> Option<DockStopH
 }
 
 pub fn fmt_elapsed(secs: u64) -> String {
-    if secs < 60 {
-        format!("{secs}s")
-    } else {
-        format!("{}m{:02}s", secs / 60, secs % 60)
-    }
+    crate::views::goal_detail::format_elapsed(secs.saturating_mul(1000))
 }
 
 #[cfg(test)]
@@ -507,15 +512,17 @@ mod tests {
     use unicode_width::UnicodeWidthStr;
 
     fn row_text(buf: &Buffer, y: u16) -> String {
-        (0..buf.area.width).map(|x| buf[(x, y)].symbol()).collect()
+        (0..buf.area.width)
+            .filter_map(|x| buf.cell((x, y)).map(|c| c.symbol()))
+            .collect()
+    }
+
+    fn header_prefix(expanded: bool, label: &str, count: usize) -> String {
+        format!("{HEADER_INDENT}{}{label} {count}", header_chevron(expanded))
     }
 
     fn subagent_hover_actions() -> String {
-        format!(
-            "{}{}",
-            crate::glyphs::enlarge_button(),
-            crate::glyphs::ballot_x_button()
-        )
+        format!("{}{STOP_LABEL}", crate::glyphs::enlarge_button())
     }
 
     fn row(kind: &str, description: &str, meta: &str, killable: bool) -> DockRow {
@@ -532,6 +539,7 @@ mod tests {
 
     fn sample() -> DockData {
         DockData {
+            workflows: Vec::new(),
             subagents: vec![
                 DockRow {
                     kind: "Explore".into(),
@@ -552,9 +560,11 @@ mod tests {
                 loop_row
             }],
             queued: 2,
+            workflows_expanded: true,
             subagents_expanded: true,
             tasks_expanded: false,
             watchers_expanded: false,
+            workflows_show_all: false,
             subagents_show_all: false,
             tasks_show_all: false,
             watchers_show_all: false,
@@ -593,7 +603,10 @@ mod tests {
         let area = Rect::new(0, 0, 40, 4);
         let mut buf = Buffer::empty(area);
         render(&mut buf, area, &theme, &data);
-        assert!(row_text(&buf, 0).starts_with(" ▾ Queued 2 ─"), "expanded");
+        assert!(
+            row_text(&buf, 0).starts_with(&header_prefix(true, "Queued", 2)),
+            "expanded"
+        );
         assert_eq!(
             queue_body_rect(area, &data),
             Rect::new(QUEUE_BODY_INDENT, 1, 40 - QUEUE_BODY_INDENT, 3),
@@ -611,7 +624,7 @@ mod tests {
         let mut buf = Buffer::empty(area);
         render(&mut buf, area, &theme, &data);
 
-        assert!(row_text(&buf, 0).starts_with(" ▾ Subagents 3 ─"));
+        assert!(row_text(&buf, 0).starts_with(&header_prefix(true, "Subagents", 3)));
         let first = row_text(&buf, 1);
         let diamond = crate::glyphs::diamond_filled();
         assert!(
@@ -637,9 +650,9 @@ mod tests {
             "no N-more line: {}",
             row_text(&buf, 3)
         );
-        assert!(row_text(&buf, 4).starts_with(" ▸ Tasks 1 ─"));
-        assert!(row_text(&buf, 5).starts_with(" ▸ Watchers 2 ─"));
-        assert!(row_text(&buf, 6).starts_with(" ▸ Queued 2 ─"));
+        assert!(row_text(&buf, 4).starts_with(&header_prefix(false, "Tasks", 1)));
+        assert!(row_text(&buf, 5).starts_with(&header_prefix(false, "Watchers", 2)));
+        assert!(row_text(&buf, 6).starts_with(&header_prefix(false, "Queued", 2)));
     }
 
     #[test]
@@ -654,10 +667,10 @@ mod tests {
         let area = Rect::new(0, 0, 80, 7);
         let mut buf = Buffer::empty(area);
         render(&mut buf, area, &theme, &data);
-        assert!(row_text(&buf, 0).starts_with(" ▸ Subagents 3 ─"));
-        assert!(row_text(&buf, 1).starts_with(" ▾ Tasks 1 ─"));
+        assert!(row_text(&buf, 0).starts_with(&header_prefix(false, "Subagents", 3)));
+        assert!(row_text(&buf, 1).starts_with(&header_prefix(true, "Tasks", 1)));
         assert!(row_text(&buf, 2).contains("Run cargo test -p theme (bg)"));
-        assert!(row_text(&buf, 3).starts_with(" ▾ Watchers 2 ─"));
+        assert!(row_text(&buf, 3).starts_with(&header_prefix(true, "Watchers", 2)));
         assert!(row_text(&buf, 4).contains("Monitor watch build log"));
         let loop_row = row_text(&buf, 5);
         assert!(loop_row.contains("Loop check CI status"), "{loop_row}");
@@ -679,8 +692,7 @@ mod tests {
             first.trim_end().ends_with(&subagent_hover_actions()),
             "{first}"
         );
-        assert!(!first.contains("[stop]"), "{first}");
-        assert_eq!(buf[(0, 1)].bg, theme.bg_highlight);
+        assert_eq!(buf.cell((0, 1)).map(|c| c.bg), Some(theme.bg_highlight));
 
         let mut data = sample();
         data.hovered = Some(DockItem::Row(Section::Subagents, 0));
@@ -691,8 +703,7 @@ mod tests {
             hovered.trim_end().ends_with(&subagent_hover_actions()),
             "{hovered}"
         );
-        assert!(!hovered.contains("[stop]"), "{hovered}");
-        assert_eq!(buf[(0, 1)].bg, theme.bg_hover);
+        assert_eq!(buf.cell((0, 1)).map(|c| c.bg), Some(theme.row_hover_bg()));
         let kill = Section::Subagents.kill_label();
         assert_eq!(
             hovered_stop_button_rect(area, &data).map(|hit| hit.rect),
@@ -715,7 +726,9 @@ mod tests {
         assert!(hovered.trim_end().ends_with(&task_actions), "{hovered}");
 
         let mut data = sample();
-        data.subagents[0].killable = false;
+        if let Some(row) = data.subagents.get_mut(0) {
+            row.killable = false;
+        }
         data.hovered = Some(DockItem::Row(Section::Subagents, 0));
         let mut buf = Buffer::empty(area);
         render(&mut buf, area, &theme, &data);
@@ -750,8 +763,10 @@ mod tests {
             "{loop_row}"
         );
 
-        data.watchers[1].killable = true;
-        data.watchers[1].openable = true;
+        if let Some(row) = data.watchers.get_mut(1) {
+            row.killable = true;
+            row.openable = true;
+        }
         let mut buf = Buffer::empty(area);
         render(&mut buf, area, &theme, &data);
         let linked = row_text(&buf, data.cursor as u16);
@@ -821,8 +836,11 @@ mod tests {
         assert!(!data.stop_hovered);
         let mut buf = Buffer::empty(area);
         render(&mut buf, area, &theme, &data);
-        assert_eq!(buf[(kill_x, 1)].fg, theme.gray);
-        assert_ne!(buf[(kill_x, 1)].fg, theme.accent_error);
+        assert_eq!(buf.cell((kill_x, 1)).map(|c| c.fg), Some(theme.gray));
+        assert_ne!(
+            buf.cell((kill_x, 1)).map(|c| c.fg),
+            Some(theme.accent_error)
+        );
 
         // Keyboard-focused row, pointer still off the kill control: gray.
         data.hovered = None;
@@ -833,15 +851,21 @@ mod tests {
         assert!(!data.stop_hovered);
         let mut buf = Buffer::empty(area);
         render(&mut buf, area, &theme, &data);
-        assert_eq!(buf[(kill_x, 1)].fg, theme.gray);
-        assert_ne!(buf[(kill_x, 1)].fg, theme.accent_error);
+        assert_eq!(buf.cell((kill_x, 1)).map(|c| c.fg), Some(theme.gray));
+        assert_ne!(
+            buf.cell((kill_x, 1)).map(|c| c.fg),
+            Some(theme.accent_error)
+        );
 
         // Pointer on the kill control: red.
         data.stop_hovered = hit.rect.contains((kill_x, 1).into());
         assert!(data.stop_hovered);
         let mut buf = Buffer::empty(area);
         render(&mut buf, area, &theme, &data);
-        assert_eq!(buf[(kill_x, 1)].fg, theme.accent_error);
+        assert_eq!(
+            buf.cell((kill_x, 1)).map(|c| c.fg),
+            Some(theme.accent_error)
+        );
     }
 
     #[test]
@@ -865,12 +889,17 @@ mod tests {
             };
             let mut buf = Buffer::empty(area);
             render(&mut buf, area, &theme, &data);
-            buf[(icon_x, 1)].symbol().to_string()
+            buf.cell((icon_x, 1))
+                .map(|c| c.symbol().to_string())
+                .unwrap_or_default()
         };
 
         // The marker advances through the spinner frames as the tick climbs.
-        assert_eq!(spinning(0), frames[0]);
-        assert_eq!(spinning(SPINNER_DIVISOR), frames[1]);
+        assert_eq!(spinning(0), frames.first().copied().unwrap_or(""));
+        assert_eq!(
+            spinning(SPINNER_DIVISOR),
+            frames.get(1).copied().unwrap_or("")
+        );
         assert_ne!(spinning(0), spinning(SPINNER_DIVISOR));
 
         // A non-spinning row (scheduled loop) keeps the static diamond.
@@ -881,7 +910,10 @@ mod tests {
         };
         let mut buf = Buffer::empty(area);
         render(&mut buf, area, &theme, &data);
-        assert_eq!(buf[(icon_x, 1)].symbol(), crate::glyphs::diamond_filled());
+        assert_eq!(
+            buf.cell((icon_x, 1)).map(|c| c.symbol()),
+            Some(crate::glyphs::diamond_filled())
+        );
     }
 
     #[test]
@@ -967,11 +999,17 @@ mod tests {
             DockLayout::new(&data.counts()).rows().len(),
             MAX_DOCK_ROWS as usize
         );
-        assert!(painted[0].starts_with(" ▾ Tasks 10 ─"), "{:?}", painted[0]);
+        assert!(
+            painted
+                .first()
+                .is_some_and(|row| row.starts_with(&header_prefix(true, "Tasks", 10))),
+            "{:?}",
+            painted.first()
+        );
         assert!(
             painted
                 .iter()
-                .any(|line| line.starts_with(" ▾ Watchers 2 ─")),
+                .any(|line| line.starts_with(&header_prefix(true, "Watchers", 2))),
             "a crowded section must not push another section's header off: {painted:#?}"
         );
         assert!(
@@ -1270,16 +1308,22 @@ mod tests {
         let mut buf = Buffer::empty(area);
         render(&mut buf, area, &theme, &data);
         let painted: Vec<String> = (0..area.height).map(|y| row_text(&buf, y)).collect();
-        assert!(painted[0].starts_with(" ▾ Tasks 10 ─"), "{:?}", painted[0]);
         assert!(
-            painted[1].contains("task 4"),
+            painted
+                .first()
+                .is_some_and(|row| row.starts_with(&header_prefix(true, "Tasks", 10))),
+            "{:?}",
+            painted.first()
+        );
+        assert!(
+            painted.get(1).is_some_and(|line| line.contains("task 4")),
             "the band starts at the scroll offset: {:?}",
-            painted[1]
+            painted.get(1)
         );
         assert!(
             painted
                 .iter()
-                .any(|line| line.starts_with(" ▾ Watchers 2 ─")),
+                .any(|line| line.starts_with(&header_prefix(true, "Watchers", 2))),
             "scrolling one section cannot move another's header: {painted:#?}"
         );
         for watcher in ["watch 0", "watch 1"] {
@@ -1297,7 +1341,7 @@ mod tests {
         render(&mut buf, area, &theme, &data);
         let painted: Vec<String> = (0..area.height).map(|y| row_text(&buf, y)).collect();
         assert!(
-            painted[1].contains("task 7"),
+            painted.get(1).is_some_and(|line| line.contains("task 7")),
             "the last rows are reachable: {painted:#?}"
         );
         assert!(
@@ -1562,7 +1606,7 @@ mod tests {
     }
 
     #[test]
-    fn child_diamond_aligns_with_header_label() {
+    fn row_marker_shares_the_header_gutter() {
         let theme = Theme::tokyonight();
         let data = DockData {
             watchers: vec![row("Loop", "check CI status", "every 5m", true)],
@@ -1573,25 +1617,70 @@ mod tests {
         let mut buf = Buffer::empty(area);
         render(&mut buf, area, &theme, &data);
         assert_eq!(
-            HEADER_INDENT.width() + header_chevron(true).width(),
+            HEADER_INDENT.width(),
             ROW_INDENT.width(),
-            "row indent must place the diamond under the header label"
+            "row indent must place the marker under the header chevron"
         );
         let header = row_text(&buf, 0);
         let item = row_text(&buf, 1);
-        let label_at = header.find("Watchers").expect("header label");
+        let chevron = crate::glyphs::disclosure_open();
         let diamond = crate::glyphs::diamond_filled();
+        let chevron_at = header.find(chevron).expect("header chevron");
         let diamond_at = item.find(diamond).expect("row diamond");
-        let label_col = header[..label_at].width();
+        let chevron_col = header[..chevron_at].width();
         let diamond_col = item[..diamond_at].width();
         assert_eq!(
-            diamond_col, label_col,
-            "diamond col {diamond_col} vs label col {label_col}\nheader={header:?}\nitem={item:?}"
+            diamond_col, chevron_col,
+            "marker col {diamond_col} vs chevron col {chevron_col}\nheader={header:?}\nitem={item:?}"
         );
+        let label_at = header.find("Watchers").expect("header label");
         let row_label_at = item.find("Loop").expect("row label");
+        assert_eq!(
+            header[..label_at].width(),
+            item[..row_label_at].width(),
+            "row title should sit under the section title\nheader={header:?}\nitem={item:?}"
+        );
         assert!(
-            item[..row_label_at].width() > label_col,
-            "row content must sit farther right than its parent header"
+            !header.contains('─'),
+            "header must not paint a rule fill: {header:?}"
+        );
+    }
+
+    #[test]
+    fn one_item_section_has_no_header_rule() {
+        let theme = Theme::tokyonight();
+        let data = DockData {
+            tasks: vec![{
+                let mut task = row("Task", "Pull the new h", "1s", true);
+                task.spinning = true;
+                task
+            }],
+            tasks_expanded: true,
+            ..DockData::default()
+        };
+        let area = Rect::new(0, 0, 40, 2);
+        let mut buf = Buffer::empty(area);
+        render(&mut buf, area, &theme, &data);
+        let header = row_text(&buf, 0);
+        assert_eq!(
+            header.trim_end(),
+            header_prefix(true, "Tasks", 1),
+            "header must be title and count only: {header:?}"
+        );
+        assert!(!header.contains('─'), "no rule fill: {header:?}");
+        let item = row_text(&buf, 1);
+        let spinner = crate::glyphs::dot_spinner_frames()
+            .first()
+            .copied()
+            .expect("spinner frames");
+        let spinner_at = item.find(spinner).expect("row spinner");
+        let chevron_at = header
+            .find(crate::glyphs::disclosure_open())
+            .expect("header chevron");
+        assert_eq!(
+            header[..chevron_at].width(),
+            item[..spinner_at].width(),
+            "spinner must share the header gutter\nheader={header:?}\nitem={item:?}"
         );
     }
 
@@ -1658,12 +1747,16 @@ mod tests {
             "a row below the dock's last painted line has no kill control"
         );
 
-        data.subagents[1].killable = false;
+        if let Some(row) = data.subagents.get_mut(1) {
+            row.killable = false;
+        }
         assert!(hovered_stop_button_rect(area, &data).is_none());
         data.hovered = None;
         assert!(hovered_stop_button_rect(area, &data).is_none());
 
-        data.subagents[1].killable = true;
+        if let Some(row) = data.subagents.get_mut(1) {
+            row.killable = true;
+        }
         data.focused = true;
         data.cursor = items(&data.counts())
             .iter()
@@ -1812,7 +1905,7 @@ mod tests {
     }
 
     #[test]
-    fn hover_paints_bg_hover_when_unfocused() {
+    fn hover_paints_terminal_row_hover_bg_when_unfocused() {
         let theme = Theme::tokyonight();
         let mut data = DockData {
             tasks: vec![row("Run", "cargo test", "1s", true)],
@@ -1823,16 +1916,21 @@ mod tests {
         let area = Rect::new(0, 0, 40, 2);
         let mut buf = Buffer::empty(area);
         render(&mut buf, area, &theme, &data);
-        assert_eq!(buf[(0, 1)].bg, theme.bg_hover);
-        assert_ne!(buf[(0, 0)].bg, theme.bg_hover);
+        let hover_bg = theme.row_hover_bg();
+        assert_ne!(
+            hover_bg, theme.bg_hover,
+            "dock hover must match the terminal row blend, not the dropdown band"
+        );
+        assert_eq!(buf.cell((0, 1)).map(|c| c.bg), Some(hover_bg));
+        assert_ne!(buf.cell((0, 0)).map(|c| c.bg), Some(hover_bg));
 
         data.focused = true;
         data.cursor = 1;
         let mut buf = Buffer::empty(area);
         render(&mut buf, area, &theme, &data);
         assert_eq!(
-            buf[(0, 1)].bg,
-            theme.bg_highlight,
+            buf.cell((0, 1)).map(|c| c.bg),
+            Some(theme.bg_highlight),
             "selection wins over hover"
         );
     }

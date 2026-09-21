@@ -173,7 +173,10 @@ async fn classifier_refresh_clears_stale_transcript() {
 
             let seen = seen.lock().unwrap();
             assert_eq!(seen.len(), 1);
-            assert_eq!(seen[0].turns, Vec::<ClassifierTurn>::new());
+            let Some(first) = seen.first() else {
+                panic!("expected one classifier capture: {seen:?}");
+            };
+            assert_eq!(first.turns, Vec::<ClassifierTurn>::new());
         })
         .await;
 }
@@ -249,7 +252,7 @@ async fn plan_mode_enter_and_exit_leave_permission_manager_untouched() {
 
 #[test]
 fn session_meta_auto_mode_key_resolution() {
-    use crate::agent::mvp_agent::resolve_session_auto_mode;
+    use crate::session::auto_mode::resolve_session_auto_mode;
 
     let meta = serde_json::json!({"autoMode": true});
     assert!(resolve_session_auto_mode(meta.as_object(), false, false));
@@ -272,7 +275,7 @@ fn session_meta_auto_mode_key_resolution() {
 
 #[test]
 fn explicit_auto_request_overrides_stale_launch_yolo() {
-    use crate::agent::mvp_agent::resolve_session_auto_mode;
+    use crate::session::auto_mode::resolve_session_auto_mode;
 
     let meta = serde_json::json!({"yoloMode": false, "autoMode": true});
     let request_meta = meta.as_object();
@@ -417,7 +420,7 @@ fn build_classifier_turns_projects_full_filtered_resident_prefix() {
 
 #[test]
 fn build_classifier_turns_filters_non_user_carriers() {
-    use xai_grok_sampling_types::ContentPart;
+    use xai_grok_sampling_types::{ContentPart, SyntheticReason};
     use xai_grok_workspace::permission::ClassifierTurn;
 
     let mut tool_image = super::ConversationItem::user("[Image extracted from tool result above]");
@@ -439,7 +442,7 @@ fn build_classifier_turns_filters_non_user_carriers() {
                 text: "<user_info>OS: test</user_info>\n<user_query>actual query</user_query>"
                     .into(),
             }],
-            synthetic_reason: None,
+            synthetic_reason: SyntheticReason::Human,
             ..Default::default()
         }),
         super::ConversationItem::user("use the safer command instead"),
@@ -501,7 +504,10 @@ fn build_classifier_turns_neutralizes_malformed_tool_args() {
     ])];
     let turns = super::build_classifier_turns(&conv);
     assert_eq!(turns.len(), 1);
-    match &turns[0] {
+    let Some(turn) = turns.first() else {
+        panic!("expected one classifier turn: {turns:?}");
+    };
+    match turn {
         ClassifierTurn::AssistantToolUse { tool, args } => {
             assert_eq!(tool, "run_terminal_command");
             assert!(!args.contains('\n'), "newlines collapsed: {args:?}");

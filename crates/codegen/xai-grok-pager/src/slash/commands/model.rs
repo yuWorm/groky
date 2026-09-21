@@ -2,7 +2,7 @@
 //! Chained autocomplete: after picking a reasoning-supported model, the trailing space re-opens the dropdown into a `low|medium|high|xhigh` sub-menu.
 
 use agent_client_protocol as acp;
-use xai_grok_shell::sampling::types::supports_reasoning_effort_meta;
+use xai_grok_shell::sampling::types::{ReasoningEffortOption, supports_reasoning_effort_meta};
 
 use crate::acp::model_state::ModelState;
 use crate::app::actions::Action;
@@ -38,6 +38,17 @@ impl SlashCommand for ModelCommand {
             return Some(build_effort_items(ctx.models, &model_id));
         }
         Some(build_model_items(ctx.models))
+    }
+
+    fn preselected_arg(&self, ctx: &AppCtx, args_query: &str) -> Option<String> {
+        let model_id = detect_effort_phase(ctx.models, args_query)?;
+        let model_name = ctx.models.display_name_for(&model_id);
+        // A typed effort filter hands the opening row to the match ranking
+        if !args_query.trim_end().eq_ignore_ascii_case(&model_name) {
+            return None;
+        }
+        let option = ctx.models.preselected_effort_option_for(&model_id)?;
+        Some(effort_insert_text(&model_name, &option))
     }
 
     fn run(&self, ctx: &mut CommandExecCtx, args: &str) -> CommandResult {
@@ -110,10 +121,12 @@ fn detect_effort_phase(models: &ModelState, args_query: &str) -> Option<acp::Mod
     candidates.sort_by_key(|(_, name)| std::cmp::Reverse(name.len()));
 
     for (id, name) in candidates {
-        if args_query.len() > name.len()
-            && args_query.is_char_boundary(name.len())
-            && args_query[..name.len()].eq_ignore_ascii_case(name)
-            && args_query[name.len()..].starts_with(char::is_whitespace)
+        if args_query
+            .get(..name.len())
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case(name))
+            && args_query
+                .get(name.len()..)
+                .is_some_and(|rest| rest.starts_with(char::is_whitespace))
         {
             return Some(id.clone());
         }
@@ -161,15 +174,18 @@ fn build_effort_items(models: &ModelState, model_id: &acp::ModelId) -> Vec<ArgIt
         Some(info) => info,
         None => return Vec::new(),
     };
-    let model_name = info.name.clone();
     let is_current_model = models.current.as_ref() == Some(model_id);
     let options = models.reasoning_effort_options_for(model_id);
     build_effort_arg_items(
         &options,
         models.reasoning_effort,
         is_current_model,
-        |option| format!("{model_name} {}", option.id),
+        |option| effort_insert_text(&info.name, option),
     )
+}
+
+fn effort_insert_text(model_name: &str, option: &ReasoningEffortOption) -> String {
+    format!("{model_name} {}", option.id)
 }
 
 #[cfg(test)]
@@ -297,15 +313,52 @@ mod tests {
         // Items come out ordered xhigh to low (strongest first) per EFFORT_LEVELS
         let items = cmd.suggest_args(&ctx, "Reasoning X ").unwrap();
         assert_eq!(items.len(), 4);
-        assert_eq!(items[0].insert_text, "Reasoning X xhigh");
-        assert_eq!(items[1].insert_text, "Reasoning X high");
-        assert_eq!(items[2].insert_text, "Reasoning X medium");
-        assert_eq!(items[3].insert_text, "Reasoning X low");
+        let [a, b, c, d] = items.as_slice() else {
+            panic!("expected 4 items: {items:?}");
+        };
+        assert_eq!(a.insert_text, "Reasoning X xhigh");
+        assert_eq!(b.insert_text, "Reasoning X high");
+        assert_eq!(c.insert_text, "Reasoning X medium");
+        assert_eq!(d.insert_text, "Reasoning X low");
         // Display is just the level so the user sees a clean column.
-        assert_eq!(items[0].display, "xhigh");
+        assert_eq!(a.display, "xhigh");
         // match_text carries the sort-key prefix that forces the matcher's alphabetical tiebreak to render rows in EFFORT_LEVELS order
-        assert!(items[0].match_text.starts_with("a "));
-        assert!(items[3].match_text.starts_with("d "));
+        assert!(a.match_text.starts_with("a "));
+        assert!(d.match_text.starts_with("d "));
+    }
+
+    #[test]
+    fn preselected_arg_targets_default_row_only_for_fresh_effort_menu() {
+        let mut state = ModelState::default();
+        let id = acp::ModelId::new(Arc::from("reasoning-x"));
+        let info = acp::ModelInfo::new(id.clone(), "Reasoning X").meta(
+            serde_json::json!({ "supportsReasoningEffort": true, "reasoningEffort": "high" })
+                .as_object()
+                .cloned(),
+        );
+        state.available.insert(id, info);
+
+        let cmd = ModelCommand;
+        let ctx = AppCtx {
+            models: &state,
+            cwd: std::path::Path::new("."),
+            has_session_announcements: false,
+            billing_surface_visible: true,
+            usage_command_visible: true,
+            workflows_available: true,
+            saved_workflows: &[],
+            workflow_runs: &[],
+            screen_mode: crate::app::ScreenMode::Fullscreen,
+            current_title: None,
+        };
+        // The preselection must name a row `suggest_args` actually builds, or the consumers fall back to row 0
+        let high_row = cmd
+            .suggest_args(&ctx, "Reasoning X ")
+            .and_then(|items| items.get(1).map(|item| item.insert_text.clone()));
+        assert_eq!(Some("Reasoning X high".to_owned()), high_row);
+        assert_eq!(high_row, cmd.preselected_arg(&ctx, "Reasoning X "));
+        assert_eq!(None, cmd.preselected_arg(&ctx, "Reasoning X h"));
+        assert_eq!(None, cmd.preselected_arg(&ctx, ""));
     }
 
     #[test]
@@ -354,7 +407,10 @@ mod tests {
         // No trailing space: the user is still typing the model name
         let items = cmd.suggest_args(&ctx, "Reason").unwrap();
         assert_eq!(items.len(), 1);
-        assert_eq!(items[0].insert_text, "Reasoning X ");
+        assert_eq!(
+            items.first().map(|item| item.insert_text.as_str()),
+            Some("Reasoning X ")
+        );
     }
 
     #[test]

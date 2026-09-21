@@ -958,10 +958,9 @@ impl AgentView {
         let Some(task) = self.session.bg_tasks.get(task_id) else {
             return false;
         };
-        // A task can lack a scrollback anchor: the completed-early race never
-        // pushes a block, and a scrollback swap can drop it. The viewer renders
-        // from the task's own stdout, so open it on the sentinel anchor instead
-        // of dead-clicking the [↗] button.
+        // A task can lack a scrollback anchor: the completed-early race never pushes a block,
+        // and a scrollback swap can drop it. The viewer renders from the task's own stdout,
+        // so open it on the sentinel anchor instead of dead-clicking the [↗] button.
         let entry_id = task
             .scrollback_entry_id
             .unwrap_or_else(|| crate::scrollback::entry::EntryId::new(0));

@@ -546,6 +546,21 @@ pub fn default_settings() -> Vec<SettingMeta> {
             hidden_in_minimal: true,
         },
         SettingMeta {
+            key: "dashboard_preview",
+            category: SettingCategory::Appearance,
+            owner: SettingOwner::Shared,
+            label: "Dashboard preview",
+            description: "Show the selected session's preview and reply panel in the dashboard. \
+                          Turn off to give the session list more space. Open a session to reply \
+                          or answer permissions when the preview is off.",
+            keywords: &["dashboard", "peek", "preview", "prompt", "reply", "panel"],
+            kind: SettingKind::Bool {
+                default: ui_default.dashboard_preview_enabled(),
+            },
+            restart_required: false,
+            hidden_in_minimal: true,
+        },
+        SettingMeta {
             key: "page_flip_on_send",
             category: SettingCategory::Appearance,
             owner: SettingOwner::Shared,

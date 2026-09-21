@@ -162,6 +162,7 @@ pub(crate) async fn run_search_replace(
         hints_enabled = res.get::<PathNotFoundHints>().is_some_and(|h| h.0);
     }
     let resolved = resolve_model_path(&cwd, display_cwd.as_deref(), &input.file_path);
+    let policy_path = resolved.clone();
     let path = match crate::util::fs::try_canonicalize(&resolved).await {
         Ok(p) => p,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
@@ -218,6 +219,7 @@ pub(crate) async fn run_search_replace(
             &notification_handle,
             &tool_call_id,
             &path,
+            &policy_path,
             &cwd,
             display_cwd.as_deref(),
             hints_enabled,
@@ -232,6 +234,7 @@ pub(crate) async fn run_search_replace(
             &notification_handle,
             &tool_call_id,
             &path,
+            &policy_path,
             &cwd,
             display_cwd.as_deref(),
             hints_enabled,
@@ -286,6 +289,7 @@ async fn handle_new_file_creation(
     notification_handle: &ToolNotificationHandle,
     tool_call_id: &str,
     path: &std::path::Path,
+    policy_path: &std::path::Path,
     cwd: &std::path::Path,
     display_cwd: Option<&std::path::Path>,
     hints_enabled: bool,
@@ -313,7 +317,18 @@ async fn handle_new_file_creation(
             old_string_name
         )));
     }
-    if let Err(e) = fs.write_file(path, input.new_string.as_bytes()).await {
+    let is_memory_write = match crate::types::memory_v2::write_memory_v2_file(
+        &resources,
+        policy_path,
+        input.new_string.as_bytes(),
+    )
+    .await
+    {
+        Ok(crate::types::memory_v2::MemoryV2Write::Written { .. }) => true,
+        Ok(crate::types::memory_v2::MemoryV2Write::Outside) => false,
+        Err(error) => return Ok(SearchReplaceOutput::InvalidInput(error)),
+    };
+    if !is_memory_write && let Err(e) = fs.write_file(path, input.new_string.as_bytes()).await {
         return Ok(match e.io_error_kind() {
             Some(std::io::ErrorKind::NotFound) => {
                 let display_dcwd = display_cwd_or_cwd(cwd, display_cwd);
@@ -434,10 +449,10 @@ fn build_confusable_hint(
     let (norm_file, offset_map) = build_offset_map(file);
     let norm_old = normalize_confusables(old_string);
     let norm_start = norm_file.find(&norm_old)?;
-    let orig_start = offset_map[norm_start];
-    let orig_end = offset_map[norm_start + norm_old.len()];
-    let match_start_line = file[..orig_start].matches('\n').count() + 1;
-    let match_end_line = file[..orig_end].matches('\n').count() + 1;
+    let orig_start = *offset_map.get(norm_start)?;
+    let orig_end = *offset_map.get(norm_start + norm_old.len())?;
+    let match_start_line = file.get(..orig_start)?.matches('\n').count() + 1;
+    let match_end_line = file.get(..orig_end)?.matches('\n').count() + 1;
     let hits = detect_confusables(file);
     let mut affected_lines: Vec<usize> = hits
         .iter()
@@ -456,7 +471,9 @@ fn build_confusable_hint(
             .collect::<Vec<_>>()
             .join(", ")
     } else {
-        let shown: Vec<String> = affected_lines[..MAX_LISTED_LINES]
+        let shown: Vec<String> = affected_lines
+            .get(..MAX_LISTED_LINES)
+            .unwrap_or(affected_lines.as_slice())
             .iter()
             .map(|n| n.to_string())
             .collect();
@@ -502,6 +519,7 @@ async fn handle_replacement(
     notification_handle: &ToolNotificationHandle,
     tool_call_id: &str,
     path: &std::path::Path,
+    policy_path: &std::path::Path,
     cwd: &std::path::Path,
     display_cwd: Option<&std::path::Path>,
     hints_enabled: bool,
@@ -687,7 +705,18 @@ async fn handle_replacement(
     } else {
         new_text.clone()
     };
-    if let Err(e) = fs.write_file(path, write_text.as_bytes()).await {
+    let is_memory_write = match crate::types::memory_v2::write_memory_v2_file(
+        &resources,
+        policy_path,
+        write_text.as_bytes(),
+    )
+    .await
+    {
+        Ok(crate::types::memory_v2::MemoryV2Write::Written { .. }) => true,
+        Ok(crate::types::memory_v2::MemoryV2Write::Outside) => false,
+        Err(error) => return Ok(SearchReplaceOutput::InvalidInput(error)),
+    };
+    if !is_memory_write && let Err(e) = fs.write_file(path, write_text.as_bytes()).await {
         return Ok(match e.io_error_kind() {
             Some(std::io::ErrorKind::AlreadyExists) => SearchReplaceOutput::InvalidInput(format!(
                 "Error: cannot write {}. A component of the path already exists as a file where a directory is expected.",

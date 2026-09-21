@@ -183,10 +183,32 @@ Project-scoped files contribute `[mcp_servers]`, `[plugins]`, and `[permission]`
 
 ## Tool Naming
 
-MCP tools are namespaced with the server name to avoid collisions:
+MCP tools are namespaced with the server name to avoid collisions. The catalog key is `server__tool` (two underscores):
 
 - Server `filesystem` with tool `read_file` becomes `filesystem__read_file`
 - Server `github` with tool `create_issue` becomes `github__create_issue`
+- A tool segment may start with a digit: server `auth` with tool `2fa_enable` becomes `auth__2fa_enable`
+
+### What Grok admits
+
+Grok admits a listed tool into the session catalog when all of these hold (`xai-grok-mcp` `qualify_mcp_tool_name`):
+
+| Part | Rule |
+| --- | --- |
+| Server name | Starts with a letter or underscore. Then ASCII letters, digits, underscores, and hyphens only. |
+| Tool name | Non-empty. ASCII letters, digits, underscores, and hyphens only. May start with a digit. |
+| Delimiter | Exactly one `__`. Names with a second `__`, or with `___`, are skipped. |
+| Catalog key | `server` + `__` + `tool` is at most **256** characters. |
+
+A rejected tool is skipped. The log line is `Skipping MCP tool` with the reason. The rest of that server's tools still load.
+
+The **64-character** cap is a provider **function-name** budget. It applies to the meta-tools `search_tool` and `use_tool` themselves. It does **not** apply to catalog keys. A `server__tool` name longer than 64 characters stays in the catalog. The model still calls it through `use_tool` with that full name. Grok used to drop those tools at 64 characters. It no longer does.
+
+The server name in `[mcp_servers.<name>]` / `grok mcp add` is the catalog prefix. A name that starts with a digit is a valid TOML key. Catalog admission still rejects it (`InvalidServerName`). Rename the server so it starts with a letter or underscore.
+
+A server name that ends with `_` makes `server__tool` contain `___`. Admission skips that key (`InvalidOrAmbiguousQualifiedName`).
+
+`search_tool` / `use_tool` take the qualified catalog key, not the raw MCP tool name. Example: `github__create_issue`, not `create_issue`.
 
 ---
 
@@ -216,6 +238,41 @@ The model has access to two built-in tools for working with MCP servers:
 
 - `search_tool` — Discover available integration tools across all enabled MCP servers. Use this to find tools by name or description.
 - `use_tool` — Call an integration tool discovered via `search_tool`. Specify the fully-qualified tool name (e.g., `github__create_issue`).
+
+---
+
+## File-backed MCP arguments
+
+On the Rust-shell local filesystem (Linux, macOS, and Windows), `use_tool` accepts exactly one form:
+
+| Form | Call | File contents |
+|------|------|---------------|
+| Inline | `{"tool_name":"example__update_page","tool_input":{"body":"Hello"}}` | None |
+| Arguments file | `{"tool_name":"example__update_page","tool_input_file":"/tmp/mcp-arguments.json"}` | The complete remote object, such as `{"body":"Hello"}`; it cannot override the target. |
+| Invocation file | `{"file":"/tmp/mcp-call.json"}` | Canonical `{"tool_name":"example__update_page","tool_input":{"body":"Hello"}}`. |
+
+Use a serializer for large documents or servers that require JSON inside a string:
+
+```python
+import json
+from pathlib import Path
+
+body = Path("/tmp/page.html").read_text(encoding="utf-8")
+arguments = {"input": json.dumps({"page_id": "123", "body": body})}
+Path("/tmp/mcp-arguments.json").write_text(json.dumps(arguments), encoding="utf-8")
+Path("/tmp/mcp-call.json").write_text(
+    json.dumps({"tool_name": "example__update_page", "tool_input": arguments}),
+    encoding="utf-8",
+)
+```
+
+Nested JSON strings are not decoded again; remote `file` and `tool_input_file` keys remain server data. Do not mix forms, delegate to another file, or name a native tool. On-disk invocation keys stay canonical even when wrapper parameters are renamed.
+
+Sources must be complete regular UTF-8 JSON objects, at most **8 MiB**. Malformed/trailing JSON, duplicate envelope keys, missing fields, null paths, and non-object invocation arguments are rejected. Each prepared batch permits **16 MiB** of source input and **32 MiB** of serialized effective invocations, including hook rewrites. File operations have a **10-second** deadline excluding permission waits. These limits do not change ordinary read windows, guarantee remote acceptance, or interrupt kernel I/O.
+
+Read authorization and path, memory, symlink, and opted-in ignored-file restrictions apply before loading; transport reads do not satisfy read-before-edit. Target hooks then see loaded arguments, and separate MCP approval shows the resolved target and source. Hooks may rewrite arguments, not retarget or load another file. Authentication retries reuse the approved snapshot even if the file changes. History retains the authored reference; capped hooks/approvals see effective arguments. Server echoes and hook-added context remain unchanged.
+
+ACP client filesystems do not yet support bounded acquisition and reject file mode without agent-local fallback. File-backed invocation is supported only through Rust-shell `use_tool`; other embedding hosts reject unresolved file inputs, and direct MCP APIs remain unchanged.
 
 ---
 
@@ -368,6 +425,17 @@ tail -f ~/.grok/logs/mcp/filesystem.stderr.log
 ### Blocked by organization policy
 
 If native TOML policy or Claude `managed-settings.json` sets `deniedMcpServers`, a nonempty `allowedMcpServers`, or `allowManagedMcpServersOnly`, Grok drops non-matching servers at merge time and logs `MCP server blocked by managed settings policy`. Native grok layers bind every server; the Claude file binds foreign-defined servers only. `grok inspect` shows the lists, lockdown scope, and each remaining server. Details and examples: [Restrict which MCP servers can run](09-plugins.md#restrict-which-mcp-servers-can-run).
+
+### A listed tool never appears
+
+The server starts and `tools/list` returns the tool, but `/mcps` and `search_tool` omit it.
+
+1. Check `Skipping MCP tool` in `GROK_LOG_FILE` / `--debug`. The reason names the rule that failed (invalid server name, invalid tool name, ambiguous `__`, or catalog key longer than 256 characters).
+2. Confirm the server config key starts with a letter or underscore. A digit-leading key never enters the catalog. A key that ends with `_` is skipped as an ambiguous `___` name.
+3. Confirm the tool name uses only `[A-Za-z0-9_-]`. Dots and colons in the raw MCP name are skipped.
+4. Do not shorten a `server__tool` key to 64 characters. Catalog keys may be up to 256. The 64-character cap is only for `search_tool` / `use_tool` as function names. See [Tool Naming](#tool-naming).
+
+This is separate from a tool that is missing on the **first** prompt because the handshake is still running. Send a second prompt after the server is up, or run `grok mcp doctor`.
 
 ### Viewing Server Status
 

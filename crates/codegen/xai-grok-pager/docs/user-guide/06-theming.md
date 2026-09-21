@@ -46,7 +46,7 @@ Syntax highlighting in minimal mode does **not** switch between light and dark t
 
 ### In the TUI
 
-Run the `/theme` slash command (alias `/t`) to open the theme picker. As you move through the list with the arrow keys, Grok previews each theme in real time. Press Enter to apply and save your choice, or press Escape to revert.
+Run the `/theme` slash command (alias `/t`) to open the theme picker. As you move through the list with the arrow keys, Grok previews each theme in real time. Press Enter to apply and save your choice, or press Escape to revert. Typing filters the list by any of a theme's config names, so `/theme transparent` narrows it to the Terminal row.
 
 To switch without the picker, pass a name directly:
 

@@ -518,13 +518,19 @@ pub async fn ensure_managed_policy_present(
     if !policy_repair_pending_from(has_deployment_key, &signed_in_team) {
         return;
     }
-    let team = refreshed_team_principal(auth_manager).await;
+    let team = {
+        let mut timer = crate::instrumentation_timer!("startup.managed_policy.auth_wait");
+        timer.with_subphase(xai_grok_telemetry::startup::Subphase::ManagedPolicyAuthWait);
+        refreshed_team_principal(auth_manager).await
+    };
     if !store::has_principal() {
         return;
     }
     if !crate::config::is_managed_config_hard_stale_for(&store::current_serving_identity()) {
         return;
     }
+    let mut timer = crate::instrumentation_timer!("startup.managed_policy.config_sync");
+    timer.with_subphase(xai_grok_telemetry::startup::Subphase::ManagedPolicyConfigSync);
     match sync_bounded(SyncBudget::SessionStart, team).await {
         Some(Ok(_)) => {}
         Some(Err(e)) => tracing::warn!("session-start managed policy refresh failed: {e}"),

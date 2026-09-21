@@ -112,6 +112,8 @@ struct TurnCompletionEmitter {
     model_id: String,
     started: std::time::Instant,
     emitted: bool,
+    context_tokens: Option<u64>,
+    turn_tokens: Option<u64>,
 }
 impl TurnCompletionEmitter {
     fn new(session: Arc<SessionActor>, model_id: String, started: std::time::Instant) -> Self {
@@ -120,7 +122,13 @@ impl TurnCompletionEmitter {
             model_id,
             started,
             emitted: false,
+            context_tokens: None,
+            turn_tokens: None,
         }
+    }
+    fn record_turn_usage(&mut self, turn_tokens: u64, context_tokens: Option<u64>) {
+        self.turn_tokens = Some(turn_tokens);
+        self.context_tokens = context_tokens;
     }
     /// Re-anchor the model and duration clock when the turn's work starts (post-setup), so an abort
     /// during the turn measures like a completed turn instead of counting setup time.
@@ -151,6 +159,8 @@ impl TurnCompletionEmitter {
             error_category: outcome.error_category,
             error_code: outcome.error_code,
             error_detail: outcome.error_detail,
+            context_tokens: self.context_tokens,
+            turn_tokens: self.turn_tokens,
         });
     }
 }
@@ -697,8 +707,17 @@ impl SessionActor {
                         token_budget,
                     } => {
                         xai_grok_telemetry::session_ctx::log_event(slash_used);
-                        let reminder = self.setup_goal(&objective, token_budget).await;
-                        vec![text_block(reminder)]
+                        match self.setup_goal(&objective, token_budget).await {
+                            GoalSetupOutcome::Inference { reminder } => {
+                                vec![text_block(reminder)]
+                            }
+                            GoalSetupOutcome::Message(msg) => {
+                                self.persist_host_turn_user_echo(&original_prompt_text, prompt_id);
+                                self.mark_front_message_committed().await;
+                                self.send_host_turn_slash_command_output(&msg).await;
+                                return ok_end_turn(0, None);
+                            }
+                        }
                     }
                     BuiltinAction::GoalResume => {
                         xai_grok_telemetry::session_ctx::log_event(slash_used);
@@ -760,21 +779,18 @@ impl SessionActor {
                             args_provided: !sk.args.is_empty(),
                         },
                     );
+                    let skill_source = crate::session::telemetry::skill_source(
+                        sk.scope,
+                        sk.plugin_name.as_deref(),
+                    );
                     xai_grok_telemetry::session_ctx::log_event(
                         xai_grok_telemetry::events::SkillDispatched {
                             skill_name: sk.name.clone(),
                             plugin_source: sk.plugin_name.clone(),
                             trigger: xai_grok_telemetry::events::SkillTrigger::SlashCommand,
+                            skill_source: Some(skill_source.to_owned()),
                         },
                     );
-                    let skill_source = if sk.plugin_name.is_some() {
-                        "plugin"
-                    } else {
-                        crate::session::telemetry::skill_source_label(
-                            &sk.skill_path,
-                            self.session_info.cwd.as_str(),
-                        )
-                    };
                     xai_grok_telemetry::event_span!(
                         "skill.activated",
                         skill_name = %sk.name,
@@ -1099,9 +1115,9 @@ impl SessionActor {
                 xai_grok_telemetry::session_ctx::log_event_dual(self.telemetry_enabled, ev);
             }
             self.maybe_inject_mcp_reminder().await;
-            self.maybe_inject_mcp_connecting_reminder().await;
             self.maybe_inject_date_rollover_reminder().await;
             self.inject_plan_mode_reminders().await;
+            self.inject_fork_reminder().await;
             self.inject_resumed_tasks_reminder();
             if policy.authority.is_human_intent() {
                 if let Some(gate) = &self.tool_context.task_wake_suppressed {
@@ -1231,6 +1247,8 @@ impl SessionActor {
                     .is_ok()
                     && matches!(flush_rx.await, Ok(Ok(())))
                 {
+                    let session_dir = crate::session::persistence::session_dir(&self.session_info);
+                    crate::session::fork_status::commit_claim(&session_dir);
                     if let Some(ack) = persist_ack {
                         let _ = ack.send(());
                     }
@@ -1256,6 +1274,7 @@ impl SessionActor {
         let turn_timer = std::time::Instant::now();
         turn_completion_emitter.begin_turn_work(turn_model_id.clone(), turn_timer);
         let mut turn_sampling = TurnSampling::default();
+        let prompt_was_blocked = prompt_block.is_some();
         let mut result = if let Some((hook_name, reason)) = prompt_block {
             self.state.lock().await.arm_hook_block_hold();
             if let Some(kind) = redirect_kind {
@@ -1415,6 +1434,16 @@ impl SessionActor {
             })),
         );
         let turn_tool_count = self.events.tool_count_this_turn();
+        if !prompt_was_blocked
+            && let Ok(Some(bill)) = self.chat_state_handle.try_get_prompt_usage().await
+        {
+            turn_completion_emitter.record_turn_usage(
+                bill.totals.total_tokens(),
+                self.chat_state_handle
+                    .try_get_estimated_total_tokens()
+                    .await,
+            );
+        }
         turn_completion_emitter.emit(
             TurnTelemetryOutcome::from_result(&result),
             turn_duration_ms,
@@ -2101,9 +2130,99 @@ impl SessionActor {
         {
             return None;
         }
+        let is_v2_mode =
+            self.memory.is_enabled() && self.memory.mode() == Some(crate::config::MemoryMode::V2);
+        let is_v2 = self.memory.can_expose_v2();
         self.memory
             .context_injected
             .store(true, std::sync::atomic::Ordering::Relaxed);
+        if is_v2_mode && !is_v2 {
+            return None;
+        }
+        if is_v2 {
+            let conversation = self.chat_state_handle.get_conversation().await;
+            if crate::session::helpers::memory_context::conversation_has_memory_context(
+                &conversation,
+            ) {
+                tracing::info!(
+                    target: xai_grok_telemetry::memory_log::TARGET,
+                    "MEMORY_INJECT: persisted v2 manifests reused to preserve prompt cache"
+                );
+                let block = conversation.first().and_then(|item| match item {
+                    xai_grok_sampling_types::ConversationItem::System(sys) => sys
+                        .content
+                        .find(xai_chat_state::MEMORY_CONTEXT_OPEN_TAG)
+                        .and_then(|start| sys.content.get(start..)),
+                    _ => None,
+                });
+                let injected_bytes = block.map(|text| text.len() as u64).unwrap_or(0);
+                let estimated_tokens = block
+                    .map(xai_token_estimation::estimate_tokens)
+                    .unwrap_or(0);
+                if injected_bytes > 0 {
+                    self.memory.record_injected_bytes(injected_bytes);
+                }
+                crate::session::memory_observation::log_memory_injection(
+                    self.session_info.id.to_string(),
+                    xai_grok_telemetry::memory_telemetry::MemoryInjectionOutcome::Skipped,
+                    crate::session::memory_observation::MemoryInjectionMetrics {
+                        injected_bytes,
+                        estimated_tokens,
+                        was_reused: true,
+                        ..Default::default()
+                    },
+                );
+                return None;
+            }
+            let inject_start = std::time::Instant::now();
+            let storage = self.memory.storage()?;
+            let context = tokio::task::spawn_blocking(move || {
+                crate::session::helpers::memory_context::format_v2_memory_context(&storage)
+            })
+            .await
+            .map_err(|error| error.to_string())
+            .and_then(std::convert::identity);
+            return match context {
+                Ok(context) => {
+                    let injected_bytes = context.content.len() as u64;
+                    self.memory.record_injected_bytes(injected_bytes);
+                    crate::session::memory_observation::log_memory_injection(
+                        self.session_info.id.to_string(),
+                        xai_grok_telemetry::memory_telemetry::MemoryInjectionOutcome::Results,
+                        crate::session::memory_observation::MemoryInjectionMetrics {
+                            result_count: context
+                                .global_entry_count
+                                .saturating_add(context.workspace_entry_count),
+                            injected_bytes,
+                            estimated_tokens: xai_token_estimation::estimate_tokens(
+                                &context.content,
+                            ),
+                            global_entry_count: context.global_entry_count,
+                            workspace_entry_count: context.workspace_entry_count,
+                            duration_ms: inject_start.elapsed().as_millis() as u64,
+                            ..Default::default()
+                        },
+                    );
+                    self.memory
+                        .injection_count
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    Some(context.content)
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        target: xai_grok_telemetry::memory_log::TARGET,
+                        %error,
+                        "MEMORY_INJECT: failed to generate v2 manifest context"
+                    );
+                    crate::session::memory_observation::log_memory_injection(
+                        self.session_info.id.to_string(),
+                        xai_grok_telemetry::memory_telemetry::MemoryInjectionOutcome::Error,
+                        Default::default(),
+                    );
+                    None
+                }
+            };
+        }
         if !self.memory.initial_injection_config.enabled {
             tracing::info!(
                 target: xai_grok_telemetry::memory_log::TARGET,
@@ -2225,6 +2344,7 @@ impl SessionActor {
                 top_score,
                 configured_min_score,
                 duration_ms: inject_start.elapsed().as_millis() as u64,
+                ..Default::default()
             },
         );
         crate::session::helpers::memory_context::format_memory_reminder(&inject_results)
@@ -2258,8 +2378,11 @@ impl SessionActor {
             tool_calls.retain(|tc| tc.name != STRUCTURED_OUTPUT_TOOL);
             return StructuredOutputStep::Proceed;
         }
-        let call_id = tool_calls[pos].id.as_ref().to_owned();
-        let validated = validate_structured_output(validator, &tool_calls[pos].arguments);
+        let Some(tc) = tool_calls.get(pos) else {
+            return StructuredOutputStep::Proceed;
+        };
+        let call_id = tc.id.as_ref().to_owned();
+        let validated = validate_structured_output(validator, &tc.arguments);
         if let Err(err) = &validated
             && *retries < STRUCTURED_OUTPUT_MAX_RETRIES
         {
@@ -2497,6 +2620,8 @@ impl SessionActor {
         let tool_prep_start = std::time::Instant::now();
         let (tool_definitions, mcp_wait_ms) = self.prepare_tool_definitions_timed().await;
         let total_prep_ms = tool_prep_start.elapsed().as_millis() as u64;
+        self.maybe_inject_mcp_connecting_reminder().await;
+        self.maybe_inject_mcp_reminder().await;
         if let Some(ref mut pt) = prompt_timing {
             pt.record_tool_prep(mcp_wait_ms, total_prep_ms);
         }
@@ -2709,26 +2834,39 @@ impl SessionActor {
                 backend_search_active,
                 "backend_search: turn tool resolution"
             );
+            let bridge = self.agent.borrow().tool_bridge().clone();
+            let messaging_grant = if bridge
+                .read_resource::<
+                    xai_grok_tools::implementations::grok_build::task::types::AgentMessageSenderResource,
+                >()
+                .await
+                .is_some()
+                && bridge
+                    .tool_for_kind(
+                        xai_grok_tools::types::tool::ToolKind::ActiveAgentMessage,
+                    )
+                    .await
+                    .is_some()
+            {
+                child_tool_projection::ChildMessagingGrant::Granted
+            } else {
+                child_tool_projection::ChildMessagingGrant::Ungranted
+            };
             let mut effective_tools: Vec<ToolSpec> =
                 if let Some(ref override_tools) = self.forked_tool_override {
-                    let bridge = self.agent.borrow().tool_bridge().clone();
-                    let mut tools = child_tool_projection::child_safe_tool_specs(
+                    child_tool_projection::child_safe_tool_specs(
                         override_tools.clone(),
                         child_tool_projection::ChildToolProjection::VerbatimMirror,
+                        messaging_grant,
                         |name| bridge.tool_kind(name),
-                    );
-                    if self.startup_hints.is_subagent {
-                        crate::agent::subagent::strip_ask_user_question_tool(&mut tools);
-                        crate::agent::subagent::strip_workflow_tool(&mut tools);
-                    }
-                    tools
+                    )
                 } else {
                     let tools = self.turn_base_tool_specs(&tool_definitions);
                     if self.startup_hints.is_subagent {
-                        let bridge = self.agent.borrow().tool_bridge().clone();
                         child_tool_projection::child_safe_tool_specs(
                             tools,
                             child_tool_projection::ChildToolProjection::Rebuilt,
+                            messaging_grant,
                             |name| bridge.tool_kind(name),
                         )
                     } else {
@@ -2746,6 +2884,8 @@ impl SessionActor {
                     parameters: schema,
                 });
             }
+            self.persist_tool_definitions_artifact(&effective_tools)
+                .await;
             let build_req_start = std::time::Instant::now();
             let build_request_span =
                 xai_grok_telemetry::region::Region::from_span(tracing::info_span!(
@@ -3169,6 +3309,7 @@ impl SessionActor {
                             .usage
                             .as_ref()
                             .map(|u| u.cache_creation_prompt_tokens),
+                        context_tokens: response.usage.as_ref().map(|u| u.total_tokens),
                         cost_usd_ticks: response.cost_usd_ticks,
                     },
                 );
@@ -3176,10 +3317,7 @@ impl SessionActor {
             self.record_response_token_usage(&response, Some(model_duration_ms));
             let response_completed = self.response_completed_update(&response);
             if let Some(mut pt) = prompt_timing.take() {
-                pt.record_stream_latency(
-                    latency.time_to_first_token_ms,
-                    latency.time_to_last_byte_ms,
-                );
+                pt.record_stream_latency(latency.time_to_last_byte_ms);
                 pt.record_model_result(
                     latency.attempts,
                     response.usage.as_ref().map(|u| u.completion_tokens),
@@ -3199,11 +3337,6 @@ impl SessionActor {
                     .get_prompt_index()
                     .await
                     .saturating_sub(1) as u32;
-                if turn_index == 0
-                    && let Some(repo_status_wait_ms) = self.repo_status_prefetch.take_wait_ms()
-                {
-                    pt.record_repo_status_wait(repo_status_wait_ms);
-                }
                 turn_phases.arm_latency(pt.build(
                     model_duration_ms,
                     turn_index,
@@ -3251,13 +3384,15 @@ impl SessionActor {
                 ))
                 .await;
                 self.push_system_reminder(&reminder);
+                self.turn_phases.discard_uncommitted_first_token();
                 self.turn_phases.discard_uncommitted_first_meaningful();
                 continue;
             }
             metrics_drop_guard.record_model_response(tool_calls.len());
             if !tool_calls.is_empty() {
-                self.record_turn_first_meaningful_output(None);
+                self.record_turn_first_token(None);
             }
+            self.turn_phases.commit_first_token();
             self.turn_phases.commit_first_meaningful();
             if let Some(fp) = response
                 .assistant()
@@ -3305,6 +3440,7 @@ impl SessionActor {
                     text_len = text.len(),
                     "emitting fallback AgentMessageChunk — no text chunks were streamed"
                 );
+                self.record_turn_first_token(None);
                 self.record_turn_first_meaningful_output(None);
                 self.send_update(
                     acp::SessionUpdate::AgentMessageChunk(acp::ContentChunk::new(
@@ -4055,7 +4191,10 @@ mod structured_output_validation_tests {
     #[test]
     fn accepts_conforming_json() {
         let v = validate_structured_output(&validator(), r#"{"name":"alice","age":30}"#).unwrap();
-        assert_eq!(v["name"], "alice");
+        assert_eq!(
+            v.pointer("/name").unwrap_or(&serde_json::Value::Null),
+            "alice"
+        );
     }
     #[test]
     fn rejects_non_json() {

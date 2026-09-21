@@ -1,6 +1,7 @@
 use agent_client_protocol as acp;
 use serde::{Deserialize, Serialize};
 
+use crate::extensions::agent_runtime::AgentRuntime;
 use crate::util::config as cli_config;
 use xai_grok_agent::prompt::skills::{
     CompatConfig, SkillInfo, SkillsConfig, list_skills_with_plugins,
@@ -14,6 +15,15 @@ use super::ExtResult;
 struct CwdParams {
     #[serde(default)]
     cwd: Option<String>,
+}
+
+/// The `cwd` a skills request is scoped to, if it names one (every request shape carries the field
+/// under the same name; unknown fields are ignored).
+pub(crate) fn request_cwd(args: &acp::ExtRequest) -> Option<std::path::PathBuf> {
+    serde_json::from_str::<CwdParams>(args.params.get())
+        .ok()
+        .and_then(|p| p.cwd)
+        .map(std::path::PathBuf::from)
 }
 
 #[derive(Debug, Deserialize)]
@@ -174,8 +184,9 @@ fn discover_auto_sources(cwd: &str, skills: &[SkillInfo]) -> Vec<(String, usize)
         .ok()
         .and_then(|repo| repo.workdir().map(|p| p.to_path_buf()));
 
-    // Once the user has imported, stop scanning hardcoded .claude/skills/ paths
-    // Equivalent locations should be opted in via [paths] extra_skill_dirs in config.toml (written by /import-claude)
+    // After /import-claude, do not list hardcoded .claude/skills/ paths.
+    // Import writes those dirs to [paths] extra_skill_dirs for the source UI.
+    // list_skills_with_plugins still does not read extra_skill_dirs.
     let imported = crate::claude_import::is_claude_import_marked();
     let local_dir_names: &[&str] = if imported {
         &[".grok", ".agents"]
@@ -227,8 +238,8 @@ fn discover_auto_sources(cwd: &str, skills: &[SkillInfo]) -> Vec<(String, usize)
         }
     }
 
-    // [paths] extra_skill_dirs from config.toml supplement the built-in scan locations
-    // They are used standalone and as the migration target after /import-claude disables the runtime .claude/skills/ scan
+    // [paths] extra_skill_dirs appear as source folders after /import-claude.
+    // Discovery does not load them. Extra injection dirs belong in [skills] paths.
     for dir in extra_skill_dirs_from_config() {
         let path = crate::util::expand_home(&dir);
         if path.is_dir()
@@ -265,7 +276,7 @@ fn extra_skill_dirs_from_config() -> Vec<String> {
 
 #[tracing::instrument(skip_all, fields(method = %args.method))]
 pub async fn handle(
-    agent: &crate::agent::mvp_agent::MvpAgent,
+    agent: &dyn AgentRuntime,
     args: &acp::ExtRequest,
     plugin_registry: Option<&xai_grok_agent::plugins::PluginRegistry>,
     compat: CompatConfig,
@@ -533,6 +544,29 @@ mod tests {
     use super::*;
 
     #[test]
+    fn request_cwd_reads_the_field_from_any_request_shape() {
+        let req = |json: &str| {
+            acp::ExtRequest::new(
+                "x.ai/skills/list",
+                serde_json::value::to_raw_value(
+                    &serde_json::from_str::<serde_json::Value>(json).unwrap(),
+                )
+                .unwrap()
+                .into(),
+            )
+        };
+        assert_eq!(
+            request_cwd(&req(r#"{"cwd": "/project"}"#)),
+            Some(std::path::PathBuf::from("/project"))
+        );
+        assert_eq!(
+            request_cwd(&req(r#"{"path": "/skills", "cwd": "/project"}"#)),
+            Some(std::path::PathBuf::from("/project"))
+        );
+        assert_eq!(request_cwd(&req(r#"{}"#)), None);
+    }
+
+    #[test]
     fn test_add_request_with_cwd() {
         let json = r#"{"path": "/home/user/skills", "cwd": "/project"}"#;
         let req: SkillsAddRequest = serde_json::from_str(json).unwrap();
@@ -573,9 +607,9 @@ mod tests {
             message: "ok".to_string(),
         };
         let json = serde_json::to_value(&resp).unwrap();
-        assert_eq!(json["addedCount"], 3);
-        assert_eq!(json["total"], 10);
-        assert_eq!(json["path"], "/test");
+        assert_eq!(json.get("addedCount"), Some(&serde_json::json!(3)));
+        assert_eq!(json.get("total"), Some(&serde_json::json!(10)));
+        assert_eq!(json.get("path"), Some(&serde_json::json!("/test")));
     }
 
     #[test]
@@ -642,7 +676,7 @@ mod tests {
             skills: vec![],
         };
         let json = serde_json::to_value(&resp).unwrap();
-        assert_eq!(json["totalSkills"], 5);
-        assert!(json["paths"].is_array());
+        assert_eq!(json.get("totalSkills"), Some(&serde_json::json!(5)));
+        assert!(json.get("paths").is_some_and(|p| p.is_array()));
     }
 }

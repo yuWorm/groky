@@ -1,4 +1,5 @@
 use super::*;
+use crate::scrollback::blocks::tool::VerbGroupKind;
 use std::sync::Arc;
 /// Default meta with no timestamps (simulates old grok-shell or tests that don't care about timing).
 fn meta() -> NotificationMeta {
@@ -13,6 +14,12 @@ fn thought_chunk(text: &str) -> acp::SessionUpdate {
     acp::SessionUpdate::AgentThoughtChunk(acp::ContentChunk::new(acp::ContentBlock::Text(
         acp::TextContent::new(text.to_string()),
     )))
+}
+fn batch(event_name: &str, tool_name: Option<&str>) -> HookBatchId {
+    HookBatchId {
+        event_name: event_name.into(),
+        tool_name: tool_name.map(str::to_string),
+    }
 }
 #[test]
 fn workflow_suppression_keeps_authoring_calls_visible() {
@@ -1257,17 +1264,15 @@ fn test_search_tool_call_flow() {
     if let RenderBlock::ToolCall(ToolCallBlock::Search(search)) = &entry.block {
         assert_eq!(search.pattern, "fn main");
         assert_eq!(search.match_count, 1);
-        assert_eq!(search.file_matches.len(), 1);
-        assert_eq!(
-            search.file_matches[0].path,
-            "/Users/alice/dev/rust/foo/src/main.rs"
-        );
-        assert_eq!(search.file_matches[0].matches.len(), 1);
-        assert_eq!(search.file_matches[0].matches[0].line_number, 54);
-        assert_eq!(
-            search.file_matches[0].matches[0].content,
-            "fn main() -> Result<()> {"
-        );
+        let [file_match] = search.file_matches.as_slice() else {
+            panic!("expected 1 file match: {:?}", search.file_matches);
+        };
+        assert_eq!(file_match.path, "/Users/alice/dev/rust/foo/src/main.rs");
+        let [m] = file_match.matches.as_slice() else {
+            panic!("expected 1 match: {:?}", file_match.matches);
+        };
+        assert_eq!(m.line_number, 54);
+        assert_eq!(m.content, "fn main() -> Result<()> {");
     } else {
         panic!(
             "Expected Search block after completion, got: {:?}",
@@ -1681,8 +1686,10 @@ fn overlapping_adjacent_edits_stitch_into_single_hunk() {
             edit.edit_count, 5,
             "the (N edits) fallback counts merged calls, not stitched hunks"
         );
-        let rows: Vec<(similar::ChangeTag, usize)> =
-            edit.hunks[0].iter().map(|l| (l.tag, l.ln)).collect();
+        let Some(hunk) = edit.hunks.first() else {
+            panic!("expected a hunk");
+        };
+        let rows: Vec<(similar::ChangeTag, usize)> = hunk.iter().map(|l| (l.tag, l.ln)).collect();
         let expected: Vec<(similar::ChangeTag, usize)> = (5..=9)
             .flat_map(|ln| {
                 [
@@ -2061,10 +2068,10 @@ fn stream_start_breaks_agent_msg_across_streams() {
         2,
         "Should have 2 separate agent message entries"
     );
-    assert_ne!(
-        sb.get(agent_indices[0]).unwrap().id,
-        sb.get(agent_indices[1]).unwrap().id,
-    );
+    let [i0, i1] = agent_indices.as_slice() else {
+        panic!("expected 2 agent indices: {agent_indices:?}");
+    };
+    assert_ne!(sb.get(*i0).unwrap().id, sb.get(*i1).unwrap().id,);
 }
 /// Same stream_start_ms should NOT break messages: chunks append normally.
 #[test]
@@ -2309,7 +2316,11 @@ fn execute_block_keeps_full_command_sets_header_display_when_peeled() {
             serde_json::json!({ "command": "cd /proj && echo hi" }),
         ))
         .locations(vec![]);
-    let block = tool_call_to_block(&tc, Some(Path::new("/proj")));
+    let block = tool_call_to_block(
+        &tc,
+        Some(Path::new("/proj")),
+        &SubagentLabelRegistry::default(),
+    );
     match &block {
         RenderBlock::ToolCall(ToolCallBlock::Execute(exec)) => {
             assert_eq!(exec.command, "cd /proj && echo hi");
@@ -2322,6 +2333,135 @@ fn execute_block_keeps_full_command_sets_header_display_when_peeled() {
     assert!(
         searchable.contains("cd /proj && echo hi"),
         "searchable_text must retain full command: {searchable}"
+    );
+}
+#[test]
+fn read_text_content_becomes_numbered_lines_with_the_sent_range() {
+    const TEXT: &str = "fn main() {}\nfn run() {}\n";
+    let range = || Some(LineRange::new(10, 11));
+    let counts = serde_json::json!({ "totalLines": 40, "range": { "start": 10, "end": 11 } });
+    let read = |raw_output: Option<serde_json::Value>, content: Vec<acp::ToolCallContent>| {
+        let call = acp::ToolCall::new(
+            acp::ToolCallId::new(Arc::from("read-1")),
+            "src/main.rs".to_string(),
+        )
+        .kind(acp::ToolKind::Read)
+        .status(acp::ToolCallStatus::Completed)
+        .raw_input(Some(serde_json::json!({ "path": "src/main.rs" })))
+        .raw_output(raw_output)
+        .content(content)
+        .locations(vec![]);
+        match tool_call_to_block(&call, None, &SubagentLabelRegistry::default()) {
+            RenderBlock::ToolCall(ToolCallBlock::Read(block)) => {
+                (block.content, block.total_lines, block.line_range)
+            }
+            other => panic!("expected read block, got {other:?}"),
+        }
+    };
+    assert_eq!(
+        read(Some(counts.clone()), vec![TEXT.into()]),
+        (Some(TEXT.to_owned()), Some(40), range())
+    );
+    assert_eq!(
+        read(None, vec![TEXT.into()]),
+        (Some(TEXT.to_owned()), Some(2), None)
+    );
+    assert_eq!(
+        read(
+            Some(serde_json::json!({ "type": "Text", "text": "**File:** rust.md\n1 | # Rust\n" })),
+            vec![TEXT.into()],
+        ),
+        (None, None, None)
+    );
+    assert_eq!(read(Some(counts), vec![]), (None, Some(40), range()));
+}
+#[test]
+fn memory_v2_metadata_groups_ordinary_file_activity_without_losing_details() {
+    let memory_meta = Some(
+        serde_json::json!({ "memory_v2_activity": true })
+            .as_object()
+            .unwrap()
+            .clone(),
+    );
+    let make_call = |id: &'static str, kind, title: &str, raw_input| {
+        acp::ToolCall::new(acp::ToolCallId::new(Arc::from(id)), title.to_string())
+            .kind(kind)
+            .status(acp::ToolCallStatus::Pending)
+            .raw_input(Some(raw_input))
+            .meta(memory_meta.clone())
+            .content(vec![])
+            .locations(vec![])
+    };
+    let read = make_call(
+        "memory-read",
+        acp::ToolKind::Read,
+        "Read memory",
+        serde_json::json!({ "path": "/memory-v2/global/topics/rust.md" }),
+    );
+    let RenderBlock::ToolCall(ToolCallBlock::Read(read)) =
+        tool_call_to_block(&read, None, &SubagentLabelRegistry::default())
+    else {
+        panic!("expected read block");
+    };
+    assert_eq!(read.path, "/memory-v2/global/topics/rust.md");
+    assert_eq!(
+        ToolCallBlock::Read(read).verb_group_kind(),
+        Some(VerbGroupKind::MemorySearch)
+    );
+    let edit = make_call(
+        "memory-edit",
+        acp::ToolKind::Edit,
+        "Edit memory",
+        serde_json::json!({
+            "path": "/memory-v2/global/topics/rust.md",
+            "old_string": "old",
+            "new_string": "new"
+        }),
+    );
+    let RenderBlock::ToolCall(ToolCallBlock::Edit(edit)) =
+        tool_call_to_block(&edit, None, &SubagentLabelRegistry::default())
+    else {
+        panic!("expected edit block");
+    };
+    assert_eq!(edit.path, "/memory-v2/global/topics/rust.md");
+    assert_eq!(
+        ToolCallBlock::Edit(edit).verb_group_kind(),
+        Some(VerbGroupKind::MemorySearch)
+    );
+    let search = make_call(
+        "memory-search",
+        acp::ToolKind::Search,
+        "Search memory",
+        serde_json::json!({
+            "pattern": "Rust",
+            "path": "/memory-v2/global/topics"
+        }),
+    );
+    let RenderBlock::ToolCall(ToolCallBlock::Search(search)) =
+        tool_call_to_block(&search, None, &SubagentLabelRegistry::default())
+    else {
+        panic!("expected search block");
+    };
+    assert_eq!(search.pattern, "Rust");
+    assert_eq!(
+        ToolCallBlock::Search(search).verb_group_kind(),
+        Some(VerbGroupKind::MemorySearch)
+    );
+    let list = make_call(
+        "memory-list",
+        acp::ToolKind::Other,
+        "List memory",
+        serde_json::json!({ "target_directory": "/memory-v2/global/topics" }),
+    );
+    let RenderBlock::ToolCall(ToolCallBlock::ListDir(list)) =
+        tool_call_to_block(&list, None, &SubagentLabelRegistry::default())
+    else {
+        panic!("expected list block");
+    };
+    assert!(list.path.contains("/memory-v2/global/topics"));
+    assert_eq!(
+        ToolCallBlock::ListDir(list).verb_group_kind(),
+        Some(VerbGroupKind::MemorySearch)
     );
 }
 #[test]
@@ -3252,9 +3392,11 @@ fn tracker_captures_available_commands_update() {
     let cmds = tracker
         .take_pending_acp_commands()
         .expect("should have pending");
-    assert_eq!(cmds.len(), 2);
-    assert_eq!(cmds[0].name, "flush");
-    assert_eq!(cmds[1].name, "compact");
+    let [flush, compact] = cmds.as_slice() else {
+        panic!("expected 2 commands: {cmds:?}");
+    };
+    assert_eq!(flush.name, "flush");
+    assert_eq!(compact.name, "compact");
 }
 #[test]
 fn tracker_single_drain_clears_pending() {
@@ -3277,9 +3419,11 @@ fn tracker_latest_update_replaces_pending() {
     let cmds = tracker
         .take_pending_acp_commands()
         .expect("should have pending");
-    assert_eq!(cmds.len(), 2);
-    assert_eq!(cmds[0].name, "new_a");
-    assert_eq!(cmds[1].name, "new_b");
+    let [a, b] = cmds.as_slice() else {
+        panic!("expected 2 commands: {cmds:?}");
+    };
+    assert_eq!(a.name, "new_a");
+    assert_eq!(b.name, "new_b");
 }
 #[test]
 fn parse_search_tool_results_grouped_format() {
@@ -3321,15 +3465,17 @@ fn parse_search_tool_results_grouped_format() {
     });
     let content = serde_json::to_string_pretty(&json).unwrap();
     let results = parse_search_tool_results(&content);
-    assert_eq!(results.len(), 3);
-    assert_eq!(results[0].name, "linear__save_issue");
-    assert_eq!(results[0].server, "linear");
-    assert_eq!(results[0].description, "Create an issue");
-    assert!((results[0].score - 0.8).abs() < f64::EPSILON);
-    assert_eq!(results[1].name, "linear__list_issues");
-    assert_eq!(results[1].server, "linear");
-    assert_eq!(results[2].name, "slack__send_message");
-    assert_eq!(results[2].server, "slack");
+    let [linear_save, linear_list, slack] = results.as_slice() else {
+        panic!("expected 3 results: {results:?}");
+    };
+    assert_eq!(linear_save.name, "linear__save_issue");
+    assert_eq!(linear_save.server, "linear");
+    assert_eq!(linear_save.description, "Create an issue");
+    assert!((linear_save.score - 0.8).abs() < f64::EPSILON);
+    assert_eq!(linear_list.name, "linear__list_issues");
+    assert_eq!(linear_list.server, "linear");
+    assert_eq!(slack.name, "slack__send_message");
+    assert_eq!(slack.server, "slack");
 }
 #[test]
 fn parse_search_tool_results_old_flat_format_returns_empty() {
@@ -4039,7 +4185,7 @@ fn completed_other_function_name_preserves_bash_output() {
     .raw_input(Some(serde_json::json!({ "command": "echo hi" })))
     .raw_output(serde_json::to_value(ToolOutput::Bash(bash)).ok())
     .locations(vec![]);
-    match tool_call_to_block(&tc, None) {
+    match tool_call_to_block(&tc, None, &SubagentLabelRegistry::default()) {
         RenderBlock::ToolCall(ToolCallBlock::Execute(ex)) => {
             assert_eq!(ex.command, "echo hi");
             assert_eq!(ex.output.as_deref(), Some("hello from bg\n"));
@@ -4606,11 +4752,94 @@ fn call_mcp_tool_coerced_to_use_tool_renders_block() {
             "tool_input" : { "query" : "alerts" } }
         )))
         .locations(vec![]);
-    let block = tool_call_to_block(&tc, None);
+    let block = tool_call_to_block(&tc, None, &SubagentLabelRegistry::default());
     let RenderBlock::ToolCall(ToolCallBlock::UseTool(ut)) = block else {
         panic!("expected UseTool block, got {block:?}");
     };
     assert_eq!(ut.tool_name, "grafana__search");
+}
+#[test]
+fn a_failed_tool_search_shows_its_output_text_as_the_error() {
+    let tc = acp::ToolCall::new(
+        acp::ToolCallId::new(Arc::from("mcp2")),
+        "Search tools slack",
+    )
+    .kind(acp::ToolKind::Other)
+    .status(acp::ToolCallStatus::Failed)
+    .content(vec![])
+    .raw_input(Some(
+        serde_json::json!({ "variant": "SearchTool", "query": "slack" }),
+    ))
+    .raw_output(Some(serde_json::json!({
+        "type": "SearchTool",
+        "result_count": 0,
+        "content": "no such server: slack"
+    })))
+    .locations(vec![]);
+    let block = tool_call_to_block(&tc, None, &SubagentLabelRegistry::default());
+    let RenderBlock::ToolCall(ToolCallBlock::IntegrationSearch(st)) = block else {
+        panic!("expected IntegrationSearch block, got {block:?}");
+    };
+    assert_eq!(st.error.as_deref(), Some("no such server: slack"));
+}
+#[test]
+fn directly_listed_mcp_tool_renders_like_a_use_tool_call() {
+    let mcp = xai_grok_tools::types::output::MCPOutput::errored(
+        "computer_check_permissions".into(),
+        "computer_use".into(),
+        "Failed to call computer_check_permissions: the helper did not answer within 15s".into(),
+    );
+    let input = xai_grok_tools::types::tool_io::ToolInput::MCPTool(
+        xai_grok_tools::types::tool_io::MCPToolInput {
+            tool_name: "computer_use__computer_check_permissions".into(),
+            tool_input: serde_json::json!({"x": 1}),
+        },
+    );
+    let tc = acp::ToolCall::new(
+        acp::ToolCallId::new(Arc::from("mcp2")),
+        "computer_use__computer_check_permissions",
+    )
+    .kind(acp::ToolKind::Other)
+    .status(acp::ToolCallStatus::Failed)
+    .content(vec![])
+    .raw_input(serde_json::to_value(input).ok())
+    .raw_output(serde_json::to_value(ToolOutput::MCP(mcp)).ok())
+    .locations(vec![]);
+    let block = tool_call_to_block(&tc, None, &SubagentLabelRegistry::default());
+    let RenderBlock::ToolCall(ToolCallBlock::UseTool(ut)) = block else {
+        panic!("expected UseTool block, got {block:?}");
+    };
+    assert_eq!("computer_use__computer_check_permissions", ut.tool_name);
+    assert_eq!(vec![("x".to_owned(), "1".to_owned())], ut.input_args);
+    assert_eq!(
+        Some("Failed to call computer_check_permissions: the helper did not answer within 15s"),
+        ut.error.as_deref()
+    );
+}
+#[test]
+fn generic_failed_tool_call_takes_its_error_from_raw_output() {
+    let output = ToolOutput::Text(xai_grok_tools::types::output::TextOutput::from(
+        "no task with id t1",
+    ));
+    let tc = acp::ToolCall::new(acp::ToolCallId::new(Arc::from("kill1")), "kill_task")
+        .kind(acp::ToolKind::Other)
+        .status(acp::ToolCallStatus::Failed)
+        .content(vec![])
+        .raw_input(Some(serde_json::json!({
+            "variant": "KillTask",
+            "task_id": "t1"
+        })))
+        .raw_output(serde_json::to_value(output).ok())
+        .locations(vec![]);
+    let block = tool_call_to_block(&tc, None, &SubagentLabelRegistry::default());
+    let RenderBlock::ToolCall(ToolCallBlock::Other(other)) = block else {
+        panic!("expected Other block, got {block:?}");
+    };
+    assert_eq!(Some("no task with id t1"), other.error.as_deref());
+    assert_eq!(
+        None, other.output,
+        "a failure carries its text as the error only"
+    );
 }
 #[test]
 fn send_feedback_update_renders_feedback_drafted() {
@@ -4668,7 +4897,7 @@ fn call_mcp_tool_no_raw_input_does_not_panic() {
     .status(acp::ToolCallStatus::Pending)
     .content(vec![])
     .locations(vec![]);
-    let _block = tool_call_to_block(&tc, None);
+    let _block = tool_call_to_block(&tc, None, &SubagentLabelRegistry::default());
 }
 #[test]
 fn cursor_todo_write_suppressed_by_title() {
@@ -4733,7 +4962,7 @@ fn video_tool_variants_use_typed_path_not_generic_scrape() {
         .raw_input(Some(serde_json::json!({ "variant" : variant })))
         .raw_output(serde_json::to_value(output).ok())
         .locations(vec![]);
-        let block = tool_call_to_block(&tc, None);
+        let block = tool_call_to_block(&tc, None, &SubagentLabelRegistry::default());
         let open_path = block
             .inline_open_button()
             .map(|(p, is_video)| {
@@ -4788,7 +5017,9 @@ fn tier_restricted_media_shows_upsell_text_not_error() {
     .raw_input(Some(serde_json::json!({ "variant": "ImageGen" })))
     .raw_output(serde_json::to_value(output).ok())
     .locations(vec![]);
-    let RenderBlock::ToolCall(ToolCallBlock::Other(block)) = tool_call_to_block(&tc, None) else {
+    let RenderBlock::ToolCall(ToolCallBlock::Other(block)) =
+        tool_call_to_block(&tc, None, &SubagentLabelRegistry::default())
+    else {
         panic!("expected an Other tool-call block");
     };
     assert!(
@@ -4804,4 +5035,254 @@ fn tier_restricted_media_shows_upsell_text_not_error() {
         "upsell text must be shown in the card body, got: {:?}",
         block.output
     );
+}
+/// The daemon client hand-builds the media card's JSON (it cannot depend on `MediaGenOutput`); this pins that the
+/// exact shape it sends — `type` + `path` only — renders as a media ref for both spellings, and that the fuller
+/// shape the built-in tools send does too.
+#[test]
+fn daemon_generate_image_output_shape_renders_as_a_media_ref() {
+    let outputs = [
+        (
+            "ImageGen",
+            serde_json::json!({ "type": "ImageGen", "path": "/work/proj/assets/cat.png" }),
+        ),
+        (
+            "ImageEdit",
+            serde_json::json!({ "type": "ImageEdit", "path": "/work/proj/assets/cat.png" }),
+        ),
+        (
+            "ImageGen",
+            serde_json::json!({
+                "type": "ImageGen",
+                "path": "/work/proj/assets/cat.png",
+                "filename": "cat.png",
+                "session_folder": "assets",
+            }),
+        ),
+    ];
+    for (variant, output) in outputs {
+        let tc = acp::ToolCall::new(
+            acp::ToolCallId::new(Arc::from("daemon-image")),
+            "Generate image: \"a cat\"",
+        )
+        .kind(acp::ToolKind::Other)
+        .status(acp::ToolCallStatus::Completed)
+        .raw_input(Some(serde_json::json!({
+            "variant": variant, "prompt": "a cat", "aspect_ratio": "16:9",
+        })))
+        .raw_output(Some(output.clone()))
+        .locations(vec![]);
+        assert_eq!(
+            media_gen_ref(&tc),
+            Some((std::path::PathBuf::from("/work/proj/assets/cat.png"), false)),
+            "{output}"
+        );
+        let RenderBlock::ToolCall(ToolCallBlock::Other(block)) =
+            tool_call_to_block(&tc, None, &SubagentLabelRegistry::default())
+        else {
+            panic!("expected an Other tool-call block for {output}");
+        };
+        assert!(block.is_success(), "{output}");
+    }
+}
+/// A refused generation (the server's access error) fails the card with the reason, and draws no image.
+#[test]
+fn daemon_generate_image_refusal_is_a_failed_card_with_the_reason() {
+    let reason = "Developer, Sand, or training access required";
+    let tc = acp::ToolCall::new(
+        acp::ToolCallId::new(Arc::from("daemon-image")),
+        "Generate image: \"a cat\"",
+    )
+    .kind(acp::ToolKind::Other)
+    .status(acp::ToolCallStatus::Failed)
+    .raw_input(Some(serde_json::json!({
+        "variant": "ImageGen", "prompt": "a cat", "aspect_ratio": "auto",
+    })))
+    .content(vec![acp::ToolCallContent::from(acp::ContentBlock::Text(
+        acp::TextContent::new(reason.to_string()),
+    ))])
+    .locations(vec![]);
+    assert_eq!(media_gen_ref(&tc), None);
+    let RenderBlock::ToolCall(ToolCallBlock::Other(block)) =
+        tool_call_to_block(&tc, None, &SubagentLabelRegistry::default())
+    else {
+        panic!("expected an Other tool-call block");
+    };
+    assert!(!block.is_success());
+    assert_eq!(block.error.as_deref(), Some(reason));
+}
+/// A hook batch younger than the reveal delay is invisible; once it outlives the delay it outranks the phase it blocks.
+#[test]
+fn hooks_running_reveals_only_after_delay_and_outranks_thinking() {
+    crate::appearance::cache::set_show_thinking_blocks(true);
+    let mut sb = ScrollbackState::new();
+    let mut tracker = AcpUpdateTracker::new();
+    tracker.handle_update(thought_chunk("planning"), &meta(), &mut sb);
+    assert_eq!(tracker.activity(), Some(TurnActivity::Thinking));
+    tracker.set_hooks_running(batch("pre_tool_use", None), 1, None);
+    assert_eq!(
+        tracker.activity(),
+        Some(TurnActivity::Thinking),
+        "a fresh batch must not flash into the spinner"
+    );
+    assert!(
+        !tracker.clear_hooks_running(&batch("pre_tool_use", None)),
+        "ending an unrevealed batch changes nothing on screen"
+    );
+    let revealed = std::time::Instant::now() - HOOK_REVEAL_DELAY;
+    tracker.set_hooks_running_since(batch("pre_tool_use", None), 1, revealed, None);
+    assert_eq!(
+        tracker.activity(),
+        Some(TurnActivity::Waiting(WaitingReason::Hooks {
+            event_name: "pre_tool_use".into(),
+            count: 1,
+        })),
+        "a batch past the reveal delay names what the turn is blocked on"
+    );
+    assert!(
+        tracker.clear_hooks_running(&batch("pre_tool_use", None)),
+        "ending a revealed batch must request a redraw"
+    );
+    assert_eq!(tracker.activity(), Some(TurnActivity::Thinking));
+}
+/// Streaming data after the batch means it finished even if its `HookExecution` was dropped or deferred.
+#[test]
+fn hooks_running_auto_clears_on_streaming_data_and_turn_end() {
+    let mut sb = ScrollbackState::new();
+    let mut tracker = AcpUpdateTracker::new();
+    let revealed = std::time::Instant::now() - HOOK_REVEAL_DELAY;
+    tracker.set_hooks_running_since(batch("user_prompt_submit", None), 2, revealed, None);
+    assert!(matches!(
+        tracker.activity(),
+        Some(TurnActivity::Waiting(WaitingReason::Hooks { .. }))
+    ));
+    tracker.handle_update(agent_chunk("hello"), &meta(), &mut sb);
+    assert_eq!(
+        tracker.activity(),
+        Some(TurnActivity::Responding),
+        "the first chunk after the gate clears the hook phase"
+    );
+    tracker.set_hooks_running_since(batch("stop", None), 1, revealed, None);
+    tracker.finish_turn(&mut sb);
+    assert_eq!(tracker.activity(), None, "finish_turn drops the phase");
+}
+/// The spinner copy: singular for one hook, a count otherwise; never the handler's config path.
+#[test]
+fn hooks_waiting_label_counts_hooks() {
+    let one = WaitingReason::Hooks {
+        event_name: "pre_tool_use".into(),
+        count: 1,
+    };
+    let many = WaitingReason::Hooks {
+        event_name: "stop".into(),
+        count: 3,
+    };
+    assert_eq!(one.label(), "Running pre_tool_use hook…");
+    assert_eq!(many.label(), "Running 3 stop hooks…");
+    assert_eq!(one.as_telemetry_label(), "waiting_hooks");
+}
+/// The gated tool's Pending row, its late args delta, sibling progress and mode/commands refreshes leave the phase alone; the batch's outcome or model output ends it.
+#[test]
+fn hook_gate_survives_tool_rows_and_ends_on_its_outcome() {
+    let mut sb = ScrollbackState::new();
+    let mut tracker = AcpUpdateTracker::new();
+    let revealed = std::time::Instant::now() - HOOK_REVEAL_DELAY;
+    let gate = TurnActivity::Waiting(WaitingReason::Hooks {
+        event_name: "pre_tool_use".into(),
+        count: 2,
+    });
+    tracker.handle_update(
+        tool_call("bg", acp::ToolKind::Execute, "bash"),
+        &meta(),
+        &mut sb,
+    );
+    tracker.set_hooks_running_since(batch("pre_tool_use", None), 2, revealed, None);
+    tracker.note_tool_call_arguments_delta(Some("list_dir"), 0);
+    tracker.handle_update(
+        tool_call("t1", acp::ToolKind::Read, "list_dir"),
+        &meta(),
+        &mut sb,
+    );
+    assert_eq!(
+        tracker.activity(),
+        Some(gate.clone()),
+        "the gate outranks the tool it is gating and its late args delta"
+    );
+    tracker.handle_update(tool_update_completed("bg"), &meta(), &mut sb);
+    assert_eq!(
+        tracker.activity(),
+        Some(gate.clone()),
+        "another tool's progress says nothing about the gate"
+    );
+    tracker.handle_update(
+        acp::SessionUpdate::CurrentModeUpdate(acp::CurrentModeUpdate::new(
+            acp::SessionModeId::new("plan"),
+        )),
+        &meta(),
+        &mut sb,
+    );
+    tracker.handle_update(available_commands_update(&["help"]), &meta(), &mut sb);
+    assert_eq!(
+        tracker.activity(),
+        Some(gate),
+        "a mode toggle or commands refresh says nothing about the gate"
+    );
+    assert!(
+        !tracker.clear_hooks_running(&batch("session_start", None)),
+        "another batch's outcome says nothing about this gate"
+    );
+    assert!(
+        tracker.clear_hooks_running(&batch("pre_tool_use", None)),
+        "the batch outcome ends it"
+    );
+    assert!(!matches!(
+        tracker.activity(),
+        Some(TurnActivity::Waiting(WaitingReason::Hooks { .. }))
+    ));
+    tracker.set_hooks_running_since(batch("post_tool_use", None), 1, revealed, None);
+    tracker.handle_update(agent_chunk("done"), &meta(), &mut sb);
+    assert!(
+        !matches!(
+            tracker.activity(),
+            Some(TurnActivity::Waiting(WaitingReason::Hooks { .. }))
+        ),
+        "model output means the shell moved past the gate"
+    );
+}
+/// A text chunk stamped at or before the batch start is a buffered straggler and must not end the phase; a later one does.
+#[test]
+fn hook_gate_survives_a_text_chunk_stamped_before_the_batch() {
+    let mut sb = ScrollbackState::new();
+    let mut tracker = AcpUpdateTracker::new();
+    let revealed = std::time::Instant::now() - HOOK_REVEAL_DELAY;
+    let gate = TurnActivity::Waiting(WaitingReason::Hooks {
+        event_name: "stop".into(),
+        count: 1,
+    });
+    let stamped = |ms: i64| NotificationMeta {
+        agent_timestamp_ms: Some(ms),
+        ..meta()
+    };
+    tracker.set_hooks_running_since(batch("stop", None), 1, revealed, Some(1_000));
+    tracker.handle_update(agent_chunk("final words"), &stamped(1_000), &mut sb);
+    tracker.handle_update(thought_chunk("trailing"), &stamped(998), &mut sb);
+    assert_eq!(
+        tracker.activity(),
+        Some(gate),
+        "text stamped at or before the batch start was already queued when the gate opened"
+    );
+    tracker.handle_update(agent_chunk("after"), &stamped(1_001), &mut sb);
+    assert!(
+        !matches!(
+            tracker.activity(),
+            Some(TurnActivity::Waiting(WaitingReason::Hooks { .. }))
+        ),
+        "text stamped after the batch start means the shell moved past the gate"
+    );
+    tracker.set_hooks_running_since(batch("stop", None), 1, revealed, None);
+    tracker.handle_update(agent_chunk("x"), &stamped(1), &mut sb);
+    assert!(!matches!(
+        tracker.activity(),
+        Some(TurnActivity::Waiting(WaitingReason::Hooks { .. }))
+    ));
 }

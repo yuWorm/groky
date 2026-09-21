@@ -34,6 +34,7 @@ fn register_worktree_writes_correct_fields() {
     let wt_canon = dunce::canonicalize(&wt_path).unwrap_or_else(|_| wt_path.clone());
 
     super::register_worktree(
+        None,
         &wt_path,
         std::path::Path::new("/src/repo"),
         WorktreeKind::Session,
@@ -55,11 +56,14 @@ fn register_worktree_writes_correct_fields() {
         .filter(|r| r.path == wt_canon)
         .collect();
     assert_eq!(mine.len(), 1);
-    assert_eq!(mine[0].kind, WorktreeKind::Session);
-    assert_eq!(mine[0].session_id.as_deref(), Some("test-session"));
-    assert_eq!(mine[0].creation_mode, "linked");
-    assert_eq!(mine[0].head_commit.as_deref(), Some("abc123"));
-    assert!(mine[0].creator_pid.is_some());
+    let Some(rec) = mine.first() else {
+        panic!("expected one worktree: {mine:?}");
+    };
+    assert_eq!(rec.kind, WorktreeKind::Session);
+    assert_eq!(rec.session_id.as_deref(), Some("test-session"));
+    assert_eq!(rec.creation_mode, "linked");
+    assert_eq!(rec.head_commit.as_deref(), Some("abc123"));
+    assert!(rec.creator_pid.is_some());
 }
 
 #[test]
@@ -160,7 +164,10 @@ fn gc_dry_run_preserves_records() {
         })
         .unwrap();
     assert_eq!(all.len(), 1);
-    assert_eq!(all[0].status, crate::db::WorktreeStatus::Alive);
+    assert_eq!(
+        all.first().map(|r| r.status),
+        Some(crate::db::WorktreeStatus::Alive)
+    );
 }
 
 #[test]
@@ -344,7 +351,10 @@ fn gc_dry_run_with_max_age_does_not_remove_expired() {
     assert!(dir.exists(), "dry run must not remove the worktree dir");
     let all = db.list(&ListFilter::default()).unwrap();
     assert_eq!(all.len(), 1);
-    assert_eq!(all[0].status, crate::db::WorktreeStatus::Alive);
+    assert_eq!(
+        all.first().map(|r| r.status),
+        Some(crate::db::WorktreeStatus::Alive)
+    );
 }
 
 #[test]
@@ -585,6 +595,7 @@ fn db_record_survives_failed_removal() {
 
     // Register via the production registration path (uses open_default).
     super::register_worktree(
+        None,
         &wt_path,
         std::path::Path::new("/src/repo"),
         WorktreeKind::Session,
@@ -634,6 +645,7 @@ fn db_record_removed_after_successful_removal() {
         .unwrap();
 
     super::register_worktree(
+        None,
         &wt_path,
         &repo,
         WorktreeKind::Session,
@@ -657,6 +669,43 @@ fn db_record_removed_after_successful_removal() {
         !record_present(&db, &wt_path),
         "a successful removal must unregister the DB record"
     );
+}
+
+#[test]
+fn registry_home_registers_the_worktree_in_the_given_home_only() {
+    xai_test_utils::require_git!();
+    use xai_test_utils::git::{git_commit_all, init_git_repo};
+
+    // The default DB is the fixture's home; the builder is pointed at another one.
+    let fx = crate::db::GrokHomeFixture::new();
+    let other_home = fx.home.join("other-home");
+    let repo = fx.home.join("repo");
+    std::fs::create_dir(&repo).unwrap();
+    init_git_repo(&repo);
+    std::fs::write(repo.join("f.txt"), "x").unwrap();
+    git_commit_all(&repo, "init");
+    let wt_path = fx.home.join("injected-wt");
+    crate::WorktreeBuilder::new(&repo, &wt_path)
+        .worktree_kind(WorktreeKind::Session)
+        .session_id("injected")
+        .registry_home(&other_home)
+        .create()
+        .unwrap();
+
+    let other = WorktreeDb::open(&other_home).unwrap();
+    let record = other
+        .get(&wt_path.to_string_lossy())
+        .unwrap()
+        .expect("registered under registry_home");
+    assert_eq!(Some("injected".to_string()), record.session_id);
+    assert!(
+        !record_present(&db_at_home(&fx.home), &wt_path),
+        "the resolved home's DB did not receive the record"
+    );
+}
+
+fn db_at_home(home: &std::path::Path) -> WorktreeDb {
+    WorktreeDb::open(home).unwrap()
 }
 
 #[test]
@@ -727,7 +776,7 @@ fn gc_report_serde_round_trip() {
     assert_eq!(deser.skipped_alive, 2);
     assert_eq!(deser.kept_unsafe, 5);
     assert_eq!(deser.kept.first().map(|k| k.path.as_str()), Some("/wt"));
-    assert_eq!(deser.kept_reasons["dirty"], 5);
+    assert_eq!(deser.kept_reasons.get("dirty"), Some(&5));
     assert_eq!(deser.names_collected, 7);
     assert_eq!(deser.no_repo_paths, 6);
     assert_eq!(deser.remove_failed, 4);

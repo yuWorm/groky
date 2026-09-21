@@ -270,6 +270,15 @@ impl Theme {
         }
     }
 
+    /// One step fainter than [`Self::dim`]: `gray_dim` blended 0.66 toward `bg_base`, for text that must be present but read after
+    /// every label. Falls back to [`Self::dim`] on palettes that cannot blend.
+    pub fn faint(&self) -> Style {
+        // Lands on the design system's `fg_gutter` token for the GrokNight palette
+        const BLEND: f32 = 0.66;
+        crate::render::color::blend_color(self.bg_base, self.gray_dim, BLEND)
+            .map_or(self.dim(), |c| Style::new().fg(c))
+    }
+
     pub const fn primary(&self) -> Style {
         Style::new().fg(self.text_primary)
     }
@@ -300,12 +309,21 @@ impl Theme {
 
     /// Hover analog of [`Self::selection_overlay`], keyed off `bg_hover`.
     /// On the bandless palette hover and selection share reverse video (they shared the same band before); the cursor row stays distinguishable by its marker/bold.
+    /// Dropdowns and chips use this. Inline terminal rows use [`Self::row_hover_bg`] instead.
     pub const fn hover_overlay(&self) -> Style {
         if self.is_bandless() {
             Style::new().add_modifier(Modifier::REVERSED)
         } else {
             Style::new().bg(self.bg_hover)
         }
+    }
+
+    /// Dim row background for hover inside the terminal itself (scrollback tool
+    /// rows, the queue pane, the dock). Half-blend of `bg_base` toward `bg_dark`,
+    /// softer than the dropdown `bg_hover` token. Named ANSI and Reset palettes
+    /// cannot blend, so fall back to `bg_hover` (Reset on the terminal theme: no band).
+    pub fn row_hover_bg(&self) -> Color {
+        crate::render::color::blend_color(self.bg_base, self.bg_dark, 0.5).unwrap_or(self.bg_hover)
     }
 
     /// Hairline fg for panel dividers/borders that RGB themes draw in the `bg_highlight` tone.

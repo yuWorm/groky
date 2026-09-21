@@ -67,7 +67,7 @@ impl SessionActor {
                 item,
                 ConversationItem::User(u)
                     if u.synthetic_reason
-                        == Some(xai_grok_sampling_types::SyntheticReason::SystemReminder)
+                        == xai_grok_sampling_types::SyntheticReason::SystemReminder
             )
         });
         let effects = bridge.apply_pending_skill_update().await;
@@ -97,10 +97,7 @@ impl SessionActor {
         let start = std::time::Instant::now();
         if full_wait {
             let deadline = tokio::time::Instant::now() + self.delivery_prefix_wait();
-            while matches!(
-                self.wait_for_mcp_handshakes_until(deadline).await,
-                McpHandshakeWait::GenerationChanged
-            ) {}
+            self.wait_for_mcp_handshakes(|_| deadline).await;
         }
         let prefix = self.build_user_message_prefix().await;
         tracing::info!(
@@ -125,29 +122,40 @@ impl SessionActor {
         };
         let start = std::time::Instant::now();
         const WAIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
-        let budget = if full_wait || self.requires_full_mcp_wait() {
-            self.delivery_prefix_wait() + WAIT_TIMEOUT
+        let (prefix, source) = if self.requires_full_mcp_wait() && !full_wait {
+            handle.abort();
+            (
+                self.build_prefix_after_mcp_wait(true).await,
+                "policy_changed",
+            )
         } else {
-            WAIT_TIMEOUT
-        };
-        let (prefix, source) = match tokio::time::timeout(budget, &mut handle).await {
-            Ok(Ok(p)) => (p, "background"),
-            Ok(Err(join_err)) => {
-                tracing::warn!(
-                    session_id = %self.session_info.id.0,
-                    error = %join_err,
-                    "ensure_prefix_ready: background task panicked, sync fallback"
-                );
-                (self.build_user_message_prefix().await, "sync_fallback")
-            }
-            Err(_elapsed) => {
-                handle.abort();
-                tracing::warn!(
-                    session_id = %self.session_info.id.0,
-                    timeout_ms = budget.as_millis() as u64,
-                    "ensure_prefix_ready: background task not ready, sync fallback"
-                );
-                (self.build_user_message_prefix().await, "sync_fallback")
+            let budget = if full_wait {
+                self.delivery_prefix_wait() + WAIT_TIMEOUT
+            } else {
+                WAIT_TIMEOUT
+            };
+            match tokio::time::timeout(budget, &mut handle).await {
+                Ok(Ok(p)) => (p, "background"),
+                Ok(Err(join_err)) => {
+                    tracing::warn!(
+                        session_id = %self.session_info.id.0,
+                        error = %join_err,
+                        "ensure_prefix_ready: background task panicked, sync fallback"
+                    );
+                    (
+                        self.build_prefix_after_mcp_wait(full_wait).await,
+                        "sync_fallback",
+                    )
+                }
+                Err(_elapsed) => {
+                    handle.abort();
+                    tracing::warn!(
+                        session_id = %self.session_info.id.0,
+                        timeout_ms = budget.as_millis() as u64,
+                        "ensure_prefix_ready: background task not ready, sync fallback"
+                    );
+                    (self.build_user_message_prefix().await, "sync_fallback")
+                }
             }
         };
         let mut conversation = self.chat_state_handle.get_conversation().await;
@@ -170,7 +178,7 @@ impl SessionActor {
                     conversation
                         .iter()
                         .position(|item| {
-                            matches!(item, ConversationItem::User(u) if u.synthetic_reason.is_none())
+                            matches!(item, ConversationItem::User(u) if u.synthetic_reason.is_human())
                         })
                         .unwrap_or(conversation.len()),
                 );

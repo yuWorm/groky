@@ -224,9 +224,11 @@ impl SessionActor {
             "\nIt runs in the background: status snapshots and the final result arrive as \
              reminders at turn starts, and the user can watch it in /workflow runs. If it pauses, \
              it can be resumed by calling the workflow tool with source: \
-             {{ type: \"resume\", resume_from_run_id: \"{run_id}\" }}. Keep run ids internal — \
-             the user knows runs by display name. No \
-             action needed unless the user asks."
+             {{ type: \"resume\", resume_from_run_id: \"{run_id}\" }}; to stop or pause it \
+             yourself, call the workflow tool with source: {{ type: \"stop\", run_id: \
+             \"{run_id}\" }} or {{ type: \"pause\", run_id: \"{run_id}\" }}. Keep run ids \
+             internal — the user knows runs by display name. No action needed unless the user \
+             asks."
         ));
         self.push_system_reminder(&body);
     }
@@ -866,7 +868,10 @@ impl SessionActor {
         for t in tasks.into_iter().filter(|t| !t.completed) {
             let task = ResumeTask {
                 task_id: t.task_id,
-                command: t.display_command.unwrap_or(t.command),
+                description: crate::session::resume_status::resume_task_description(
+                    t.description,
+                    t.display_command.as_deref(),
+                ),
             };
             match t.kind {
                 TaskKind::Monitor => monitors.push(task),
@@ -938,6 +943,25 @@ impl SessionActor {
             subagents,
             workflows,
             goal,
+        }
+    }
+    pub(super) async fn inject_fork_reminder(&self) {
+        let session_dir = crate::session::persistence::session_dir(&self.session_info);
+        let Some(status) = crate::session::fork_status::claim(&session_dir) else {
+            return;
+        };
+        let reminder = crate::session::fork_status::format_reminder(&status);
+        tracing::info!(kind = %status.kind, "injecting fork status reminder");
+        let delivered = self
+            .chat_state_handle
+            .push_user_message_and_ack(wrap_untrusted_in_reminder_tag(
+                &reminder,
+                self.reminder_wrapper_tag(),
+            ))
+            .await
+            .is_some();
+        if !delivered {
+            crate::session::fork_status::release_claim(&session_dir);
         }
     }
     pub(super) fn inject_resumed_tasks_reminder(&self) {

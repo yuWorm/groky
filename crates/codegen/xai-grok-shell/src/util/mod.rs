@@ -10,6 +10,22 @@ pub(crate) mod user_identity;
 // Re-exported at the original paths so existing `crate::util::…` and `xai_grok_shell::util::…` users compile unchanged
 pub use xai_grok_shell_base::util::*;
 
+/// Parse an env var as a JSON object. Returns `None` if unset or not a valid JSON object.
+pub(crate) fn parse_json_object_env(var: &str) -> Option<serde_json::Value> {
+    let val = std::env::var(var).ok()?;
+    match serde_json::from_str::<serde_json::Value>(&val) {
+        Ok(v) if v.is_object() => Some(v),
+        Ok(_) => {
+            tracing::warn!("{var} is not a JSON object, ignoring");
+            None
+        }
+        Err(e) => {
+            tracing::warn!("{var} is invalid JSON: {e}");
+            None
+        }
+    }
+}
+
 pub(crate) fn is_user_instruction_path(
     path: &std::path::Path,
     grok_home: &std::path::Path,

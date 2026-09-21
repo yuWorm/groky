@@ -235,6 +235,7 @@ enum TerminalCommand {
     },
 
     ListTasks {
+        include_output: bool,
         reply: oneshot::Sender<Vec<TaskSnapshot>>,
     },
 
@@ -398,7 +399,7 @@ impl ProcessState {
                 .nth(half)
                 .map(|(i, _)| i)
                 .unwrap_or(s.len());
-            self.front_buffer = Some(s[..front_end].as_bytes().to_vec());
+            self.front_buffer = Some(s.get(..front_end).unwrap_or("").as_bytes().to_vec());
         }
 
         let tail_start_char = char_count.saturating_sub(half);
@@ -407,7 +408,7 @@ impl ProcessState {
             .nth(tail_start_char)
             .map(|(i, _)| i)
             .unwrap_or(s.len());
-        self.output_buffer = s[tail_start_byte..].as_bytes().to_vec();
+        self.output_buffer = s.get(tail_start_byte..).unwrap_or("").as_bytes().to_vec();
         self.truncated = true;
     }
 
@@ -474,6 +475,39 @@ impl ProcessState {
             output_file: self.output_file.clone(),
             truncated: self.truncated || short_of_full_log,
             output_total_bytes: self.total_bytes,
+            exit_code: self.lifecycle.exit_status().and_then(|s| s.exit_code),
+            signal: self.lifecycle.exit_status().and_then(|s| s.signal.clone()),
+            completed: self.is_complete(),
+            block_waited: self.block_waited,
+            explicitly_killed: self.explicitly_killed,
+            kill_result_delivered: self.kill_result_delivered,
+            kind: self.kind,
+            owner_session_id: self.owner_session_id.clone(),
+            description: self.description.clone(),
+            is_backgrounded: self.bg_status.is_backgrounded(),
+        }
+    }
+
+    /// Metadata-only row: no log reads, empty stdout.
+    fn to_task_snapshot_metadata(&self, task_id: &str) -> TaskSnapshot {
+        TaskSnapshot {
+            task_id: task_id.to_string(),
+            command: self.command.clone(),
+            display_command: self.display_command.clone(),
+            cwd: self.cwd.clone(),
+            start_time: self.start_wall_time,
+            end_time: if self.lifecycle.has_exited() {
+                Some(
+                    self.end_wall_time
+                        .unwrap_or_else(std::time::SystemTime::now),
+                )
+            } else {
+                None
+            },
+            output: String::new(),
+            output_file: self.output_file.clone(),
+            truncated: false,
+            output_total_bytes: 0,
             exit_code: self.lifecycle.exit_status().and_then(|s| s.exit_code),
             signal: self.lifecycle.exit_status().and_then(|s| s.signal.clone()),
             completed: self.is_complete(),
@@ -1017,14 +1051,29 @@ impl LocalTerminalActor {
                 self.handle_wait_for_completion(task_id, timeout, reply)
                     .await;
             }
-            TerminalCommand::ListTasks { reply } => {
+            TerminalCommand::ListTasks {
+                include_output,
+                reply,
+            } => {
                 let mut snapshots =
                     Vec::with_capacity(self.processes.len() + self.completed_task_snapshots.len());
                 for (id, p) in &self.processes {
-                    snapshots.push(p.to_task_snapshot(id).await);
+                    if include_output {
+                        snapshots.push(p.to_task_snapshot(id).await);
+                    } else {
+                        snapshots.push(p.to_task_snapshot_metadata(id));
+                    }
                 }
                 for snap in self.completed_task_snapshots.values() {
-                    snapshots.push(snap.clone());
+                    if include_output {
+                        snapshots.push(snap.clone());
+                    } else {
+                        let mut meta = snap.clone();
+                        meta.output.clear();
+                        meta.output_total_bytes = 0;
+                        meta.truncated = false;
+                        snapshots.push(meta);
+                    }
                 }
                 let _ = reply.send(snapshots);
             }
@@ -1618,7 +1667,7 @@ impl LocalTerminalActor {
             if let Some(waiters) = self.completion_waiters.get_mut(&task_id) {
                 let mut i = 0;
                 while i < waiters.len() {
-                    if now >= waiters[i].deadline {
+                    if waiters.get(i).is_some_and(|w| now >= w.deadline) {
                         let waiter = waiters.swap_remove(i);
                         let _ = waiter.reply.send(snapshot.clone());
                         timed_out_tasks.push(task_id.clone());
@@ -1803,7 +1852,9 @@ impl LocalTerminalActor {
                         break;
                     }
                     Some(Ok(n)) => {
-                        new_bytes.extend_from_slice(&buf[..n]);
+                        if let Some(read) = buf.get(..n) {
+                            new_bytes.extend_from_slice(read);
+                        }
                     }
                     Some(Err(_)) => {
                         stdout_eof = true;
@@ -1824,7 +1875,9 @@ impl LocalTerminalActor {
                         break;
                     }
                     Some(Ok(n)) => {
-                        new_bytes.extend_from_slice(&buf[..n]);
+                        if let Some(read) = buf.get(..n) {
+                            new_bytes.extend_from_slice(read);
+                        }
                     }
                     Some(Err(_)) => {
                         stderr_eof = true;
@@ -2567,7 +2620,26 @@ impl TerminalBackend for LocalTerminalBackend {
         let (reply_tx, reply_rx) = oneshot::channel();
         if self
             .cmd_tx
-            .send(TerminalCommand::ListTasks { reply: reply_tx })
+            .send(TerminalCommand::ListTasks {
+                include_output: true,
+                reply: reply_tx,
+            })
+            .await
+            .is_err()
+        {
+            return vec![];
+        }
+        reply_rx.await.unwrap_or_default()
+    }
+
+    async fn list_tasks_metadata(&self) -> Vec<TaskSnapshot> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        if self
+            .cmd_tx
+            .send(TerminalCommand::ListTasks {
+                include_output: false,
+                reply: reply_tx,
+            })
             .await
             .is_err()
         {
@@ -2765,7 +2837,7 @@ fn spawn_detached_drain(
                 loop {
                     match stdout.read(&mut buf).await {
                         Ok(0) | Err(_) => break,
-                        Ok(n) => output.extend_from_slice(&buf[..n]),
+                        Ok(n) => output.extend_from_slice(buf.get(..n).unwrap_or(&[])),
                     }
                 }
             }
@@ -2774,7 +2846,7 @@ fn spawn_detached_drain(
                 loop {
                     match stderr.read(&mut buf).await {
                         Ok(0) | Err(_) => break,
-                        Ok(n) => output.extend_from_slice(&buf[..n]),
+                        Ok(n) => output.extend_from_slice(buf.get(..n).unwrap_or(&[])),
                     }
                 }
             }
@@ -2802,10 +2874,12 @@ async fn drain_remaining_output(process: &mut ProcessState) {
                 match stdout.read(&mut buf).await {
                     Ok(0) | Err(_) => break,
                     Ok(n) => {
-                        process.output_buffer.extend_from_slice(&buf[..n]);
+                        process
+                            .output_buffer
+                            .extend_from_slice(buf.get(..n).unwrap_or(&[]));
                         process.total_bytes += n;
                         if let Some(ref mut file) = process.file_handle {
-                            let _ = file.write_all(&buf[..n]).await;
+                            let _ = file.write_all(buf.get(..n).unwrap_or(&[])).await;
                         }
                     }
                 }
@@ -2818,10 +2892,12 @@ async fn drain_remaining_output(process: &mut ProcessState) {
                 match stderr.read(&mut buf).await {
                     Ok(0) | Err(_) => break,
                     Ok(n) => {
-                        process.output_buffer.extend_from_slice(&buf[..n]);
+                        process
+                            .output_buffer
+                            .extend_from_slice(buf.get(..n).unwrap_or(&[]));
                         process.total_bytes += n;
                         if let Some(ref mut file) = process.file_handle {
-                            let _ = file.write_all(&buf[..n]).await;
+                            let _ = file.write_all(buf.get(..n).unwrap_or(&[])).await;
                         }
                     }
                 }
@@ -2874,7 +2950,7 @@ fn read_available(reader: &mut (impl tokio::io::AsyncRead + Unpin), out: &mut Ve
     loop {
         match try_read_nonblocking(reader, &mut buf) {
             Some(Ok(0)) | Some(Err(_)) | None => return,
-            Some(Ok(n)) => out.extend_from_slice(&buf[..n]),
+            Some(Ok(n)) => out.extend_from_slice(buf.get(..n).unwrap_or(&[])),
         }
     }
 }
@@ -3625,7 +3701,10 @@ mod tests {
             1,
             "the running command was backgrounded"
         );
-        assert_eq!(backgrounded[0].tool_call_id, tool_call_id);
+        assert_eq!(
+            backgrounded.first().map(|t| t.tool_call_id.as_str()),
+            Some(tool_call_id)
+        );
 
         let result = run.await.unwrap().unwrap();
         assert_eq!(
@@ -4018,7 +4097,9 @@ mod tests {
             chunks.len()
         );
 
-        let initial = &chunks[0];
+        let Some(initial) = chunks.first() else {
+            panic!("expected an initial chunk");
+        };
         assert_eq!(initial.base.tool_call_id, "test-call-123");
         assert!(!initial.base.command.is_empty());
         assert!(
@@ -4026,7 +4107,9 @@ mod tests {
             "Initial chunk should have empty output"
         );
 
-        let first_with_output = &chunks[1];
+        let Some(first_with_output) = chunks.get(1) else {
+            panic!("expected a follow-up chunk");
+        };
         assert!(!first_with_output.base.output.is_empty());
 
         assert!(
@@ -4078,11 +4161,12 @@ mod tests {
         }
 
         for w in chunks.windows(2) {
+            let [a, b] = w else { continue };
             assert!(
-                w[1].base.total_bytes >= w[0].base.total_bytes,
+                b.base.total_bytes >= a.base.total_bytes,
                 "total_bytes regressed: {} < {}",
-                w[1].base.total_bytes,
-                w[0].base.total_bytes
+                b.base.total_bytes,
+                a.base.total_bytes
             );
         }
 

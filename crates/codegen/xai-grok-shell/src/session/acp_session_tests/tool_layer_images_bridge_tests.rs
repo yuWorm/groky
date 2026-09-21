@@ -181,6 +181,7 @@ fn prepared_post_tool_use_call(id: &str, tool_name: &str) -> PreparedToolCall {
         tool_call_id: acp::ToolCallId::new(id),
         tool_name: tool_name.to_string(),
         raw_arguments: "{}".to_string(),
+        mcp_file: None,
         parsed_args: serde_json::json!({}),
         model_id: "test-model".to_string(),
         concatenated_json_count: 0,

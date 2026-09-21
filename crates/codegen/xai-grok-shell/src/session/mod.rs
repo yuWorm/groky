@@ -1,8 +1,10 @@
 pub mod acp_types;
 pub mod announcement_state;
+pub(crate) mod auto_mode;
 pub mod commands;
 pub(crate) mod compaction_config;
 pub(crate) mod doom_loop_telemetry;
+pub(crate) mod fork_status;
 pub mod handle;
 pub(crate) mod memory_state;
 pub mod merge;
@@ -12,6 +14,7 @@ pub mod pending_interaction;
 pub mod prompt_queue;
 pub(crate) mod resume_status;
 pub mod two_pass;
+pub mod user_echo;
 pub mod visibility;
 pub use self::acp_session::*;
 pub use self::acp_types::*;
@@ -24,6 +27,7 @@ pub use self::persistence::{
 };
 pub use self::result::{Empty, ExtMethodResult};
 pub use self::share::{ShareSessionRequest, ShareSessionResponse};
+pub use self::user_echo::{CLIENT_USER_MESSAGE_ECHO_META, USER_MESSAGE_ECHO_CAPABILITY};
 pub use prod_mc_cli_chat_proxy_types::feedback_types::{
     ClientType, FeedbackImage, FeedbackTerminalInfo, MAX_FEEDBACK_IMAGE_BYTES,
     MAX_FEEDBACK_IMAGE_TOTAL_BYTES, MAX_FEEDBACK_IMAGES, RatingType, feedback_image_extension,
@@ -548,6 +552,7 @@ pub mod memory;
 pub(crate) mod memory_observation;
 pub(crate) mod normalize_cache;
 pub mod persistence;
+pub(crate) mod session_create_prefetch;
 pub use xai_grok_shared::placeholder_images;
 pub mod plan_mode;
 pub mod prompt_history;
@@ -562,7 +567,7 @@ pub mod signals;
 pub(crate) mod slash_authority;
 pub(crate) mod slash_commands;
 pub mod usage_file;
-pub use slash_commands::PAGER_COMMAND_KEYS;
+pub use slash_commands::{PAGER_COMMAND_KEYS, builtin_command};
 pub(crate) mod repo_status_prefix;
 pub mod storage;
 pub(crate) mod streaming_capture;
@@ -570,6 +575,7 @@ pub(crate) mod summary;
 pub(crate) mod telemetry;
 #[cfg(feature = "test-support")]
 pub mod testkit;
+pub mod tool_definitions_artifact;
 pub mod tool_index;
 pub mod turn_completion;
 pub mod unified_list;

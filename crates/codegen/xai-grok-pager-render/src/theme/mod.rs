@@ -127,25 +127,35 @@ impl ThemeKind {
         self == Self::Terminal
     }
 
-    /// Parse a theme name (case-insensitive).
+    /// Alternate lowercase spellings accepted by [`from_name`](Self::from_name), excluding [`display_name`](Self::display_name).
+    pub fn aliases(self) -> &'static [&'static str] {
+        match self {
+            Self::GrokNight => &["grok-night", "dark"],
+            Self::TokyoNight => &["tokyo-night", "tokyo"],
+            Self::GrokDay => &["grok-day", "light", "day"],
+            Self::RosePineMoon => &["rosepine", "rose-pine", "rose-pine-moon"],
+            Self::OscuraMidnight => &["oscura"],
+            Self::Terminal => &["terminal-default", "transparent", "native"],
+            Self::Auto => &["system"],
+        }
+    }
+
+    /// Parse a theme name (case-insensitive) against [`display_name`](Self::display_name) and [`aliases`](Self::aliases).
     /// Every conversion from string to `ThemeKind` must go through this function.
     /// While the `terminal` rollout gate is off its names do not parse, so a configured or typed value falls back like any unknown name.
     pub fn from_name(name: &str) -> Option<Self> {
         let lower = name.to_lowercase();
-        match lower.as_str() {
-            "auto" | "system" => Some(Self::Auto),
-            "groknight" | "grok-night" | "dark" => Some(Self::GrokNight),
-            "tokyonight" | "tokyo-night" | "tokyo" => Some(Self::TokyoNight),
-            "grokday" | "grok-day" | "light" | "day" => Some(Self::GrokDay),
-            "rosepine" | "rose-pine" | "rosepine-moon" | "rose-pine-moon" => {
-                Some(Self::RosePineMoon)
-            }
-            "oscura" | "oscura-midnight" => Some(Self::OscuraMidnight),
-            "terminal" | "terminal-default" | "transparent" | "native" => {
-                cache::terminal_theme_enabled().then_some(Self::Terminal)
-            }
-            _ => None,
+        let kind = Self::ALL
+            .iter()
+            .chain(std::iter::once(&Self::Auto))
+            .copied()
+            .find(|kind| {
+                kind.display_name() == lower || kind.aliases().contains(&lower.as_str())
+            })?;
+        if kind.is_terminal_native() && !cache::terminal_theme_enabled() {
+            return None;
         }
+        Some(kind)
     }
 
     /// Whether this is the meta "auto" variant (resolved at runtime).
@@ -621,6 +631,25 @@ pub fn reset_cursor_color() {
 mod tests {
     use super::*;
 
+    /// `faint()` sits strictly between the background and `gray_dim` on a palette that can blend, and degrades to the DIM
+    /// attribute with no hard colour on the bandless terminal palette.
+    #[test]
+    fn faint_is_between_bg_and_gray_dim_or_dim_when_unblendable() {
+        use ratatui::style::{Color, Modifier};
+        let luma = |c: Color| match c {
+            Color::Rgb(r, g, b) => u32::from(r) + u32::from(g) + u32::from(b),
+            other => panic!("expected RGB, got {other:?}"),
+        };
+        let night = Theme::groknight();
+        let faint = night.faint().fg.expect("GrokNight blends to a hard colour");
+        assert!(luma(night.bg_base) < luma(faint) && luma(faint) < luma(night.gray_dim));
+
+        let terminal = Theme::terminal_default();
+        let style = terminal.faint();
+        assert_eq!(style.fg, None, "no hard colour on the bandless palette");
+        assert!(style.add_modifier.contains(Modifier::DIM));
+    }
+
     #[test]
     fn from_name_auto() {
         assert_eq!(ThemeKind::from_name("auto"), Some(ThemeKind::Auto));
@@ -636,6 +665,20 @@ mod tests {
         assert_eq!(ThemeKind::from_name("AUTO"), Some(ThemeKind::Auto));
         assert_eq!(ThemeKind::from_name("Auto"), Some(ThemeKind::Auto));
         assert_eq!(ThemeKind::from_name("SYSTEM"), Some(ThemeKind::Auto));
+    }
+
+    /// Every alias parses back to its own kind, so no alias is shadowed by another kind's name.
+    #[test]
+    fn from_name_accepts_every_alias() {
+        let _guard = cache::test_lock().lock().unwrap_or_else(|e| e.into_inner());
+        cache::reset_for_test();
+        cache::set_terminal_theme_enabled(true);
+        for kind in ThemeKind::ALL.iter().chain([&ThemeKind::Auto]).copied() {
+            for alias in kind.aliases() {
+                assert_eq!(ThemeKind::from_name(alias), Some(kind), "alias {alias}");
+            }
+        }
+        cache::reset_for_test();
     }
 
     #[test]

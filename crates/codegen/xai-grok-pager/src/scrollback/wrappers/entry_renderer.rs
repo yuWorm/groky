@@ -229,8 +229,6 @@ impl<'a> EntryRenderer<'a> {
         // Verb-group header: an aggregated "Verb N noun" label whose diamond takes the run-state color
         // An active group's glyph animates with the same wave as a running tool row's bullet
         if let Some(GroupHeaderLabel::VerbRun(vg)) = self.group_header_label {
-            use unicode_width::UnicodeWidthStr;
-
             let glyph_color = if vg.failed {
                 self.theme.accent_error
             } else if vg.running {
@@ -251,28 +249,10 @@ impl<'a> EntryRenderer<'a> {
             // It flips `›`/`⌄` with the group's fold state
             let prefix = group_header_chrome_prefix();
             let mut spans = vec![ratatui::text::Span::styled(
-                prefix.clone(),
+                prefix,
                 Style::default().fg(glyph_color),
             )];
-            let hook_start = vg
-                .line
-                .spans
-                .iter()
-                .position(|span| span.content.starts_with("  [hooks: "));
-            if let Some(hook_start) = hook_start {
-                let suffix_width: usize = vg.line.spans[hook_start..]
-                    .iter()
-                    .map(|span| UnicodeWidthStr::width(span.content.as_ref()))
-                    .sum();
-                let label_budget = usize::from(content_area.width)
-                    .saturating_sub(UnicodeWidthStr::width(prefix.as_str()))
-                    .saturating_sub(suffix_width);
-                let label = ratatui::text::Line::from(vg.line.spans[..hook_start].to_vec());
-                spans.extend(crate::render::line_utils::truncate_line(label, label_budget).spans);
-                spans.extend(vg.line.spans[hook_start..].iter().cloned());
-            } else {
-                spans.extend(vg.line.spans.iter().cloned());
-            }
+            spans.extend(vg.line.spans.iter().cloned());
             let line = ratatui::text::Line::from(spans);
             // Group-header content is registered selectable (GROUP_HEADER_RANGE_ID)
             // Its selection maps visual columns, so it must paint visual too
@@ -408,8 +388,7 @@ impl<'a> EntryRenderer<'a> {
             return lines;
         }
         // Collapsed / Truncated foldable entries render a compact ~1-line header, NOT their (often huge) hidden body
-        // Use the ENTRY-level foldability (`block.is_foldable()` OR attached hooks), matching the fold path
-        // A collapsed entry foldable only through hooks would otherwise be over-counted
+        // Use the ENTRY-level foldability, matching the fold path
         let lines = if self.entry.display_mode != DisplayMode::Expanded && self.entry.is_foldable()
         {
             1
@@ -466,6 +445,53 @@ impl<'a> EntryRenderer<'a> {
             u16::try_from(output.lines.len().saturating_sub(1)).unwrap_or(u16::MAX),
         );
         (starts, last_content_row)
+    }
+
+    /// Per painted buffer row: WRAPLINE only when the next `BlockLine` is a mid-word
+    /// soft wrap (`joiner == Some("")`). Word (`" "`) and hard (`"\n"`) joiners stay
+    /// `false` so native copy keeps those separators.
+    ///
+    /// Exact-width hard breaks stay `false`. Last-column occupancy is not a wrap signal.
+    pub fn row_soft_wraps(&self, height: u16) -> Vec<bool> {
+        let mut flags = vec![false; usize::from(height)];
+        if height == 0 || (self.group_header_count > 0 && !self.group_collapse_header) {
+            return flags;
+        }
+        let output = self.entry.cached_output_ref();
+        let vpad_top = u16::from(self.entry.block.has_vpad_for(self.appearance()));
+        let (header_rows, skip_remaining) = if self.group_collapse_header {
+            if self.skip_rows == 0 {
+                (1u16, 0u16)
+            } else {
+                (0u16, self.skip_rows.saturating_sub(1))
+            }
+        } else {
+            (0u16, self.skip_rows)
+        };
+        let vpad_top_visible = skip_remaining < vpad_top;
+        let content_skip = skip_remaining.saturating_sub(vpad_top);
+        let start_y = header_rows.saturating_add(u16::from(vpad_top_visible));
+
+        let mut painted = 0u16;
+        for (i, line) in output.lines.iter().enumerate() {
+            if i < usize::from(content_skip) {
+                continue;
+            }
+            if painted > 0 && line.joiner.as_deref().is_some_and(str::is_empty) {
+                let wrap_y = start_y.saturating_add(painted.saturating_sub(1));
+                let cont_y = start_y.saturating_add(painted);
+                if cont_y < height
+                    && let Some(flag) = flags.get_mut(usize::from(wrap_y))
+                {
+                    *flag = true;
+                }
+            }
+            painted = painted.saturating_add(1);
+            if start_y.saturating_add(painted) >= height {
+                break;
+            }
+        }
+        flags
     }
 
     /// The rendered-row offset (from the entry's top, including any top vpad row) where the search index's
@@ -875,6 +901,51 @@ mod tests {
         // One content line plus two vpad rows
         // Width 80 minus chrome 4 leaves 76 for content
         assert_eq!(renderer.desired_height(80), 3);
+    }
+
+    #[test]
+    fn row_soft_wraps_only_empty_joiners() {
+        let theme = Theme::current();
+        let appearance = AppearanceConfig::default();
+        let assert_joiners = |entry: &ScrollbackEntry, width: u16| {
+            let renderer = EntryRenderer::new(entry, &theme).with_appearance(appearance.clone());
+            let height = renderer.desired_height(width);
+            let wraps = renderer.row_soft_wraps(height);
+            let output = entry.cached_output_ref();
+            let vpad_top = u16::from(entry.block.has_vpad_for(&appearance));
+            let mut painted = 0u16;
+            let mut saw_empty = false;
+            let mut saw_separator = false;
+            for line in &output.lines {
+                if painted > 0 {
+                    let wrap_y = vpad_top.saturating_add(painted.saturating_sub(1));
+                    let expected = line.joiner.as_deref().is_some_and(str::is_empty);
+                    saw_empty |= expected;
+                    saw_separator |= line.joiner.as_deref().is_some_and(|s| !s.is_empty());
+                    assert_eq!(
+                        wraps.get(usize::from(wrap_y)).copied().unwrap_or(false),
+                        expected,
+                        "joiner {:?} at wrap_y {wrap_y}: {wraps:?}",
+                        line.joiner
+                    );
+                }
+                painted = painted.saturating_add(1);
+            }
+            (saw_empty, saw_separator)
+        };
+
+        let words = ScrollbackEntry::new(RenderBlock::user_prompt("hello world foo bar baz"));
+        let (empty, sep) = assert_joiners(&words, 24);
+        assert!(sep, "precondition: word wrap must produce a space joiner");
+        assert!(!empty, "word wrap must not use empty joiners at this width");
+
+        let path = "falcon_missions_nrol97_trajectory_nrol97.mat_unbreakable";
+        let midword = ScrollbackEntry::new(RenderBlock::agent_message(path));
+        let (empty, _) = assert_joiners(&midword, 20);
+        assert!(
+            empty,
+            "unbreakable path must produce empty mid-word joiners"
+        );
     }
 
     #[test]
@@ -1493,52 +1564,6 @@ mod tests {
             h_with,
             EntryRenderer::new(&with_nl, &theme).desired_height(80),
             "estimate with trailing newline still equals exact"
-        );
-    }
-
-    #[test]
-    fn estimate_uses_entry_level_foldability_for_collapsed_shortcut() {
-        let _theme = pin_theme();
-        // An AgentMessage block is NOT block-foldable, but attaching hooks makes the ENTRY foldable (matching the fold path)
-        // A Collapsed foldable entry takes the compact ~1-line shortcut; a non-foldable one estimates its body
-        use crate::scrollback::blocks::tool::hook::{
-            HookRunEntry, HookRunStatus, ToolCallHookData,
-        };
-        let theme = Theme::current();
-        // AgentMessage renders as markdown (single newlines collapse to spaces), so force a multi-row body with length, not line count
-        let body = "word ".repeat(60);
-
-        // With no hooks the entry is not foldable, so a Collapsed entry estimates its body, not the 1-line fold shortcut
-        let mut plain = ScrollbackEntry::new(RenderBlock::agent_message(body.as_str()));
-        plain.set_display_mode(DisplayMode::Collapsed);
-        let plain_est = EntryRenderer::new(&plain, &theme).estimate_height(80);
-        assert!(
-            plain_est > 1,
-            "non-foldable collapsed entry estimates its body, not the shortcut (got {plain_est})"
-        );
-
-        // With hooks the entry is foldable, so the compact shortcut applies (1 line, no vpad)
-        let mut hooked = ScrollbackEntry::new(RenderBlock::agent_message(body.as_str()));
-        hooked.set_display_mode(DisplayMode::Collapsed);
-        hooked.hook_data = Some(ToolCallHookData {
-            pre_hooks: vec![HookRunEntry {
-                name: "fmt".into(),
-                status: HookRunStatus::Success {
-                    elapsed: std::time::Duration::from_millis(1),
-                },
-                output: None,
-            }],
-            ..Default::default()
-        });
-        let hooked_est = EntryRenderer::new(&hooked, &theme).estimate_height(80);
-        assert_eq!(
-            hooked_est, 1,
-            "hook-foldable collapsed entry uses the compact shortcut"
-        );
-        assert!(
-            plain_est > hooked_est,
-            "entry-level foldability must change the collapsed estimate \
-             (plain {plain_est} vs hooked {hooked_est})"
         );
     }
 

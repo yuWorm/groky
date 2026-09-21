@@ -347,7 +347,9 @@ fn session_start_snapshot_counts_not_names() {
     emit_event_into(&stream, &sentinel_session_harness());
     let events = exported_events(&stream);
     assert_eq!(events.len(), 1);
-    let ev = &events[0];
+    let Some(ev) = events.first() else {
+        panic!("expected an event: {events:?}");
+    };
     assert_eq!(ev.0, "grok_code.session_start");
     let mut keys = attr_keys(ev);
     keys.sort();
@@ -391,6 +393,24 @@ fn session_new_increments_session_count_only() {
     assert!(exported_events(&stream).is_empty(), "metric-only mapping");
     let names = exported_metric_names(&stream);
     assert_eq!(names, vec!["grok_code.session.count".to_owned()]);
+}
+
+#[test]
+fn session_create_timeout_emits_the_timeout_counter() {
+    let stream = build(gates_off());
+    emit_event_into(
+        &stream,
+        &events::SessionCreateFailed {
+            outcome: crate::startup::StartupOutcome::Timeout,
+            stuck_phase: Some("plugin_registry".into()),
+            elapsed_ms: 180_000,
+        },
+    );
+    assert!(exported_events(&stream).is_empty(), "metric-only mapping");
+    assert_eq!(
+        vec!["grok_code.session.create_timeout".to_owned()],
+        exported_metric_names(&stream)
+    );
 }
 
 #[test]
@@ -444,9 +464,9 @@ fn startup_sub_timers_carry_outcome_and_auth_mode() {
     );
 
     // Pin the wire literals so a label rename or serialization change is caught here.
-    let MetricIncrement::StartupSubTimerDuration {
+    let Some(MetricIncrement::StartupSubTimerDuration {
         outcome, auth_mode, ..
-    } = &rec.metrics[0]
+    }) = rec.metrics.first()
     else {
         panic!("expected a startup sub-timer metric: {:?}", rec.metrics);
     };
@@ -473,6 +493,8 @@ fn startup_completed_records_the_total_histogram_only() {
             resolve_config_ms: Some(22),
             remote_settings_ms: Some(80),
             models_manager_ms: Some(40),
+            managed_policy_auth_wait_ms: None,
+            managed_policy_config_sync_ms: None,
             time_to_first_frame_ms: Some(650),
         },
     );
@@ -480,6 +502,99 @@ fn startup_completed_records_the_total_histogram_only() {
     assert_eq!(
         exported_metric_names(&stream),
         vec!["grok_code.startup.total".to_owned()]
+    );
+}
+
+fn prompt_latency(ttft_ms: Option<u64>, ttfm_ms: Option<u64>) -> events::PromptLatency {
+    events::PromptLatency {
+        turn_index: 0,
+        total_ms: 0,
+        mcp_wait_ms: 0,
+        tool_collection_ms: 0,
+        model_call_ms: 0,
+        pre_model_ms: 0,
+        mcp_server_count: 0,
+        mcp_tools_registered: 0,
+        mcp_strategy: events::McpStrategy::Blocking,
+        model_id: "sk-supersecretmodeltoken000".into(),
+        ttft_ms,
+        ttlb_ms: 0,
+        attempts: 1,
+        output_tokens: None,
+        before_first_model_ms: 0,
+        sampling_ms: 0,
+        tool_blocking_ms: 0,
+        compaction_ms: 0,
+        between_sampling_overhead_ms: 0,
+        after_last_sampling_ms: 0,
+        turn_total_ms: 0,
+        sampling_request_count: 0,
+        sampling_retry_count: 0,
+        ttfm_ms,
+    }
+}
+
+/// The `model` attribute on the first `grok_code.turn.ttft` histogram datapoint, if present.
+fn turn_ttft_metric_model(stream: &TestStream) -> Option<String> {
+    use opentelemetry_sdk::metrics::data::{AggregatedMetrics, MetricData};
+    for rm in &stream.metrics.get_finished_metrics().unwrap() {
+        for sm in rm.scope_metrics() {
+            for m in sm.metrics().filter(|m| m.name() == "grok_code.turn.ttft") {
+                if let AggregatedMetrics::U64(MetricData::Histogram(hist)) = m.data() {
+                    for dp in hist.data_points() {
+                        for kv in dp.attributes() {
+                            if kv.key.as_str() == "model" {
+                                return Some(kv.value.as_str().into_owned());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+#[test]
+fn prompt_latency_records_ttft_ttfm_histograms_only() {
+    let both = build(gates_off());
+    emit_event_into(&both, &prompt_latency(Some(120), Some(450)));
+    assert!(exported_events(&both).is_empty(), "metric-only mapping");
+    let mut names = exported_metric_names(&both);
+    names.sort();
+    assert_eq!(
+        names,
+        vec![
+            "grok_code.turn.ttfm".to_owned(),
+            "grok_code.turn.ttft".to_owned()
+        ]
+    );
+    assert_eq!(
+        turn_ttft_metric_model(&both).as_deref(),
+        Some("[REDACTED_SECRET]"),
+        "model rides the metric datapoint scrubbed"
+    );
+
+    let ttft_only = build(gates_off());
+    emit_event_into(&ttft_only, &prompt_latency(Some(120), None));
+    assert_eq!(
+        exported_metric_names(&ttft_only),
+        vec!["grok_code.turn.ttft".to_owned()]
+    );
+
+    let ttfm_only = build(gates_off());
+    emit_event_into(&ttfm_only, &prompt_latency(None, Some(450)));
+    assert_eq!(
+        exported_metric_names(&ttfm_only),
+        vec!["grok_code.turn.ttfm".to_owned()]
+    );
+
+    let neither = build(gates_off());
+    emit_event_into(&neither, &prompt_latency(None, None));
+    assert!(exported_events(&neither).is_empty());
+    assert!(
+        exported_metric_names(&neither).is_empty(),
+        "None gate records nothing"
     );
 }
 
@@ -497,11 +612,14 @@ fn api_request_snapshot_and_token_usage() {
             reasoning_tokens: Some(25),
             cached_prompt_tokens: None,
             cache_creation_tokens: None,
+            context_tokens: None,
             cost_usd_ticks: None,
         },
     );
     let events = exported_events(&stream);
-    let ev = &events[0];
+    let Some(ev) = events.first() else {
+        panic!("expected an event: {events:?}");
+    };
     assert_eq!(ev.0, "grok_code.api_request");
     assert_eq!(attr(ev, "input_tokens").as_deref(), Some("100"));
     assert_eq!(attr(ev, "output_tokens").as_deref(), Some("50"));
@@ -527,11 +645,15 @@ fn api_request_cost_and_cache_creation_export_attrs_and_metrics() {
             reasoning_tokens: None,
             cached_prompt_tokens: None,
             cache_creation_tokens: Some(40),
+            context_tokens: None,
             // 5e9 ticks is $0.50, which exports as 500_000 micros
             cost_usd_ticks: Some(5_000_000_000),
         },
     );
-    let ev = &exported_events(&stream)[0];
+    let exported = exported_events(&stream);
+    let Some(ev) = exported.first() else {
+        panic!("expected an exported event");
+    };
     assert_eq!(ev.0, "grok_code.api_request");
     assert_eq!(attr(ev, "cache_creation_tokens").as_deref(), Some("40"));
     assert_eq!(attr(ev, "cost_usd_micros").as_deref(), Some("500000"));
@@ -579,6 +701,8 @@ fn one_failed_turn_increments_error_count_exactly_once() {
             error_category: Some("rate_limit".into()),
             error_code: None,
             error_detail: None,
+            context_tokens: None,
+            turn_tokens: None,
         },
     );
     // Both api_error events are exported as log records
@@ -624,6 +748,8 @@ fn turn_error_increments_error_count() {
             error_category: Some("server_error".into()),
             error_code: None,
             error_detail: None,
+            context_tokens: None,
+            turn_tokens: None,
         },
     );
     let mut names = exported_metric_names(&stream);
@@ -647,6 +773,8 @@ fn turn_completed_carries_event_session_id_without_ctx() {
             error_category: None,
             error_code: None,
             error_detail: None,
+            context_tokens: None,
+            turn_tokens: None,
         },
     );
     let events = exported_events(&stream);
@@ -684,7 +812,16 @@ fn tool_result_hook_rewrote_is_content_free() {
             },
         );
         let events = exported_events(&stream);
-        assert_eq!(attr(&events[0], "hook_rewrote").as_deref(), Some(want));
+        assert_eq!(
+            attr(
+                events
+                    .first()
+                    .unwrap_or_else(|| panic!("expected an event")),
+                "hook_rewrote"
+            )
+            .as_deref(),
+            Some(want)
+        );
     }
 }
 
@@ -729,7 +866,9 @@ fn tool_result_gates_off_collapses_and_reduces() {
         },
     );
     let events = exported_events(&stream);
-    let ev = &events[0];
+    let Some(ev) = events.first() else {
+        panic!("expected an event: {events:?}");
+    };
     assert_eq!(ev.0, "grok_code.tool_result");
     assert_eq!(attr(ev, "tool_name").as_deref(), Some("mcp_tool"));
     assert_eq!(attr(ev, "model").as_deref(), Some("grok"));
@@ -783,7 +922,9 @@ fn tool_result_details_gate_exposes_verbatim_scrubbed() {
         },
     );
     let events = exported_events(&stream);
-    let ev = &events[0];
+    let Some(ev) = events.first() else {
+        panic!("expected an event: {events:?}");
+    };
     assert_eq!(
         attr(ev, "tool_name").as_deref(),
         Some("docs__post_message"),
@@ -818,7 +959,9 @@ fn user_prompt_gates_off_drops_text() {
         },
     );
     let events = exported_events(&stream);
-    let ev = &events[0];
+    let Some(ev) = events.first() else {
+        panic!("expected an event: {events:?}");
+    };
     assert_eq!(ev.0, "grok_code.user_prompt");
     assert_eq!(attr(ev, "prompt_length").as_deref(), Some("26"));
     // screen_mode is ungated session metadata, not prompt content.
@@ -859,8 +1002,23 @@ fn user_prompt_screen_mode_sanitized_and_optional() {
         },
     );
     let events = exported_events(&stream);
-    assert_eq!(attr(&events[0], "screen_mode").as_deref(), Some("other"));
-    assert_eq!(attr(&events[1], "screen_mode"), None);
+    assert_eq!(
+        attr(
+            events
+                .first()
+                .unwrap_or_else(|| panic!("expected an event")),
+            "screen_mode"
+        )
+        .as_deref(),
+        Some("other")
+    );
+    assert_eq!(
+        attr(
+            events.get(1).unwrap_or_else(|| panic!("expected event 1")),
+            "screen_mode"
+        ),
+        None
+    );
 }
 
 #[test]
@@ -878,7 +1036,9 @@ fn user_prompt_gate_on_exports_scrubbed_text() {
         },
     );
     let events = exported_events(&stream);
-    let ev = &events[0];
+    let Some(ev) = events.first() else {
+        panic!("expected an event: {events:?}");
+    };
     let prompt = attr(ev, "prompt").expect("gate on ⇒ prompt exported");
     assert!(prompt.contains("fix the bug"));
     assert!(
@@ -901,7 +1061,9 @@ fn mcp_connection_collapses_server_name_by_default() {
         },
     );
     let events = exported_events(&stream);
-    let ev = &events[0];
+    let Some(ev) = events.first() else {
+        panic!("expected an event: {events:?}");
+    };
     assert_eq!(ev.0, "grok_code.mcp_server_connection");
     assert_eq!(attr(ev, "status").as_deref(), Some("failed"));
     assert_eq!(attr(ev, "mcp_server.name").as_deref(), Some("mcp_server"));
@@ -940,7 +1102,9 @@ fn agent_message_tool_decision_identity() {
         },
     );
     let events = exported_events(&stream);
-    let ev = &events[0];
+    let Some(ev) = events.first() else {
+        panic!("expected an event: {events:?}");
+    };
     assert_eq!(
         attr(ev, "tool_name").as_deref(),
         Some("send_subagent_message")
@@ -979,7 +1143,9 @@ fn tool_decision_snapshot() {
         },
     );
     let events = exported_events(&stream);
-    let ev = &events[0];
+    let Some(ev) = events.first() else {
+        panic!("expected an event: {events:?}");
+    };
     assert_eq!(ev.0, "grok_code.tool_decision");
     assert_eq!(attr(ev, "tool_name").as_deref(), Some("run_terminal_cmd"));
     assert_eq!(attr(ev, "decision").as_deref(), Some("deny"));
@@ -1021,11 +1187,14 @@ fn skill_activated_name_gated() {
             skill_name: "internal-deploy-runbook".into(),
             plugin_source: None,
             trigger: events::SkillTrigger::SlashCommand,
+            skill_source: Some("bundled".into()),
         },
     );
     let events = exported_events(&stream);
-    let ev = &events[0];
-    assert_eq!(attr(ev, "skill_source").as_deref(), Some("local"));
+    let Some(ev) = events.first() else {
+        panic!("expected an event: {events:?}");
+    };
+    assert_eq!(attr(ev, "skill_source").as_deref(), Some("bundled"));
     assert_eq!(attr(ev, "trigger").as_deref(), Some("slash_command"));
     assert_eq!(attr(ev, "skill.name"), None);
     assert!(!format!("{events:?}").contains("internal-deploy-runbook"));
@@ -1045,10 +1214,41 @@ fn skill_activated_exports_every_trigger() {
                 skill_name: "pdf".into(),
                 plugin_source: None,
                 trigger,
+                skill_source: None,
             },
         );
         let events = exported_events(&stream);
-        assert_eq!(attr(&events[0], "trigger").as_deref(), Some(label));
+        assert_eq!(
+            attr(
+                events
+                    .first()
+                    .unwrap_or_else(|| panic!("expected an event")),
+                "trigger"
+            )
+            .as_deref(),
+            Some(label)
+        );
+    }
+}
+
+#[test]
+fn skill_activated_does_not_infer_skill_source() {
+    for plugin_source in [None, Some("acme".into())] {
+        let stream = build(gates_off());
+        emit_event_into(
+            &stream,
+            &events::SkillDispatched {
+                skill_name: "pdf".into(),
+                plugin_source,
+                trigger: events::SkillTrigger::SlashCommand,
+                skill_source: None,
+            },
+        );
+        let events = exported_events(&stream);
+        let ev = events
+            .first()
+            .unwrap_or_else(|| panic!("expected an event: {events:?}"));
+        assert_eq!(attr(ev, "skill_source"), None);
     }
 }
 
@@ -1077,7 +1277,9 @@ fn contextual_tip_maps_every_tip_and_action() {
         let stream = build(gates_off());
         emit_event_into(&stream, &events::ContextualTip { tip, action });
         let events = exported_events(&stream);
-        let ev = &events[0];
+        let Some(ev) = events.first() else {
+            panic!("expected an event: {events:?}");
+        };
         assert_eq!(ev.0, "grok_code.contextual_tip");
         assert_eq!(attr(ev, "tip").as_deref(), Some(tip_label));
         assert_eq!(attr(ev, "action").as_deref(), Some(action_label));
@@ -1124,9 +1326,34 @@ fn mapping_supplied_session_id_wins_and_sequence_increments() {
     emit_event_into(&stream, &sentinel_session_harness());
     let events = exported_events(&stream);
     assert_eq!(events.len(), 2);
-    assert_eq!(attr(&events[0], "event.sequence").as_deref(), Some("0"));
-    assert_eq!(attr(&events[1], "event.sequence").as_deref(), Some("1"));
-    assert_eq!(attr(&events[0], "session.id").as_deref(), Some("sess-1"));
+    assert_eq!(
+        attr(
+            events
+                .first()
+                .unwrap_or_else(|| panic!("expected an event")),
+            "event.sequence"
+        )
+        .as_deref(),
+        Some("0")
+    );
+    assert_eq!(
+        attr(
+            events.get(1).unwrap_or_else(|| panic!("expected event 1")),
+            "event.sequence"
+        )
+        .as_deref(),
+        Some("1")
+    );
+    assert_eq!(
+        attr(
+            events
+                .first()
+                .unwrap_or_else(|| panic!("expected an event")),
+            "session.id"
+        )
+        .as_deref(),
+        Some("sess-1")
+    );
 }
 
 #[test]
@@ -1151,7 +1378,10 @@ fn identity_api_key_user_id_exports_without_email() {
         }),
     );
     emit_event_into(&stream, &sentinel_session_harness());
-    let ev = &exported_events(&stream)[0];
+    let exported = exported_events(&stream);
+    let Some(ev) = exported.first() else {
+        panic!("expected an exported event");
+    };
     assert_eq!(attr(ev, "user.id").as_deref(), Some("api-key-principal"));
     assert_eq!(attr(ev, "user.email"), None);
 }
@@ -1171,7 +1401,9 @@ fn identity_attrs_attached_when_set_and_blank_ids_never_export() {
     );
     emit_event_into(&stream, &sentinel_session_harness());
     let events = exported_events(&stream);
-    let ev = &events[0];
+    let Some(ev) = events.first() else {
+        panic!("expected an event: {events:?}");
+    };
     assert_eq!(attr(ev, "user.id").as_deref(), Some("user-42"));
     assert_eq!(attr(ev, "deployment.id").as_deref(), Some("dep-7"));
     assert_eq!(attr(ev, "organization.id"), None, "blank ids never export");
@@ -1194,7 +1426,13 @@ fn identity_email_attached_on_logs_and_metrics_when_present() {
     emit_event_into(&stream, &sentinel_session_harness());
     let events = exported_events(&stream);
     assert_eq!(
-        attr(&events[0], "user.email").as_deref(),
+        attr(
+            events
+                .first()
+                .unwrap_or_else(|| panic!("expected an event")),
+            "user.email"
+        )
+        .as_deref(),
         Some("alice@corp.example")
     );
     emit_event_into(
@@ -1244,7 +1482,16 @@ fn identity_blank_email_never_exports() {
         },
     );
     emit_event_into(&stream, &sentinel_session_harness());
-    assert_eq!(attr(&exported_events(&stream)[0], "user.email"), None);
+    let exported = exported_events(&stream);
+    assert_eq!(
+        attr(
+            exported
+                .first()
+                .unwrap_or_else(|| panic!("expected an exported event")),
+            "user.email"
+        ),
+        None
+    );
 }
 
 #[test]
@@ -1307,17 +1554,20 @@ fn lock_content_gates_drops_prompt_and_response_not_email() {
     assert!(!blob.contains("CANARY_REPLY"));
     assert!(!blob.contains("CANARY_OUTPUT"));
     assert!(!blob.contains("CANARY_ERR"));
+    let [e0, e1, e2, ..] = exported.as_slice() else {
+        panic!("expected three exported events: {exported:?}");
+    };
     assert_eq!(
-        attr(&exported[0], "user.email").as_deref(),
+        attr(e0, "user.email").as_deref(),
         Some("alice@corp.example")
     );
-    assert_eq!(attr(&exported[0], "prompt"), None);
-    assert_eq!(attr(&exported[1], "response"), None);
-    assert_eq!(attr(&exported[1], "response_length").as_deref(), Some("14"));
-    assert_eq!(attr(&exported[2], "tool_output"), None);
-    assert_eq!(attr(&exported[2], "error_message"), None);
-    assert_eq!(attr(&exported[2], "tool_input"), None);
-    assert_eq!(attr(&exported[2], "full_command"), None);
+    assert_eq!(attr(e0, "prompt"), None);
+    assert_eq!(attr(e1, "response"), None);
+    assert_eq!(attr(e1, "response_length").as_deref(), Some("14"));
+    assert_eq!(attr(e2, "tool_output"), None);
+    assert_eq!(attr(e2, "error_message"), None);
+    assert_eq!(attr(e2, "tool_input"), None);
+    assert_eq!(attr(e2, "full_command"), None);
 }
 
 #[test]
@@ -1357,14 +1607,20 @@ fn deny_tool_decision_exports_gated_params_and_full_command() {
     );
     let off = build(gates_off());
     emit_event_into(&off, &ev);
-    let off_ev = &exported_events(&off)[0];
+    let off_exported = exported_events(&off);
+    let Some(off_ev) = off_exported.first() else {
+        panic!("expected an exported event");
+    };
     assert_eq!(attr(off_ev, "tool_parameters"), None);
     assert_eq!(attr(off_ev, "full_command"), None);
     assert_eq!(attr(off_ev, "tool_use_id").as_deref(), Some("call-deny-1"));
 
     let on = build(gates_all_on());
     emit_event_into(&on, &ev);
-    let on_ev = &exported_events(&on)[0];
+    let on_exported = exported_events(&on);
+    let Some(on_ev) = on_exported.first() else {
+        panic!("expected an exported event");
+    };
     let params_out = attr(on_ev, "tool_parameters").expect("details gate exports params");
     assert!(params_out.contains("ls -la"));
     assert_eq!(attr(on_ev, "full_command").as_deref(), Some("ls -la /tmp"));
@@ -1395,7 +1651,10 @@ fn details_without_content_exports_preview_not_bodies() {
         ..ContentGates::default()
     });
     emit_event_into(&stream, &ev);
-    let out = &exported_events(&stream)[0];
+    let exported = exported_events(&stream);
+    let Some(out) = exported.first() else {
+        panic!("expected an exported event");
+    };
     assert!(attr(out, "tool_parameters").unwrap().contains("ls -la"));
     assert_eq!(attr(out, "file_path").as_deref(), Some("/tmp/x.rs"));
     assert_eq!(attr(out, "full_command"), None);
@@ -1433,7 +1692,10 @@ fn content_without_details_exports_bodies_not_preview() {
         ..ContentGates::default()
     });
     emit_event_into(&stream, &ev);
-    let out = &exported_events(&stream)[0];
+    let exported = exported_events(&stream);
+    let Some(out) = exported.first() else {
+        panic!("expected an exported event");
+    };
     assert_eq!(attr(out, "tool_name").as_deref(), Some("mcp_tool"));
     assert_eq!(attr(out, "mcp_tool.name").as_deref(), Some("mcp_tool"));
     assert_eq!(attr(out, "file_path"), None);
@@ -1471,7 +1733,10 @@ fn command_name_is_always_on_metadata() {
         !mixpanel.contains("CANARY_PROMPT") && !mixpanel.contains("compact"),
         "Mixpanel must skip prompt/command_name: {mixpanel}"
     );
-    let ev = &exported_events(&stream)[0];
+    let exported = exported_events(&stream);
+    let Some(ev) = exported.first() else {
+        panic!("expected an exported event");
+    };
     assert_eq!(attr(ev, "command_name").as_deref(), Some("compact"));
     assert_eq!(attr(ev, "prompt"), None);
 }
@@ -1508,18 +1773,15 @@ fn from_mode_is_always_on() {
         },
     );
     let exported = exported_events(&stream);
-    assert_eq!(attr(&exported[0], "from_mode").as_deref(), Some("default"));
-    assert_eq!(attr(&exported[0], "to_mode").as_deref(), Some("plan"));
-    assert_eq!(attr(&exported[1], "from_mode").as_deref(), Some("default"));
-    assert_eq!(
-        attr(&exported[1], "to_mode").as_deref(),
-        Some("bypass_permissions")
-    );
-    assert_eq!(attr(&exported[2], "from_mode").as_deref(), Some("plan"));
-    assert_eq!(
-        attr(&exported[2], "to_mode").as_deref(),
-        Some("bypass_permissions")
-    );
+    let [e0, e1, e2, ..] = exported.as_slice() else {
+        panic!("expected three exported events: {exported:?}");
+    };
+    assert_eq!(attr(e0, "from_mode").as_deref(), Some("default"));
+    assert_eq!(attr(e0, "to_mode").as_deref(), Some("plan"));
+    assert_eq!(attr(e1, "from_mode").as_deref(), Some("default"));
+    assert_eq!(attr(e1, "to_mode").as_deref(), Some("bypass_permissions"));
+    assert_eq!(attr(e2, "from_mode").as_deref(), Some("plan"));
+    assert_eq!(attr(e2, "to_mode").as_deref(), Some("bypass_permissions"));
 }
 
 #[test]
@@ -1540,7 +1802,10 @@ fn full_command_skips_512_collapse() {
     };
     let stream = build(gates_all_on());
     emit_event_into(&stream, &ev);
-    let exported = &exported_events(&stream)[0];
+    let exported_list = exported_events(&stream);
+    let Some(exported) = exported_list.first() else {
+        panic!("expected an exported event");
+    };
     let cmd = attr(exported, "full_command").expect("full_command present");
     assert_eq!(cmd.len(), 600, "full_command must not 512→128 collapse");
     assert!(!cmd.contains("…[truncated]"));
@@ -1561,7 +1826,10 @@ fn assistant_response_tool_only_omits_response() {
             response_text: Some(String::new()),
         },
     );
-    let ev = &exported_events(&stream)[0];
+    let exported = exported_events(&stream);
+    let Some(ev) = exported.first() else {
+        panic!("expected an exported event");
+    };
     assert_eq!(ev.0, "grok_code.assistant_response");
     assert_eq!(attr(ev, "response_length").as_deref(), Some("0"));
     assert_eq!(attr(ev, "response"), None);
@@ -1577,7 +1845,10 @@ fn assistant_response_gate_exports_text() {
             response_text: Some("hello world".into()),
         },
     );
-    let ev = &exported_events(&stream)[0];
+    let exported = exported_events(&stream);
+    let Some(ev) = exported.first() else {
+        panic!("expected an exported event");
+    };
     assert_eq!(attr(ev, "response").as_deref(), Some("hello world"));
     assert_eq!(attr(ev, "response_length").as_deref(), Some("11"));
 }
@@ -1604,7 +1875,10 @@ fn assistant_response_with_url_does_not_drop_at_validator() {
         0,
         "scrubbed assistant response must pass the export validator"
     );
-    let ev = &exported_events(&stream)[0];
+    let exported = exported_events(&stream);
+    let Some(ev) = exported.first() else {
+        panic!("expected an exported event");
+    };
     assert_eq!(ev.0, "grok_code.assistant_response");
     let response = attr(ev, "response").expect("gated response");
     assert!(
@@ -1631,7 +1905,13 @@ fn long_attr_values_truncated() {
         },
     );
     let events = exported_events(&stream);
-    let model = attr(&events[0], "model").unwrap();
+    let model = attr(
+        events
+            .first()
+            .unwrap_or_else(|| panic!("expected an event")),
+        "model",
+    )
+    .unwrap();
     assert!(
         model.len() < 200,
         "value not truncated: {} chars",

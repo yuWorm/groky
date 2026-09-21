@@ -1,7 +1,5 @@
 mod edit;
 mod execute;
-pub(crate) mod hook;
-mod lifecycle;
 pub mod list_dir;
 pub(crate) mod memory_search;
 mod other;
@@ -19,8 +17,6 @@ pub use edit::{
     render_diff_hunk_highlighted, render_diff_hunks_highlighted, render_diff_hunks_with_styles,
 };
 pub use execute::ExecuteToolCallBlock;
-pub use hook::{HookPhase, HookRunEntry, HookRunStatus, ToolCallHookData};
-pub use lifecycle::LifecycleEventBlock;
 pub use list_dir::ListDirToolCallBlock;
 pub use memory_search::MemorySearchToolCallBlock;
 pub use other::OtherToolCallBlock;
@@ -31,7 +27,10 @@ pub use search::{
 pub use search_tool::{
     DiscoveredTool, SearchToolCallBlock as IntegrationSearchToolCallBlock, discovered_tool_action,
 };
-pub use sent_message::{SentMessagePresentation, SentMessageToolCallBlock};
+pub use sent_message::{
+    SentMessageDelivery, SentMessageInput, SentMessagePresentation, SentMessageTarget,
+    SentMessageToolCallBlock,
+};
 pub use use_tool::UseToolCallBlock;
 pub use web_fetch::WebFetchToolCallBlock;
 pub use web_search::WebSearchToolCallBlock;
@@ -166,9 +165,6 @@ pub enum ToolCallBlock {
     /// Skill invocation (user skills / slash commands via the Skill tool).
     Skill(OtherToolCallBlock),
     Other(OtherToolCallBlock),
-    /// Lifecycle event (e.g. `user_prompt_submit`, `session_start`).
-    /// Not a real tool call, so `last_tool_call_entry_id()` skips it.
-    Lifecycle(LifecycleEventBlock),
 }
 
 /// Delegate to inner variant, with tool bullet prepended to output.
@@ -188,7 +184,6 @@ macro_rules! delegate_tool {
             ToolCallBlock::SentMessage(b) => b.$method($($arg),*),
             ToolCallBlock::Skill(b) => b.$method($($arg),*),
             ToolCallBlock::Other(b) => b.$method($($arg),*),
-            ToolCallBlock::Lifecycle(b) => b.$method($($arg),*),
         }
     };
 }
@@ -337,8 +332,7 @@ impl ToolCallBlock {
                 | ToolCallBlock::MemorySearch(_)
                 | ToolCallBlock::SentMessage(_)
                 | ToolCallBlock::Skill(_)
-                | ToolCallBlock::Other(_)
-                | ToolCallBlock::Lifecycle(_),
+                | ToolCallBlock::Other(_),
                 _,
             ) => {}
         }
@@ -360,7 +354,6 @@ impl ToolCallBlock {
             ToolCallBlock::SentMessage(b) => b.is_success(),
             ToolCallBlock::Skill(b) => b.is_success(),
             ToolCallBlock::Other(b) => b.is_success(),
-            ToolCallBlock::Lifecycle(_) => true,
         }
     }
 
@@ -382,8 +375,6 @@ impl ToolCallBlock {
             ToolCallBlock::SentMessage(b) => b.started_at = Some(instant),
             ToolCallBlock::Skill(b) => b.started_at = Some(instant),
             ToolCallBlock::Other(b) => b.started_at = Some(instant),
-            // Lifecycle events have no timing.
-            ToolCallBlock::Lifecycle(_) => {}
         }
     }
 
@@ -456,8 +447,6 @@ impl ToolCallBlock {
                     b.started_at = Some(std::time::Instant::now());
                 }
             }
-            // Lifecycle events have no timing.
-            ToolCallBlock::Lifecycle(_) => {}
         }
     }
 
@@ -561,31 +550,39 @@ impl ToolCallBlock {
                 b.output.clone(),
                 b.error.clone(),
             ]),
-            ToolCallBlock::Lifecycle(b) => join_searchable([Some(b.name.clone())]),
         }
     }
 
     /// Verb-group kind; `None` renders standalone and splits verb-group runs (still dense-packs via `is_groupable`).
     pub fn verb_group_kind(&self) -> Option<VerbGroupKind> {
         match self {
+            ToolCallBlock::Read(b) if b.is_memory_activity => Some(VerbGroupKind::MemorySearch),
             ToolCallBlock::Read(b) => Some(if b.is_skill_read() {
                 VerbGroupKind::Skill
             } else {
                 VerbGroupKind::File
             }),
-            ToolCallBlock::ListDir(_) => Some(VerbGroupKind::Dir),
-            ToolCallBlock::Search(_) => Some(VerbGroupKind::Search),
+            ToolCallBlock::ListDir(b) => Some(if b.is_memory_activity {
+                VerbGroupKind::MemorySearch
+            } else {
+                VerbGroupKind::Dir
+            }),
+            ToolCallBlock::Search(b) => Some(if b.is_memory_activity {
+                VerbGroupKind::MemorySearch
+            } else {
+                VerbGroupKind::Search
+            }),
             ToolCallBlock::WebFetch(_) => Some(VerbGroupKind::WebFetch),
             ToolCallBlock::WebSearch(_) => Some(VerbGroupKind::WebSearch),
             ToolCallBlock::IntegrationSearch(_) => Some(VerbGroupKind::IntegrationSearch),
             ToolCallBlock::MemorySearch(_) => Some(VerbGroupKind::MemorySearch),
             ToolCallBlock::Skill(_) => Some(VerbGroupKind::Skill),
+            ToolCallBlock::Edit(b) if b.is_memory_activity => Some(VerbGroupKind::MemorySearch),
             ToolCallBlock::Execute(_)
             | ToolCallBlock::Edit(_)
             | ToolCallBlock::UseTool(_)
             | ToolCallBlock::SentMessage(_)
-            | ToolCallBlock::Other(_)
-            | ToolCallBlock::Lifecycle(_) => None,
+            | ToolCallBlock::Other(_) => None,
         }
     }
 
@@ -594,11 +591,11 @@ impl ToolCallBlock {
     pub fn label_kind(&self) -> Option<VerbGroupKind> {
         match self {
             ToolCallBlock::Execute(_) => Some(VerbGroupKind::Command),
+            ToolCallBlock::Edit(b) if b.is_memory_activity => Some(VerbGroupKind::MemorySearch),
             ToolCallBlock::Edit(_) => Some(VerbGroupKind::EditFile),
             ToolCallBlock::UseTool(_) => Some(VerbGroupKind::McpCall),
             ToolCallBlock::SentMessage(_) => Some(VerbGroupKind::Message),
             ToolCallBlock::Other(_) => Some(VerbGroupKind::OtherTool),
-            ToolCallBlock::Lifecycle(_) => None,
             ToolCallBlock::Read(_)
             | ToolCallBlock::ListDir(_)
             | ToolCallBlock::Search(_)
@@ -684,12 +681,16 @@ mod tests {
             ToolCallBlock::MemorySearch(MemorySearchToolCallBlock::new("auth")),
             ToolCallBlock::SentMessage(SentMessageToolCallBlock::new(
                 SentMessagePresentation::Sent,
-                Some("sub-123".into()),
-                Some("hello".into()),
+                Some(SentMessageInput {
+                    target: SentMessageTarget::Unresolved {
+                        subagent_id: "sub-123".into(),
+                    },
+                    delivery: Some(SentMessageDelivery::Steer),
+                    text: "hello".into(),
+                }),
             )),
             ToolCallBlock::Skill(OtherToolCallBlock::new("Skill", "deploy")),
             ToolCallBlock::Other(OtherToolCallBlock::new("todo_write", "update")),
-            ToolCallBlock::Lifecycle(LifecycleEventBlock::new("session_start")),
         ];
         for block in &blocks {
             // Exhaustive on purpose: a new variant fails compilation here until it gets an explicit verb-grouping decision
@@ -707,8 +708,7 @@ mod tests {
                 | ToolCallBlock::Edit(_)
                 | ToolCallBlock::UseTool(_)
                 | ToolCallBlock::SentMessage(_)
-                | ToolCallBlock::Other(_)
-                | ToolCallBlock::Lifecycle(_) => None,
+                | ToolCallBlock::Other(_) => None,
             };
             assert_eq!(block.verb_group_kind(), expected, "block: {block:?}");
         }
@@ -731,8 +731,7 @@ mod tests {
         assert_eq!(
             ToolCallBlock::SentMessage(SentMessageToolCallBlock::new(
                 SentMessagePresentation::Sent,
-                None,
-                None,
+                None
             ))
             .label_kind(),
             Some(VerbGroupKind::Message)
@@ -740,10 +739,6 @@ mod tests {
         assert_eq!(
             ToolCallBlock::Other(OtherToolCallBlock::new("todo_write", "update")).label_kind(),
             Some(VerbGroupKind::OtherTool)
-        );
-        assert_eq!(
-            ToolCallBlock::Lifecycle(LifecycleEventBlock::new("session_start")).label_kind(),
-            None
         );
         // Verb-groupable kinds defer to the fold's own classification.
         assert_eq!(

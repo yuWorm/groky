@@ -6,6 +6,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 use xai_grok_sampling_types::ReasoningEffort;
+use xai_grok_tools::implementations::grok_build::workflow::WorkflowControl;
 use xai_workflow::{Journal, WorkflowOutcome, WorkflowRunParams};
 
 use super::host_service::{
@@ -14,7 +15,8 @@ use super::host_service::{
 use super::notify::WorkflowNotifySender;
 use super::registry::{ResolvedWorkflow, WorkflowSource};
 use super::store::WorkflowRunStore;
-use super::tracker::WorkflowTracker;
+use super::tracker::{WorkflowRunState, WorkflowRunStatus, WorkflowTracker};
+use crate::agent::remote_config::task_model_policy::LatchedTaskModelSelection;
 
 pub(crate) const WORKFLOW_MAX_ACTIVE_RUNS_PER_SESSION: usize = 4;
 pub(crate) const WORKFLOW_DEFAULT_AGENT_BUDGET: u64 = xai_workflow::DEFAULT_AGENT_BUDGET;
@@ -59,6 +61,21 @@ pub(crate) enum LaunchError {
     TooManyActiveRuns,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub(crate) enum ControlError {
+    #[error("no workflow run in this session matches '{0}'")]
+    UnknownRun(String),
+    #[error("run '{name}' is {} and cannot be {}", status.as_ref(), match control {
+        WorkflowControl::Pause => "paused",
+        WorkflowControl::Stop => "stopped",
+    })]
+    NotApplicable {
+        name: String,
+        status: WorkflowRunStatus,
+        control: WorkflowControl,
+    },
+}
+
 pub(crate) struct WorkflowManager {
     session_id: String,
     session_dir: Option<PathBuf>,
@@ -76,6 +93,8 @@ pub(crate) struct WorkflowManager {
     active: HashMap<String, ActiveRun>,
     retiring: Vec<(String, oneshot::Receiver<()>)>,
     max_concurrent_agents: usize,
+    /// `agent()` spawns carry the owning session's mode instead of reclassifying.
+    task_model_selection: LatchedTaskModelSelection,
 }
 
 impl WorkflowManager {
@@ -95,6 +114,7 @@ impl WorkflowManager {
         session_cmd_tx: mpsc::UnboundedSender<crate::session::commands::SessionCommand>,
         templates: HashMap<String, String>,
         max_concurrent_agents: usize,
+        task_model_selection: LatchedTaskModelSelection,
     ) -> Self {
         Self {
             session_id,
@@ -113,6 +133,7 @@ impl WorkflowManager {
             max_concurrent_agents: super::host_service::workflow_max_concurrent_agents(
                 max_concurrent_agents,
             ),
+            task_model_selection,
         }
     }
 
@@ -295,6 +316,7 @@ impl WorkflowManager {
                 telemetry: self.telemetry.clone(),
                 stats: agent_stats.clone(),
                 cancel: cancel.clone(),
+                task_model_selection: self.task_model_selection.clone(),
             },
             host_rx,
         );
@@ -519,6 +541,7 @@ impl WorkflowManager {
             mpsc::unbounded_channel().0,
             std::collections::HashMap::new(),
             super::host_service::DEFAULT_WORKFLOW_MAX_CONCURRENT_AGENTS,
+            LatchedTaskModelSelection::default(),
         )));
         (manager, tracker)
     }
@@ -657,6 +680,45 @@ impl WorkflowManager {
                 true
             }
             None => false,
+        }
+    }
+
+    /// Pause or stop the run whose id or display name is `key`, returning its
+    /// state as of before the op.
+    pub(crate) fn control_run(
+        &mut self,
+        key: &str,
+        control: WorkflowControl,
+    ) -> Result<WorkflowRunState, ControlError> {
+        let run = {
+            let tracker = self.tracker.lock();
+            tracker
+                .find_run_id(key)
+                .and_then(|run_id| tracker.get(&run_id))
+        }
+        .ok_or_else(|| ControlError::UnknownRun(key.to_owned()))?;
+        let not_applicable = |status: WorkflowRunStatus| ControlError::NotApplicable {
+            name: run.name.clone(),
+            status,
+            control,
+        };
+        if !run.status.accepts(control) {
+            return Err(not_applicable(run.status));
+        }
+        let applied = match control {
+            WorkflowControl::Pause => self.pause(&run.run_id),
+            WorkflowControl::Stop => self.cancel(&run.run_id),
+        };
+        if applied {
+            Ok(run)
+        } else {
+            // The run finished between the gate and the op; report the status it reached.
+            let status = self
+                .tracker
+                .lock()
+                .get(&run.run_id)
+                .map_or(run.status, |state| state.status);
+            Err(not_applicable(status))
         }
     }
 
@@ -901,6 +963,7 @@ mod tests {
             mpsc::unbounded_channel().0,
             HashMap::new(),
             crate::session::workflow::host_service::DEFAULT_WORKFLOW_MAX_CONCURRENT_AGENTS,
+            LatchedTaskModelSelection::default(),
         );
         (manager, event_rx, cancels)
     }
@@ -1148,66 +1211,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn pause_marks_user_paused_and_resume_replays() {
-        let dir = tempfile::tempdir().unwrap();
-        let (mut manager, mut subagent_rx) = test_manager(Some(dir.path().to_path_buf()));
-        let script = "let meta = #{ name: \"t\", description: \"d\" };\nlet r = agent(\"work\");\ncomplete(r.output);";
-        let resolved = resolve_inline(script.into()).unwrap();
-        let (run_id, outcome_rx) = manager.launch(resolved, spec()).unwrap();
-
-        use xai_grok_tools::implementations::grok_build::task::types::SubagentEvent;
-        let spawn_req = subagent_rx.recv().await.expect("spawn request");
-        let SubagentEvent::Spawn(_spawn) = spawn_req else {
-            panic!("expected spawn request");
-        };
-        assert!(manager.pause(&run_id));
-        assert_eq!(
-            manager.tracker.lock().get(&run_id).unwrap().status,
-            crate::session::workflow::tracker::WorkflowRunStatus::UserPaused,
-            "pause() must mark UserPaused immediately"
-        );
-        let outcome = outcome_rx.await.unwrap();
-        assert!(matches!(outcome, WorkflowOutcome::Cancelled));
-        let state = manager.tracker.lock().get(&run_id).unwrap();
-        assert_eq!(
-            state.status,
-            crate::session::workflow::tracker::WorkflowRunStatus::UserPaused,
-            "pause intent must map Cancelled → UserPaused"
-        );
-
-        let resolved = resolve_inline(script.into()).unwrap();
-        let (_run_id2, outcome_rx) = manager
-            .launch(
-                resolved,
-                LaunchSpec {
-                    resume_run_id: Some(run_id.clone()),
-                    ..spec()
-                },
-            )
-            .unwrap();
-        let spawn_req = subagent_rx.recv().await.expect("respawned agent");
-        use xai_grok_tools::implementations::grok_build::task::types::SubagentResult;
-        if let SubagentEvent::Spawn(req) = spawn_req {
-            let id = req.id.clone();
-            let _ = req.result_tx.send(SubagentResult {
-                success: true,
-                output: std::sync::Arc::from("resumed output"),
-                subagent_id: id,
-                ..Default::default()
-            });
-        } else {
-            panic!("expected spawn event");
-        }
-        let outcome = outcome_rx.await.unwrap();
-        match outcome {
-            WorkflowOutcome::Completed { result } => {
-                assert_eq!(result, serde_json::json!("resumed output"));
-            }
-            other => panic!("expected Completed, got {other:?}"),
-        }
-    }
-
-    #[tokio::test]
     async fn resume_reconciles_agents_used_from_journal_no_double_charge() {
         use xai_grok_tools::implementations::grok_build::task::types::{
             SubagentEvent, SubagentResult,
@@ -1449,7 +1452,7 @@ mod tests {
     #[tokio::test]
     async fn workflow_spawns_await_to_completion() {
         use xai_grok_tools::implementations::grok_build::task::types::{
-            SubagentEvent, SubagentResult,
+            ModelOverrideProvenance, SubagentEvent, SubagentResult,
         };
 
         let dir = tempfile::tempdir().unwrap();
@@ -1477,7 +1480,9 @@ mod tests {
         );
         assert_eq!(
             req.runtime_overrides.model_override_provenance,
-            xai_grok_tools::implementations::grok_build::task::types::ModelOverrideProvenance::Tool,
+            ModelOverrideProvenance::Tool {
+                selection: Default::default(),
+            },
             "script model overrides are untrusted tool provenance"
         );
         assert_eq!(req.runtime_overrides.reasoning_effort, None);
@@ -1840,45 +1845,80 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cancellation_uses_run_owned_cancel_event_without_parent_detach() {
-        use xai_grok_tools::implementations::grok_build::task::types::{
-            SubagentCancelTarget, SubagentEvent,
-        };
-
+    async fn control_run_refuses_to_stop_a_budget_limited_run_so_resume_still_needs_a_raised_cap() {
         let dir = tempfile::tempdir().unwrap();
-        let (mut manager, mut subagent_rx, cancels) =
-            test_manager_with_cancels(Some(dir.path().to_path_buf()));
-        let resolved = resolve_inline(
-            "let meta = #{ name: \"t\", description: \"d\" };\n\
-             let r = agent(\"work\");\ncomplete(r.output);"
-                .into(),
-        )
-        .unwrap();
-        let (run_id, outcome_rx) = manager
-            .launch(
-                resolved,
-                LaunchSpec {
-                    agent_budget: Some(100),
-                    ..spec()
-                },
-            )
+        let (mut manager, mut subagent_rx) = test_manager(Some(dir.path().to_path_buf()));
+        let script = "let meta = #{ name: \"t\", description: \"d\" };\n\
+                      let r = agent(\"work\");\ncomplete(r.output);";
+        let (run_id, _outcome) = manager
+            .launch(resolve_inline(script.into()).unwrap(), spec())
             .unwrap();
-        let SubagentEvent::Spawn(req) = subagent_rx.recv().await.expect("spawn") else {
-            panic!("expected spawn");
-        };
-        assert!(req.owner.is_workflow());
-        assert!(manager.cancel(&run_id));
-        let _ = outcome_rx.await;
-        assert!(
-            req.cancel_token.is_cancelled(),
-            "run cancel must cancel the child token, not silently detach the receiver"
+        let _child = recv_spawn(&mut subagent_rx).await;
+        manager.tracker.lock().apply_outcome(
+            &run_id,
+            &WorkflowOutcome::BudgetExceeded {
+                message: "budget".into(),
+            },
         );
-        assert!(
-            cancels.lock().iter().any(|target| matches!(
-                target,
-                SubagentCancelTarget::WorkflowRunId(id) if id == &run_id
-            )),
-            "cancellation must emit an explicit run-owned cancel event"
+
+        assert_eq!(
+            manager
+                .control_run(&run_id, WorkflowControl::Stop)
+                .unwrap_err(),
+            ControlError::NotApplicable {
+                name: "t".to_owned(),
+                status: WorkflowRunStatus::BudgetLimited,
+                control: WorkflowControl::Stop,
+            }
+        );
+        assert_eq!(
+            manager.tracker.lock().get(&run_id).unwrap().status,
+            WorkflowRunStatus::BudgetLimited
+        );
+        let resume = LaunchSpec {
+            resume_run_id: Some(run_id.clone()),
+            ..spec()
+        };
+        assert!(matches!(
+            manager
+                .launch(resolve_inline(script.into()).unwrap(), resume)
+                .unwrap_err(),
+            LaunchError::BudgetNotRaised { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn control_run_refuses_to_pause_an_engine_paused_run() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut manager, mut subagent_rx) = test_manager(Some(dir.path().to_path_buf()));
+        let script = "let meta = #{ name: \"t\", description: \"d\" };\n\
+                      let r = agent(\"work\");\ncomplete(r.output);";
+        let (run_id, _outcome) = manager
+            .launch(resolve_inline(script.into()).unwrap(), spec())
+            .unwrap();
+        let _child = recv_spawn(&mut subagent_rx).await;
+        manager.tracker.lock().apply_outcome(
+            &run_id,
+            &WorkflowOutcome::Paused {
+                kind: xai_workflow::PauseKind::BackOff,
+                message: "backing off".into(),
+            },
+        );
+
+        // The run is still in `active`, so a bare pause() would report success without changing anything.
+        assert_eq!(
+            manager
+                .control_run(&run_id, WorkflowControl::Pause)
+                .unwrap_err(),
+            ControlError::NotApplicable {
+                name: "t".to_owned(),
+                status: WorkflowRunStatus::BackOffPaused,
+                control: WorkflowControl::Pause,
+            }
+        );
+        assert_eq!(
+            manager.tracker.lock().get(&run_id).unwrap().status,
+            WorkflowRunStatus::BackOffPaused
         );
     }
 
@@ -1963,28 +2003,5 @@ mod tests {
             WorkflowOutcome::Completed { result } => assert_eq!(result, serde_json::json!(N)),
             other => panic!("expected Completed, got {other:?}"),
         }
-    }
-
-    #[tokio::test]
-    async fn cancel_drops_queued_spawns_before_coordinator() {
-        let dir = tempfile::tempdir().unwrap();
-        let (mut manager, mut subagent_rx) = test_manager(Some(dir.path().to_path_buf()));
-        manager.test_set_max_concurrent_agents(1);
-        let (run_id, outcome_rx) = manager
-            .launch(resolve_inline(parallel_n_script(4)).unwrap(), spec())
-            .unwrap();
-
-        let first = recv_spawn(&mut subagent_rx).await;
-        assert!(
-            tokio::time::timeout(std::time::Duration::from_millis(150), subagent_rx.recv())
-                .await
-                .is_err(),
-            "queued agents reached the coordinator before cancel"
-        );
-
-        assert!(manager.cancel(&run_id));
-        let _ = outcome_rx.await;
-        assert!(first.cancel_token.is_cancelled());
-        assert!(subagent_rx.try_recv().is_err());
     }
 }

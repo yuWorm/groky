@@ -420,19 +420,23 @@ pub fn build_agent_list(
             continue;
         }
         if let Some(pos) = entries.iter().position(|e| e.name == def.name) {
-            let existing_priority = scope_priority(entries[pos].scope);
+            let Some(existing_priority) = entries.get(pos).map(|e| scope_priority(e.scope)) else {
+                continue;
+            };
             if scope_priority(def.scope) > existing_priority {
                 let enabled = toggle.get(&def.name).copied().unwrap_or(true);
-                entries[pos] = AgentListEntry {
-                    name: def.name.clone(),
-                    description: def.description.clone(),
-                    scope: def.scope,
-                    source_path: def.source_path.clone(),
-                    enabled,
-                    is_builtin: false,
-                    expanded: false,
-                    definition: def,
-                };
+                if let Some(slot) = entries.get_mut(pos) {
+                    *slot = AgentListEntry {
+                        name: def.name.clone(),
+                        description: def.description.clone(),
+                        scope: def.scope,
+                        source_path: def.source_path.clone(),
+                        enabled,
+                        is_builtin: false,
+                        expanded: false,
+                        definition: def,
+                    };
+                }
             }
         } else {
             let enabled = toggle.get(&def.name).copied().unwrap_or(true);
@@ -712,12 +716,20 @@ pub fn delete_persona_file(path: &Path) -> Result<(), String> {
     Ok(())
 }
 /// Load `[agent]` from effective config (merged shell + pager config layers).
-fn load_agent_selection_config() -> AgentSelectionConfig {
+pub(crate) fn load_agent_selection_config() -> AgentSelectionConfig {
     xai_grok_shell::config::load_effective_config()
         .ok()
         .and_then(|root| xai_grok_shell::agent::config::Config::new_from_toml_cfg(&root).ok())
         .map(|cfg| cfg.agent)
         .unwrap_or_default()
+}
+pub(crate) fn config_agent_is_explicit() -> bool {
+    let agent = load_agent_selection_config();
+    agent
+        .name
+        .as_deref()
+        .is_some_and(|name| !name.trim().is_empty())
+        || agent.definition.is_some()
 }
 /// Explicit `[agent] name` in config.toml (not env/CLI overrides).
 fn load_config_agent_name() -> Option<String> {
@@ -752,13 +764,9 @@ pub fn set_default_agent(name: Option<&str>) -> Result<(), String> {
         return Err("Could not read or parse config.toml".to_string());
     };
     if let Some(agent_name) = name {
-        if !doc.contains_key("agent") {
-            doc["agent"] = toml_edit::Item::Table(toml_edit::Table::new());
-        }
-        let agent_table = doc["agent"]
-            .as_table_mut()
-            .ok_or("[agent] is not a table")?;
-        agent_table["name"] = toml_edit::value(agent_name);
+        let agent_item = doc.entry("agent").or_insert(toml_edit::table());
+        let agent_table = agent_item.as_table_mut().ok_or("[agent] is not a table")?;
+        agent_table.insert("name", toml_edit::value(agent_name));
     } else if let Some(agent_table) = doc.get_mut("agent").and_then(|v| v.as_table_mut()) {
         agent_table.remove("name");
     }
@@ -775,19 +783,15 @@ pub fn toggle_agent(name: &str, enabled: bool) -> Result<(), String> {
     let Some(mut doc) = crate::config_toml_edit::read_config_document_for_edit(&config_path) else {
         return Err("Could not read or parse config.toml".to_string());
     };
-    if !doc.contains_key("subagents") {
-        doc["subagents"] = toml_edit::Item::Table(toml_edit::Table::new());
-    }
-    let subagents = doc["subagents"]
+    let subagents_item = doc.entry("subagents").or_insert(toml_edit::table());
+    let subagents = subagents_item
         .as_table_mut()
         .ok_or("subagents is not a table")?;
-    if !subagents.contains_key("toggle") {
-        subagents["toggle"] = toml_edit::Item::Table(toml_edit::Table::new());
-    }
-    let toggle_table = subagents["toggle"]
+    let toggle_item = subagents.entry("toggle").or_insert(toml_edit::table());
+    let toggle_table = toggle_item
         .as_table_mut()
         .ok_or("subagents.toggle is not a table")?;
-    toggle_table[name] = toml_edit::value(enabled);
+    toggle_table.insert(name, toml_edit::value(enabled));
     std::fs::write(&config_path, doc.to_string())
         .map_err(|e| format!("Failed to write config.toml: {e}"))?;
     Ok(())
@@ -926,7 +930,9 @@ impl AgentsModalState {
         }
         let cur_pos = indices.iter().position(|&i| i == self.selected);
         let next_pos = cur_pos.map(|p| (p + 1).min(indices.len() - 1)).unwrap_or(0);
-        self.selected = indices[next_pos];
+        if let Some(&idx) = indices.get(next_pos) {
+            self.selected = idx;
+        }
     }
     /// Move selection to the previous visible item.
     pub fn select_prev(&mut self) {
@@ -938,7 +944,9 @@ impl AgentsModalState {
         let next_pos = cur_pos
             .map(|p| p.saturating_sub(1))
             .unwrap_or(indices.len() - 1);
-        self.selected = indices[next_pos];
+        if let Some(&idx) = indices.get(next_pos) {
+            self.selected = idx;
+        }
     }
     /// Expand the selected agent's detail view.
     pub fn expand(&mut self) {
@@ -980,7 +988,9 @@ impl AgentsModalState {
         }
         let cur_pos = indices.iter().position(|&i| i == self.persona_selected);
         let next_pos = cur_pos.map(|p| (p + 1).min(indices.len() - 1)).unwrap_or(0);
-        self.persona_selected = indices[next_pos];
+        if let Some(&idx) = indices.get(next_pos) {
+            self.persona_selected = idx;
+        }
     }
     /// Move persona selection to the previous visible item.
     pub fn persona_select_prev(&mut self) {
@@ -992,7 +1002,9 @@ impl AgentsModalState {
         let next_pos = cur_pos
             .map(|p| p.saturating_sub(1))
             .unwrap_or(indices.len() - 1);
-        self.persona_selected = indices[next_pos];
+        if let Some(&idx) = indices.get(next_pos) {
+            self.persona_selected = idx;
+        }
     }
 }
 fn modal_sizing(compact: bool) -> ModalSizing {
@@ -1230,7 +1242,10 @@ fn render_agents_search(
     let viewport = editor.viewport(editor_width as usize);
     let leading;
     let visible: &str = if focused {
-        &editor.text()[viewport.visible_byte_range.clone()]
+        editor
+            .text()
+            .get(viewport.visible_byte_range.clone())
+            .unwrap_or("")
     } else {
         leading = crate::render::line_utils::truncate_str(editor.text(), editor_width as usize);
         &leading
@@ -1293,7 +1308,9 @@ fn render_agents_tab(
     let mut rows: Vec<FlatRow> = Vec::new();
     let mut current_group: Option<AgentGroup> = None;
     for &idx in &filtered {
-        let entry = &state.agents[idx];
+        let Some(entry) = state.agents.get(idx) else {
+            continue;
+        };
         let group = AgentGroup::of(entry);
         if current_group != Some(group) {
             current_group = Some(group);
@@ -1323,8 +1340,8 @@ fn render_agents_tab(
     let mut selected_end = selected_row + 1;
     while selected_end < rows.len()
         && matches!(
-            rows[selected_end],
-            FlatRow::Detail(_) | FlatRow::Description(..)
+            rows.get(selected_end),
+            Some(FlatRow::Detail(_) | FlatRow::Description(..))
         )
     {
         selected_end += 1;
@@ -1349,8 +1366,8 @@ fn render_agents_tab(
         if row_y >= content_area.y + content_area.height {
             break;
         }
-        match &rows[ri] {
-            FlatRow::GroupHeader(group) => {
+        match rows.get(ri) {
+            Some(FlatRow::GroupHeader(group)) => {
                 let label = match group {
                     AgentGroup::Scope(AgentScope::BuiltIn) => {
                         "\u{2500}\u{2500} Built-in \u{2500}\u{2500}"
@@ -1369,9 +1386,11 @@ fn render_agents_tab(
                     .add_modifier(Modifier::BOLD);
                 buf.set_string(content_area.x, row_y, label, style);
             }
-            FlatRow::Agent(idx) => {
+            Some(FlatRow::Agent(idx)) => {
                 state.row_map.push((row_y, *idx));
-                let entry = &state.agents[*idx];
+                let Some(entry) = state.agents.get(*idx) else {
+                    continue;
+                };
                 let is_selected = *idx == state.selected;
                 let bg = if is_selected {
                     Some(theme.bg_highlight)
@@ -1494,7 +1513,7 @@ fn render_agents_tab(
                     buf.set_string(x + 1, row_y, &badge_text, badge_style);
                 }
             }
-            FlatRow::Description(idx, line) => {
+            Some(FlatRow::Description(idx, line)) => {
                 state.row_map.push((row_y, *idx));
                 let is_selected = *idx == state.selected;
                 let bg = if is_selected {
@@ -1509,16 +1528,19 @@ fn render_agents_tab(
                     desc_style = desc_style.bg(bg_color);
                     let fill = Style::default().bg(bg_color);
                     for cx in content_area.x..content_area.x + content_area.width {
-                        buf[(cx, row_y)].set_style(fill);
+                        if let Some(cell) = buf.cell_mut((cx, row_y)) {
+                            cell.set_style(fill);
+                        }
                     }
                 }
                 buf.set_string(desc_x, row_y, line, desc_style);
             }
-            FlatRow::Detail(text) => {
+            Some(FlatRow::Detail(text)) => {
                 let detail_style = Style::default().fg(theme.gray);
                 let display: String = text.chars().take(w).collect();
                 buf.set_string(content_area.x, row_y, &display, detail_style);
             }
+            None => continue,
         }
     }
 }
@@ -1583,7 +1605,9 @@ fn render_personas_tab(
     let mut rows: Vec<PersonaFlatRow> = Vec::new();
     for &idx in &filtered {
         rows.push(PersonaFlatRow::Name(idx));
-        let persona = &state.personas[idx];
+        let Some(persona) = state.personas.get(idx) else {
+            continue;
+        };
         let is_expanded = state.persona_expanded.contains(&idx);
         if is_expanded {
             if let Some(ref desc) = persona.description
@@ -1620,8 +1644,12 @@ fn render_personas_tab(
     let mut selected_end = selected_row + 1;
     while selected_end < rows.len()
         && matches!(
-            rows[selected_end],
-            PersonaFlatRow::Description(..) | PersonaFlatRow::Tags(..) | PersonaFlatRow::Hint(..)
+            rows.get(selected_end),
+            Some(
+                PersonaFlatRow::Description(..)
+                    | PersonaFlatRow::Tags(..)
+                    | PersonaFlatRow::Hint(..)
+            )
         )
     {
         selected_end += 1;
@@ -1646,8 +1674,8 @@ fn render_personas_tab(
         if row_y >= content_area.y + content_area.height {
             break;
         }
-        match &rows[ri] {
-            PersonaFlatRow::Name(idx) => {
+        match rows.get(ri) {
+            Some(PersonaFlatRow::Name(idx)) => {
                 state.row_map.push((row_y, *idx));
                 let is_selected = *idx == state.persona_selected;
                 let is_expanded = state.persona_expanded.contains(idx);
@@ -1676,7 +1704,9 @@ fn render_personas_tab(
                 }
                 buf.set_string(x, row_y, indicator, ind_style);
                 x += 2;
-                let persona = &state.personas[*idx];
+                let Some(persona) = state.personas.get(*idx) else {
+                    continue;
+                };
                 let remaining = (content_area.x + content_area.width).saturating_sub(x) as usize;
                 let name_display: String = persona.name.chars().take(remaining).collect();
                 let mut name_style = Style::default()
@@ -1717,7 +1747,7 @@ fn render_personas_tab(
                     }
                 }
             }
-            PersonaFlatRow::Description(idx, line) => {
+            Some(PersonaFlatRow::Description(idx, line)) => {
                 state.row_map.push((row_y, *idx));
                 let is_selected = *idx == state.persona_selected;
                 let bg = if is_selected {
@@ -1739,7 +1769,7 @@ fn render_personas_tab(
                 }
                 buf.set_string(desc_x, row_y, line, desc_style);
             }
-            PersonaFlatRow::Tags(idx, tags) => {
+            Some(PersonaFlatRow::Tags(idx, tags)) => {
                 state.row_map.push((row_y, *idx));
                 let is_selected = *idx == state.persona_selected;
                 let bg = if is_selected {
@@ -1762,7 +1792,7 @@ fn render_personas_tab(
                 let display = format!("[{tags}]");
                 buf.set_string(tag_x, row_y, &display, tag_style);
             }
-            PersonaFlatRow::Hint(idx, text) => {
+            Some(PersonaFlatRow::Hint(idx, text)) => {
                 state.row_map.push((row_y, *idx));
                 let is_selected = *idx == state.persona_selected;
                 let bg = if is_selected {
@@ -1784,6 +1814,7 @@ fn render_personas_tab(
                 }
                 buf.set_string(hint_x, row_y, text, hint_style);
             }
+            None => continue,
         }
     }
 }
@@ -1833,7 +1864,10 @@ fn render_create_text_field(
     let viewport = editor.viewport(remaining);
     let leading;
     let display: &str = if active {
-        &editor.text()[viewport.visible_byte_range.clone()]
+        editor
+            .text()
+            .get(viewport.visible_byte_range.clone())
+            .unwrap_or("")
     } else {
         leading = crate::render::line_utils::truncate_str(editor.text(), remaining);
         &leading
@@ -2588,9 +2622,7 @@ mod tests {
     }
     #[test]
     fn agents_tab_all_covers_variants() {
-        assert_eq!(AgentsTab::ALL.len(), 2);
-        assert_eq!(AgentsTab::ALL[0], AgentsTab::Agents);
-        assert_eq!(AgentsTab::ALL[1], AgentsTab::Personas);
+        assert_eq!(AgentsTab::ALL, &[AgentsTab::Agents, AgentsTab::Personas]);
     }
     #[test]
     fn agents_tab_labels_nonempty() {
@@ -2630,15 +2662,20 @@ mod tests {
             ..Default::default()
         };
         let list = merge_persona_lists(&bundle, Path::new("/tmp"));
-        assert_eq!(list.len(), 2);
-        assert_eq!(list[0].name, "researcher");
-        assert_eq!(list[0].description.as_deref(), Some("thorough researcher"));
-        assert!(list[0].has_inputs);
-        assert!(!list[0].has_outputs);
-        assert_eq!(list[1].name, "auditor");
-        assert!(list[1].description.is_none());
-        assert!(!list[1].has_inputs);
-        assert!(list[1].has_outputs);
+        let [researcher, auditor] = list.as_slice() else {
+            panic!("expected two personas: {list:?}");
+        };
+        assert_eq!(researcher.name, "researcher");
+        assert_eq!(
+            researcher.description.as_deref(),
+            Some("thorough researcher")
+        );
+        assert!(researcher.has_inputs);
+        assert!(!researcher.has_outputs);
+        assert_eq!(auditor.name, "auditor");
+        assert!(auditor.description.is_none());
+        assert!(!auditor.has_inputs);
+        assert!(auditor.has_outputs);
     }
     #[test]
     fn build_persona_list_fallback_to_names() {
@@ -2648,12 +2685,14 @@ mod tests {
             ..Default::default()
         };
         let list = merge_persona_lists(&bundle, Path::new("/tmp"));
-        assert_eq!(list.len(), 2);
-        assert_eq!(list[0].name, "alpha");
-        assert!(list[0].description.is_none());
-        assert!(!list[0].has_inputs);
-        assert!(!list[0].has_outputs);
-        assert_eq!(list[1].name, "beta");
+        let [alpha, beta] = list.as_slice() else {
+            panic!("expected two personas: {list:?}");
+        };
+        assert_eq!(alpha.name, "alpha");
+        assert!(alpha.description.is_none());
+        assert!(!alpha.has_inputs);
+        assert!(!alpha.has_outputs);
+        assert_eq!(beta.name, "beta");
     }
     #[test]
     fn build_persona_list_empty_bundle() {
@@ -2683,11 +2722,13 @@ mod tests {
             ..Default::default()
         };
         let list = merge_persona_lists(&bundle, dir.path());
-        assert_eq!(list.len(), 2);
-        assert_eq!(list[0].name, "bundled-one");
-        assert_eq!(list[1].name, "local-only");
-        assert_eq!(list[1].scope_label.as_deref(), Some("project"));
-        assert!(list[1].source_path.is_some());
+        let [bundled, local] = list.as_slice() else {
+            panic!("expected two personas: {list:?}");
+        };
+        assert_eq!(bundled.name, "bundled-one");
+        assert_eq!(local.name, "local-only");
+        assert_eq!(local.scope_label.as_deref(), Some("project"));
+        assert!(local.source_path.is_some());
     }
     #[test]
     fn create_persona_template_project_scope_writes_toml() {
@@ -3325,12 +3366,20 @@ mod tests {
             &theme,
         );
         let search_view = state.search_viewport(16);
-        let search_visible = &state.search_query()[search_view.visible_byte_range.clone()];
+        let Some(search_visible) = state
+            .search_query()
+            .get(search_view.visible_byte_range.clone())
+        else {
+            panic!("search viewport out of range: {search_view:?}");
+        };
         assert!(search_visible.contains('中'));
         assert!(search_visible.contains("e\u{301}"));
         assert!(search_visible.contains(grapheme));
         let search_cursor_x = 2 + search_view.cursor_display_column as u16;
-        assert_eq!(search_buffer[(search_cursor_x, 0)].bg, theme.text_primary);
+        assert_eq!(
+            search_buffer.cell((search_cursor_x, 0)).map(|c| c.bg),
+            Some(theme.text_primary)
+        );
         state.search_active = false;
         let mut unfocused_search = Buffer::empty(search_area);
         render_agents_search(
@@ -3341,7 +3390,7 @@ mod tests {
             &theme,
         );
         let unfocused_text = (2..search_area.width)
-            .map(|x| unfocused_search[(x, 0)].symbol())
+            .filter_map(|x| unfocused_search.cell((x, 0)).map(|c| c.symbol()))
             .collect::<String>();
         assert!(unfocused_text.starts_with("1234567890"));
         let mut input = PersonaCreateInput::new();
@@ -3352,18 +3401,23 @@ mod tests {
         render_persona_create_form(&mut create_buffer, &create_area, &input, None, &theme);
         let editor_width = create_area.width as usize - "Name: ".len();
         let create_view = input.name_editor().viewport(editor_width);
-        let create_visible = &input.name()[create_view.visible_byte_range.clone()];
+        let Some(create_visible) = input.name().get(create_view.visible_byte_range.clone()) else {
+            panic!("create viewport out of range: {create_view:?}");
+        };
         assert!(create_visible.contains('中'));
         assert!(create_visible.contains("e\u{301}"));
         assert!(create_visible.contains(grapheme));
         let create_cursor_x = "Name: ".len() as u16 + create_view.cursor_display_column as u16;
-        assert_eq!(create_buffer[(create_cursor_x, 2)].bg, theme.text_primary);
+        assert_eq!(
+            create_buffer.cell((create_cursor_x, 2)).map(|c| c.bg),
+            Some(theme.text_primary)
+        );
         input.set_field_text(CreateField::Description, &text);
         let _ = input.set_field_cursor_byte(CreateField::Description, text.len() - 1);
         let mut inactive_buffer = Buffer::empty(create_area);
         render_persona_create_form(&mut inactive_buffer, &create_area, &input, None, &theme);
         let description_text = ("Description: ".len() as u16..create_area.width)
-            .map(|x| inactive_buffer[(x, 4)].symbol())
+            .filter_map(|x| inactive_buffer.cell((x, 4)).map(|c| c.symbol()))
             .collect::<String>();
         assert!(description_text.starts_with("1234567890"));
     }

@@ -14,9 +14,27 @@
 
 use std::path::{Path, PathBuf};
 
-use crate::agent::mvp_agent::{CodeNavEligibility, MvpAgent};
+use crate::extensions::agent_runtime::AgentRuntime;
 use agent_client_protocol as acp;
 use serde::{Deserialize, Serialize};
+
+/// Reason why a client is not eligible to use codebase indexing.
+/// Produced by the run loop's eligibility check when one of the policy gates fails.
+/// Used in `x.ai/code/status` responses and to generate clear error messages on code-nav requests from ineligible clients.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CodeNavEligibility {
+    /// Client type is not web (web-only for initial rollout).
+    ClientNotWeb,
+    /// Client did not advertise `x.ai/codeNavigation.enabled`.
+    CapabilityNotAdvertised,
+    /// `codebase_indexing` feature is disabled in config (or excluded by glob).
+    DisabledByConfig,
+    /// The cwd is not inside a git repository.
+    NotGitRepo,
+    /// `sessionId` is required for code navigation but was absent or refers to an unknown / evicted session.
+    /// Per-client capability cannot be determined without a valid session context.
+    SessionRequired,
+}
 
 /// Record a structured telemetry event at the end of a code-nav handler call, once per request.
 /// The fields separate first-use latency (newly spawned, high elapsed_ms) from reuse latency.
@@ -162,7 +180,7 @@ pub(crate) struct StatusResponse {
 /// Eligibility checks still run in shell since they depend on agent-level config (client type, feature flags).
 #[tracing::instrument(name = "ext.code_nav", skip_all, fields(method = %args.method))]
 pub async fn handle(
-    agent: &MvpAgent,
+    agent: &dyn AgentRuntime,
     ops: &xai_grok_workspace::WorkspaceOps,
     args: &acp::ExtRequest,
 ) -> ExtResult {
@@ -366,7 +384,7 @@ fn to_code_nav_ext_response(resp: xai_grok_workspace::workspace_ops::CodeNavResp
 
 /// Check eligibility, ensure the codebase index is started, and return whether the index was newly created (for telemetry).
 fn ensure_eligible_and_started(
-    agent: &MvpAgent,
+    agent: &dyn AgentRuntime,
     session_id: Option<&acp::SessionId>,
     cwd: &Path,
 ) -> Result<bool, acp::Error> {
@@ -385,7 +403,7 @@ fn ensure_eligible_and_started(
 
 /// Resolve cwd from session_id or direct cwd parameter.
 fn resolve_cwd(
-    agent: &MvpAgent,
+    agent: &dyn AgentRuntime,
     cwd: Option<String>,
     session_id: Option<&acp::SessionId>,
 ) -> Result<PathBuf, acp::Error> {

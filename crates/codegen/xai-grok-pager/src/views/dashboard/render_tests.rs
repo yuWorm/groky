@@ -1,17 +1,128 @@
 use super::*;
-use crate::views::dashboard::DashboardRowId;
-use crate::views::dashboard::state::DashboardState;
+use crate::views::dashboard::state::{ActionsFocus, DashboardState};
+use crate::views::dashboard::test_support::{buf_to_text, header_test_row};
+use crate::views::dashboard::{DashboardRowId, RowBadge};
 
-/// Spinner glyph stays stable for `SPINNER_DIVISOR` successive ticks before advancing.
+fn buf_cell(buf: &Buffer, x: u16, y: u16) -> &ratatui::buffer::Cell {
+    buf.cell((x, y))
+        .unwrap_or_else(|| panic!("missing cell ({x},{y})"))
+}
+
 #[test]
 fn state_icon_spinner_advances_every_n_ticks() {
     let g0 = state_icon(RowState::Working, 0);
-    // Same glyph for divisor-1 more ticks.
     for t in 1..SPINNER_DIVISOR {
         assert_eq!(state_icon(RowState::Working, t), g0);
     }
     let g1 = state_icon(RowState::Working, SPINNER_DIVISOR);
     assert_ne!(g1, g0, "spinner must advance after SPINNER_DIVISOR ticks");
+}
+
+fn paint_rows(states: &[RowState], tick: u64) -> (Vec<(String, Color)>, PaintedAnimations) {
+    let area = Rect::new(0, 0, 80, 3 + 3 * states.len() as u16);
+    let rows: Vec<DashboardRow> = states
+        .iter()
+        .enumerate()
+        .map(|(i, &s)| header_test_row(i as u32 + 1, s, "row label"))
+        .collect();
+    let mut buf = Buffer::empty(area);
+    let mut state = DashboardState::new();
+    state.spinner_tick = tick;
+    render_rows(&mut buf, area, &Theme::groknight(), &rows, &mut state);
+    let cells = buf
+        .content
+        .iter()
+        .map(|cell| (cell.symbol().to_owned(), cell.fg))
+        .collect();
+    (cells, state.painted_animations)
+}
+
+fn painted_row_cells(row_state: RowState, tick: u64) -> Vec<(String, Color)> {
+    paint_rows(&[row_state], tick).0
+}
+
+#[test]
+fn row_paint_changes_across_ticks_iff_state_is_animated() {
+    use strum::IntoEnumIterator as _;
+    let later = NEEDS_INPUT_BLINK_DIVISOR;
+    assert_ne!(
+        state_icon(RowState::Working, 0),
+        state_icon(RowState::Working, later),
+        "fixture: the tick pair must land on different spinner frames"
+    );
+    for row_state in RowState::iter() {
+        assert_eq!(
+            row_state.animation().is_some(),
+            painted_row_cells(row_state, 0) != painted_row_cells(row_state, later),
+            "{row_state:?}: animation() must match whether the painted row changes across ticks"
+        );
+    }
+}
+
+#[test]
+fn dashboard_tick_reports_exactly_the_ticks_where_the_painted_rows_repaint() {
+    use strum::IntoEnumIterator as _;
+    let animated: Vec<RowState> = RowState::iter()
+        .filter(|s| s.animation().is_some())
+        .collect();
+    let cycle = SPINNER_DIVISOR * NEEDS_INPUT_BLINK_DIVISOR;
+    for mask in 0..(1u32 << animated.len()) {
+        let on_screen: Vec<RowState> = animated
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| mask & (1 << i) != 0)
+            .map(|(_, &s)| s)
+            .collect();
+        let mut state = DashboardState::new();
+        let (mut previous_cells, painted) = paint_rows(&on_screen, state.spinner_tick);
+        state.painted_animations = painted;
+        let mut changes = 0;
+        for _ in 0..cycle {
+            let previous = state.spinner_tick;
+            let reported = state.tick();
+            let tick = state.spinner_tick;
+            let (cells, _) = paint_rows(&on_screen, tick);
+            let painted_changed = cells != previous_cells;
+            previous_cells = cells;
+            assert_eq!(
+                painted_changed, reported,
+                "{on_screen:?} on screen, tick {previous}->{tick}: DashboardState::tick must match whether a painted row repaints"
+            );
+            changes += u64::from(reported);
+        }
+        let expected = match (
+            on_screen.contains(&RowState::Working),
+            on_screen.contains(&RowState::NeedsInput),
+        ) {
+            (false, false) => 0,
+            (true, false) => cycle / SPINNER_DIVISOR,
+            (false, true) => cycle / NEEDS_INPUT_BLINK_DIVISOR,
+            (true, true) => {
+                let spinner = cycle / SPINNER_DIVISOR;
+                let blink = cycle / NEEDS_INPUT_BLINK_DIVISOR;
+                let (mut a, mut b) = (SPINNER_DIVISOR, NEEDS_INPUT_BLINK_DIVISOR);
+                while b != 0 {
+                    let r = a % b;
+                    a = b;
+                    b = r;
+                }
+                spinner + blink - a
+            }
+        };
+        assert_eq!(
+            expected, changes,
+            "{on_screen:?}: redraws per {cycle}-tick cycle"
+        );
+    }
+}
+
+#[test]
+fn dashboard_tick_wraps_the_counter() {
+    let mut state = DashboardState::new();
+    state.painted_animations.mark(Animation::Spinner);
+    state.spinner_tick = u64::MAX;
+    assert!(state.tick());
+    assert_eq!(0, state.spinner_tick);
 }
 
 /// Every `RowState` variant resolves to a glyph.
@@ -72,18 +183,6 @@ fn slash_dropdown_never_paints_outside_a_short_dashboard() {
             );
         }
     }
-}
-
-/// Helper: read buffer row-by-row so multi-cell substring checks see the visible text in left-to-right order.
-fn buf_to_text(buf: &Buffer) -> String {
-    let mut content = String::new();
-    for y in 0..buf.area.height {
-        for x in 0..buf.area.width {
-            content.push_str(buf[(x, y)].symbol());
-        }
-        content.push('\n');
-    }
-    content
 }
 
 #[test]
@@ -335,8 +434,8 @@ fn open_previous_actions_button_is_v2_only_and_follows_new_agent() {
         v2_state.handle_input(&click, &crate::actions::ActionRegistry::defaults()),
         crate::app::app_view::InputOutcome::Action(crate::app::actions::Action::ShowSessionPicker)
     ));
-    assert!(v2_state.open_session_button_focused);
-    assert!(!v2_state.new_agent_button_focused);
+    assert!(v2_state.open_session_button_focused());
+    assert!(!v2_state.new_agent_button_focused());
     assert!(v2_state.list_focused);
     let enter = crossterm::event::Event::Key(crossterm::event::KeyEvent::new(
         crossterm::event::KeyCode::Enter,
@@ -347,21 +446,9 @@ fn open_previous_actions_button_is_v2_only_and_follows_new_agent() {
         crate::app::app_view::InputOutcome::Action(crate::app::actions::Action::ShowSessionPicker)
     ));
 
+    // Visual order: `+ New Agent` → (Right) `Open Previous` → (Left) back
     v2_state.focus_new_agent_button();
     v2_state.list_focused = true;
-    let left = crossterm::event::Event::Key(crossterm::event::KeyEvent::new(
-        crossterm::event::KeyCode::Left,
-        crossterm::event::KeyModifiers::NONE,
-    ));
-    assert!(matches!(
-        v2_state.handle_input(&left, &crate::actions::ActionRegistry::defaults()),
-        crate::app::app_view::InputOutcome::Changed
-    ));
-    assert!(v2_state.open_session_button_focused);
-    assert!(matches!(
-        v2_state.handle_input(&enter, &crate::actions::ActionRegistry::defaults()),
-        crate::app::app_view::InputOutcome::Action(crate::app::actions::Action::ShowSessionPicker)
-    ));
     let right = crossterm::event::Event::Key(crossterm::event::KeyEvent::new(
         crossterm::event::KeyCode::Right,
         crossterm::event::KeyModifiers::NONE,
@@ -370,8 +457,21 @@ fn open_previous_actions_button_is_v2_only_and_follows_new_agent() {
         v2_state.handle_input(&right, &crate::actions::ActionRegistry::defaults()),
         crate::app::app_view::InputOutcome::Changed
     ));
-    assert!(v2_state.new_agent_button_focused);
-    assert!(!v2_state.open_session_button_focused);
+    assert!(v2_state.open_session_button_focused());
+    assert!(matches!(
+        v2_state.handle_input(&enter, &crate::actions::ActionRegistry::defaults()),
+        crate::app::app_view::InputOutcome::Action(crate::app::actions::Action::ShowSessionPicker)
+    ));
+    let left = crossterm::event::Event::Key(crossterm::event::KeyEvent::new(
+        crossterm::event::KeyCode::Left,
+        crossterm::event::KeyModifiers::NONE,
+    ));
+    assert!(matches!(
+        v2_state.handle_input(&left, &crate::actions::ActionRegistry::defaults()),
+        crate::app::app_view::InputOutcome::Changed
+    ));
+    assert!(v2_state.new_agent_button_focused());
+    assert!(!v2_state.open_session_button_focused());
 
     let (v1, mut v1_state) = render(false, 100);
     assert!(!v1.contains("Open Previous"));
@@ -381,8 +481,8 @@ fn open_previous_actions_button_is_v2_only_and_follows_new_agent() {
         v1_state.handle_input(&left, &crate::actions::ActionRegistry::defaults()),
         crate::app::app_view::InputOutcome::Unchanged
     ));
-    assert!(v1_state.new_agent_button_focused);
-    assert!(!v1_state.open_session_button_focused);
+    assert!(v1_state.new_agent_button_focused());
+    assert!(!v1_state.open_session_button_focused());
 
     let (_, narrow_state) = render(true, 10);
     assert!(narrow_state.open_session_button_hit.rect.is_none());
@@ -390,6 +490,7 @@ fn open_previous_actions_button_is_v2_only_and_follows_new_agent() {
 
 #[test]
 fn dashboard_session_picker_renders_simple_open_surface() {
+    crate::appearance::cache::set_vim_mode(true);
     let area = Rect::new(0, 0, 100, 28);
     let mut buf = Buffer::empty(area);
     let mut state = DashboardState::new();
@@ -446,9 +547,162 @@ fn dashboard_session_picker_renders_simple_open_surface() {
     assert!(content.contains("Open session"));
     assert!(content.contains("Resume this local session"));
     assert!(
+        content.contains("/ search"),
+        "dashboard /resume must advertise / search, got: {content:?}"
+    );
+    assert!(
+        !content.contains("i search"),
+        "leaving the field must not add an i search hint, got: {content:?}"
+    );
+    crate::appearance::cache::set_vim_mode(false);
+    assert!(
+        content.contains("/ to search"),
+        "an unfocused search field must show the browse hint, got: {content:?}"
+    );
+    assert!(
+        !content.contains(">search:"),
+        "an unfocused search field must not use the editing marker"
+    );
+    assert!(
         surface.state.hit_areas.is_some(),
         "shared picker renderer must publish dashboard-owned hit areas"
     );
+}
+
+#[test]
+fn dashboard_session_picker_search_focus_keeps_the_selected_row() {
+    let _theme = crate::theme::cache::pin_theme();
+    let theme = Theme::current();
+    let area = Rect::new(0, 0, 100, 28);
+    let mut buf = Buffer::empty(area);
+    let mut state = DashboardState::new();
+    state.cwd = "/repo".into();
+    let mut agents = IndexMap::new();
+    let registry = crate::actions::ActionRegistry::defaults();
+    let snapshot = xai_grok_dashboard_store::WorkspaceSnapshot {
+        grouping: xai_grok_dashboard_store::Grouping::State,
+        members: vec![],
+        data_version: 1,
+    };
+    let workspace = crate::app::workspace_layout::WorkspaceView::from_snapshot(&snapshot);
+    let mut surface = crate::views::session_picker_surface::SessionPickerSurface::new(1);
+    surface.source_filter = crate::views::session_picker::SourceFilter::Local;
+    surface.entries = Some(vec![crate::app::app_view::SessionPickerEntry {
+        id: "local-session".to_owned(),
+        summary: "Resume this local session".to_owned(),
+        updated_at: chrono::Utc::now(),
+        created_at: chrono::Utc::now(),
+        cwd: "/repo".to_owned(),
+        hostname: None,
+        source: "local".to_owned(),
+        model_id: None,
+        num_messages: 1,
+        last_active_at: None,
+        branch: None,
+        repo_name: "repo".to_owned(),
+        worktree_label: None,
+        last_turn_summary: None,
+        last_recap: None,
+        session_kind: None,
+        card_detail: None,
+    }]);
+    surface.state.search_active = true;
+    surface.state.selected = 1;
+    surface.state.set_query("local");
+
+    let _ = render_dashboard(
+        &mut buf,
+        area,
+        &mut state,
+        &mut agents,
+        &registry,
+        None,
+        &[],
+        true,
+        crate::views::dashboard::WorkspaceRowInputs {
+            workspace: Some(&workspace),
+            provisional: &[],
+        },
+        Some(&mut surface),
+        false,
+        None,
+        None,
+    );
+    let content = buf_to_text(&buf);
+    assert!(
+        content.contains(" search:"),
+        "focused /resume search must keep the search label, got: {content:?}"
+    );
+    assert!(
+        !content.contains(">search:"),
+        "focused /resume search must not use a > marker"
+    );
+    assert!(
+        content.contains("local"),
+        "focused search must keep the query visible"
+    );
+    let search_y = (0..buf.area.height)
+        .find(|y| row_text(&buf, *y).contains(" search:"))
+        .expect("search row");
+    assert!(
+        row_has_title_label(&buf, search_y, &theme),
+        "focused search label must use the modal title color"
+    );
+    assert!(
+        row_has_block_cursor(&buf, search_y, &theme),
+        "focused search must paint a caret"
+    );
+    let title_y = (0..buf.area.height)
+        .find(|y| row_text(&buf, *y).contains("Resume this local session"))
+        .expect("selected session row");
+    assert!(
+        row_has_selection(&buf, title_y, &theme),
+        "editing search must keep the selected-result highlight"
+    );
+}
+
+fn row_text(buf: &Buffer, y: u16) -> String {
+    (0..buf.area.width).fold(String::new(), |mut text, x| {
+        if let Some(cell) = buf.cell((x, y)) {
+            text.push_str(cell.symbol());
+        }
+        text
+    })
+}
+
+fn row_has_title_label(buf: &Buffer, y: u16, theme: &Theme) -> bool {
+    (0..buf.area.width).any(|x| {
+        buf.cell((x, y)).is_some_and(|cell| {
+            cell.symbol() == "s"
+                && cell.fg == theme.text_primary
+                && cell.modifier.contains(ratatui::style::Modifier::BOLD)
+        })
+    })
+}
+
+fn row_has_block_cursor(buf: &Buffer, y: u16, theme: &Theme) -> bool {
+    (0..buf.area.width).any(|x| {
+        buf.cell((x, y)).is_some_and(|cell| {
+            if theme.is_bandless() {
+                cell.modifier.contains(ratatui::style::Modifier::REVERSED)
+            } else {
+                cell.bg == theme.text_primary
+            }
+        })
+    })
+}
+
+fn row_has_selection(buf: &Buffer, y: u16, theme: &Theme) -> bool {
+    let overlay = theme.selection_overlay();
+    (0..buf.area.width).any(|x| {
+        buf.cell((x, y)).is_some_and(|cell| {
+            if theme.is_bandless() {
+                cell.modifier.contains(ratatui::style::Modifier::REVERSED)
+            } else {
+                overlay.bg.is_some_and(|bg| cell.bg == bg)
+            }
+        })
+    })
 }
 
 /// The empty state with no agents renders the single hint line (never a fully blank screen).
@@ -478,6 +732,7 @@ fn render_dashboard_shows_roster_when_local_agents_empty() {
         title: Some("Fix fleet dashboard".into()),
         cwd: "/repo/work".into(),
         is_worktree: false,
+        session_kind: None,
         model_id: None,
         yolo: false,
         activity: RosterActivity::Working,
@@ -531,6 +786,7 @@ fn render_dashboard_hover_shows_delete_x_only_for_settled_rows() {
             title: Some("Hover me".into()),
             cwd: "/repo/work".into(),
             is_worktree: false,
+            session_kind: None,
             model_id: None,
             yolo: false,
             activity,
@@ -597,216 +853,6 @@ fn render_empty_state_paints_on_single_row_area() {
     assert!(
         content.contains("No agents yet"),
         "expected empty-state hint on 1-row area, got: {content:?}"
-    );
-}
-
-/// Session overlay paints a full bordered frame with `{title}` on the left of the title row and
-/// four affordances on the right: position indicator `{i}/{n}`, previous-row chip `[‹]`, next-row.
-#[test]
-fn render_dashboard_session_overlay_paints_bordered_frame_chrome() {
-    let mut buf = Buffer::empty(Rect::new(0, 0, 80, 10));
-    let theme = Theme::current();
-    let chrome = render_dashboard_session_overlay(
-        &mut buf,
-        Rect::new(0, 0, 80, 10),
-        &theme,
-        "Add responsiveness to /context",
-        Some((1, 2)),
-        false,
-        false,
-        false,
-    )
-    .expect("overlay must paint on a reasonably sized area");
-    let content = buf_to_text(&buf);
-    assert!(
-        content.contains("Add responsiveness to /context"),
-        "title must render, got: {content:?}",
-    );
-    for chip in ["[‹]", "[›]", "[Dashboard]"] {
-        assert!(
-            content.contains(chip),
-            "overlay must paint `{chip}`, got: {content:?}",
-        );
-    }
-    assert!(
-        content.contains("1/2"),
-        "overlay must paint the `1/2` position indicator, got: {content:?}",
-    );
-    // Frame chrome.
-    for corner in ['\u{250c}', '\u{2510}', '\u{2514}', '\u{2518}'] {
-        assert!(
-            content.contains(corner),
-            "overlay must paint frame corner `{corner}`, got: {content:?}",
-        );
-    }
-    for tee in ['\u{251c}', '\u{2524}'] {
-        assert!(
-            content.contains(tee),
-            "overlay must paint title-divider T-junction `{tee}`, got: {content:?}",
-        );
-    }
-    assert!(chrome.prev_rect.is_some(), "prev_rect must be populated");
-    assert!(chrome.next_rect.is_some(), "next_rect must be populated");
-    assert!(chrome.close_rect.is_some(), "close_rect must be populated");
-    // The `[‹]` / `[›]` chips are painted as plain text on `bg_base` (matching `[Dashboard]` and every other close affordance in the pager)
-    let prev = chrome.prev_rect.unwrap();
-    let prev_cell = &buf[(prev.x, prev.y)];
-    assert_eq!(
-        prev_cell.bg, theme.bg_base,
-        "`[‹]` must paint on `bg_base` (plain text like [Dashboard], no button bg), got bg={:?}",
-        prev_cell.bg,
-    );
-    // The `[‹]` and `[›]` chips paint flush against each other (no separating space) so the pair reads as one nav widget
-    let next = chrome.next_rect.unwrap();
-    assert_eq!(
-        prev.x + prev.width,
-        next.x,
-        "`[‹]` and `[›]` must be adjacent (no space between), got prev_end={}, next_start={}",
-        prev.x + prev.width,
-        next.x,
-    );
-    assert!(
-        content.contains("[‹][›]"),
-        "row must contain `[‹][›]` as a single adjacent group, got: {content:?}",
-    );
-    let close = chrome.close_rect.unwrap();
-    let close_cell = &buf[(close.x, close.y)];
-    assert_eq!(
-        close_cell.bg, theme.bg_base,
-        "close `[Dashboard]` must paint on `bg_base` (NOT a button), got bg={:?}",
-        close_cell.bg,
-    );
-}
-
-/// With `position = None` (overlay not active or single-agent dashboard), the overlay still paints the close button.
-/// It omits the position indicator and both cycle chips.
-#[test]
-fn render_dashboard_session_overlay_omits_cycle_chips_when_position_is_none() {
-    let mut buf = Buffer::empty(Rect::new(0, 0, 80, 10));
-    let theme = Theme::current();
-    let chrome = render_dashboard_session_overlay(
-        &mut buf,
-        Rect::new(0, 0, 80, 10),
-        &theme,
-        "Investigate bug",
-        None,
-        false,
-        false,
-        false,
-    )
-    .expect("overlay must paint");
-    let content = buf_to_text(&buf);
-    assert!(content.contains("[Dashboard]"));
-    assert!(!content.contains("[‹]"));
-    assert!(!content.contains("[›]"));
-    assert!(chrome.prev_rect.is_none());
-    assert!(chrome.next_rect.is_none());
-    assert!(chrome.close_rect.is_some());
-}
-
-/// `position = Some((1, 1))` (the user is the only attachable row) also omits the cycle chips.
-/// There is nowhere to walk to, so the chips would be dead clicks.
-#[test]
-fn render_dashboard_session_overlay_omits_cycle_chips_when_total_is_one() {
-    let mut buf = Buffer::empty(Rect::new(0, 0, 80, 10));
-    let theme = Theme::current();
-    let chrome = render_dashboard_session_overlay(
-        &mut buf,
-        Rect::new(0, 0, 80, 10),
-        &theme,
-        "Solo agent",
-        Some((1, 1)),
-        false,
-        false,
-        false,
-    )
-    .expect("overlay must paint");
-    let content = buf_to_text(&buf);
-    assert!(!content.contains("[‹]"));
-    assert!(!content.contains("[›]"));
-    // The position indicator is also suppressed; a `1/1` chip would be visual noise
-    assert!(
-        !content.contains("1/1"),
-        "single-row overlays must omit the position indicator, got: {content:?}",
-    );
-    assert!(chrome.prev_rect.is_none());
-    assert!(chrome.next_rect.is_none());
-}
-
-/// Hover feedback on the plain-text affordances (`[‹]`, `[›]`) only changes the foreground color (to `text_primary` on hover, `gray` otherwise).
-/// Background is always `bg_base` (no button fill).
-#[test]
-fn render_dashboard_session_overlay_highlights_hovered_affordance() {
-    let mut buf = Buffer::empty(Rect::new(0, 0, 80, 10));
-    let theme = Theme::current();
-    let chrome = render_dashboard_session_overlay(
-        &mut buf,
-        Rect::new(0, 0, 80, 10),
-        &theme,
-        "x",
-        Some((1, 2)),
-        false,
-        true, // hover_next
-        false,
-    )
-    .expect("overlay must paint");
-    let next = chrome.next_rect.unwrap();
-    let next_cell = &buf[(next.x, next.y)];
-    assert_eq!(
-        next_cell.bg, theme.bg_base,
-        "hovered `[›]` must paint on `bg_base` (plain text like [Dashboard]), got bg={:?}",
-        next_cell.bg,
-    );
-    assert_eq!(
-        next_cell.fg, theme.text_primary,
-        "hovered `[›]` must use text_primary fg, got: {:?}",
-        next_cell.fg,
-    );
-
-    let prev = chrome.prev_rect.unwrap();
-    let prev_cell = &buf[(prev.x, prev.y)];
-    assert_eq!(
-        prev_cell.bg, theme.bg_base,
-        "non-hovered `[‹]` must paint on `bg_base`, got bg={:?}",
-        prev_cell.bg,
-    );
-    assert_eq!(
-        prev_cell.fg, theme.gray,
-        "non-hovered `[‹]` must use gray fg, got: {:?}",
-        prev_cell.fg,
-    );
-}
-
-/// Paint the header row on its own, the way `render_dashboard` does (per-frame hit-area reset included), with no promo CTA.
-fn render_header_only(
-    buf: &mut Buffer,
-    area: Rect,
-    theme: &Theme,
-    rows: &[DashboardRow],
-    state: &mut DashboardState,
-) {
-    let registry = crate::actions::ActionRegistry::defaults();
-    state.clear_chrome_hit_areas();
-    render_header(buf, area, theme, rows, state, &registry, None);
-}
-
-/// Paint the actions row on its own, the way `render_dashboard` does (per-frame hit-area reset included).
-fn render_actions_only(
-    buf: &mut Buffer,
-    area: Rect,
-    theme: &Theme,
-    state: &mut DashboardState,
-    workspace_dashboard_enabled: bool,
-) {
-    let registry = crate::actions::ActionRegistry::defaults();
-    state.clear_chrome_hit_areas();
-    render_actions_row(
-        buf,
-        area,
-        theme,
-        state,
-        &registry,
-        workspace_dashboard_enabled,
     );
 }
 
@@ -878,537 +924,6 @@ fn chrome_hit_areas_do_not_survive_a_frame_that_skips_the_header() {
     }
 }
 
-/// The `+ New Agent` button paints green (`accent_success`) when focused so the cursor is obvious, and `text_secondary` otherwise.
-#[test]
-fn actions_new_agent_button_focused_is_green() {
-    let theme = Theme::current();
-    let area = Rect::new(0, 0, 120, 1);
-
-    // Focused (default for a fresh dashboard with no row selected).
-    let mut focused = DashboardState::new();
-    focused.focus_new_agent_button();
-    let mut buf = Buffer::empty(area);
-    render_actions_only(&mut buf, area, &theme, &mut focused, false);
-    let rect = focused
-        .new_agent_button_hit
-        .rect
-        .expect("button must render");
-    assert_eq!(
-        buf[(rect.x, rect.y)].fg,
-        theme.accent_success,
-        "focused + New Agent must paint green (accent_success), got {:?}",
-        buf[(rect.x, rect.y)].fg,
-    );
-
-    // Unfocused (a row holds the cursor instead).
-    let mut unfocused = DashboardState::new();
-    unfocused.focus_row(super::super::state::DashboardRowId::TopLevel(
-        crate::app::agent::AgentId(0),
-    ));
-    let mut buf2 = Buffer::empty(area);
-    render_actions_only(&mut buf2, area, &theme, &mut unfocused, false);
-    let rect2 = unfocused
-        .new_agent_button_hit
-        .rect
-        .expect("button must render");
-    assert_eq!(
-        buf2[(rect2.x, rect2.y)].fg,
-        theme.text_secondary,
-        "unfocused + New Agent must paint text_secondary, got {:?}",
-        buf2[(rect2.x, rect2.y)].fg,
-    );
-}
-
-/// On hover the unfocused `+ New Agent` button brightens its text from `text_secondary` to `text_primary` so the mouse user sees it is clickable.
-/// Only the foreground changes; the background stays `bg_base` (no fill).
-/// The `hovered` flag, which the mouse-move handler flips via `HitArea::update_hover`, drives the styling.
-#[test]
-fn actions_new_agent_button_hover_brightens_text() {
-    let theme = Theme::current();
-    let area = Rect::new(0, 0, 120, 1);
-
-    // Unfocused so the hover styling is isolated from the focus (green) styling
-    let mut state = DashboardState::new();
-    state.focus_row(super::super::state::DashboardRowId::TopLevel(
-        crate::app::agent::AgentId(0),
-    ));
-
-    // First render populates the button's hit rect.
-    let mut buf = Buffer::empty(area);
-    render_actions_only(&mut buf, area, &theme, &mut state, false);
-    let rect = state.new_agent_button_hit.rect.expect("button must render");
-
-    // Moving the mouse over the button flips hover on.
-    assert!(
-        state.new_agent_button_hit.update_hover(rect.x, rect.y),
-        "moving the mouse over the button must flip hover on",
-    );
-
-    // Re-render with hover active: text_primary fg, background unchanged (still bg_base, no fill on hover)
-    let mut buf2 = Buffer::empty(area);
-    render_actions_only(&mut buf2, area, &theme, &mut state, false);
-    let cell = &buf2[(rect.x, rect.y)];
-    assert_eq!(
-        cell.fg, theme.text_primary,
-        "hovered + New Agent must use text_primary fg, got {:?}",
-        cell.fg,
-    );
-    assert_eq!(
-        cell.bg, theme.bg_base,
-        "hovered + New Agent must keep bg_base (no hover fill), got {:?}",
-        cell.bg,
-    );
-
-    // Moving the mouse off the button clears hover: back to the resting state (text_secondary fg, bg_base)
-    assert!(
-        state.new_agent_button_hit.update_hover(rect.right() + 1, 0),
-        "moving the mouse off the button must flip hover off",
-    );
-    let mut buf3 = Buffer::empty(area);
-    render_actions_only(&mut buf3, area, &theme, &mut state, false);
-    let cell3 = &buf3[(rect.x, rect.y)];
-    assert_eq!(
-        cell3.bg, theme.bg_base,
-        "non-hovered + New Agent must paint on bg_base, got {:?}",
-        cell3.bg,
-    );
-    assert_eq!(
-        cell3.fg, theme.text_secondary,
-        "non-hovered + New Agent must use text_secondary fg, got {:?}",
-        cell3.fg,
-    );
-}
-
-/// Regression: the header renders from the dashboard's STAGED `cwd` (synced from `app.cwd` on a `/cd`), not the live process cwd.
-/// A location change updates `state.cwd` immediately; the process cwd only moves later via `Effect::SetWorkingDir` (which can fail).
-/// The header must follow `state.cwd` to show where dispatches will run.
-#[test]
-fn header_location_renders_from_staged_cwd() {
-    let theme = Theme::current();
-    let rows: Vec<DashboardRow> = Vec::new();
-    // Wide area so the path isn't width-truncated.
-    let area = Rect::new(0, 0, 200, 1);
-
-    let mut state = DashboardState::new();
-    // A distinct absolute path outside $HOME (rendered verbatim) that differs from the process cwd
-    // No git cache entry, so no branch span
-    state.cwd = std::path::PathBuf::from("/grok-staged-cwd-marker");
-
-    let mut buf = Buffer::empty(area);
-    render_header_only(&mut buf, area, &theme, &rows, &mut state);
-
-    let top_row: String = (0..area.width)
-        .map(|x| buf[(x, 0)].symbol().to_string())
-        .collect();
-    assert!(
-        top_row.contains("/grok-staged-cwd-marker"),
-        "header must render the staged cwd, not the process cwd; got: {top_row:?}",
-    );
-}
-
-/// The header paints the cwd in `text_secondary` and follows it with the `[Choose Ctrl+l]` picker hint.
-/// The hint's `Choose` label takes the dim row-secondary colour; its key is a shade fainter still, so the path reads first.
-#[test]
-fn header_paints_cwd_then_choose_hint_with_design_colours() {
-    // Fixed RGB palette: the colour tiers below collapse to `Reset` on the terminal theme
-    let theme = Theme::groknight();
-    let area = Rect::new(0, 0, 200, 1);
-    let mut state = DashboardState::new();
-    state.cwd = std::path::PathBuf::from("/grok-choose-hint-marker");
-    let mut buf = Buffer::empty(area);
-    render_header_only(&mut buf, area, &theme, &[], &mut state);
-    let text = buf_to_text(&buf);
-    let registry = crate::actions::ActionRegistry::defaults();
-    let key = registry
-        .key_for(crate::actions::ActionId::DashboardOpenLocationPicker)
-        .expect("location picker has a dashboard binding")
-        .display();
-    let expected = format!("/grok-choose-hint-marker [Choose {key}]");
-    let start = text
-        .find(&expected)
-        .unwrap_or_else(|| panic!("header must read `{expected}`, got: {text:?}"));
-
-    let cell = |offset: usize| &buf[((start + offset) as u16, 0)];
-    assert_eq!(
-        cell(0).fg,
-        theme.text_secondary,
-        "cwd paints text_secondary"
-    );
-    let choose_at = "/grok-choose-hint-marker [".len();
-    assert_eq!(
-        cell(choose_at).fg,
-        theme.gray_dim,
-        "`Choose` takes the dim row-secondary colour"
-    );
-    let key_at = "/grok-choose-hint-marker [Choose ".len();
-    // The key sits strictly between the background and `gray_dim`: fainter than `Choose`, still visible. Derived from the same theme
-    // slots the renderer blends, so a palette edit moves the expectation with it
-    let key_fg = cell(key_at).fg;
-    assert_eq!(
-        key_fg,
-        key_hint_style(&theme).fg.expect("key hint sets a fg")
-    );
-    let luma = |c: Color| match c {
-        Color::Rgb(r, g, b) => u32::from(r) + u32::from(g) + u32::from(b),
-        other => panic!("expected an RGB colour, got {other:?}"),
-    };
-    assert!(
-        luma(theme.bg_base) < luma(key_fg) && luma(key_fg) < luma(theme.gray_dim),
-        "the key must be fainter than `Choose` ({:?}) but lighter than the background ({:?}), got {key_fg:?}",
-        theme.gray_dim,
-        theme.bg_base,
-    );
-    assert_eq!(
-        cell(expected.len() - 1).fg,
-        theme.gray_dim,
-        "the closing bracket matches `Choose`"
-    );
-
-    let hit = state.location_hit.rect.expect("location hit rect");
-    assert!(
-        (hit.x as usize + hit.width as usize) >= start + expected.len(),
-        "the location hit rect must cover the `[Choose …]` hint, got {hit:?}",
-    );
-}
-
-/// On the bandless terminal theme nothing can be blended, so the key falls back to the polarity-safe DIM attribute with no hard colour.
-#[test]
-fn header_key_hint_falls_back_to_dim_on_terminal_theme() {
-    let theme = Theme::terminal();
-    let area = Rect::new(0, 0, 200, 1);
-    let mut state = DashboardState::new();
-    state.cwd = std::path::PathBuf::from("/grok-terminal-theme-marker");
-    let mut buf = Buffer::empty(area);
-    render_header_only(&mut buf, area, &theme, &[], &mut state);
-    let text = buf_to_text(&buf);
-    let key_at = text.find("[Choose ").expect("hint painted") + "[Choose ".len();
-    let key = &buf[(key_at as u16, 0)];
-    assert_eq!(
-        key.fg,
-        Color::Reset,
-        "no hard colour on the terminal palette"
-    );
-    assert!(
-        key.modifier.contains(Modifier::DIM),
-        "the key must use the DIM attribute instead, got {:?}",
-        key.modifier
-    );
-}
-
-/// When the header is too narrow for the cwd plus the hint, the hint is dropped before the path is cut.
-#[test]
-fn header_drops_choose_hint_before_truncating_path() {
-    let theme = Theme::current();
-    let mut state = DashboardState::new();
-    state.cwd = std::path::PathBuf::from("/grok-narrow-header-marker");
-    // Exactly the path width: the hint can't fit, the path must
-    let area = Rect::new(0, 0, "/grok-narrow-header-marker".len() as u16, 1);
-    let mut buf = Buffer::empty(area);
-    render_header_only(&mut buf, area, &theme, &[], &mut state);
-    let text = buf_to_text(&buf);
-    assert!(
-        text.contains("/grok-narrow-header-marker") && !text.contains("Choose"),
-        "path must survive intact and the hint must go, got: {text:?}",
-    );
-}
-
-/// The `+ New Agent` button reads `+ New Agent in Worktree` (and the toggle `Disable Worktree`) when worktree mode is armed in a git repo.
-/// It reads `+ New Agent` / `Worktree` otherwise (off, or armed outside a git repo, where the mode can't take effect).
-#[test]
-fn actions_labels_reflect_worktree_mode() {
-    let theme = Theme::current();
-    let area = Rect::new(0, 0, 120, 1);
-
-    // Off: plain new-agent button
-    let mut off = DashboardState::new();
-    off.cwd_has_git_ancestor = true;
-    let mut buf = Buffer::empty(area);
-    render_actions_only(&mut buf, area, &theme, &mut off, false);
-    let text = buf_to_text(&buf);
-    assert!(
-        text.contains("+ New Agent ") && !text.contains("in Worktree") && !text.contains("Disable"),
-        "worktree mode off → + New Agent / Worktree, got: {text:?}",
-    );
-
-    // Armed in a git repo: worktree labels
-    let mut armed = DashboardState::new();
-    armed.cwd_has_git_ancestor = true;
-    armed.dispatch_worktree = true;
-    let mut buf2 = Buffer::empty(area);
-    render_actions_only(&mut buf2, area, &theme, &mut armed, false);
-    let text2 = buf_to_text(&buf2);
-    assert!(
-        text2.contains("+ New Agent in Worktree") && text2.contains("Disable Worktree"),
-        "worktree mode armed in a repo → worktree labels, got: {text2:?}",
-    );
-
-    // Armed but NOT a git repo: still the plain labels (mode is inert)
-    let mut armed_no_git = DashboardState::new();
-    armed_no_git.cwd_has_git_ancestor = false;
-    armed_no_git.dispatch_worktree = true;
-    let mut buf3 = Buffer::empty(area);
-    render_actions_only(&mut buf3, area, &theme, &mut armed_no_git, false);
-    let text3 = buf_to_text(&buf3);
-    assert!(
-        text3.contains("+ New Agent ")
-            && !text3.contains("in Worktree")
-            && !text3.contains("Disable"),
-        "armed outside a repo → plain labels, got: {text3:?}",
-    );
-}
-
-/// The `Worktree Ctrl+w` hint is right-aligned, shows the registry's chord, and is a click target for the same toggle.
-#[test]
-fn actions_worktree_hint_shows_chord_and_toggles_on_click() {
-    let theme = Theme::current();
-    let area = Rect::new(0, 0, 120, 1);
-    let mut state = DashboardState::new();
-    let mut buf = Buffer::empty(area);
-    render_actions_only(&mut buf, area, &theme, &mut state, false);
-    let text = buf_to_text(&buf);
-    let registry = crate::actions::ActionRegistry::defaults();
-    let key = registry
-        .key_for(crate::actions::ActionId::DashboardToggleWorktree)
-        .expect("worktree toggle has a dashboard binding")
-        .display();
-    let expected = format!("Worktree {key}");
-    assert!(text.contains(&expected), "got: {text:?}");
-    let hit = state
-        .worktree_toggle_hit
-        .rect
-        .expect("worktree hint hit rect");
-    assert_eq!(
-        hit.x + hit.width,
-        area.x + area.width,
-        "the hint is flush with the row's right edge"
-    );
-
-    let click = crossterm::event::Event::Mouse(crossterm::event::MouseEvent {
-        kind: crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
-        column: hit.x,
-        row: hit.y,
-        modifiers: crossterm::event::KeyModifiers::NONE,
-    });
-    assert!(matches!(
-        state.handle_input(&click, &registry),
-        crate::app::app_view::InputOutcome::Action(
-            crate::app::actions::Action::DashboardToggleWorktree
-        )
-    ));
-}
-
-/// A squeezed actions row drops the right-hand items rather than painting over `+ New Agent`, which always survives.
-#[test]
-fn actions_row_drops_right_items_when_narrow() {
-    let theme = Theme::current();
-    let mut state = DashboardState::new();
-    // Room for `+ New Agent` plus a couple of cells, not for any right-hand hint
-    let area = Rect::new(0, 0, 14, 1);
-    let mut buf = Buffer::empty(area);
-    render_actions_only(&mut buf, area, &theme, &mut state, true);
-    let text = buf_to_text(&buf);
-    assert!(text.contains("+ New Agent"), "got: {text:?}");
-    assert!(state.new_agent_button_hit.rect.is_some());
-    assert!(state.worktree_toggle_hit.rect.is_none());
-    assert!(state.open_session_button_hit.rect.is_none());
-}
-
-/// At an in-between width the row keeps `Worktree` (laid out first, flush right) and drops `Open Previous` together with its divider,
-/// so no `│` is left dangling. A cursor parked on the dropped button falls back to `+ New Agent` in the same frame, painted focused.
-#[test]
-fn actions_row_keeps_worktree_and_drops_open_previous_with_divider() {
-    let theme = Theme::groknight();
-    let mut state = DashboardState::new();
-    state.focus_open_session_button();
-    // `+ New Agent` (11) + gap (2) + `Worktree Ctrl+w` (15) = 28 fits; adding ` │ Open Previous /resume` (24) does not
-    let area = Rect::new(0, 0, 40, 1);
-    let mut buf = Buffer::empty(area);
-    render_actions_only(&mut buf, area, &theme, &mut state, true);
-    let text = buf_to_text(&buf);
-    assert!(text.contains("Worktree"), "got: {text:?}");
-    assert!(
-        !text.contains("Open Previous") && !text.contains('│'),
-        "Open Previous and its divider must both go, got: {text:?}",
-    );
-    let worktree = state
-        .worktree_toggle_hit
-        .rect
-        .expect("worktree hint painted");
-    assert_eq!(worktree.x + worktree.width, area.x + area.width);
-    assert!(state.open_session_button_hit.rect.is_none());
-    assert!(
-        state.new_agent_button_focused && !state.open_session_button_focused,
-        "focus must fall back to + New Agent when Open Previous is dropped",
-    );
-    let new_agent = state.new_agent_button_hit.rect.expect("button painted");
-    assert_eq!(
-        buf[(new_agent.x, new_agent.y)].fg,
-        theme.accent_success,
-        "the fallback must show in the same frame: + New Agent paints focused",
-    );
-}
-
-/// Right-hand items follow strict right-to-left priority at every width.
-/// `Open Previous` is never painted without the worktree toggle; the toggle stays flush right.
-/// A wider armed label must not let a narrower item take the freed space.
-#[test]
-fn actions_row_right_items_follow_strict_priority_at_every_width() {
-    let theme = Theme::current();
-    for armed in [false, true] {
-        for width in 1u16..=90 {
-            let mut state = DashboardState::new();
-            state.cwd_has_git_ancestor = true;
-            state.dispatch_worktree = armed;
-            let area = Rect::new(0, 0, width, 1);
-            let mut buf = Buffer::empty(area);
-            render_actions_only(&mut buf, area, &theme, &mut state, true);
-            let ctx = format!("armed={armed} width={width}");
-            assert!(
-                state.new_agent_button_hit.rect.is_some(),
-                "{ctx}: + New Agent"
-            );
-            let worktree = state.worktree_toggle_hit.rect;
-            let open = state.open_session_button_hit.rect;
-            if let Some(w) = worktree {
-                assert_eq!(
-                    w.x + w.width,
-                    area.x + area.width,
-                    "{ctx}: toggle flush right"
-                );
-            }
-            assert!(
-                open.is_none() || worktree.is_some(),
-                "{ctx}: Open Previous must not outlive the worktree toggle",
-            );
-            let text = buf_to_text(&buf);
-            assert_eq!(
-                text.contains('│'),
-                open.is_some(),
-                "{ctx}: the divider appears exactly when both right-hand items do",
-            );
-        }
-    }
-
-    // The exact armed bands from the width table: 46-47 used to show `Open Previous` with the toggle gone
-    let armed_at = |width: u16| {
-        let mut state = DashboardState::new();
-        state.cwd_has_git_ancestor = true;
-        state.dispatch_worktree = true;
-        let area = Rect::new(0, 0, width, 1);
-        let mut buf = Buffer::empty(area);
-        render_actions_only(&mut buf, area, &theme, &mut state, true);
-        (
-            state.worktree_toggle_hit.rect.is_some(),
-            state.open_session_button_hit.rect.is_some(),
-        )
-    };
-    assert_eq!(armed_at(45), (false, false));
-    assert_eq!(armed_at(46), (false, false));
-    assert_eq!(armed_at(47), (false, false));
-    assert_eq!(armed_at(48), (true, false));
-    assert_eq!(armed_at(71), (true, false));
-    assert_eq!(armed_at(72), (true, true));
-}
-
-/// Tiny areas return `None` so the caller falls back to a chromeless render.
-#[test]
-fn render_dashboard_session_overlay_returns_none_on_tiny_area() {
-    let mut buf = Buffer::empty(Rect::new(0, 0, 12, 3));
-    let theme = Theme::current();
-    let chrome = render_dashboard_session_overlay(
-        &mut buf,
-        Rect::new(0, 0, 12, 3),
-        &theme,
-        "x",
-        Some((1, 2)),
-        false,
-        false,
-        false,
-    );
-    assert!(chrome.is_none());
-}
-
-/// The chromeless header variant paints the title and chips on the title row, with the requested top/side padding aligning it with the body below.
-/// It populates the affordance hit rects, hands back a full-width `content` rect beneath the header band, and paints NO border frame.
-#[test]
-fn render_dashboard_session_header_paints_padded_top_bar_without_border() {
-    const PAD_LEFT: u16 = 2;
-    const PAD_RIGHT: u16 = 2;
-    const PAD_TOP: u16 = 1;
-    let mut buf = Buffer::empty(Rect::new(0, 0, 80, 10));
-    let theme = Theme::current();
-    let chrome = render_dashboard_session_header(
-        &mut buf,
-        Rect::new(0, 0, 80, 10),
-        &theme,
-        "Add responsiveness to /context",
-        Some((1, 2)),
-        false,
-        false,
-        false,
-        PAD_LEFT,
-        PAD_RIGHT,
-        PAD_TOP,
-    )
-    .expect("header must paint on a reasonably sized area");
-    let content = buf_to_text(&buf);
-    assert!(
-        content.contains("Add responsiveness to /context"),
-        "title must render, got: {content:?}",
-    );
-    for chip in ["[‹]", "[›]", "[Dashboard]"] {
-        assert!(
-            content.contains(chip),
-            "header must paint `{chip}`, got: {content:?}",
-        );
-    }
-    assert!(
-        content.contains("1/2"),
-        "header must paint the `1/2` position indicator, got: {content:?}",
-    );
-    // No bordered frame: none of the box-drawing glyphs the bordered overlay paints should appear
-    for glyph in [
-        '\u{250c}', '\u{2510}', '\u{2514}', '\u{2518}', '\u{251c}', '\u{2524}', '\u{2502}',
-    ] {
-        assert!(
-            !content.contains(glyph),
-            "header must NOT paint frame glyph `{glyph}`, got: {content:?}",
-        );
-    }
-    // Content is the full-width area below the header band (`PAD_TOP` blank rows + 1 title row)
-    assert_eq!(
-        chrome.content,
-        Rect::new(0, PAD_TOP + 1, 80, 10 - (PAD_TOP + 1))
-    );
-    assert!(chrome.prev_rect.is_some(), "prev_rect must be populated");
-    assert!(chrome.next_rect.is_some(), "next_rect must be populated");
-    assert!(chrome.close_rect.is_some(), "close_rect must be populated");
-    // All affordances live on the title row (below the top pad).
-    assert_eq!(chrome.close_rect.unwrap().y, PAD_TOP);
-    assert_eq!(chrome.prev_rect.unwrap().y, PAD_TOP);
-    assert_eq!(chrome.next_rect.unwrap().y, PAD_TOP);
-    // Left side spacing: the title's first glyph lands exactly at column `PAD_LEFT`, and the columns before it are blank
-    assert_eq!(
-        buf[(PAD_LEFT, PAD_TOP)].symbol(),
-        "A",
-        "title must start at column PAD_LEFT",
-    );
-    for x in 0..PAD_LEFT {
-        assert_eq!(
-            buf[(x, PAD_TOP)].symbol(),
-            " ",
-            "columns before the title must be blank left padding",
-        );
-    }
-    // Right side spacing: the close chip's last glyph ends exactly `PAD_RIGHT` columns from the right edge
-    let close = chrome.close_rect.unwrap();
-    assert_eq!(
-        close.x + close.width,
-        80 - PAD_RIGHT,
-        "close chip must end PAD_RIGHT columns from the right edge",
-    );
-}
-
 /// Narrow-mode rendering truncates labels and still registers row_rects.
 #[test]
 fn render_narrow_mode_registers_row_rects() {
@@ -1417,6 +932,7 @@ fn render_narrow_mode_registers_row_rects() {
     let mut state = DashboardState::new();
     let row = DashboardRow {
         id: DashboardRowId::TopLevel(AgentId(1)),
+        session_id: None,
         label: "abcdefghij ".repeat(10),
         subtitle: None,
         state: RowState::Working,
@@ -1476,9 +992,12 @@ fn render_rows_hit_rects_leave_no_dead_zones() {
         .collect();
     rects.sort_by_key(|r| r.y);
     for pair in rects.windows(2) {
+        let [a, b] = pair else {
+            continue;
+        };
         assert_eq!(
-            pair[0].y + pair[0].height,
-            pair[1].y,
+            a.y + a.height,
+            b.y,
             "hit rects must tile without gaps: {pair:?}",
         );
     }
@@ -1486,23 +1005,25 @@ fn render_rows_hit_rects_leave_no_dead_zones() {
     // These rows are title-only, so the content line is the middle of the 3-cell rect.
     let theme = Theme::groknight();
     assert_ne!(theme.bg_hover, theme.bg_base);
-    let (id, rect) = state.row_rects[0].clone();
+    let Some((id, rect)) = state.row_rects.first().cloned() else {
+        panic!("expected a row rect: {:?}", state.row_rects);
+    };
     state.hovered_row = Some(id);
     render_rows(&mut buf, area, &theme, &rows, &mut state);
     let title_y = rect.y + 1;
     assert_eq!(
-        buf[(rect.x, title_y)].style().bg,
+        buf_cell(&buf, rect.x, title_y).style().bg,
         Some(theme.bg_hover),
         "hovered row must highlight its content line",
     );
-    let above = &buf[(rect.x, title_y - 1)];
+    let above = buf_cell(&buf, rect.x, title_y - 1);
     assert_eq!(above.symbol(), "\u{2580}", "spacer above must be a halo");
     assert_eq!(
         above.style().bg,
         Some(theme.bg_hover),
         "halo above must show the hover colour in its bottom half",
     );
-    let below = &buf[(rect.x, title_y + 1)];
+    let below = buf_cell(&buf, rect.x, title_y + 1);
     assert_eq!(below.symbol(), "\u{2580}", "spacer below must be a halo");
     assert_eq!(
         below.style().fg,
@@ -1517,13 +1038,13 @@ fn render_rows_hit_rects_leave_no_dead_zones() {
     let native = Theme::terminal();
     render_rows(&mut buf, area, &native, &rows, &mut state);
     assert!(
-        buf[(rect.x, title_y)]
+        buf_cell(&buf, rect.x, title_y)
             .style()
             .add_modifier
             .contains(ratatui::style::Modifier::REVERSED),
         "hovered row carries reverse video on the terminal theme",
     );
-    let above = &buf[(rect.x, title_y - 1)];
+    let above = buf_cell(&buf, rect.x, title_y - 1);
     assert_ne!(
         above.symbol(),
         "\u{2580}",
@@ -1544,7 +1065,7 @@ fn hovered_row_secondary_text_stays_visible_on_terminal_theme() {
     let theme = Theme::terminal();
     let mut buf = Buffer::empty(Rect::new(0, 0, 40, 3));
     render_row(&mut buf, Rect::new(0, 0, 40, 3), &theme, &row, &mut state);
-    let cell = &buf[(4, 1)];
+    let cell = &buf_cell(&buf, 4, 1);
     assert_eq!(cell.symbol(), "R", "secondary must render");
     assert!(
         cell.style()
@@ -1568,7 +1089,7 @@ fn hovered_row_secondary_text_stays_visible_on_terminal_theme() {
     let theme = Theme::groknight();
     let mut buf = Buffer::empty(Rect::new(0, 0, 40, 3));
     render_row(&mut buf, Rect::new(0, 0, 40, 3), &theme, &row, &mut state);
-    assert_eq!(buf[(4, 1)].style().fg, Some(theme.gray_dim));
+    assert_eq!(buf_cell(&buf, 4, 1).style().fg, Some(theme.gray_dim));
 }
 
 /// Terminal theme: the selected row inverts uniformly — colored glyphs. (state symbol, the Pending
@@ -1588,7 +1109,7 @@ fn selected_row_inverts_uniformly_on_terminal_theme() {
     render_row(&mut buf, Rect::new(0, 0, 40, 3), &theme, &row, &mut state);
     for y in 0..2u16 {
         for x in 0..40u16 {
-            let st = buf[(x, y)].style();
+            let st = buf_cell(&buf, x, y).style();
             assert!(
                 st.add_modifier.contains(Modifier::REVERSED),
                 "({x},{y}) must be reversed"
@@ -1606,7 +1127,7 @@ fn selected_row_inverts_uniformly_on_terminal_theme() {
     let mut buf = Buffer::empty(Rect::new(0, 0, 40, 3));
     render_row(&mut buf, Rect::new(0, 0, 40, 3), &theme, &row, &mut state);
     assert!(
-        !buf[(2, 0)]
+        !buf_cell(&buf, 2, 0)
             .style()
             .add_modifier
             .contains(Modifier::REVERSED)
@@ -1624,18 +1145,30 @@ fn render_row_centers_title_only_content() {
     let row = header_test_row(1, RowState::Idle, "solo");
     let mut buf = Buffer::empty(Rect::new(0, 0, 40, 3));
     render_row(&mut buf, Rect::new(0, 0, 40, 3), &theme, &row, &mut state);
-    assert_eq!(buf[(4, 1)].symbol(), "s", "title must sit on line 1");
-    assert_eq!(buf[(4, 0)].symbol(), " ", "line 0 must be padding");
-    assert_eq!(buf[(4, 2)].symbol(), " ", "line 2 must be padding");
+    assert_eq!(
+        buf_cell(&buf, 4, 1).symbol(),
+        "s",
+        "title must sit on line 1"
+    );
+    assert_eq!(buf_cell(&buf, 4, 0).symbol(), " ", "line 0 must be padding");
+    assert_eq!(buf_cell(&buf, 4, 2).symbol(), " ", "line 2 must be padding");
 
     // Title and secondary: top-aligned
     let mut row = header_test_row(2, RowState::Working, "pair");
     row.secondary_line = Some("Responding".to_string());
     let mut buf = Buffer::empty(Rect::new(0, 0, 40, 3));
     render_row(&mut buf, Rect::new(0, 0, 40, 3), &theme, &row, &mut state);
-    assert_eq!(buf[(4, 0)].symbol(), "p", "title must sit on line 0");
-    assert_eq!(buf[(4, 1)].symbol(), "R", "secondary must sit on line 1");
-    assert_eq!(buf[(4, 2)].symbol(), " ", "line 2 must be padding");
+    assert_eq!(
+        buf_cell(&buf, 4, 0).symbol(),
+        "p",
+        "title must sit on line 0"
+    );
+    assert_eq!(
+        buf_cell(&buf, 4, 1).symbol(),
+        "R",
+        "secondary must sit on line 1"
+    );
+    assert_eq!(buf_cell(&buf, 4, 2).symbol(), " ", "line 2 must be padding");
 }
 
 /// Empty area is a quick exit.
@@ -1664,8 +1197,6 @@ fn render_no_match_paints_filter_hint() {
         "no-match hint should embed the filter value, got: {content:?}"
     );
 }
-
-// ── snap_offset_to_line_boundary unit tests ──────────────────────
 
 /// An offset already on a boundary is returned unchanged.
 #[test]
@@ -2000,6 +1531,7 @@ fn sanitized_rename_draft_is_safe_in_both_render_paths() {
     let id = DashboardRowId::TopLevel(AgentId(7));
     let row = DashboardRow {
         id: id.clone(),
+        session_id: None,
         label: "row label".to_string(),
         subtitle: None,
         state: RowState::Working,
@@ -2063,6 +1595,7 @@ fn render_rename_overlay_aligns_with_title_and_keeps_icon() {
     let id = DashboardRowId::TopLevel(AgentId(7));
     let row = DashboardRow {
         id: id.clone(),
+        session_id: None,
         label: "row label".to_string(),
         subtitle: None,
         state: RowState::Idle,
@@ -2082,7 +1615,9 @@ fn render_rename_overlay_aligns_with_title_and_keeps_icon() {
     let rows = vec![row];
     let theme = Theme::current();
     let row_text = |buf: &Buffer, y: u16, w: u16| -> String {
-        (0..w).map(|x| buf[(x, y)].symbol().to_string()).collect()
+        (0..w)
+            .map(|x| buf_cell(buf, x, y).symbol().to_string())
+            .collect()
     };
 
     // Wide path: this title-only row centers its title within its 3-cell rect.
@@ -2092,7 +1627,12 @@ fn render_rename_overlay_aligns_with_title_and_keeps_icon() {
         render_rows(&mut buf, Rect::new(0, 0, 80, 5), &theme, &rows, &mut state);
         let line = row_text(&buf, 3, 80);
         let byte = line.find("row label").expect("title must render");
-        (byte, line[..byte].chars().count() as u16)
+        (
+            byte,
+            line.get(..byte)
+                .map(|s| s.chars().count() as u16)
+                .unwrap_or(0),
+        )
     };
     {
         let mut buf = Buffer::empty(Rect::new(0, 0, 80, 5));
@@ -2106,7 +1646,7 @@ fn render_rename_overlay_aligns_with_title_and_keeps_icon() {
             "wide: `rename:` must start at the title column, got: {line:?}",
         );
         assert_eq!(
-            buf[(2, 3)].symbol(),
+            buf_cell(&buf, 2, 3).symbol(),
             crate::glyphs::diamond_hollow(),
             "wide: the state icon must stay in place while renaming",
         );
@@ -2148,7 +1688,7 @@ fn render_rename_overlay_aligns_with_title_and_keeps_icon() {
             "narrow: `rename:` must start at the title column, got: {line:?}",
         );
         assert_eq!(
-            buf[(2, 1)].symbol(),
+            buf_cell(&buf, 2, 1).symbol(),
             crate::glyphs::diamond_hollow(),
             "narrow: the state icon must stay in place while renaming",
         );
@@ -2156,13 +1696,146 @@ fn render_rename_overlay_aligns_with_title_and_keeps_icon() {
 }
 
 #[test]
-fn rename_viewport_handles_long_unicode_in_wide_and_narrow_rows() {
+fn idle_live_chip_columns_stay_fixed_when_delete_replaces_age() {
+    let theme = Theme::groknight();
+    let delete_label = crate::glyphs::ballot_x_button();
+    let delete_width = UnicodeWidthStr::width(delete_label) as u16;
+    for badges in [
+        vec![RowBadge::Subagents(1)],
+        vec![RowBadge::Workflows(1)],
+        vec![RowBadge::Subagents(1), RowBadge::Workflows(1)],
+    ] {
+        let mut row = header_test_row(1, RowState::Idle, &"Long title ".repeat(20));
+        row.last_change_at = std::time::UNIX_EPOCH;
+        row.secondary_line = Some("Last turn summary".to_owned());
+        row.badges = badges;
+        let rows = [row];
+        for width in [40, 80] {
+            let area = Rect::new(0, 0, width, 8);
+            let mut normal = Buffer::empty(area);
+            let mut state = DashboardState::new();
+            render_rows(&mut normal, area, &theme, &rows, &mut state);
+            let row_rect = state.row_rects.first().expect("row rect").1;
+            let title_y = row_rect.y;
+            let row_id = rows.first().expect("row").id.clone();
+            let age = crate::util::format_time_ago(
+                rows.first()
+                    .expect("row")
+                    .last_change_at
+                    .elapsed()
+                    .unwrap_or_default(),
+            );
+            let age_w = UnicodeWidthStr::width(age.as_str()) as u16;
+            let age_x = width.saturating_sub(age_w + 1);
+            let delete_x = area.right() - delete_width - 1;
+            let painted_age = (age_x..age_x + age_w)
+                .map(|x| buf_cell(&normal, x, title_y).symbol())
+                .collect::<String>();
+            assert_eq!(age, painted_age);
+            let chip_line = (0..age_x)
+                .map(|x| buf_cell(&normal, x, title_y).symbol())
+                .collect::<String>();
+            assert!(chip_line.ends_with(" · "), "{chip_line}");
+            assert!(!chip_line.contains('['), "{chip_line}");
+            assert!(state.row_delete_rects.is_empty());
+            for hovered in [true, false] {
+                let mut state = DashboardState::new();
+                if hovered {
+                    state.hovered_row = Some(row_id.clone());
+                } else {
+                    state.arm_delete(row_id.clone());
+                }
+                let mut decorated = Buffer::empty(area);
+                render_rows(&mut decorated, area, &theme, &rows, &mut state);
+                let decorated_line = (0..delete_x)
+                    .map(|x| buf_cell(&decorated, x, title_y).symbol())
+                    .collect::<String>();
+                assert!(
+                    decorated_line.ends_with(" · "),
+                    "width {width}, hovered {hovered}: {decorated_line}"
+                );
+                if age_x == delete_x {
+                    assert_eq!(
+                        chip_line, decorated_line,
+                        "width {width}, hovered {hovered}"
+                    );
+                }
+                assert_eq!(row_rect, state.row_rects.first().expect("row rect").1);
+                assert_eq!(
+                    vec![(
+                        row_id.clone(),
+                        Rect::new(delete_x, title_y, delete_width, 1)
+                    )],
+                    state.row_delete_rects
+                );
+                let painted_delete = (delete_x..delete_x + delete_width)
+                    .map(|x| buf_cell(&decorated, x, title_y).symbol())
+                    .collect::<String>();
+                assert_eq!(delete_label, painted_delete);
+            }
+        }
+    }
+}
+
+#[test]
+fn working_row_hover_keeps_its_own_age_flush_with_chips() {
+    let theme = Theme::groknight();
+    let mut row = header_test_row(1, RowState::Working, "Hi monitors");
+    row.badges = vec![RowBadge::Watchers(3)];
+    row.secondary_line = Some("monitor said hi".to_owned());
+    row.last_change_at = std::time::SystemTime::now()
+        .checked_sub(std::time::Duration::from_secs(25 * 60))
+        .expect("age");
+    let rows = [row];
+    let width = 80u16;
+    let area = Rect::new(0, 0, width, 8);
+    let mut normal = Buffer::empty(area);
+    let mut state = DashboardState::new();
+    render_rows(&mut normal, area, &theme, &rows, &mut state);
+    let title_y = state.row_rects.first().expect("row rect").1.y;
+    let row_id = rows.first().expect("row").id.clone();
+    let age = crate::util::format_time_ago(
+        rows.first()
+            .expect("row")
+            .last_change_at
+            .elapsed()
+            .unwrap_or_default(),
+    );
+    let age_w = UnicodeWidthStr::width(age.as_str()) as u16;
+    let age_x = width.saturating_sub(age_w + 1);
+    let painted_age = (age_x..age_x + age_w)
+        .map(|x| buf_cell(&normal, x, title_y).symbol())
+        .collect::<String>();
+    assert_eq!(age, painted_age);
+    let before = (age_x.saturating_sub(3)..age_x)
+        .map(|x| buf_cell(&normal, x, title_y).symbol())
+        .collect::<String>();
+    assert_eq!(" · ", before);
+    assert!(state.row_delete_rects.is_empty());
+
+    let mut hovered = Buffer::empty(area);
+    let mut hovered_state = DashboardState::new();
+    hovered_state.hovered_row = Some(row_id);
+    render_rows(&mut hovered, area, &theme, &rows, &mut hovered_state);
+    let hovered_line = (0..width)
+        .map(|x| buf_cell(&hovered, x, title_y).symbol())
+        .collect::<String>();
+    let normal_line = (0..width)
+        .map(|x| buf_cell(&normal, x, title_y).symbol())
+        .collect::<String>();
+    assert_eq!(normal_line, hovered_line);
+    assert!(hovered_state.row_delete_rects.is_empty());
+}
+
+#[test]
+fn rename_hover_selection_and_delete_geometry_stay_consistent() {
     use crate::app::agent::AgentId;
     use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
 
     let id = DashboardRowId::TopLevel(AgentId(7));
     let row = DashboardRow {
         id: id.clone(),
+        session_id: None,
         label: "row label".to_string(),
         subtitle: None,
         state: RowState::Idle,
@@ -2172,7 +1845,7 @@ fn rename_viewport_handles_long_unicode_in_wide_and_narrow_rows() {
         cwd: std::path::PathBuf::from("/tmp"),
         last_change_at: std::time::SystemTime::now(),
         pinned: false,
-        badges: Vec::new(),
+        badges: vec![RowBadge::Subagents(1)],
         context_pct: None,
         indent: 0,
         parent_label: None,
@@ -2195,7 +1868,7 @@ fn rename_viewport_handles_long_unicode_in_wide_and_narrow_rows() {
             render_rows(&mut buffer, area, &theme, &rows, &mut state);
         }
         let line = (0..width)
-            .map(|x| buffer[(x, row_y)].symbol().to_string())
+            .map(|x| buf_cell(&buffer, x, row_y).symbol().to_string())
             .collect::<String>();
         assert!(line.contains('中'), "CJK tail missing: {line:?}");
         assert!(line.contains("e\u{301}"), "combining tail split: {line:?}");
@@ -2227,7 +1900,7 @@ fn rename_viewport_handles_long_unicode_in_wide_and_narrow_rows() {
             assert_ne!(middle_cursor, end_cursor);
         }
         let prefix_x = (0..width)
-            .find(|x| middle_buffer[(*x, row_y)].symbol() == "r")
+            .find(|x| buf_cell(&middle_buffer, *x, row_y).symbol() == "r")
             .expect("rename prefix");
         let row_rect = state
             .row_rects
@@ -2242,6 +1915,38 @@ fn rename_viewport_handles_long_unicode_in_wide_and_narrow_rows() {
             .saturating_sub(editor_x);
         let expected_cursor = editor_x + 20u16.min(editor_width.saturating_sub(1));
         assert_eq!(middle_cursor, (expected_cursor, row_y));
+        state.rename = None;
+        state.selected = Some(id.clone());
+        state.hovered_row = Some(id.clone());
+        state.row_delete_rects.clear();
+        let mut decorated = Buffer::empty(area);
+        if narrow {
+            render_narrow_rows(&mut decorated, area, &theme, &rows, &mut state);
+        } else {
+            render_rows(&mut decorated, area, &theme, &rows, &mut state);
+        }
+        let text = buf_to_text(&decorated);
+        assert!(
+            text.contains("Subagents 1") || text.contains("Sub 1"),
+            "{text}"
+        );
+        let delete_rect = state.row_delete_rects.first().expect("delete rect").1;
+        assert_eq!(row_y, delete_rect.y);
+        assert_eq!(
+            crate::glyphs::ballot_x_button()
+                .chars()
+                .next()
+                .unwrap()
+                .to_string(),
+            buf_cell(&decorated, delete_rect.x, delete_rect.y).symbol()
+        );
+        let decorated_row = state
+            .row_rects
+            .iter()
+            .find(|(row_id, _)| row_id == &id)
+            .unwrap()
+            .1;
+        assert_eq!(row_rect, decorated_row);
     }
 }
 
@@ -2280,9 +1985,27 @@ fn render_search_mode_uses_textarea_cursor_not_text_end() {
     let cursor = render_dispatch(&mut buffer, area, &theme, &mut state, None)
         .expect("focused search cursor");
     let prefix_x = (0..area.width)
-        .find(|x| buffer[(*x, cursor.1)].symbol() == "S")
+        .find(|x| buf_cell(&buffer, *x, cursor.1).symbol() == "S")
         .expect("Search prefix");
     assert_eq!(cursor.0, prefix_x + "Search: ".len() as u16 + 2);
+    assert!(
+        row_has_block_cursor(&buffer, cursor.1, &theme),
+        "focused dashboard search must paint a caret"
+    );
+}
+
+#[test]
+fn render_search_mode_hides_the_caret_while_the_list_is_focused() {
+    let area = Rect::new(0, 0, 40, 3);
+    let mut buffer = Buffer::empty(area);
+    let theme = Theme::current();
+    let mut state = DashboardState::new();
+    state.search_mode = true;
+    state.list_focused = true;
+    assert!(
+        render_dispatch(&mut buffer, area, &theme, &mut state, None).is_none(),
+        "a list-focused search field must not park the caret"
+    );
 }
 
 #[test]
@@ -2304,7 +2027,7 @@ fn render_search_mode_clips_prefix_and_cursor_at_widths_one_through_nine() {
         for x in 0..full.width {
             if x < area.x || x >= area.x + area.width {
                 assert_eq!(
-                    buffer[(x, 0)].symbol(),
+                    buf_cell(&buffer, x, 0).symbol(),
                     "#",
                     "width {width} wrote outside at column {x}",
                 );
@@ -2445,14 +2168,16 @@ fn render_dispatch_paints_feedback_badge_on_top_border() {
     let _ = render_dispatch(&mut buf, Rect::new(0, 0, 80, 3), &theme, &mut state, None);
 
     // Toast text lands on the TOP border row (y == 0).
-    let top_row: String = (0..80).map(|x| buf[(x, 0)].symbol().to_string()).collect();
+    let top_row: String = (0..80)
+        .map(|x| buf_cell(&buf, x, 0).symbol().to_string())
+        .collect();
     assert!(
         top_row.contains("Too short"),
         "feedback badge must paint on the top border, got: {top_row:?}",
     );
     // The badge ends before the right `╮` corner (corner preserved).
     assert_eq!(
-        buf[(79, 0)].symbol(),
+        buf_cell(&buf, 79, 0).symbol(),
         "\u{256e}",
         "right rounded corner must survive the badge",
     );
@@ -2476,7 +2201,9 @@ fn feedback_badge_renders_verbatim_in_neutral_color() {
     state.error_toast = Some(format!("{check} Theme: Grok Day"));
     let _ = render_dispatch(&mut buf, Rect::new(0, 0, 80, 3), &theme, &mut state, None);
 
-    let top_row: String = (0..80).map(|x| buf[(x, 0)].symbol().to_string()).collect();
+    let top_row: String = (0..80)
+        .map(|x| buf_cell(&buf, x, 0).symbol().to_string())
+        .collect();
     assert!(
         top_row.contains(&format!("{check} Theme: Grok Day")),
         "badge must paint the message verbatim, got: {top_row:?}",
@@ -2487,36 +2214,13 @@ fn feedback_badge_renders_verbatim_in_neutral_color() {
     );
     // Neutral colour: accent_user, never the error red
     let cx = (0..80)
-        .find(|&x| buf[(x, 0)].symbol() == check)
+        .find(|&x| buf_cell(&buf, x, 0).symbol() == check)
         .expect("the ✓ glyph must be painted");
     assert_eq!(
-        buf[(cx, 0)].fg,
+        buf_cell(&buf, cx, 0).fg,
         theme.accent_user,
         "badge must paint in the neutral accent_user colour (not the error red)",
     );
-}
-
-/// Helper for the group-header tests: build a top-level row with the given id and state, all other fields filled with sensible defaults.
-fn header_test_row(id: u32, state: RowState, label: &str) -> DashboardRow {
-    use crate::app::agent::AgentId;
-    DashboardRow {
-        id: DashboardRowId::TopLevel(AgentId(id as usize)),
-        label: label.to_string(),
-        subtitle: None,
-        state,
-        activity: None,
-        secondary_line: None,
-        cwd_display: String::new(),
-        cwd: std::path::PathBuf::from("/tmp"),
-        last_change_at: std::time::SystemTime::now(),
-        pinned: false,
-        badges: Vec::new(),
-        context_pct: None,
-        indent: 0,
-        parent_label: None,
-        is_more_placeholder: false,
-        more_count: 0,
-    }
 }
 
 /// A collapsed state section keeps its header (with the true count) but hides its rows; other sections are unaffected.
@@ -2863,6 +2567,53 @@ fn render_rows_emits_pinned_section_at_top() {
     );
 }
 
+#[test]
+fn pinned_rows_render_in_manual_order_after_activity_changes() {
+    for grouping in [Grouping::State, Grouping::Directory] {
+        for width in [30, 100] {
+            let mut first = header_test_row(2, RowState::Idle, "first pin");
+            first.pinned = true;
+            first.cwd_display = "/z".to_owned();
+            let mut second = header_test_row(1, RowState::Idle, "second pin");
+            second.pinned = true;
+            second.cwd_display = "/a".to_owned();
+            let reorder = vec![first.id.clone(), second.id.clone()];
+            let mut rows = vec![
+                first,
+                second,
+                header_test_row(3, RowState::Working, "unpinned"),
+            ];
+            let mut state = DashboardState::new();
+            state.grouping = grouping;
+            state.selected = reorder.first().cloned();
+            let area = Rect::new(0, 0, width, 30);
+
+            for activity in [RowState::Working, RowState::Idle] {
+                let row = rows
+                    .iter_mut()
+                    .find(|row| row.label == "second pin")
+                    .expect("second pin");
+                row.state = activity;
+                row.last_change_at += std::time::Duration::from_secs(60);
+                crate::views::dashboard::sort_rows(&mut rows, grouping, &reorder);
+                let mut buffer = Buffer::empty(area);
+                if width < MIN_DASHBOARD_WIDTH {
+                    render_narrow_rows(&mut buffer, area, &Theme::groknight(), &rows, &mut state);
+                } else {
+                    render_rows(&mut buffer, area, &Theme::groknight(), &rows, &mut state);
+                }
+
+                let text = buf_to_text(&buffer);
+                let first = text.find("first pin").expect("first pin rendered");
+                let second = text.find("second pin").expect("second pin rendered");
+                let unpinned = text.find("unpinned").expect("unpinned row rendered");
+                assert!(first < second && second < unpinned, "{text}");
+                assert_eq!(reorder.first(), state.selected.as_ref());
+            }
+        }
+    }
+}
+
 /// With grouping OFF (Directory) the "Pinned" text header is suppressed.
 /// A textless divider (a horizontal rule, no label) separates the pinned block from the rest; no state headers are emitted either.
 #[test]
@@ -3001,18 +2752,18 @@ fn render_rows_scrollbar_is_thick_overlay_without_layout_shift() {
 
     // The thick `█` thumb is painted on the rightmost column.
     let last_x = w - 1;
-    let has_thumb = (0..h).any(|y| buf_scroll[(last_x, y)].symbol() == "\u{2588}");
+    let has_thumb = (0..h).any(|y| buf_cell(&buf_scroll, last_x, y).symbol() == "\u{2588}");
     assert!(has_thumb, "scrollbar thumb (█) must overlay the right edge");
     // Old thin `│`-only thumb is gone.
-    let thin_only = (0..h).all(|y| buf_scroll[(last_x, y)].symbol() != "\u{2588}");
+    let thin_only = (0..h).all(|y| buf_cell(&buf_scroll, last_x, y).symbol() != "\u{2588}");
     assert!(!thin_only, "thumb must be the thick block glyph");
 
     // No layout shift: every content column (all but the overlaid right edge) matches the no-scrollbar render across the visible top
     for y in 0..h {
         for x in 0..(w - 1) {
             assert_eq!(
-                buf_scroll[(x, y)].symbol(),
-                buf_fit[(x, y)].symbol(),
+                buf_cell(&buf_scroll, x, y).symbol(),
+                buf_cell(&buf_fit, x, y).symbol(),
                 "content shifted at ({x},{y}) when the scrollbar appeared",
             );
         }
@@ -3031,6 +2782,7 @@ fn render_row_two_line_layout_paints_title_and_secondary() {
     state.spinner_tick = 8; // Tick 8 selects dot_spinner_frames()[2], the `⸬` glyph.
     let row = DashboardRow {
         id: DashboardRowId::TopLevel(crate::app::agent::AgentId(1)),
+        session_id: None,
         label: "who are you?".to_string(),
         subtitle: None,
         state: RowState::Working,
@@ -3051,34 +2803,34 @@ fn render_row_two_line_layout_paints_title_and_secondary() {
 
     // Title row.
     assert_eq!(
-        buf[(0, 0)].symbol(),
+        buf_cell(&buf, 0, 0).symbol(),
         " ",
         "row 0 col 0 must be marker space"
     );
     assert_eq!(
-        buf[(1, 0)].symbol(),
+        buf_cell(&buf, 1, 0).symbol(),
         " ",
         "row 0 col 1 must be the post-marker gap"
     );
     assert_eq!(
-        buf[(2, 0)].symbol(),
+        buf_cell(&buf, 2, 0).symbol(),
         "\u{2e2c}",
         "row 0 col 2 must be the spinner glyph `⸬` at tick=8",
     );
     assert_eq!(
-        buf[(3, 0)].symbol(),
+        buf_cell(&buf, 3, 0).symbol(),
         " ",
         "row 0 col 3 must be the post-icon gap"
     );
     assert_eq!(
-        buf[(4, 0)].symbol(),
+        buf_cell(&buf, 4, 0).symbol(),
         "w",
         "row 0 col 4 must start the label"
     );
 
     // Secondary row: `Responding` starts at the same column as the title's label start (col 4)
     assert_eq!(
-        buf[(4, 1)].symbol(),
+        buf_cell(&buf, 4, 1).symbol(),
         "R",
         "row 1 col 4 must start the secondary text",
     );
@@ -3086,7 +2838,7 @@ fn render_row_two_line_layout_paints_title_and_secondary() {
     // Age column right-aligns in the last few cells of row 0.
     let mut saw_s_in_age_zone = false;
     for x in (100 - 8)..100 {
-        if buf[(x, 0)].symbol() == "s" {
+        if buf_cell(&buf, x, 0).symbol() == "s" {
             saw_s_in_age_zone = true;
             break;
         }
@@ -3112,6 +2864,7 @@ fn render_row_selected_brightens_secondary_text() {
     let id = DashboardRowId::TopLevel(crate::app::agent::AgentId(7));
     let row = DashboardRow {
         id: id.clone(),
+        session_id: None,
         label: "investigate caching".to_string(),
         subtitle: None,
         state: RowState::Working,
@@ -3141,7 +2894,7 @@ fn render_row_selected_brightens_secondary_text() {
         &mut state_unselected,
     );
     assert_eq!(
-        buf[(4, 1)].fg,
+        buf_cell(&buf, 4, 1).fg,
         theme.gray_dim,
         "unselected row's secondary must paint in `gray_dim`",
     );
@@ -3158,7 +2911,7 @@ fn render_row_selected_brightens_secondary_text() {
         &mut state_selected,
     );
     assert_eq!(
-        buf[(4, 1)].fg,
+        buf_cell(&buf, 4, 1).fg,
         theme.text_secondary,
         "selected row's secondary must brighten to `text_secondary` \
          so the response line is readable",
@@ -3174,6 +2927,7 @@ fn render_row_needs_input_yellow_blink_no_badge_pending_prefix() {
     let theme = Theme::current();
     let make_row = || DashboardRow {
         id: DashboardRowId::TopLevel(crate::app::agent::AgentId(1)),
+        session_id: None,
         label: "ask me".to_string(),
         subtitle: None,
         state: RowState::NeedsInput,
@@ -3207,12 +2961,12 @@ fn render_row_needs_input_yellow_blink_no_badge_pending_prefix() {
     // Bright phase (tick 0): the bullet is full yellow.
     let bright = render(0);
     assert_eq!(
-        bright[(2, 0)].symbol(),
+        buf_cell(&bright, 2, 0).symbol(),
         crate::glyphs::diamond_filled(),
         "bullet glyph"
     );
     assert_eq!(
-        bright[(2, 0)].fg,
+        buf_cell(&bright, 2, 0).fg,
         theme.warning,
         "bright needs-input bullet must be yellow (warning)",
     );
@@ -3220,7 +2974,7 @@ fn render_row_needs_input_yellow_blink_no_badge_pending_prefix() {
     // No `[needs input]` badge on the title row.
     let mut title = String::new();
     for x in 0..bright.area.width {
-        title.push_str(bright[(x, 0)].symbol());
+        title.push_str(buf_cell(&bright, x, 0).symbol());
     }
     assert!(
         !title.contains("needs input"),
@@ -3229,12 +2983,12 @@ fn render_row_needs_input_yellow_blink_no_badge_pending_prefix() {
 
     // `Pending:` subtitle prefix is painted yellow (the rest of the subtitle is painted separately in the dim secondary colour)
     assert_eq!(
-        bright[(4, 1)].symbol(),
+        buf_cell(&bright, 4, 1).symbol(),
         "P",
         "secondary starts with `Pending:`"
     );
     assert_eq!(
-        bright[(4, 1)].fg,
+        buf_cell(&bright, 4, 1).fg,
         theme.warning,
         "`Pending:` prefix must be yellow",
     );
@@ -3243,7 +2997,7 @@ fn render_row_needs_input_yellow_blink_no_badge_pending_prefix() {
     if crate::render::color::blend_color(theme.bg_base, theme.warning, 0.5).is_some() {
         let dim = render(NEEDS_INPUT_BLINK_DIVISOR);
         assert_ne!(
-            dim[(2, 0)].fg,
+            buf_cell(&dim, 2, 0).fg,
             theme.warning,
             "dim blink phase must fade the bullet away from full yellow",
         );
@@ -3261,6 +3015,7 @@ fn render_row_new_session_fallback_label_is_two_tone() {
     let mut state = DashboardState::new();
     let row = DashboardRow {
         id: DashboardRowId::TopLevel(crate::app::agent::AgentId(1)),
+        session_id: None,
         label: "New session #abc12345".to_string(),
         subtitle: None,
         state: RowState::Idle,
@@ -3281,19 +3036,23 @@ fn render_row_new_session_fallback_label_is_two_tone() {
 
     // Title starts at col 4: "New session" (11 chars, cols 4..15) then " #abc12345" (suffix from col 15)
     assert_eq!(
-        buf[(4, 0)].symbol(),
+        buf_cell(&buf, 4, 0).symbol(),
         "N",
         "title head starts with `New session`"
     );
     assert_eq!(
-        buf[(4, 0)].fg,
+        buf_cell(&buf, 4, 0).fg,
         theme.text_primary,
         "`New session` head must use the primary colour",
     );
     // The `#` of the suffix sits at col 16 and must be dim.
-    assert_eq!(buf[(16, 0)].symbol(), "#", "suffix must start with `#`");
     assert_eq!(
-        buf[(16, 0)].fg,
+        buf_cell(&buf, 16, 0).symbol(),
+        "#",
+        "suffix must start with `#`"
+    );
+    assert_eq!(
+        buf_cell(&buf, 16, 0).fg,
         theme.gray_dim,
         "the `#id` suffix must be dim gray",
     );
@@ -3311,7 +3070,7 @@ fn unselected_group_header_label_is_muted_on_terminal_theme() {
 
     let theme = Theme::terminal();
     render_rows(&mut buf, Rect::new(0, 0, 80, 8), &theme, &rows, &mut state);
-    let label = buf[(2, 0)].style();
+    let label = buf_cell(&buf, 2, 0).style();
     assert!(
         label.add_modifier.contains(ratatui::style::Modifier::DIM),
         "terminal theme header label must be dimmed, got {label:?}"
@@ -3324,7 +3083,7 @@ fn unselected_group_header_label_is_muted_on_terminal_theme() {
     let theme = Theme::groknight();
     let mut buf = Buffer::empty(Rect::new(0, 0, 80, 8));
     render_rows(&mut buf, Rect::new(0, 0, 80, 8), &theme, &rows, &mut state);
-    let label = buf[(2, 0)].style();
+    let label = buf_cell(&buf, 2, 0).style();
     assert_eq!(label.fg, Some(theme.gray), "RGB keeps the gray label fg");
     assert!(!label.add_modifier.contains(ratatui::style::Modifier::DIM));
 }
@@ -3340,11 +3099,11 @@ fn render_group_header_leads_with_disclosure_glyph() {
     // Col 0 is the (expanded) disclosure glyph; the label starts at col 2 (glyph, then a space)
     // Rows below have their marker/icon in the left columns and text indented
     assert_eq!(
-        buf[(0, 0)].symbol(),
+        buf_cell(&buf, 0, 0).symbol(),
         crate::glyphs::disclosure_open(),
         "section header must lead with the expanded disclosure glyph",
     );
-    let header_label_x = buf[(2, 0)].symbol().to_string();
+    let header_label_x = buf_cell(&buf, 2, 0).symbol().to_string();
     assert_eq!(
         header_label_x, "I",
         "section title `Idle …` must start after the disclosure glyph, got: {header_label_x:?}",
@@ -3353,9 +3112,9 @@ fn render_group_header_leads_with_disclosure_glyph() {
     // Header gap: row 1 is blank
     // The title-only row centers its title within its 3-cell rect (y=2..5), so the title sits at y=3
     // Rows still render their marker/icon in the left chrome columns
-    let row_col0 = buf[(0, 3)].symbol().to_string();
-    let row_col1 = buf[(1, 3)].symbol().to_string();
-    let row_col2 = buf[(2, 3)].symbol().to_string();
+    let row_col0 = buf_cell(&buf, 0, 3).symbol().to_string();
+    let row_col1 = buf_cell(&buf, 1, 3).symbol().to_string();
+    let row_col2 = buf_cell(&buf, 2, 3).symbol().to_string();
     assert_eq!(
         row_col0, " ",
         "row's col 0 must be the marker space when nothing selected, got: {row_col0:?}",
@@ -3589,7 +3348,7 @@ fn render_dashboard_paints_full_area_background() {
     // The dashboard fills with `theme.bg_base`; the exact colour need not match a constant, we only assert the seed is gone
     for y in 0..area.height {
         for x in 0..area.width {
-            let cell_bg = buf[(x, y)].bg;
+            let cell_bg = buf_cell(&buf, x, y).bg;
             assert_ne!(
                 cell_bg, seed,
                 "cell at ({x}, {y}) still carries the seed bg — render_dashboard must fill the entire area",
@@ -3600,7 +3359,7 @@ fn render_dashboard_paints_full_area_background() {
     let mut saw_bg_base = false;
     for y in 0..area.height {
         for x in 0..area.width {
-            if buf[(x, y)].bg == theme.bg_base {
+            if buf_cell(&buf, x, y).bg == theme.bg_base {
                 saw_bg_base = true;
                 break;
             }
@@ -3612,182 +3371,6 @@ fn render_dashboard_paints_full_area_background() {
     assert!(
         saw_bg_base,
         "render_dashboard must paint at least one cell with theme.bg_base",
-    );
-}
-
-// ─────────────────────────────────────────────────────────────────
-// Header redesign tests
-// ─────────────────────────────────────────────────────────────────
-
-/// Basename of the test process's cwd, the one deterministic fragment of the header's location label.
-/// The full label depends on global git caches (`git_info::*`) that parallel tests may touch.
-/// Every fallback path still renders a cwd display ending in the current directory's basename.
-fn cwd_basename() -> String {
-    std::env::current_dir()
-        .ok()
-        .and_then(|d| d.file_name().map(|n| n.to_string_lossy().into_owned()))
-        .expect("test process must have a cwd with a basename")
-}
-
-/// The header pairs the location label (cwd and git info) on the left with right-aligned, labelled state-count chips.
-/// The glyph carries the state colour and the `{count} {label}` text keeps each chip readable without colour.
-#[test]
-fn render_header_paints_label_and_state_chips() {
-    let theme = Theme::groknight();
-    // Wide rect so the location label never truncates regardless of how deep the test machine's checkout path is
-    let area = Rect::new(0, 0, 400, 1);
-    let mut buf = Buffer::empty(area);
-    let mut state = DashboardState::new();
-    let rows = vec![
-        header_test_row(1, RowState::NeedsInput, "a"),
-        header_test_row(2, RowState::NeedsInput, "b"),
-        header_test_row(3, RowState::Working, "c"),
-        header_test_row(4, RowState::Idle, "d"),
-    ];
-    render_header_only(&mut buf, area, &theme, &rows, &mut state);
-    let content = buf_to_text(&buf);
-    let basename = cwd_basename();
-    assert!(
-        content.contains(&basename),
-        "header must show the current location (`{basename}`), got: {content:?}",
-    );
-    let row: String = (0..area.width).map(|x| buf[(x, 0)].symbol()).collect();
-    let chips = format!(
-        "{} 2 awaiting │ {} 1 working │ {} 1 idle",
-        crate::glyphs::diamond_filled(),
-        crate::glyphs::dot_spinner_frames()[0],
-        crate::glyphs::diamond_hollow(),
-    );
-    assert!(
-        row.trim_end().ends_with(&chips),
-        "chips `{chips}` must be right-aligned in the header, got: {row:?}",
-    );
-    // The buttons live on the actions row now, not in the header
-    for word in ["Agents", "New Agent"] {
-        assert!(
-            !content.contains(word),
-            "header must not paint `{word}`, got: {content:?}",
-        );
-    }
-    let chips_x = area.width - UnicodeWidthStr::width(chips.as_str()) as u16;
-    assert_eq!(buf[(chips_x, 0)].fg, theme.warning, "awaiting glyph");
-    assert_eq!(buf[(chips_x + 2, 0)].fg, theme.gray, "awaiting count");
-}
-
-/// Every state in the chip table renders when present, in priority order, with its own glyph colour and the shared gray count label.
-#[test]
-fn render_header_paints_every_state_chip_in_its_colour() {
-    let theme = Theme::groknight();
-    let area = Rect::new(0, 0, 400, 1);
-    let mut buf = Buffer::empty(area);
-    let mut state = DashboardState::new();
-    let rows = vec![
-        header_test_row(1, RowState::Failed, "e"),
-        header_test_row(2, RowState::Completed, "d"),
-        header_test_row(3, RowState::Idle, "c"),
-        header_test_row(4, RowState::Working, "b"),
-        header_test_row(5, RowState::NeedsInput, "a"),
-    ];
-    render_header_only(&mut buf, area, &theme, &rows, &mut state);
-    let row: String = (0..area.width).map(|x| buf[(x, 0)].symbol()).collect();
-    let filled = crate::glyphs::diamond_filled();
-    let expected = [
-        ("1 awaiting", filled, theme.warning),
-        (
-            "1 working",
-            crate::glyphs::dot_spinner_frames()[0],
-            theme.accent_running,
-        ),
-        ("1 idle", crate::glyphs::diamond_hollow(), theme.gray_dim),
-        ("1 done", filled, theme.accent_success),
-        ("1 failed", filled, theme.accent_error),
-    ];
-    let mut search_from = 0;
-    for (label, glyph, color) in expected {
-        let chip = format!("{glyph} {label}");
-        let at = row[search_from..]
-            .find(&chip)
-            .map(|i| i + search_from)
-            .unwrap_or_else(|| panic!("`{chip}` must follow the previous chip, got: {row:?}"));
-        let col = UnicodeWidthStr::width(&row[..at]) as u16;
-        assert_eq!(buf[(col, 0)].fg, color, "`{label}` glyph colour");
-        assert_eq!(buf[(col + 2, 0)].fg, theme.gray, "`{label}` count colour");
-        search_from = at + chip.len();
-    }
-}
-
-/// The header records a click target for the location label so the mouse handler can open the location picker.
-#[test]
-fn render_header_sets_location_click_target() {
-    let theme = Theme::current();
-    let area = Rect::new(0, 0, 120, 1);
-    let mut buf = Buffer::empty(area);
-    let mut state = DashboardState::new();
-    render_header_only(&mut buf, area, &theme, &[], &mut state);
-    assert!(
-        state.location_hit.rect.is_some(),
-        "render_header must record a click target for the location label",
-    );
-}
-
-/// On hover the location text (branch and path) is underlined; the `[Choose …]` hint that follows it is not.
-#[test]
-fn render_header_hover_underlines_only_location_text() {
-    let theme = Theme::current();
-    let area = Rect::new(0, 0, 400, 1);
-    let mut buf = Buffer::empty(area);
-    let mut state = DashboardState::new();
-    state.cwd = std::path::PathBuf::from("/grok-hover-marker");
-    state.location_hit.hovered = true;
-    render_header_only(&mut buf, area, &theme, &[], &mut state);
-    let text = buf_to_text(&buf);
-    let underlined = |x: usize| {
-        buf.cell((x as u16, 0))
-            .unwrap()
-            .style()
-            .add_modifier
-            .contains(Modifier::UNDERLINED)
-    };
-
-    let path_start = text.find("/grok-hover-marker").expect("path painted");
-    let path_end = path_start + "/grok-hover-marker".len();
-    assert!(
-        underlined(path_start) && underlined(path_end - 1),
-        "the path is underlined"
-    );
-    assert!(
-        !underlined(path_end),
-        "the space before the hint is not underlined"
-    );
-    let hint_start = text.find("[Choose").expect("hint painted");
-    assert!(
-        !underlined(hint_start) && !underlined(hint_start + 1),
-        "the hint is not underlined"
-    );
-}
-
-/// Hover underlines the branch and the path; the whitespace separator between them stays bare.
-#[test]
-fn underline_location_on_hover_skips_whitespace_spans() {
-    let plain = Style::default();
-    let spans = vec![
-        Span::styled("main".to_string(), plain),
-        Span::styled(" ".to_string(), plain), // branch↔path separator
-        Span::styled("/home/me/repo".to_string(), plain),
-    ];
-    let out = underline_location_on_hover(spans);
-    let underlined: Vec<(&str, bool)> = out
-        .iter()
-        .map(|s| {
-            (
-                s.content.as_ref(),
-                s.style.add_modifier.contains(Modifier::UNDERLINED),
-            )
-        })
-        .collect();
-    assert_eq!(
-        underlined,
-        vec![("main", true), (" ", false), ("/home/me/repo", true)]
     );
 }
 
@@ -3984,116 +3567,6 @@ fn render_location_picker_echoes_typed_path() {
     );
 }
 
-/// Zero-count states are suppressed.
-#[test]
-fn render_header_suppresses_zero_count_chips() {
-    let theme = Theme::current();
-    let mut buf = Buffer::empty(Rect::new(0, 0, 120, 1));
-    let mut state = DashboardState::new();
-    // Only one Idle row: no awaiting/working/done/failed chips
-    let rows = vec![header_test_row(1, RowState::Idle, "x")];
-    render_header_only(&mut buf, Rect::new(0, 0, 120, 1), &theme, &rows, &mut state);
-    let content = buf_to_text(&buf);
-    assert!(
-        content.contains("1 idle"),
-        "expected `1 idle`, got: {content:?}"
-    );
-    for absent in ["0 awaiting", "0 working", "0 done", "0 failed", "0 blocked"] {
-        assert!(
-            !content.contains(absent),
-            "zero-count chip `{absent}` must be suppressed, got: {content:?}",
-        );
-    }
-}
-
-/// Inactive (roster-only) rows get no header chip; only the section header carries their count.
-#[test]
-fn render_header_has_no_inactive_chip() {
-    let theme = Theme::current();
-    let mut buf = Buffer::empty(Rect::new(0, 0, 120, 1));
-    let mut state = DashboardState::new();
-    let rows = vec![
-        header_test_row(1, RowState::Inactive, "a"),
-        header_test_row(2, RowState::Idle, "b"),
-    ];
-    render_header_only(&mut buf, Rect::new(0, 0, 120, 1), &theme, &rows, &mut state);
-    let content = buf_to_text(&buf);
-    assert!(
-        content.contains("1 idle"),
-        "idle chip must still render, got: {content:?}"
-    );
-    assert!(
-        !content.contains("inactive"),
-        "no chip for Inactive rows, got: {content:?}"
-    );
-}
-
-/// The left title is the current location (cwd display), shown with and without agent rows, mirroring the session views' top-bar location line.
-#[test]
-fn render_header_shows_location_label() {
-    let theme = Theme::current();
-    // Wide rect so the location label never truncates regardless of how deep the test machine's checkout path is
-    let area = Rect::new(0, 0, 400, 1);
-    let mut state = DashboardState::new();
-    let basename = cwd_basename();
-
-    // 0 agents: the location still shows
-    let mut buf = Buffer::empty(area);
-    render_header_only(&mut buf, area, &theme, &[], &mut state);
-    let c = buf_to_text(&buf);
-    assert!(
-        c.contains(&basename),
-        "0-agent header must show the location (`{basename}`), got: {c:?}"
-    );
-
-    // 1 agent.
-    let mut buf = Buffer::empty(area);
-    let rows = vec![header_test_row(1, RowState::Idle, "x")];
-    render_header_only(&mut buf, area, &theme, &rows, &mut state);
-    let c = buf_to_text(&buf);
-    assert!(
-        c.contains(&basename),
-        "header must show the location (`{basename}`), got: {c:?}"
-    );
-}
-
-/// On a narrow header the location label truncates against a 3-cell blank gutter before the leftmost chip and never paints over the chips.
-#[test]
-fn render_header_location_label_never_overlaps_chips() {
-    let theme = Theme::current();
-    // Narrow enough that a long path overflows the label budget once three chips are reserved
-    let area = Rect::new(0, 0, 60, 1);
-    let mut buf = Buffer::empty(area);
-    let mut state = DashboardState::new();
-    state.cwd = std::path::PathBuf::from("/grok-overlap/a/very/long/checkout/path/that/overflows");
-    let rows = vec![
-        header_test_row(1, RowState::NeedsInput, "a"),
-        header_test_row(2, RowState::Working, "b"),
-        header_test_row(3, RowState::Idle, "c"),
-    ];
-    render_header_only(&mut buf, area, &theme, &rows, &mut state);
-    let content = buf_to_text(&buf);
-    // Chips must survive the (long) location label, which is cut with an ellipsis.
-    for chunk in ["1 awaiting", "1 working", "1 idle", "…"] {
-        assert!(
-            content.contains(chunk),
-            "`{chunk}` must not be overpainted by the location label, got: {content:?}",
-        );
-    }
-    assert!(
-        !content.contains("Choose"),
-        "the hint goes before the path is cut"
-    );
-    // The ellipsis ends the label; exactly three blank cells separate it from the first chip's glyph
-    let row: String = (0..area.width).map(|x| buf[(x, 0)].symbol()).collect();
-    let ellipsis_at = row.find('…').expect("truncated label ends in an ellipsis");
-    let after = &row[ellipsis_at + '…'.len_utf8()..];
-    assert!(
-        after.starts_with(&format!("   {}", crate::glyphs::diamond_filled())),
-        "expected a 3-cell gutter then the awaiting glyph after the ellipsis, got: {after:?}",
-    );
-}
-
 /// Footer chips use the shared `ShortcutsBar` styling (`Key:label` separated by ` │ `).
 #[test]
 fn render_footer_uses_shared_shortcuts_bar_styling() {
@@ -4122,29 +3595,106 @@ fn render_footer_uses_shared_shortcuts_bar_styling() {
     );
 }
 
+/// The footer names what Enter does on the focused actions-row item — from either pane, since an empty Enter acts on the item from
+/// both — and never advertises the arrows: the row is meant to read as a row.
 #[test]
-fn render_footer_open_session_focus_shows_keyboard_actions() {
-    let mut buf = Buffer::empty(Rect::new(0, 0, 200, 1));
+fn render_footer_names_enter_action_for_each_actions_item() {
     let theme = Theme::current();
-    let mut state = DashboardState::new();
-    state.list_focused = true;
-    state.focus_open_session_button();
     let registry = crate::actions::ActionRegistry::defaults();
+    let footer = |focus: ActionsFocus, armed: bool, list_focused: bool| {
+        let mut buf = Buffer::empty(Rect::new(0, 0, 200, 1));
+        let mut state = DashboardState::new();
+        state.list_focused = list_focused;
+        state.cwd_has_git_ancestor = true;
+        state.dispatch_worktree = armed;
+        state.focus_action(focus);
+        render_footer(
+            &mut buf,
+            Rect::new(0, 0, 200, 1),
+            &theme,
+            &state,
+            &registry,
+            None,
+            false,
+            None,
+        );
+        buf_to_text(&buf)
+    };
+    for list_focused in [true, false] {
+        for (focus, armed, label) in [
+            (ActionsFocus::NewAgent, false, ":create"),
+            (ActionsFocus::OpenPrevious, false, ":open previous"),
+            (ActionsFocus::Worktree, false, ":enable worktree"),
+            (ActionsFocus::Worktree, true, ":disable worktree"),
+        ] {
+            let content = footer(focus, armed, list_focused);
+            assert!(
+                content.contains(label),
+                "{focus:?} armed={armed} list_focused={list_focused}: expected `{label}`, got: {content:?}"
+            );
+            for stale in [":new agent", ":open session", "←", "→"] {
+                assert!(
+                    !content.contains(stale),
+                    "{focus:?} list_focused={list_focused}: footer must not paint `{stale}`, got: {content:?}"
+                );
+            }
+            // With a right-hand item focused, the input-pane footer must not fall back to the `+ New Agent` wording
+            if !list_focused && focus != ActionsFocus::NewAgent {
+                assert!(
+                    !content.contains(":create"),
+                    "{focus:?} from the input pane: `:create` would promise an action Enter does not perform, got: {content:?}"
+                );
+            }
+        }
+    }
+}
 
-    render_footer(
-        &mut buf,
-        Rect::new(0, 0, 200, 1),
-        &theme,
-        &state,
-        &registry,
-        None,
-        false,
-        None,
-    );
-
-    let content = buf_to_text(&buf);
-    assert!(content.contains(":open session"), "{content:?}");
-    assert!(content.contains(":new agent"), "{content:?}");
+/// With a draft typed, Enter on `+ New Agent` sends it (from either pane), so the footer says `send`, never `create`.
+/// From the list pane Enter on a right-hand item still acts on the item (its label stays); from the input pane a draft always sends.
+#[test]
+fn render_footer_says_send_not_create_when_new_agent_holds_a_draft() {
+    let theme = Theme::current();
+    let registry = crate::actions::ActionRegistry::defaults();
+    let footer = |focus: ActionsFocus, list_focused: bool| {
+        let mut buf = Buffer::empty(Rect::new(0, 0, 200, 1));
+        let mut state = DashboardState::new();
+        state.list_focused = list_focused;
+        state.cwd_has_git_ancestor = true;
+        state.dispatch.set_text("a typed draft");
+        state.focus_action(focus);
+        render_footer(
+            &mut buf,
+            Rect::new(0, 0, 200, 1),
+            &theme,
+            &state,
+            &registry,
+            None,
+            false,
+            None,
+        );
+        buf_to_text(&buf)
+    };
+    for list_focused in [true, false] {
+        let content = footer(ActionsFocus::NewAgent, list_focused);
+        assert!(
+            content.contains("Enter:send") && !content.contains(":create"),
+            "list_focused={list_focused}: a draft on + New Agent sends, got: {content:?}"
+        );
+        assert!(
+            content.contains("send+open"),
+            "list_focused={list_focused}: Ctrl+S send+open is offered alongside send, got: {content:?}"
+        );
+        let content = footer(ActionsFocus::Worktree, list_focused);
+        let expected = if list_focused {
+            ":enable worktree"
+        } else {
+            ":send"
+        };
+        assert!(
+            content.contains(expected),
+            "list_focused={list_focused}: Worktree focused with a draft should say `{expected}`, got: {content:?}"
+        );
+    }
 }
 
 #[test]
@@ -5003,7 +4553,7 @@ fn render_footer_button_focused_with_prompt_shows_send_and_send_open_no_stop() {
     let theme = Theme::current();
     let mut state = DashboardState::new();
     // Default state: button focused. Plant typed text.
-    assert!(state.new_agent_button_focused);
+    assert!(state.new_agent_button_focused());
     state.dispatch.set_text("kick off a fresh session");
     let registry = crate::actions::ActionRegistry::defaults();
     render_footer(
@@ -5077,7 +4627,7 @@ fn render_footer_multiline_empty_create_uses_shift_or_alt_enter() {
     let theme = Theme::current();
     let mut state = DashboardState::new();
     state.multiline_mode = true;
-    assert!(state.new_agent_button_focused);
+    assert!(state.new_agent_button_focused());
     assert!(state.dispatch.text().trim().is_empty());
     let registry = crate::actions::ActionRegistry::defaults();
     render_footer(
@@ -5163,39 +4713,5 @@ fn render_footer_expired_delete_confirm_shows_regular_hints() {
     assert!(
         content.contains(":open"),
         "expired stop-confirm must fall back to the regular hints, got: {content:?}",
-    );
-}
-
-/// Subagents inherit their parent's state and must NOT inflate the header chip tallies.
-/// The header counts top-level rows only.
-#[test]
-fn render_header_counts_top_level_rows_only() {
-    let theme = Theme::current();
-    let mut buf = Buffer::empty(Rect::new(0, 0, 160, 1));
-    let mut state = DashboardState::new();
-    let parent = DashboardRow {
-        indent: 0,
-        ..header_test_row(1, RowState::Working, "parent")
-    };
-    let sub_completed = DashboardRow {
-        id: DashboardRowId::Subagent {
-            parent: crate::app::agent::AgentId(1),
-            child_session_id: "c1".to_string(),
-        },
-        indent: 1,
-        ..header_test_row(11, RowState::Completed, "child")
-    };
-    let rows = vec![parent, sub_completed];
-    render_header_only(&mut buf, Rect::new(0, 0, 160, 1), &theme, &rows, &mut state);
-    let content = buf_to_text(&buf);
-    // Only the top-level parent counts: its Working chip shows.
-    assert!(
-        content.contains("1 working"),
-        "expected `1 working` chip for the top-level parent, got: {content:?}"
-    );
-    // Subagent's Completed must NOT show up as `1 done`.
-    assert!(
-        !content.contains("1 done"),
-        "header must not count subagent state, got: {content:?}",
     );
 }

@@ -22,10 +22,10 @@ pub enum SamplingChannel {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, strum::AsRefStr, strum::IntoStaticStr)]
 #[strum(serialize_all = "snake_case")]
 pub enum StripReason {
-    /// A 400 stamped with the invalid-image code: the server's deterministic verdict on this exact payload.
+    /// A coded `invalid_image` rejection: HTTP 400, Responses mid-stream, or StreamError.
     ServerRejected,
     /// A size/transport heuristic (413, connection reset on upload) or a non-deterministic rejection.
-    /// Non-deterministic covers a proxy-wrapped 500, a legacy phrase match, or a mid-stream error.
+    /// Non-deterministic covers a proxy-wrapped 500, a legacy phrase match, or an uncoded mid-stream error.
     /// The failure may be transient and blames no particular image.
     PayloadHeuristic,
 }

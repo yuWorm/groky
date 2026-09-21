@@ -2,12 +2,13 @@
 //! Each event variant carries structured data (e.g., elapsed time, error messages, token counts).
 //! This enables variant-specific rendering and future styling differentiation.
 
+use std::path::Path;
+use std::sync::Arc;
 use std::time::Duration;
 
 use ratatui::style::Modifier;
 use ratatui::text::{Line, Span};
 
-use super::tool::HookRunEntry;
 use crate::app::actions::PermissionLabel;
 use crate::appearance::AppearanceConfig;
 use crate::render::wrapping::word_wrap_lines;
@@ -18,9 +19,28 @@ use crate::scrollback::types::{
 use crate::theme::Theme;
 use crate::util::format_duration;
 use crate::views::plan_approval_view::PlanReviewOutcome;
+use xai_grok_shell::extensions::notification::{
+    MODEL_FAMILY_SWITCH_COMPACT_BANNER, MemoryCaptureDebugEntry,
+};
 
 /// Shared text-selection range id for recap body lines (header is excluded).
 const RECAP_BODY_RANGE: u16 = 0;
+
+/// Which pager-local memory command a [`SessionEvent::MemoryCommandStarted`] marker belongs to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MemoryCommandKind {
+    Flush,
+    Dream,
+}
+
+impl MemoryCommandKind {
+    fn started_text(self) -> &'static str {
+        match self {
+            Self::Flush => "Flushing memory…",
+            Self::Dream => "Consolidating memory…",
+        }
+    }
+}
 
 /// A session-level event with structured data.
 /// Each variant carries the information needed to render a concise, informational message in the scrollback.
@@ -33,17 +53,18 @@ pub enum SessionEvent {
         /// `None` when unknown: a wake turn whose deltas carried no `turnStartMs` (old shells) renders without a duration instead of a fake "0.0s".
         elapsed: Option<Duration>,
     },
-    /// Agent turn was cancelled by the user.
+    /// Agent turn was cancelled.
     TurnCancelled {
-        /// Wall-clock elapsed time before cancellation.
-        elapsed: Duration,
+        /// `None` when unknown: do not render `0.0s`.
+        elapsed: Option<Duration>,
+        cause: crate::scrollback::blocks::CancelledBy,
     },
     /// Agent turn ended because a hook denied it, today only a `UserPromptSubmit` block (a `PreToolUse` deny feeds back and the turn continues).
     /// Distinct from [`SessionEvent::TurnCancelled`] so the marker never claims the USER cancelled a policy block.
     /// The warning annotation above the marker attributes the hook and reason.
     TurnBlockedByHook {
-        /// Wall-clock elapsed time before the block.
-        elapsed: Duration,
+        /// `None` when unknown: do not render `0.0s`.
+        elapsed: Option<Duration>,
     },
     /// Agent turn was halted by the system (e.g. doom loop detection).
     TurnHalted {
@@ -61,6 +82,7 @@ pub enum SessionEvent {
     CompactionStarted {
         /// Percentage of context window used (e.g., 85).
         percentage: u8,
+        reason: String,
     },
     /// Auto-compaction completed successfully.
     CompactionCompleted {
@@ -117,9 +139,21 @@ pub enum SessionEvent {
         /// Wall-clock elapsed time for the command.
         elapsed: Duration,
     },
+    /// `/flush` or `/dream` started; the invocation marker that pairs each run with its outcome line.
+    /// Local scrollback block only, like [`SessionEvent::CompactStarted`].
+    MemoryCommandStarted { command: MemoryCommandKind },
+    /// `/flush` or `/dream` finished. `summary` comes from the shell's typed response.
+    MemoryCommandCompleted {
+        summary: String,
+        /// False when the run did not achieve what the user asked (failed, timed out, disabled).
+        succeeded: bool,
+        elapsed: Duration,
+    },
     /// Hook annotation, displayed inline after a tool call.
     /// The message comes from the agent via `XaiSessionUpdate::HookAnnotation`.
     HookAnnotation { message: String },
+    /// A hook's verdict on the tool call above it (deny, failure, timeout); this block draws the tool-row bullet.
+    HookOutcome { message: String },
     /// The session's persisted model is no longer available after re-auth.
     /// Both IDs are empty when re-shown on blocked prompt attempts.
     ModelUnavailable {
@@ -156,6 +190,184 @@ pub enum SessionEvent {
     },
 }
 
+/// Debug-only, foldable view of observations created by a memory-v2 capture.
+#[derive(Debug, Clone)]
+pub struct MemoryCaptureBlock {
+    from_turn: u32,
+    through_turn: u32,
+    entries: Vec<MemoryCaptureDebugEntry>,
+}
+
+impl MemoryCaptureBlock {
+    pub fn new(from_turn: u32, through_turn: u32, entries: Vec<MemoryCaptureDebugEntry>) -> Self {
+        Self {
+            from_turn,
+            through_turn,
+            entries: entries
+                .into_iter()
+                .map(|entry| MemoryCaptureDebugEntry {
+                    statement: sanitize_model_debug_text(&entry.statement),
+                    body: entry.body.map(|body| sanitize_model_debug_text(&body)),
+                    // The path is produced only after create-only persistence
+                    // succeeds and remains the block's sole trusted link target.
+                    path: entry.path,
+                })
+                .collect(),
+        }
+    }
+
+    fn title(&self) -> String {
+        let noun = if self.entries.len() == 1 {
+            "memory"
+        } else {
+            "memories"
+        };
+        format!(
+            "Model-generated memory debug output: {} {noun} for turns {}-{}",
+            self.entries.len(),
+            self.from_turn,
+            self.through_turn
+        )
+    }
+
+    pub(crate) fn searchable_text(&self) -> String {
+        let mut parts = vec![self.title()];
+        for entry in &self.entries {
+            parts.push(entry.statement.clone());
+            if let Some(body) = &entry.body {
+                parts.push(body.clone());
+            }
+            parts.push(entry.path.clone());
+        }
+        parts.join("\n")
+    }
+}
+
+impl BlockContent for MemoryCaptureBlock {
+    fn output(&self, ctx: &BlockContext) -> BlockOutput {
+        let theme = Theme::current();
+        let title_style = if ctx.mode == DisplayMode::Collapsed {
+            theme.muted().add_modifier(Modifier::BOLD)
+        } else {
+            theme.primary().add_modifier(Modifier::BOLD)
+        };
+        let mut lines = vec![BlockLine::styled(Line::from(Span::styled(
+            self.title(),
+            title_style,
+        )))];
+
+        if ctx.mode != DisplayMode::Collapsed {
+            let width = ctx.content_width().max(1);
+            for (index, entry) in self.entries.iter().enumerate() {
+                lines.push(BlockLine::separator(Line::default()));
+                lines.push(BlockLine::styled(Line::from(Span::styled(
+                    format!("Untrusted model-generated observation {}", index + 1),
+                    theme.muted().add_modifier(Modifier::BOLD),
+                ))));
+                lines.extend(
+                    word_wrap_lines(
+                        entry
+                            .statement
+                            .lines()
+                            .map(|line| Line::from(Span::styled(line.to_owned(), theme.primary())))
+                            .collect::<Vec<_>>(),
+                        width,
+                    )
+                    .into_iter()
+                    .map(BlockLine::styled),
+                );
+                if let Some(body) = entry.body.as_deref() {
+                    lines.extend(
+                        word_wrap_lines(
+                            body.lines()
+                                .map(|line| {
+                                    Line::from(Span::styled(line.to_owned(), theme.muted()))
+                                })
+                                .collect::<Vec<_>>(),
+                            width,
+                        )
+                        .into_iter()
+                        .map(BlockLine::styled),
+                    );
+                }
+
+                let label = Path::new(&entry.path)
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .unwrap_or(entry.path.as_str());
+                let mut path_line = BlockLine::styled(Line::from(vec![
+                    Span::styled("Open file \u{2192} ", theme.muted()),
+                    Span::styled(
+                        label.to_owned(),
+                        theme.primary().add_modifier(Modifier::UNDERLINED),
+                    ),
+                ]));
+                path_line.link_target = Some(crate::render::osc8::LinkTarget::File(Arc::from(
+                    Path::new(&entry.path),
+                )));
+                lines.push(path_line);
+            }
+        }
+
+        if let Some(max_lines) = ctx.max_lines {
+            lines.truncate(max_lines as usize);
+        }
+        BlockOutput { lines }
+    }
+
+    fn accent(&self, _ctx: &BlockContext) -> Option<AccentStyle> {
+        None
+    }
+
+    fn has_vpad_for(&self, _appearance: &AppearanceConfig) -> bool {
+        false
+    }
+
+    fn default_display_mode(&self) -> DisplayMode {
+        DisplayMode::Collapsed
+    }
+
+    fn has_bullet(&self, _ctx: &BlockContext) -> bool {
+        true
+    }
+
+    fn is_groupable(&self) -> bool {
+        true
+    }
+}
+
+fn sanitize_model_debug_text(text: &str) -> String {
+    let stripped = strip_ansi_escapes::strip_str(text);
+    let mut sanitized = String::with_capacity(stripped.len());
+    let mut characters = stripped.chars().peekable();
+    let mut previous = None;
+    while let Some(character) = characters.next() {
+        if character.is_control() && !matches!(character, '\n' | '\t') {
+            sanitized.push('\u{fffd}');
+            continue;
+        }
+        if matches!(
+            character,
+            '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}'
+        ) {
+            sanitized.push('\u{fffd}');
+            continue;
+        }
+        sanitized.push(character);
+        // Keep debug prose from becoming terminal-native links. Word joiners break
+        // URL/email recognition without changing visible text; the committed local
+        // path below is linked explicitly through `LinkTarget::File`.
+        let domain_dot = character == '.'
+            && previous.is_some_and(char::is_alphanumeric)
+            && characters.peek().is_some_and(|next| next.is_alphanumeric());
+        if matches!(character, ':' | '/' | '@') || domain_dot {
+            sanitized.push('\u{2060}');
+        }
+        previous = Some(character);
+    }
+    sanitized
+}
+
 impl SessionEvent {
     /// Format the event as a human-readable string.
     pub fn message(&self) -> String {
@@ -167,11 +379,23 @@ impl SessionEvent {
                 format!("Worked for {}", format_duration(*elapsed))
             }
             SessionEvent::TurnCompleted { elapsed: None } => "Turn completed.".to_string(),
-            SessionEvent::TurnCancelled { elapsed } => {
-                format!("Turn cancelled by user in {}.", format_duration(*elapsed))
+            SessionEvent::TurnCancelled {
+                elapsed: Some(elapsed),
+                cause,
+            } => {
+                format!("{} in {}.", cause.phrase(), format_duration(*elapsed))
             }
-            SessionEvent::TurnBlockedByHook { elapsed } => {
+            SessionEvent::TurnCancelled {
+                elapsed: None,
+                cause,
+            } => format!("{}.", cause.phrase()),
+            SessionEvent::TurnBlockedByHook {
+                elapsed: Some(elapsed),
+            } => {
                 format!("Turn blocked by a hook in {}.", format_duration(*elapsed))
+            }
+            SessionEvent::TurnBlockedByHook { elapsed: None } => {
+                "Turn blocked by a hook.".to_string()
             }
             SessionEvent::TurnHalted { elapsed } => {
                 format!(
@@ -191,8 +415,12 @@ impl SessionEvent {
             } => {
                 format!("Turn failed: {error}")
             }
-            SessionEvent::CompactionStarted { percentage } => {
-                format!("Context {percentage}% full. Compacting…")
+            SessionEvent::CompactionStarted { percentage, reason } => {
+                if reason == MODEL_FAMILY_SWITCH_COMPACT_BANNER {
+                    MODEL_FAMILY_SWITCH_COMPACT_BANNER.to_string()
+                } else {
+                    format!("Context {percentage}% full. Compacting…")
+                }
             }
             SessionEvent::CompactionCompleted {
                 tokens_before,
@@ -260,7 +488,24 @@ impl SessionEvent {
             SessionEvent::CompactCompleted { elapsed } => {
                 format!("Compaction completed in {}.", format_duration(*elapsed))
             }
-            SessionEvent::HookAnnotation { message } => message.clone(),
+            SessionEvent::MemoryCommandStarted { command } => command.started_text().to_string(),
+            SessionEvent::MemoryCommandCompleted {
+                summary,
+                succeeded,
+                elapsed,
+            } => {
+                if *succeeded {
+                    format!(
+                        "{summary} ({})  \u{00b7}  /memory to view",
+                        format_duration(*elapsed)
+                    )
+                } else {
+                    summary.clone()
+                }
+            }
+            SessionEvent::HookAnnotation { message } | SessionEvent::HookOutcome { message } => {
+                message.clone()
+            }
             SessionEvent::ModelUnavailable {
                 new_model_id,
                 reason,
@@ -322,12 +567,15 @@ impl SessionEvent {
                 | SessionEvent::RequestFailed { .. }
                 | SessionEvent::RetryFailed { .. }
                 | SessionEvent::TurnFailed { .. }
+                | SessionEvent::MemoryCommandCompleted {
+                    succeeded: false,
+                    ..
+                }
         )
     }
 
-    /// Whether this event marks the end of an agent turn (the "Turn completed/cancelled/failed" markers). These are the
-    /// only events that can carry the turn's stop-family hook runs inline. treating it as terminal would change
-    /// stop-hook attribution.
+    /// Whether this event ends an agent turn. [`SessionEvent::RequestFailed`] and [`SessionEvent::ReAuthRequired`] are
+    /// excluded: RetryState may push them before PromptResponse, and dedicated banners skip the TurnFailed marker.
     pub fn is_turn_terminal(&self) -> bool {
         matches!(
             self,
@@ -354,46 +602,11 @@ fn format_tokens(tokens: u64) -> String {
 #[derive(Debug, Clone)]
 pub struct SessionEventBlock {
     pub event: SessionEvent,
-    /// Stop-family hook runs folded into a turn-terminal marker (`(event_name, runs)` per hook batch).
-    /// Rendered as a right-justified `stop  [hooks: N]` summary on the marker line, with per-hook detail on expand.
-    /// Always empty for non-terminal events.
-    pub stop_hooks: Vec<(String, Vec<HookRunEntry>)>,
-    /// The prompt turn a terminal marker belongs to, when known.
-    /// Gates which stop-hook batches may merge into it.
-    pub prompt_id: Option<String>,
 }
 
 impl SessionEventBlock {
     pub fn new(event: SessionEvent) -> Self {
-        Self {
-            event,
-            stop_hooks: Vec::new(),
-            prompt_id: None,
-        }
-    }
-
-    /// A turn-terminal marker carrying the turn's stop-hook runs and prompt id.
-    pub fn with_stop_hooks(
-        event: SessionEvent,
-        stop_hooks: Vec<(String, Vec<HookRunEntry>)>,
-        prompt_id: Option<String>,
-    ) -> Self {
-        debug_assert!(stop_hooks.is_empty() || event.is_turn_terminal());
-        Self {
-            event,
-            stop_hooks,
-            prompt_id,
-        }
-    }
-
-    /// Whether any attached stop hook actually ran (non-skipped).
-    /// Gates the fold/selection affordances and the inline summary.
-    /// Mirrors [`ToolCallHookData::has_content`](super::tool::ToolCallHookData::has_content).
-    pub fn has_stop_hook_content(&self) -> bool {
-        self.stop_hooks.iter().any(|(_, runs)| {
-            runs.iter()
-                .any(|r| !matches!(r.status, super::tool::HookRunStatus::Skipped))
-        })
+        Self { event }
     }
 
     /// A recap with real body content, i.e. not the empty loading spinner or a stray empty recap.
@@ -402,62 +615,6 @@ impl SessionEventBlock {
         self.event
             .recap_summary()
             .is_some_and(|s| !s.trim().is_empty())
-    }
-
-    /// Merge the stop-hook runs into the marker's output: a right-justified `stop [hooks: N]` summary plus per-hook
-    /// detail lines when expanded. The summary spans are decoration: [`Selectable::Spans`] keeps drag-copy on the
-    /// marker text only. A copied "Worked for 4.4s" never drags the padding and hook counts along.
-    fn append_stop_hooks(&self, lines: &mut Vec<BlockLine>, ctx: &BlockContext) {
-        use super::tool::hook::{render_hooks_for_mode, render_stop_hooks_summary};
-
-        if !self.has_stop_hook_content() {
-            return;
-        }
-        let Some(summary) = render_stop_hooks_summary(&self.stop_hooks) else {
-            return;
-        };
-
-        let avail = ctx.width as usize;
-        let summary_width: usize = summary
-            .iter()
-            .map(|s| unicode_width::UnicodeWidthStr::width(s.content.as_ref()))
-            .sum();
-        // Inline attach is for single-line markers only: on a wrapped marker (a long TurnFailed error) the summary would land mid-paragraph
-        let single_line = lines.len() == 1;
-        if let Some(first) = lines.first_mut() {
-            let text = crate::scrollback::types::line_plain_text(&first.content);
-            let text_width = unicode_width::UnicodeWidthStr::width(text.as_str());
-            // Restrict drag-copy to the marker text span(s) before padding.
-            let text_spans = first.content.spans.len();
-            if single_line && text_width + 2 + summary_width <= avail {
-                let pad = avail - text_width - summary_width;
-                first.content.spans.push(Span::raw(" ".repeat(pad)));
-                first.content.spans.extend(summary);
-                first.selectable = Selectable::Spans(0..text_spans);
-                first.selection_text = Some(text);
-            } else {
-                // No room on the marker line (or a wrapped marker): right-justify on its own line below the text
-                let pad = avail.saturating_sub(summary_width);
-                let mut spans = vec![Span::raw(" ".repeat(pad))];
-                spans.extend(summary);
-                lines.push(BlockLine::separator(Line::from(spans)));
-            }
-        }
-
-        // Expanded: per-hook detail below the marker line
-        // The section header ("stop") is redundant with the inline summary for a single batch
-        // Keep it when both stop_failure and stop ran so the groups read apart
-        if !matches!(ctx.mode, DisplayMode::Collapsed) {
-            let multiple = self.stop_hooks.len() > 1;
-            for (event_name, runs) in &self.stop_hooks {
-                let detail = if multiple {
-                    render_hooks_for_mode(event_name, runs, ctx.mode)
-                } else {
-                    super::tool::hook::render_hooks_detail(runs, ctx.mode)
-                };
-                lines.extend(detail);
-            }
-        }
     }
 
     /// Render a recap event in the tool-call visual style. While the recap is still being generated the entry is
@@ -573,7 +730,6 @@ impl BlockContent for SessionEventBlock {
         if lines.is_empty() {
             lines.push(BlockLine::styled(Line::from("")).with_selection_range(Some(0)));
         }
-        self.append_stop_hooks(&mut lines, ctx);
         BlockOutput { lines }
     }
 
@@ -598,10 +754,11 @@ impl BlockContent for SessionEventBlock {
 
     fn bullet(&self, ctx: &BlockContext) -> Option<AccentStyle> {
         // Recap: animated dot while loading; default gray dot when collapsed-idle; accent color when expanded
-        // Other events never show a bullet
-        if self.event.recap_summary().is_some()
-            && !ctx.is_running
-            && ctx.mode == DisplayMode::Collapsed
+        // A hook outcome keeps the default gray, matching its muted text; other events never show a bullet
+        if matches!(self.event, SessionEvent::HookOutcome { .. })
+            || (self.event.recap_summary().is_some()
+                && !ctx.is_running
+                && ctx.mode == DisplayMode::Collapsed)
         {
             return None;
         }
@@ -617,30 +774,24 @@ impl BlockContent for SessionEventBlock {
     }
 
     fn is_foldable(&self) -> bool {
-        // A recap with body content folds, as does a turn marker carrying stop-hook runs (the fold reveals per-hook detail)
-        // Other events are single informational lines with nothing to collapse
-        self.recap_has_body() || self.has_stop_hook_content()
+        // A recap with body content folds; other events are single informational lines with nothing to collapse
+        self.recap_has_body()
     }
 
     fn is_selectable(&self) -> bool {
         // Recap is tool-like: navigable so it can be folded, but only once it has body content (mirrors `is_foldable`)
-        // That way j/k never lands on the loading spinner or an empty recap
-        // A turn marker with stop hooks is navigable for the same reason. Other events stay non-interactive.
-        self.recap_has_body() || self.has_stop_hook_content()
+        // That way j/k never lands on the loading spinner or an empty recap. Other events stay non-interactive.
+        self.recap_has_body()
     }
 
     fn default_display_mode(&self) -> DisplayMode {
-        // A marker with stop hooks starts collapsed: the right-justified summary is the resting state; detail is opt-in via fold
-        if self.has_stop_hook_content() {
-            DisplayMode::Collapsed
-        } else {
-            DisplayMode::Expanded
-        }
+        DisplayMode::Expanded
     }
 
     fn has_bullet(&self, ctx: &BlockContext) -> bool {
-        // Recap only, and only when the shared tool bullet is configured, so it tracks the same appearance setting as real tool calls
-        self.event.recap_summary().is_some()
+        // Recap and hook outcomes only, gated on the shared tool bullet so they track the tool rows' appearance setting
+        (self.event.recap_summary().is_some()
+            || matches!(self.event, SessionEvent::HookOutcome { .. }))
             && ctx
                 .appearance
                 .scrollback
@@ -671,9 +822,27 @@ mod tests {
     #[test]
     fn turn_cancelled_message() {
         let event = SessionEvent::TurnCancelled {
-            elapsed: Duration::from_secs(10),
+            elapsed: Some(Duration::from_secs(10)),
+            cause: crate::scrollback::blocks::CancelledBy::User,
         };
         assert_eq!(event.message(), "Turn cancelled by user in 10s.");
+    }
+
+    #[test]
+    fn turn_cancelled_message_names_passive_cause() {
+        let event = SessionEvent::TurnCancelled {
+            elapsed: Some(Duration::from_secs(10)),
+            cause: crate::scrollback::blocks::CancelledBy::SessionClosed,
+        };
+        assert_eq!(
+            event.message(),
+            "Turn cancelled because the session closed in 10s."
+        );
+        let event = SessionEvent::TurnCancelled {
+            elapsed: Some(Duration::from_secs(4)),
+            cause: crate::scrollback::blocks::CancelledBy::Unspecified,
+        };
+        assert_eq!(event.message(), "Turn cancelled in 4.0s.");
     }
 
     #[test]
@@ -837,6 +1006,26 @@ mod tests {
     }
 
     #[test]
+    fn compaction_started_switch_reason_renders_reason() {
+        let event = SessionEvent::CompactionStarted {
+            percentage: 9,
+            reason: MODEL_FAMILY_SWITCH_COMPACT_BANNER.into(),
+        };
+        assert_eq!(event.message(), MODEL_FAMILY_SWITCH_COMPACT_BANNER);
+    }
+
+    #[test]
+    fn compaction_started_threshold_reason_renders_fullness() {
+        for reason in ["Context window 9% full", ""] {
+            let event = SessionEvent::CompactionStarted {
+                percentage: 9,
+                reason: reason.into(),
+            };
+            assert_eq!(event.message(), "Context 9% full. Compacting…");
+        }
+    }
+
+    #[test]
     fn compaction_completed_renders_before_after_delta() {
         let event = SessionEvent::CompactionCompleted {
             tokens_before: Some(48_800),
@@ -893,11 +1082,11 @@ mod tests {
         });
         assert_eq!(out.lines.len(), 2, "one block line per message line");
         assert_eq!(
-            plain(&out.lines[0]),
+            plain(nth(&out, 0)),
             "Compaction failed - it'll retry on the next turn, or start a new session using /new."
         );
         assert_eq!(
-            plain(&out.lines[1]),
+            plain(nth(&out, 1)),
             "API error (status 400 Bad Request): invalid_image: too big"
         );
     }
@@ -926,6 +1115,97 @@ mod tests {
             is_selected: false,
             cwd: None,
         }
+    }
+
+    #[test]
+    fn memory_capture_debug_block_is_collapsed_by_default() {
+        let block = MemoryCaptureBlock::new(
+            2,
+            4,
+            vec![MemoryCaptureDebugEntry {
+                statement: "Use the focused test target.".into(),
+                body: Some("The full suite is expensive.".into()),
+                path: "/tmp/memory/observation.md".into(),
+            }],
+        );
+        assert_eq!(block.default_display_mode(), DisplayMode::Collapsed);
+
+        let mut collapsed = ctx();
+        collapsed.mode = DisplayMode::Collapsed;
+        let output = block.output(&collapsed);
+        let [line] = output.lines.as_slice() else {
+            panic!("expected one collapsed line, got {}", output.lines.len());
+        };
+        let text = crate::scrollback::types::line_plain_text(&line.content);
+        assert_eq!(
+            text,
+            "Model-generated memory debug output: 1 memory for turns 2-4"
+        );
+        assert!(line.link_target.is_none());
+    }
+
+    #[test]
+    fn expanded_memory_capture_debug_block_shows_content_and_file_link() {
+        let path = "/tmp/memory/observation.md";
+        let block = MemoryCaptureBlock::new(
+            2,
+            4,
+            vec![MemoryCaptureDebugEntry {
+                statement: "Use the focused test target.".into(),
+                body: Some("The full suite is expensive.".into()),
+                path: path.into(),
+            }],
+        );
+        let output = block.output(&ctx());
+        let text = output
+            .lines
+            .iter()
+            .map(|line| crate::scrollback::types::line_plain_text(&line.content))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("Use the focused test target."));
+        assert!(text.contains("The full suite is expensive."));
+        assert!(text.contains("Open file \u{2192} observation.md"));
+        assert!(output.lines.iter().any(|line| {
+            line.link_target.as_ref()
+                == Some(&crate::render::osc8::LinkTarget::File(Arc::from(
+                    Path::new(path),
+                )))
+        }));
+    }
+
+    #[test]
+    fn memory_capture_debug_sanitizes_controls_and_disarms_remote_links() {
+        let local_path = "/tmp/memory/observation.md";
+        let block = MemoryCaptureBlock::new(
+            2,
+            4,
+            vec![MemoryCaptureDebugEntry {
+                statement: "\u{1b}]8;;https://evil.example\u{7}trusted\u{1b}]8;;\u{7}".into(),
+                body: Some("Visit https://evil.example or attacker@example.com\u{202e}".into()),
+                path: local_path.into(),
+            }],
+        );
+        let output = block.output(&ctx());
+        let text = output
+            .lines
+            .iter()
+            .map(|line| crate::scrollback::types::line_plain_text(&line.content))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(text.contains("Untrusted model-generated observation 1"));
+        assert!(!text.contains('\u{1b}'));
+        assert!(!text.contains('\u{7}'));
+        assert!(!text.contains("https://"));
+        assert!(!text.contains("attacker@example.com"));
+        assert!(output.lines.iter().all(|line| {
+            line.link_target.is_none()
+                || line.link_target.as_ref()
+                    == Some(&crate::render::osc8::LinkTarget::File(Arc::from(
+                        Path::new(local_path),
+                    )))
+        }));
     }
 
     #[test]
@@ -1004,6 +1284,13 @@ mod tests {
         crate::scrollback::types::line_plain_text(&line.content)
     }
 
+    fn nth<'a>(out: &'a BlockOutput, i: usize) -> &'a BlockLine {
+        let Some(line) = out.lines.get(i) else {
+            panic!("expected line {i}, got {} lines", out.lines.len());
+        };
+        line
+    }
+
     #[test]
     fn recap_renders_tool_style_header_and_body() {
         let block = SessionEventBlock::new(SessionEvent::Recap {
@@ -1012,7 +1299,7 @@ mod tests {
         });
         let out = block.output(&recap_ctx(DisplayMode::Expanded, false));
         assert_eq!(
-            plain(&out.lines[0]),
+            plain(nth(&out, 0)),
             "Recap",
             "header line is the 'Recap' label"
         );
@@ -1020,6 +1307,39 @@ mod tests {
         assert!(
             body.contains("Refactored the parser and added tests."),
             "summary is shown as body text: {body}"
+        );
+    }
+
+    /// The deny / failure line takes the tool rows' bullet (config-gated like theirs); a plain hook note stays unbulleted.
+    #[test]
+    fn hook_outcome_takes_the_tool_bullet_and_a_note_does_not() {
+        let outcome = SessionEventBlock::new(SessionEvent::HookOutcome {
+            message: "`web_fetch` blocked by global/qa: no".into(),
+        });
+        let note = SessionEventBlock::new(SessionEvent::HookAnnotation {
+            message: "`web_fetch` blocked by global/qa: no".into(),
+        });
+        assert!(outcome.has_bullet(&ctx()));
+        assert!(!note.has_bullet(&ctx()));
+        assert!(
+            outcome.bullet(&ctx()).is_none(),
+            "default gray, matching the muted text"
+        );
+
+        let mut no_bullet = ctx();
+        no_bullet.appearance.scrollback.blocks.tool.bullet = crate::appearance::ToolBullet::None;
+        assert!(
+            !outcome.has_bullet(&no_bullet),
+            "a user who turned tool bullets off gets none on hook lines either"
+        );
+        assert_eq!(
+            outcome
+                .output(&ctx())
+                .lines
+                .first()
+                .map(|line| line.content.to_string()),
+            Some("`web_fetch` blocked by global/qa: no".to_string()),
+            "the message itself carries no glyph"
         );
     }
 
@@ -1083,7 +1403,7 @@ mod tests {
         // Header only: no blank line or body while still generating
         let out = block.output(&rc);
         assert_eq!(out.lines.len(), 1, "loading recap is just the header");
-        assert_eq!(plain(&out.lines[0]), "Recap");
+        assert_eq!(plain(nth(&out, 0)), "Recap");
 
         // The sidebar and bullet animate in gray (the feedback), not the magenta running color used for active tool turns
         let accent = block.accent(&rc).expect("loading recap has an accent bar");
@@ -1104,7 +1424,7 @@ mod tests {
         });
         let out = block.output(&recap_ctx(DisplayMode::Collapsed, false));
         assert_eq!(out.lines.len(), 1, "collapsed recap is a single line");
-        let text = plain(&out.lines[0]);
+        let text = plain(nth(&out, 0));
         assert!(text.starts_with("Recap"), "starts with the header: {text}");
         assert!(
             text.contains("First line of recap."),
@@ -1144,12 +1464,12 @@ mod tests {
         });
         let out = block.output(&recap_ctx(DisplayMode::Expanded, false));
         assert!(
-            matches!(out.lines[0].selectable, Selectable::None),
+            matches!(nth(&out, 0).selectable, Selectable::None),
             "header must be decoration, not copyable"
         );
-        assert_eq!(out.lines[0].selection_range, None);
+        assert_eq!(nth(&out, 0).selection_range, None);
         assert!(
-            matches!(out.lines[1].selectable, Selectable::None),
+            matches!(nth(&out, 1).selectable, Selectable::None),
             "blank gap under header must not be selectable"
         );
         let body: Vec<_> = out.lines.iter().skip(2).collect();
@@ -1175,7 +1495,7 @@ mod tests {
         });
         let out = block.output(&recap_ctx(DisplayMode::Collapsed, false));
         assert_eq!(out.lines.len(), 1);
-        let line = &out.lines[0];
+        let line = nth(&out, 0);
         assert!(
             matches!(&line.selectable, Selectable::Spans(r) if *r == (1..2)),
             "only the preview span is selectable, not the Recap label: {:?}",
@@ -1198,224 +1518,5 @@ mod tests {
         assert!(!block.is_selectable());
         assert!(!block.has_bullet(&ctx()));
         assert_eq!(block.accent(&ctx()), None);
-    }
-
-    fn stop_group(name: &str) -> (String, Vec<HookRunEntry>) {
-        use super::super::tool::HookRunStatus;
-        (
-            name.to_string(),
-            vec![HookRunEntry {
-                name: "global/notify".into(),
-                status: HookRunStatus::Success {
-                    elapsed: Duration::from_millis(12),
-                },
-                output: None,
-            }],
-        )
-    }
-
-    fn completed_with_stop_hooks() -> SessionEventBlock {
-        SessionEventBlock::with_stop_hooks(
-            SessionEvent::TurnCompleted {
-                elapsed: Some(Duration::from_secs(5)),
-            },
-            vec![stop_group("stop")],
-            None,
-        )
-    }
-
-    #[test]
-    fn stop_hooks_summary_is_right_justified_on_marker_line() {
-        let block = completed_with_stop_hooks();
-        let out = block.output(&BlockContext {
-            mode: DisplayMode::Collapsed,
-            ..ctx()
-        });
-        assert_eq!(out.lines.len(), 1, "collapsed marker stays a single line");
-        let text = plain(&out.lines[0]);
-        assert!(
-            text.starts_with("Worked for 5.0s"),
-            "marker text keeps the left edge: {text}"
-        );
-        assert!(
-            text.ends_with("stop  [hooks: 1]"),
-            "summary sits at the right edge: {text}"
-        );
-        assert_eq!(
-            unicode_width::UnicodeWidthStr::width(text.as_str()),
-            80,
-            "padding right-justifies the summary to the content width"
-        );
-        // Drag-copy stays on the marker text, never the padding or counts.
-        assert!(
-            matches!(&out.lines[0].selectable, Selectable::Spans(r) if *r == (0..1)),
-            "only the marker text span is selectable: {:?}",
-            out.lines[0].selectable
-        );
-        assert_eq!(
-            out.lines[0].selection_text.as_deref(),
-            Some("Worked for 5.0s")
-        );
-    }
-
-    #[test]
-    fn stop_hooks_summary_wraps_to_own_line_when_narrow() {
-        let block = completed_with_stop_hooks();
-        // "Worked for 5.0s" is 15 cols and the summary is 16, so at width 30 there is no room and the summary right-justifies on its own line
-        let out = block.output(&BlockContext {
-            mode: DisplayMode::Collapsed,
-            width: 30,
-            ..ctx()
-        });
-        assert_eq!(out.lines.len(), 2);
-        let summary_line = plain(&out.lines[1]);
-        assert!(summary_line.ends_with("stop  [hooks: 1]"));
-        assert_eq!(
-            unicode_width::UnicodeWidthStr::width(summary_line.as_str()),
-            30
-        );
-        assert!(
-            matches!(out.lines[1].selectable, Selectable::None),
-            "the overflow summary line is decoration"
-        );
-    }
-
-    #[test]
-    fn stop_hooks_summary_goes_below_wrapped_multi_line_marker() {
-        // This wrapped TurnFailed marker's first line has room for the summary
-        // Attaching there would read mid-paragraph, so the summary right-justifies on its own line below the text instead
-        let block = SessionEventBlock::with_stop_hooks(
-            SessionEvent::TurnFailed {
-                error: format!("boom {}", "x".repeat(70)),
-                elapsed: Some(Duration::from_secs(3)),
-            },
-            vec![stop_group("stop")],
-            None,
-        );
-        let out = block.output(&BlockContext {
-            mode: DisplayMode::Collapsed,
-            ..ctx()
-        });
-        assert_eq!(out.lines.len(), 3, "two wrapped text lines + summary line");
-        assert!(
-            !plain(&out.lines[0]).contains("[hooks:"),
-            "no summary interleaved with the wrapped text: {}",
-            plain(&out.lines[0])
-        );
-        let summary_line = plain(&out.lines[2]);
-        assert!(summary_line.ends_with("stop  [hooks: 1]"));
-        assert!(
-            matches!(out.lines[2].selectable, Selectable::None),
-            "the summary line is decoration"
-        );
-    }
-
-    #[test]
-    fn stop_hooks_detail_only_when_expanded() {
-        let block = completed_with_stop_hooks();
-        let collapsed = block.output(&BlockContext {
-            mode: DisplayMode::Collapsed,
-            ..ctx()
-        });
-        let collapsed_text = collapsed
-            .lines
-            .iter()
-            .map(plain)
-            .collect::<Vec<_>>()
-            .join("\n");
-        assert!(
-            !collapsed_text.contains("global/notify"),
-            "collapsed marker hides per-hook detail: {collapsed_text}"
-        );
-
-        let expanded = block.output(&ctx());
-        let expanded_text = expanded
-            .lines
-            .iter()
-            .map(plain)
-            .collect::<Vec<_>>()
-            .join("\n");
-        assert!(
-            expanded_text.contains("global/notify (12ms)"),
-            "expanded marker shows per-hook detail: {expanded_text}"
-        );
-    }
-
-    #[test]
-    fn marker_with_stop_hooks_is_interactive_and_starts_collapsed() {
-        let block = completed_with_stop_hooks();
-        assert!(block.is_foldable(), "fold reveals per-hook detail");
-        assert!(block.is_selectable(), "navigable so it can be folded");
-        assert_eq!(block.default_display_mode(), DisplayMode::Collapsed);
-
-        // All-skipped batches change nothing (mirrors has_content()).
-        use super::super::tool::HookRunStatus;
-        let skipped = SessionEventBlock::with_stop_hooks(
-            SessionEvent::TurnCompleted {
-                elapsed: Some(Duration::from_secs(5)),
-            },
-            vec![(
-                "stop".into(),
-                vec![HookRunEntry {
-                    name: "h".into(),
-                    status: HookRunStatus::Skipped,
-                    output: None,
-                }],
-            )],
-            None,
-        );
-        assert!(!skipped.is_foldable());
-        assert!(!skipped.is_selectable());
-        let out = skipped.output(&BlockContext {
-            mode: DisplayMode::Collapsed,
-            ..ctx()
-        });
-        assert_eq!(plain(&out.lines[0]), "Worked for 5.0s");
-    }
-
-    #[test]
-    fn stop_and_stop_failure_groups_render_labeled_sections() {
-        let block = SessionEventBlock::with_stop_hooks(
-            SessionEvent::TurnFailed {
-                error: "boom".into(),
-                elapsed: Some(Duration::from_secs(3)),
-            },
-            vec![stop_group("stop_failure"), stop_group("stop")],
-            None,
-        );
-        let out = block.output(&BlockContext {
-            mode: DisplayMode::Collapsed,
-            ..ctx()
-        });
-        let text = plain(&out.lines[0]);
-        assert!(
-            text.ends_with("stop_failure  [hooks: 1]  stop  [hooks: 1]"),
-            "both groups summarized: {text}"
-        );
-
-        let expanded = block.output(&ctx());
-        let expanded_text = expanded
-            .lines
-            .iter()
-            .map(plain)
-            .collect::<Vec<_>>()
-            .join("\n");
-        assert!(
-            expanded_text.contains("stop_failure") && expanded_text.contains("global/notify"),
-            "multi-group detail keeps section headers: {expanded_text}"
-        );
-    }
-
-    #[test]
-    fn only_turn_terminal_events_accept_stop_hooks() {
-        let settled = SessionEventBlock::new(SessionEvent::TurnCompleted {
-            elapsed: Some(Duration::from_secs(24)),
-        });
-        assert!(settled.event.is_turn_terminal());
-        let recap = SessionEventBlock::new(SessionEvent::Recap {
-            summary: "did stuff".into(),
-            auto: false,
-        });
-        assert!(!recap.event.is_turn_terminal());
     }
 }

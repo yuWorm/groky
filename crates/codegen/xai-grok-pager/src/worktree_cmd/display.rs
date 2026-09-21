@@ -86,11 +86,7 @@ pub fn print_show(rec: &WorktreeRecord, out: &mut impl Write) -> std::io::Result
         writeln!(out, "  Git Ref:        {git_ref}")?;
     }
     if let Some(ref commit) = rec.head_commit {
-        let short = if commit.len() > 12 {
-            &commit[..12]
-        } else {
-            commit
-        };
+        let short = commit.get(..12).unwrap_or(commit);
         writeln!(out, "  HEAD:           {short}")?;
     }
     writeln!(

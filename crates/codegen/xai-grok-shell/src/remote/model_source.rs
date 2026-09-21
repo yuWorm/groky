@@ -1,6 +1,6 @@
 //! Picks the URL and auth used to fetch the model list.
 use crate::agent::config::EndpointsConfig;
-use crate::agent::models::ModelFetchAuth;
+use crate::agent::remote_config::ModelFetchAuth;
 use crate::remote::client::{BackendError, FetchModelsResult};
 use xai_grok_login::GrokAuth;
 mod oai;

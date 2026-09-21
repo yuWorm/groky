@@ -72,6 +72,106 @@ pub(crate) fn should_adopt_running_prompt(prompt_id: &str) -> bool {
     !is_server_initiated_prompt(prompt_id) || is_scheduler_fired_prompt(prompt_id)
 }
 
+/// `TurnCancelling` with no id, or this id, stays cancelling. Ended and superseded ids do not replace the current turn.
+/// A command in flight is left alone. Returns false when the update belongs to a turn that already ended.
+/// `turn_start_ms` is this chunk's `turnStartMs`, not the view's stamp.
+pub(super) fn note_child_live_prompt(
+    child: &mut AgentView,
+    prompt_id: Option<&str>,
+    turn_start_ms: Option<i64>,
+    is_replay: bool,
+) -> bool {
+    if is_replay || child.session.loading_replay {
+        return true;
+    }
+    let prompt_id = prompt_id.filter(|pid| !pid.is_empty());
+    // Same start as the closed nameless turn. A late id matches while the
+    // stored prompt is still None; that id is recorded so a later prompt does not.
+    let is_closed_turn = child
+        .unidentified_child_turn_closed_ms
+        .is_some_and(|closed_start| {
+            let closed_pid = child.unidentified_child_turn_closed_prompt.as_deref();
+            turn_start_ms == Some(closed_start)
+                && (closed_pid.is_none() || prompt_id.is_none() || closed_pid == prompt_id)
+        });
+    if is_closed_turn {
+        if let Some(pid) = prompt_id {
+            child.ended_child_prompt_ids.insert(pid.to_owned());
+            if child.unidentified_child_turn_closed_prompt.is_none() {
+                child.unidentified_child_turn_closed_prompt = Some(pid.to_owned());
+            }
+        }
+        return false;
+    }
+    let Some(pid) = prompt_id else {
+        // A nameless leftover keeps the previous turn's start. Once a named
+        // prompt owns the clock, applying it restamps that anchor and lands
+        // the rows on the follow-up.
+        if let (Some(chunk_start), Some(live_pid)) =
+            (turn_start_ms, child.session.current_prompt_id.as_deref())
+            && child.turn_start_ms_prompt.as_deref() == Some(live_pid)
+            && child.turn_start_ms.is_some_and(|live| live != chunk_start)
+        {
+            return false;
+        }
+        return true;
+    };
+    if child.ended_child_prompt_ids.contains(pid) || child.superseded_child_prompt_ids.contains(pid)
+    {
+        return false;
+    }
+    if child.session.state.command_in_flight().is_some() {
+        return true;
+    }
+    let same = child.session.current_prompt_id.as_deref() == Some(pid);
+    let missing = child.session.current_prompt_id.is_none();
+    if matches!(child.session.state, AgentState::TurnCancelling) {
+        if !same {
+            adopt_child_prompt_id(child, pid);
+        }
+        if same || missing {
+            return true;
+        }
+        child.session.state = AgentState::TurnRunning;
+        return true;
+    }
+    if !same {
+        adopt_child_prompt_id(child, pid);
+    }
+    if !child.session.state.is_turn_running() {
+        child.session.state = AgentState::TurnRunning;
+    }
+    true
+}
+
+fn adopt_child_prompt_id(child: &mut AgentView, pid: &str) {
+    if let Some(prev) = child.session.current_prompt_id.replace(pid.to_string())
+        && prev != pid
+    {
+        child.superseded_child_prompt_ids.insert(prev);
+        // Later updates for `prev` are dropped. Finish its rows now; the terminal still pushes the marker.
+        child.session.tracker.finish_turn(&mut child.scrollback);
+        child.scrollback.finish_all_running();
+    }
+    child.turn_started_at = None;
+}
+
+pub(super) fn backdate_child_turn_clock(child: &mut AgentView) {
+    if child.turn_started_at.is_some() {
+        return;
+    }
+    let Some(pid) = child.session.current_prompt_id.as_deref() else {
+        return;
+    };
+    if child.turn_start_ms_prompt.as_deref() != Some(pid) {
+        return;
+    }
+    let Some(start_ms) = child.turn_start_ms else {
+        return;
+    };
+    child.turn_started_at = Some(viewer_turn_anchor(Some(start_ms)));
+}
+
 /// Compute the monotonic anchor a viewer should use as its turn-start time.
 /// A viewer adopts the driver's turn mid-stream, so stamping `Instant::now()` would undercount elapsed by the wait for the first delta.
 /// Falls back to `now` when `turnStartMs` is absent (older shell) or the wall clock is skewed forward.
@@ -104,7 +204,12 @@ pub(super) struct WakeTerminal<'a> {
 /// Close out a wake turn. This is the only place that flushes its streamed entries still in flight, because wake turns skip `PromptResponse`.
 /// Failures are the exception and still get a marker when silent, because the user's standing instruction stopped executing invisibly.
 /// The `HookAnnotation` warning attributes the deny but is not turn output, so a silently blocked wake closes without a marker.
-pub(super) fn finish_wake_turn(agent: &mut AgentView, prompt_id: &str, terminal: WakeTerminal<'_>) {
+/// Returns true when the wake closed with a visible `TurnCompleted` marker (chatty EndTurn).
+pub(super) fn finish_wake_turn(
+    agent: &mut AgentView,
+    prompt_id: &str,
+    terminal: WakeTerminal<'_>,
+) -> bool {
     let WakeTerminal {
         stop_reason,
         agent_result,
@@ -163,6 +268,7 @@ pub(super) fn finish_wake_turn(agent: &mut AgentView, prompt_id: &str, terminal:
                 elapsed_ms,
                 agent_result,
                 send_now_cancel,
+                cancel_trigger,
                 cancellation_category,
                 // Failures were handled above, so the Error arm is unreachable here
                 error_kind: None,
@@ -170,16 +276,15 @@ pub(super) fn finish_wake_turn(agent: &mut AgentView, prompt_id: &str, terminal:
             },
         ),
     };
-    if event.is_some() {
-        crate::app::turn_completion::push_turn_terminal_marker(agent, event, Some(prompt_id));
-    }
-    // Wake turns are synthetic and never gated, so no hook detail exists here.
+    let notify = matches!(&event, Some(SessionEvent::TurnCompleted { .. }));
+    crate::app::turn_completion::push_turn_terminal_marker(agent, event);
     crate::app::turn_completion::note_hook_blocked_turn(
         agent,
         Some(prompt_id),
         cancellation_category,
         None,
     );
+    notify
 }
 
 #[cfg(test)]

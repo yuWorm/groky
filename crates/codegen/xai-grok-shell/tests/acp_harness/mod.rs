@@ -120,8 +120,8 @@ pub struct AgentPipes {
 }
 
 /// Stand up `MvpAgent` plus its ACP connection and IO tasks on the current `LocalSet`.
-/// `remote` is installed before `MvpAgent::new` so the grove gate does not fail
-/// closed as `remote_unavailable`.
+/// `remote` is installed before `MvpAgent::new` so tests can seed `RemoteSettings`
+/// (including a grove kill) before the first worktree RPC.
 fn spawn_agent_local(remote: Option<xai_grok_shell::util::config::RemoteSettings>) -> AgentPipes {
     let (c2a_a, c2a_b) = tokio::io::duplex(DUPLEX_BUFFER_BYTES);
     let (a2c_a, a2c_b) = tokio::io::duplex(DUPLEX_BUFFER_BYTES);
@@ -130,8 +130,14 @@ fn spawn_agent_local(remote: Option<xai_grok_shell::util::config::RemoteSettings
     agent_config.remote_settings = remote;
     let auth_manager = Arc::new(agent_config.create_auth_manager());
     let (gw_tx, gw_rx) = tokio::sync::mpsc::unbounded_channel();
-    let agent = MvpAgent::new(GatewaySender::new(gw_tx), &agent_config, auth_manager, None)
-        .expect("valid config");
+    let agent = MvpAgent::new(
+        GatewaySender::new(gw_tx),
+        &agent_config,
+        auth_manager,
+        None,
+        None,
+    )
+    .expect("valid config");
 
     let agent_incoming = LineBufferedRead::spawn_local(c2a_b.compat());
     let (agent_conn, agent_io) =
@@ -209,8 +215,6 @@ where
                     json!({
                         "startupHints": {
                             "nonInteractive": true,
-                            "skipGitStatus": true,
-                            "skipProjectLayout": true,
                         },
                         "clientType": client_type,
                         "clientVersion": "0.0-test",
@@ -307,6 +311,32 @@ pub async fn prompt_turn(
     );
 }
 
+/// Clears process-global prefetch / profile / OTEL state on enter and drop.
+struct RestoreProcessGlobals;
+
+impl RestoreProcessGlobals {
+    fn enter() -> Self {
+        Self::reset();
+        Self
+    }
+
+    fn reset() {
+        // These seams exist only when the library is built with test-support
+        // (integration tests) or as a unit-test crate.
+        #[cfg(feature = "test-support")]
+        {
+            xai_grok_shell::managed_config::clear_startup_profile_for_tests();
+        }
+        xai_grok_telemetry::external::mark_external_otel_settings_resolved();
+    }
+}
+
+impl Drop for RestoreProcessGlobals {
+    fn drop(&mut self) {
+        Self::reset();
+    }
+}
+
 fn set_test_env(grok_home: &std::path::Path, server_url: &str) {
     // SAFETY: the only live threads are the mock's HTTP workers, which never read env.
     unsafe {
@@ -347,6 +377,7 @@ pub fn run_agent_test_with_models<F, Fut>(
     Fut: std::future::Future<Output = ()>,
 {
     let _env_guard = hold_global_env();
+    xai_grok_shell::agent::remote_config::settings_get::reset_startup_settings_for_tests();
     xai_grok_extra_ca::ensure_default_crypto_provider();
 
     // Own thread: agent startup blocks on a models prefetch and would starve the mock.
@@ -363,6 +394,8 @@ pub fn run_agent_test_with_models<F, Fut>(
     let grok_home = tempfile::TempDir::new().expect("grok home");
     let workdir = tempfile::TempDir::new().expect("workdir");
     set_test_env(grok_home.path(), &server.url());
+    // After GROK_HOME is the temp dir, so teardown cannot OnceLock ~/.grok.
+    let _globals = RestoreProcessGlobals::enter();
 
     let agent_rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -381,4 +414,47 @@ fn hold_global_env() -> MutexGuard<'static, ()> {
         .get_or_init(|| Mutex::new(()))
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Runs one session under `GROK_INSTRUMENTATION=log` and asserts each `probe` name reaches the log file.
+/// `name` labels the temp log file and the client. The instrumentation mode is read once per process, so a
+/// caller must own its own test binary.
+#[allow(dead_code)]
+pub fn assert_probes_emitted(name: &str, probes: &[&str]) {
+    use tracing_subscriber::prelude::*;
+
+    let log_path = std::env::temp_dir().join(format!("{name}-{}.jsonl", std::process::id()));
+    // SAFETY: set before any agent code; mode is read once on first use.
+    unsafe {
+        std::env::set_var("GROK_INSTRUMENTATION", "log");
+        std::env::set_var("GROK_INSTRUMENTATION_LOG", &log_path);
+    }
+    let _ = tracing_subscriber::registry()
+        .with(xai_grok_shell::instrumentation::layer::<
+            tracing_subscriber::Registry,
+        >())
+        .try_init();
+
+    let session_name = name.to_owned();
+    run_agent_test(move |cwd, _server| async move {
+        let (conn, _init) = connect_and_auth(AutoApproveClient, &session_name).await;
+        let _session_id = new_session(&conn, &cwd).await;
+    });
+    let _ = xai_grok_shell::instrumentation::finalize();
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let log = loop {
+        let log = std::fs::read_to_string(&log_path).unwrap_or_default();
+        if probes.iter().all(|probe| log.contains(probe)) || std::time::Instant::now() >= deadline {
+            break log;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    for probe in probes {
+        assert!(
+            log.contains(probe),
+            "must emit the {probe} probe; log:\n{log}"
+        );
+    }
+    let _ = std::fs::remove_file(&log_path);
 }

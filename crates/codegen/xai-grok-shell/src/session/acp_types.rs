@@ -587,6 +587,9 @@ pub struct FeedbackContext {
     pub context_tokens_used: u64,
     pub context_window_tokens: u64,
     pub session_cwd: String,
+    pub reasoning_effort: Option<crate::sampling::ReasoningEffort>,
+    pub model_id: Option<String>,
+    pub model_fingerprint: Option<String>,
 }
 
 // ── Startup hints ───────────────────────────────────────────────────────
@@ -598,8 +601,6 @@ pub struct FeedbackContext {
 pub struct StartupHints {
     #[serde(default)]
     pub non_interactive: bool,
-    #[serde(default)]
-    pub skip_git_status: bool,
     /// Leading conversation items to preserve verbatim across compaction (the immutable head).
     /// A fresh subagent's head is its spawn-injected items; a `resume_from` subagent's is just the System head so the resumed body stays compactable.
     #[serde(default)]
@@ -832,9 +833,9 @@ mod tests {
             error: None,
         };
         let v = serde_json::to_value(&resp).unwrap();
-        assert_eq!(v["mode"], json!("conversation_only"));
-        assert_eq!(v["prompt_text"], json!("fix the bug"));
-        assert_eq!(v["success"], json!(true));
+        assert_eq!(v.get("mode"), Some(&json!("conversation_only")));
+        assert_eq!(v.get("prompt_text"), Some(&json!("fix the bug")));
+        assert_eq!(v.get("success"), Some(&json!(true)));
     }
 
     #[test]
@@ -850,8 +851,8 @@ mod tests {
             error: None,
         };
         let v = serde_json::to_value(&resp).unwrap();
-        assert!(v["prompt_text"].is_null());
-        assert_eq!(v["reverted_files"], json!(["src/main.rs"]));
+        assert_eq!(v.get("prompt_text"), Some(&json!(null)));
+        assert_eq!(v.get("reverted_files"), Some(&json!(["src/main.rs"])));
     }
 
     #[test]
@@ -870,7 +871,10 @@ mod tests {
         assert!(resp.prompt_text.is_none());
         assert!(resp.clean_files.is_empty());
         assert_eq!(resp.conflicts.len(), 1);
-        assert_eq!(resp.conflicts[0].path, "a.rs");
+        assert_eq!(
+            resp.conflicts.first().map(|c| c.path.as_str()),
+            Some("a.rs")
+        );
     }
 
     // ── RewindPointInfo.has_file_changes ──────────────────────────────
@@ -885,8 +889,8 @@ mod tests {
             prompt_preview: Some("refactor auth".into()),
         };
         let v = serde_json::to_value(&point).unwrap();
-        assert_eq!(v["has_file_changes"], json!(true));
-        assert_eq!(v["num_file_snapshots"], json!(3));
+        assert_eq!(v.get("has_file_changes"), Some(&json!(true)));
+        assert_eq!(v.get("num_file_snapshots"), Some(&json!(3)));
     }
 
     #[test]
@@ -899,8 +903,8 @@ mod tests {
             prompt_preview: None,
         };
         let v = serde_json::to_value(&point).unwrap();
-        assert_eq!(v["has_file_changes"], json!(false));
-        assert_eq!(v["num_file_snapshots"], json!(0));
+        assert_eq!(v.get("has_file_changes"), Some(&json!(false)));
+        assert_eq!(v.get("num_file_snapshots"), Some(&json!(0)));
     }
 
     #[test]

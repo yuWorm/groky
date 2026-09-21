@@ -68,12 +68,12 @@ fn registered_settings() {
                 ("GROK_SUBAGENT_WORKTREE_SNAPSHOT", false),
             ),
             (
-                "active_agent_messages",
-                ("GROK_ACTIVE_AGENT_MESSAGES", false),
+                "subagent_model_inheritance",
+                ("GROK_SUBAGENT_MODEL_INHERITANCE", false),
             ),
             (
-                "repo_status_in_system_prompt",
-                ("GROK_REPO_STATUS_IN_SYSTEM_PROMPT", true),
+                "active_agent_messages",
+                ("GROK_ACTIVE_AGENT_MESSAGES", false),
             ),
             ("dock", ("GROK_DOCK", false)),
             ("terminal_theme", ("GROK_TERMINAL_THEME", false)),
@@ -105,10 +105,10 @@ fn every_registered_feature_reads_its_own_remote_setting() {
             Feature::SubagentWorktreeSnapshot => {
                 settings.subagent_worktree_snapshot_enabled = Some(value)
             }
-            Feature::ActiveAgentMessages => settings.active_agent_messages_enabled = Some(value),
-            Feature::RepoStatusInSystemPrompt => {
-                settings.repo_status_in_system_prompt = Some(value)
+            Feature::SubagentModelInheritance => {
+                settings.subagent_model_inheritance_enabled = Some(value)
             }
+            Feature::ActiveAgentMessages => settings.active_agent_messages_enabled = Some(value),
             Feature::Dock => settings.dock_enabled = Some(value),
             Feature::TerminalTheme => settings.terminal_theme_enabled = Some(value),
             // The one row with no remote tier, stated as such rather than as a projection that reads nothing

@@ -81,33 +81,83 @@ pub(super) fn notification_hook_for_update(
 }
 
 pub(super) struct DeferredPostToolUseScrollback {
-    tool_name: String,
+    batch: HookBatch,
     results: Vec<xai_grok_hooks::result::HookRunResult>,
 }
 
+/// The identity `HookRunStarted` and `HookExecution` share; built once per dispatch so the pager's phase always gets its end.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct HookBatch {
+    pub(crate) event_name: String,
+    pub(crate) tool_name: Option<String>,
+    pub(crate) prompt_id: Option<String>,
+}
+
+impl HookBatch {
+    pub(crate) fn from_envelope(envelope: &xai_grok_hooks::event::HookEventEnvelope) -> Self {
+        Self {
+            event_name: envelope.hook_event_name.to_string(),
+            tool_name: envelope.payload.tool_name().map(str::to_string),
+            prompt_id: envelope.prompt_id.clone(),
+        }
+    }
+}
+
 impl SessionActor {
+    /// One context per dispatch; the announced count and the run loop filter on the same disabled-hooks snapshot.
     pub(super) fn hook_run_ctx(&self) -> xai_grok_hooks::runner::RunContext<'_> {
         xai_grok_hooks::runner::RunContext {
             session_id: &self.session_info.id.0,
             workspace_root: &self.hook_resolved_workspace_root,
             process_scope: self.tool_context.process_scope.clone(),
+            disabled: self.hook_disabled.borrow().clone(),
         }
+    }
+
+    /// Re-read the disabled-hooks file after this session changed it or reloaded its hooks.
+    pub(super) fn refresh_hook_disabled(&self) {
+        *self.hook_disabled.borrow_mut() =
+            std::sync::Arc::new(crate::util::hooks::disabled_hooks_snapshot());
     }
 
     /// The annotation renders inline with the preceding tool call block rather than as a separate agent message.
     pub(super) async fn send_hook_annotation(&self, message: &str) {
+        self.send_hook_annotation_of(message, HookAnnotationKind::Note)
+            .await;
+    }
+
+    pub(super) async fn send_hook_annotation_of(&self, message: &str, kind: HookAnnotationKind) {
         self.send_xai_notification(XaiSessionUpdate::HookAnnotation {
             message: message.to_string(),
+            kind,
         })
         .await;
     }
 
-    /// `prompt_id` is `None` for session-level dispatches (session_start / session-end stop).
+    /// Announces an awaited batch before its dispatch; silent when nothing would run, and a non-zero count guarantees a
+    /// `send_hook_execution` that ends it. Live-only: replayed on reload it would arm a phase nothing ends.
+    pub(super) fn announce_hook_run(
+        &self,
+        registry: &xai_grok_hooks::discovery::HookRegistry,
+        envelope: &xai_grok_hooks::event::HookEventEnvelope,
+        ctx: &xai_grok_hooks::runner::RunContext<'_>,
+    ) -> HookBatch {
+        let batch = HookBatch::from_envelope(envelope);
+        let count = xai_grok_hooks::dispatcher::runnable_count(registry, envelope, ctx);
+        if count > 0 {
+            self.send_xai_notification_transient(XaiSessionUpdate::HookRunStarted {
+                event_name: batch.event_name.clone(),
+                tool_name: batch.tool_name.clone(),
+                prompt_id: batch.prompt_id.clone(),
+                count,
+            });
+        }
+        batch
+    }
+
     pub(super) async fn send_hook_execution(
         &self,
-        event_name: &str,
-        tool_name: Option<&str>,
-        prompt_id: Option<&str>,
+        batch: &HookBatch,
         results: &[xai_grok_hooks::result::HookRunResult],
     ) {
         if results.is_empty()
@@ -171,9 +221,9 @@ impl SessionActor {
             .collect();
 
         self.send_xai_notification(XaiSessionUpdate::HookExecution {
-            event_name: event_name.to_string(),
-            tool_name: tool_name.map(|s| s.to_string()),
-            prompt_id: prompt_id.map(|s| s.to_string()),
+            event_name: batch.event_name.clone(),
+            tool_name: batch.tool_name.clone(),
+            prompt_id: batch.prompt_id.clone(),
             runs,
         })
         .await;
@@ -227,7 +277,6 @@ impl SessionActor {
         event: xai_grok_hooks::event::HookEventName,
         payload: xai_grok_hooks::event::HookPayload,
         prompt_id: Option<&str>,
-        tool_name: Option<&str>,
     ) {
         if !self.may_have_hooks_for(event) {
             return;
@@ -238,13 +287,13 @@ impl SessionActor {
             return;
         };
         let ctx = self.hook_run_ctx();
+        let batch = self.announce_hook_run(&registry, &envelope, &ctx);
         // Prompt-gate events go through dispatch_prompt_submit_hook; dispatch_non_blocking debug-asserts observe-only
         let results =
             xai_grok_hooks::dispatcher::dispatch_non_blocking(&registry, event, &envelope, &ctx)
                 .await;
-        self.send_hook_execution(&event.to_string(), tool_name, prompt_id, &results)
-            .await;
-        self.emit_hook_executed_telemetry(&event.to_string(), tool_name, &results)
+        self.send_hook_execution(&batch, &results).await;
+        self.emit_hook_executed_telemetry(&batch.event_name, batch.tool_name.as_deref(), &results)
             .await;
     }
 
@@ -261,8 +310,7 @@ impl SessionActor {
         }
 
         let tool_result = serde_json::to_value(output).unwrap_or(serde_json::Value::Null);
-        let raw_input: serde_json::Value =
-            serde_json::from_str(&prepared.raw_arguments).unwrap_or(serde_json::Value::Null);
+        let raw_input = prepared.hook_arguments().into_owned();
         let (tool_input_value, tool_input_truncated) = truncate_payload(raw_input);
         let (tool_result_value, tool_result_truncated) = truncate_payload(tool_result);
         let hook_tool_name = prepared.hook_tool_name().to_owned();
@@ -284,11 +332,18 @@ impl SessionActor {
             },
         );
         let registry = self.hook_registry.borrow().clone();
-        let mut dispatch_result = if let Some(registry) = registry {
+        let (batch, mut dispatch_result) = if let Some(registry) = registry {
             let ctx = self.hook_run_ctx();
-            xai_grok_hooks::dispatcher::dispatch_post_tool_use(&registry, &envelope, &ctx).await
+            let batch = self.announce_hook_run(&registry, &envelope, &ctx);
+            let result =
+                xai_grok_hooks::dispatcher::dispatch_post_tool_use(&registry, &envelope, &ctx)
+                    .await;
+            (batch, result)
         } else {
-            xai_grok_hooks::dispatcher::PostToolUseResult::default()
+            (
+                HookBatch::from_envelope(&envelope),
+                xai_grok_hooks::dispatcher::PostToolUseResult::default(),
+            )
         };
         // Client PostToolUse runs the awaited gate though it is not yet in
         // ADVERTISED_BLOCKING_EVENTS; SDK clients dispatch by callback id and answer.
@@ -304,10 +359,7 @@ impl SessionActor {
 
         self.emit_hook_executed_telemetry(&event, Some(&hook_tool_name), &results)
             .await;
-        let deferred = DeferredPostToolUseScrollback {
-            tool_name: hook_tool_name,
-            results,
-        };
+        let deferred = DeferredPostToolUseScrollback { batch, results };
         (delivery, Some(deferred))
     }
 
@@ -315,8 +367,7 @@ impl SessionActor {
         &self,
         deferred: DeferredPostToolUseScrollback,
     ) {
-        let event = xai_grok_hooks::event::HookEventName::PostToolUse.to_string();
-        self.send_hook_execution(&event, Some(&deferred.tool_name), None, &deferred.results)
+        self.send_hook_execution(&deferred.batch, &deferred.results)
             .await;
     }
 
@@ -332,8 +383,7 @@ impl SessionActor {
         if !self.may_have_hooks_for(xai_grok_hooks::event::HookEventName::PostToolUseFailure) {
             return Vec::new();
         }
-        let raw_input: serde_json::Value =
-            serde_json::from_str(&prepared.raw_arguments).unwrap_or(serde_json::Value::Null);
+        let raw_input = prepared.hook_arguments().into_owned();
         let (tool_input, tool_input_truncated) = xai_grok_hooks::event::truncate_payload(raw_input);
         let hook_tool_name = prepared.hook_tool_name();
         self.dispatch_post_tool_use_failure_hook(
@@ -368,12 +418,12 @@ impl SessionActor {
             return Vec::new();
         };
         let ctx = self.hook_run_ctx();
+        let batch = self.announce_hook_run(&registry, &envelope, &ctx);
         let result =
             xai_grok_hooks::dispatcher::dispatch_post_tool_use_failure(&registry, &envelope, &ctx)
                 .await;
-        self.send_hook_execution(&event.to_string(), Some(tool_name), None, &result.results)
-            .await;
-        self.emit_hook_executed_telemetry(&event.to_string(), Some(tool_name), &result.results)
+        self.send_hook_execution(&batch, &result.results).await;
+        self.emit_hook_executed_telemetry(&batch.event_name, Some(tool_name), &result.results)
             .await;
         result.additional_context
     }
@@ -404,11 +454,11 @@ impl SessionActor {
             return xai_grok_hooks::result::PromptDecision::Allow;
         };
         let ctx = self.hook_run_ctx();
+        let batch = self.announce_hook_run(&registry, &envelope, &ctx);
         let gate =
             xai_grok_hooks::dispatcher::dispatch_prompt_gate(&registry, &envelope, &ctx).await;
-        self.send_hook_execution(&event.to_string(), None, prompt_id, &gate.results)
-            .await;
-        self.emit_hook_executed_telemetry(&event.to_string(), None, &gate.results)
+        self.send_hook_execution(&batch, &gate.results).await;
+        self.emit_hook_executed_telemetry(&batch.event_name, None, &gate.results)
             .await;
         gate.decision
     }
@@ -465,6 +515,14 @@ mod notification_hook_filter_tests {
 
     #[test]
     fn hook_updates_do_not_fire_notification_hook() {
+        let started = XaiSessionUpdate::HookRunStarted {
+            event_name: "pre_tool_use".into(),
+            tool_name: Some("read_file".into()),
+            prompt_id: None,
+            count: 1,
+        };
+        assert!(notification_hook_for_update(&started).is_none());
+
         let execution = XaiSessionUpdate::HookExecution {
             event_name: "pre_tool_use".into(),
             tool_name: Some("read_file".into()),
@@ -479,6 +537,7 @@ mod notification_hook_filter_tests {
 
         let annotation = XaiSessionUpdate::HookAnnotation {
             message: "running hooks".into(),
+            kind: Default::default(),
         };
         assert!(notification_hook_for_update(&annotation).is_none());
     }

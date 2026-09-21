@@ -13,10 +13,6 @@ use crate::settings::{
     SettingKey, SettingKind, SettingValue, StringValidator, dynamic_enum_choices,
 };
 
-// ---------------------------------------------------------------------------
-// Key handling
-// ---------------------------------------------------------------------------
-
 /// F2/Ctrl+,/Cmd+, always close regardless of mode. Space/Enter Repeat events are suppressed to
 /// avoid per-tick disk writes.
 pub fn handle_settings_key(state: &mut SettingsModalState, key: &KeyEvent) -> SettingsKeyOutcome {
@@ -24,7 +20,6 @@ pub fn handle_settings_key(state: &mut SettingsModalState, key: &KeyEvent) -> Se
         return SettingsKeyOutcome::Unchanged;
     }
 
-    // Suppress Repeat for toggle keys to avoid per-tick disk writes.
     if key.kind == KeyEventKind::Repeat && matches!(key.code, KeyCode::Char(' ') | KeyCode::Enter) {
         return SettingsKeyOutcome::Unchanged;
     }
@@ -249,6 +244,8 @@ pub(super) fn set_picker_idx(
         // The caller bounds-checks already; this re-check protects a future caller that does not
         return SettingsKeyOutcome::Unchanged;
     }
+    // Focus moves cancel a pending double-click.
+    state.picker_last_click = None;
     state.transition_to_picking_enum(setting_key, new_idx, original_value, supports_preview);
     // Preview dispatch for static Enums with preview support.
     if supports_preview
@@ -574,7 +571,12 @@ fn handle_browse(state: &mut SettingsModalState, key: &KeyEvent) -> SettingsKeyO
                 .filtered_cache
                 .iter()
                 .copied()
-                .find(|&idx| matches!(state.rows[idx], RowEntry::Setting { .. }))
+                .find(|&idx| {
+                    state
+                        .rows
+                        .get(idx)
+                        .is_some_and(|r| matches!(r, RowEntry::Setting { .. }))
+                })
                 .unwrap_or(state.selected);
             if first != state.selected {
                 state.selected = first;
@@ -590,7 +592,12 @@ fn handle_browse(state: &mut SettingsModalState, key: &KeyEvent) -> SettingsKeyO
                 .iter()
                 .rev()
                 .copied()
-                .find(|&idx| matches!(state.rows[idx], RowEntry::Setting { .. }))
+                .find(|&idx| {
+                    state
+                        .rows
+                        .get(idx)
+                        .is_some_and(|r| matches!(r, RowEntry::Setting { .. }))
+                })
                 .unwrap_or(state.selected);
             if last != state.selected {
                 state.selected = last;
@@ -758,10 +765,6 @@ fn apply_filter_edit(
     }
 }
 
-// ---------------------------------------------------------------------------
-// Mouse handling
-// ---------------------------------------------------------------------------
-
 /// Handle a mouse event in the modal content area.
 pub fn handle_settings_mouse(
     state: &mut SettingsModalState,
@@ -865,12 +868,18 @@ pub fn handle_settings_mouse(
                 return SettingsKeyOutcome::Unchanged;
             };
             // Clicking a header is a no-op.
-            if !matches!(state.rows[idx], RowEntry::Setting { .. }) {
+            if !state
+                .rows
+                .get(idx)
+                .is_some_and(|r| matches!(r, RowEntry::Setting { .. }))
+            {
                 return SettingsKeyOutcome::Unchanged;
             }
             // Two-stage clicks. Click on a different row: only select, so the user can read the description
             // first.
-            let row_rect = state.row_rects[idx];
+            let Some(&row_rect) = state.row_rects.get(idx) else {
+                return SettingsKeyOutcome::Unchanged;
+            };
             // Col 0 of the row is the `▸`/`▾` triangle glyph. A click there toggles expansion without touching
             // the value, matching the keyboard's Right/Left arrows. Two-line rows have `row_rect.height = 2`
             // with the triangle on line 1 only.
@@ -973,20 +982,36 @@ fn handle_picker_mouse(
         .iter()
         .position(|r| r.height > 0 && rect_contains(*r, column, row));
     let Some(target_idx) = clicked_idx else {
+        state.picker_last_click = None;
         return SettingsKeyOutcome::Unchanged;
     };
-    if target_idx == current_idx {
-        // Already focused: re-clicking the same choice is a no-op; commit fires on Enter, not on a re-click
-        return SettingsKeyOutcome::Unchanged;
+    // Do not move focus and then Enter-commit: that drops the preview Action
+    // and can persist a different radio than the one clicked.
+    if picker_click_is_double(state, target_idx) && target_idx == current_idx {
+        state.picker_last_click = None;
+        let synthetic = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+        return handle_picking_enum(state, &synthetic);
     }
-    // Reuse the keyboard nav helper to update `choices_idx` and fire the matching preview Action (when the kind supports it)
-    set_picker_idx(
-        state,
-        setting_key,
-        target_idx,
-        original_value,
-        supports_preview,
-    )
+    let outcome = if target_idx == current_idx {
+        SettingsKeyOutcome::Unchanged
+    } else {
+        set_picker_idx(
+            state,
+            setting_key,
+            target_idx,
+            original_value,
+            supports_preview,
+        )
+    };
+    // Arm after `set_picker_idx`, which clears a pending double-click.
+    state.picker_last_click = Some((target_idx, std::time::Instant::now()));
+    outcome
+}
+
+fn picker_click_is_double(state: &SettingsModalState, idx: usize) -> bool {
+    state.picker_last_click.is_some_and(|(prev, at)| {
+        prev == idx && at.elapsed().as_millis() < crate::app::agent_view::MULTI_CLICK_TIMEOUT_MS
+    })
 }
 
 /// Handle a mouse event while the modal is in `PickingGroup` mode.

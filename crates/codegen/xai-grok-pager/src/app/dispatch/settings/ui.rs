@@ -152,7 +152,7 @@ pub(in crate::app::dispatch) fn dispatch_open_settings(
     focus_key: Option<&'static str>,
 ) -> Vec<Effect> {
     use crate::views::modal::ActiveModal;
-    use crate::views::settings_modal::SettingsModalState;
+    use crate::views::settings_modal::{RowVisibility, SettingsModalState};
 
     let mut effects = vec![];
     let id = match app.active_view {
@@ -187,6 +187,11 @@ pub(in crate::app::dispatch) fn dispatch_open_settings(
     let auto_mode_gate_from_app = app.auto_mode_gate;
     let ask_user_question_timeout_enabled_from_app = app.ask_user_question_timeout_enabled;
     let voice_stt_language_from_app = app.voice_config.language.clone();
+    // Theme rows are `hidden_in_minimal`. Snapshot this AppView's mode, not `MINIMAL_MODE_ACTIVE`
+    // (other tests flip that process flag in parallel and would drop `theme` from the list).
+    let visibility = RowVisibility {
+        hide_appearance: app.screen_mode.is_minimal(),
+    };
 
     let Some(agent) = app.agents.get_mut(&id) else {
         return effects;
@@ -234,10 +239,11 @@ pub(in crate::app::dispatch) fn dispatch_open_settings(
         ask_user_question_timeout_enabled: ask_user_question_timeout_enabled_from_app,
         voice_stt_language: voice_stt_language_from_app,
     };
-    let mut state = Box::new(SettingsModalState::new(
+    let mut state = Box::new(SettingsModalState::new_with_row_visibility(
         registry,
         ui_snapshot,
         pager_snapshot,
+        visibility,
     ));
     if let Some(key) = focus_key
         && state.focus_key(key)
@@ -348,12 +354,24 @@ pub(in crate::app::dispatch) fn dispatch_confirm_reset_setting(
                 return vec![];
             };
             let default_value = crate::settings::default_value_for(meta);
+            let Some(action) = action_for_reset(key, &default_value) else {
+                tracing::error!(
+                    target: "settings",
+                    key,
+                    ?default_value,
+                    "reset has no action_for_reset arm — registry/dispatch skew",
+                );
+                return vec![];
+            };
 
             // Gate idempotent reset: a value already at its default only shows a toast
+            // Not for the coding-data setter, which owns that decision: its local "opt-out" may be the unconfirmed fail-safe, so it writes anyway
             let pager_snapshot = build_pager_snapshot(app);
             let current_value =
                 crate::settings::current_value_for(key, &app.current_ui, &pager_snapshot);
-            if current_value.as_ref() == Some(&default_value) {
+            if current_value.as_ref() == Some(&default_value)
+                && !matches!(action, Action::SetCodingDataSharing { .. })
+            {
                 tracing::debug!(
                     target: "settings",
                     key,
@@ -366,15 +384,6 @@ pub(in crate::app::dispatch) fn dispatch_confirm_reset_setting(
                 return vec![];
             }
 
-            let Some(action) = action_for_reset(key, &default_value) else {
-                tracing::error!(
-                    target: "settings",
-                    key,
-                    ?default_value,
-                    "reset has no action_for_reset arm — registry/dispatch skew",
-                );
-                return vec![];
-            };
             tracing::info!(
                 target: "settings",
                 key,
@@ -639,6 +648,9 @@ pub(in crate::app::dispatch) fn action_for_reset(
         ("show_timestamps", SettingValue::Bool(b)) => Some(Action::SetTimestamps(*b)),
         ("show_timeline", SettingValue::Bool(b)) => Some(Action::SetTimeline(*b)),
         ("page_flip_on_send", SettingValue::Bool(b)) => Some(Action::SetPageFlipOnSend(*b)),
+        ("dashboard_preview", SettingValue::Bool(enabled)) => {
+            Some(Action::SetDashboardPreview(*enabled))
+        }
         ("confirm_before_rewind", SettingValue::Bool(b)) => {
             Some(Action::SetConfirmBeforeRewind(*b))
         }
@@ -812,6 +824,9 @@ pub(in crate::app::dispatch) fn apply_setting_rollback(
         ("show_timestamps", SettingValue::Bool(b)) => set_timestamps_inner(app, *b),
         ("show_timeline", SettingValue::Bool(b)) => set_timeline_inner(app, *b),
         ("page_flip_on_send", SettingValue::Bool(b)) => set_page_flip_on_send_inner(app, *b),
+        ("dashboard_preview", SettingValue::Bool(enabled)) => {
+            app.current_ui.dashboard_preview = Some(*enabled);
+        }
         ("confirm_before_rewind", SettingValue::Bool(b)) => {
             set_confirm_before_rewind_inner(app, *b)
         }

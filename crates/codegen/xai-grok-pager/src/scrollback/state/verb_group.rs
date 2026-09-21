@@ -14,9 +14,6 @@ use ratatui::text::{Line, Span};
 
 use crate::scrollback::block::RenderBlock;
 use crate::scrollback::blocks::SubagentBlockKind;
-use crate::scrollback::blocks::tool::hook::{
-    HookRunCounts, render_group_hook_counts_inline_suffix,
-};
 use crate::scrollback::blocks::tool::{ToolCallBlock, VerbGroupKind};
 use crate::scrollback::entry::ScrollbackEntry;
 use crate::scrollback::types::DisplayMode;
@@ -30,19 +27,18 @@ pub(crate) enum RunStep {
     /// It never counts toward the threshold and never appears in the header label.
     ThoughtMember,
     /// An entry that renders its own rows (or none) without joining or breaking the run.
-    /// That covers hidden, streaming, user-opened thinking, thinking that carries prompt or hook chrome, and a manually-opened verb-groupable tool.
+    /// That covers hidden, streaming, user-opened thinking, thinking that carries prompt chrome, and a manually-opened verb-groupable tool.
     Transparent,
     /// Anything else: ends the run.
     Break,
 }
 
 /// A manually-opened member is [`RunStep::Transparent`] and keeps its own rows without splitting the run. Thinking
-/// never breaks a run: a finished collapsed thought without prompt or hook chrome folds in as
+/// never breaks a run: a finished collapsed thought without prompt chrome folds in as
 /// [`RunStep::ThoughtMember`].
 pub(crate) fn run_step(entry: &ScrollbackEntry, show_thinking: bool) -> RunStep {
-    let is_claimable_thinking = entry.display_mode == DisplayMode::Collapsed
-        && !entry.is_pending_user_input
-        && entry.hook_data.is_none();
+    let is_claimable_thinking =
+        entry.display_mode == DisplayMode::Collapsed && !entry.is_pending_user_input;
     if let RenderBlock::ToolCall(block) = &entry.block
         && let Some(kind) = block.verb_group_kind()
         && !entry.is_pending_user_input
@@ -145,7 +141,7 @@ pub struct VerbGroupHeaderLabel {
     pub text: String,
     /// Any member still running (animated accent and present-tense verbs).
     pub running: bool,
-    /// Any member or summarized hook failed (error accent).
+    /// Any member failed (error accent).
     pub failed: bool,
 }
 
@@ -176,6 +172,8 @@ struct Bucket<'e> {
     /// Holds WebSearch citation URLs (distinct result websites) and subagent child session ids.
     /// The started and terminal rows of one subagent count once; a burst of terminal rows counts each distinct subagent.
     sources: std::collections::HashSet<&'e str>,
+    /// Distinct child ids whose Subagent row is still `is_running`. Empty for other kinds.
+    running_sources: std::collections::HashSet<&'e str>,
 }
 
 /// The label counts members only: folded thoughts contribute nothing here and appear as their own member rows only
@@ -191,13 +189,16 @@ pub fn verb_group_header_label(
     let mut acc = BucketAccumulator::default();
 
     let end = end.min(entries.len());
-    for &entry in &entries[header_idx.min(end)..end] {
+    let Some(run) = entries.get(header_idx.min(end)..end) else {
+        return acc.into_label(theme);
+    };
+    for &entry in run {
         let kind = match run_step(entry, show_thinking) {
             RunStep::Member(kind) => kind,
             RunStep::Break => break,
             RunStep::ThoughtMember | RunStep::Transparent => continue,
         };
-        acc.push(kind, entry, true);
+        acc.push(kind, entry);
     }
 
     acc.into_label(theme)
@@ -217,7 +218,8 @@ pub fn truncation_header_label(
     let end = range.end.min(entries.len());
     let mut participants = 0usize;
 
-    for &entry in &entries[range.start.min(end)..end] {
+    let run = entries.get(range.start.min(end)..end)?;
+    for &entry in run {
         if limit.is_some_and(|n| participants >= n) {
             break;
         }
@@ -229,8 +231,8 @@ pub fn truncation_header_label(
             continue;
         }
         match &entry.block {
-            RenderBlock::ToolCall(block) => acc.push(block.label_kind()?, entry, false),
-            RenderBlock::Subagent(_) => acc.push(VerbGroupKind::Subagent, entry, false),
+            RenderBlock::ToolCall(block) => acc.push(block.label_kind()?, entry),
+            RenderBlock::Subagent(_) => acc.push(VerbGroupKind::Subagent, entry),
             // A participant the vocabulary can't name would leave the label dishonest about what's hidden
             // Decline so the numerically exact plain count renders instead
             _ => return None,
@@ -245,13 +247,12 @@ pub fn truncation_header_label(
 
 /// Shared bucket accumulation and label rendering for the aggregated group headers.
 /// Callers own the walk: which entries join and under what classification.
-/// This owns per-kind counting, distinct-source overrides, tool and hook outcome counting, and the rendered line.
+/// This owns per-kind counting, distinct-source overrides, tool outcome counting, and the rendered line.
 #[derive(Default)]
 struct BucketAccumulator<'e> {
     buckets: Vec<Bucket<'e>>,
     running: bool,
     failed_count: usize,
-    hook_counts: HookRunCounts,
 }
 
 impl<'e> BucketAccumulator<'e> {
@@ -259,7 +260,7 @@ impl<'e> BucketAccumulator<'e> {
         self.buckets.is_empty()
     }
 
-    fn push(&mut self, kind: VerbGroupKind, entry: &'e ScrollbackEntry, include_hook_counts: bool) {
+    fn push(&mut self, kind: VerbGroupKind, entry: &'e ScrollbackEntry) {
         let pos = match self.buckets.iter().position(|b| b.kind == kind) {
             Some(pos) => pos,
             None => {
@@ -267,11 +268,14 @@ impl<'e> BucketAccumulator<'e> {
                     kind,
                     calls: 0,
                     sources: std::collections::HashSet::new(),
+                    running_sources: std::collections::HashSet::new(),
                 });
                 self.buckets.len() - 1
             }
         };
-        let bucket = &mut self.buckets[pos];
+        let Some(bucket) = self.buckets.get_mut(pos) else {
+            return;
+        };
         bucket.calls += 1;
         // Both walks only bucket tool-call or subagent rows
         // The block feeds the distinct-count override and failure detection
@@ -290,6 +294,9 @@ impl<'e> BucketAccumulator<'e> {
             }
             RenderBlock::Subagent(sb) => {
                 bucket.sources.insert(sb.child_session_id.as_str());
+                if entry.is_running {
+                    bucket.running_sources.insert(sb.child_session_id.as_str());
+                }
                 // Cancelled is deliberate, not an error; only Failed feeds the red suffix
                 if matches!(sb.kind, SubagentBlockKind::Failed { .. }) {
                     self.failed_count += 1;
@@ -299,9 +306,6 @@ impl<'e> BucketAccumulator<'e> {
             _ => debug_assert!(false, "bucketed entry has a block with no label-extras arm"),
         }
 
-        if include_hook_counts && let Some(hook_data) = &entry.hook_data {
-            self.hook_counts.add_data(hook_data);
-        }
         if entry.is_running {
             self.running = true;
         }
@@ -317,13 +321,32 @@ impl<'e> BucketAccumulator<'e> {
             } else {
                 bucket.sources.len()
             };
-            let segment = format!(
-                "{}{} {} {}",
-                if i == 0 { "" } else { ", " },
-                bucket.kind.verb(self.running),
-                count,
-                bucket.kind.noun(count)
-            );
+            let sep = if i == 0 { "" } else { ", " };
+            // Subagent tense is per-bucket: a finished-only set must not inherit group-wide Running.
+            let segment = match bucket.kind {
+                VerbGroupKind::Subagent => {
+                    let running_n = bucket.running_sources.len();
+                    let done_n = count.saturating_sub(running_n);
+                    if running_n > 0 && done_n > 0 {
+                        format!(
+                            "{sep}{} {running_n} {}, {done_n} completed",
+                            bucket.kind.verb(true),
+                            bucket.kind.noun(running_n),
+                        )
+                    } else {
+                        format!(
+                            "{sep}{} {count} {}",
+                            bucket.kind.verb(running_n > 0),
+                            bucket.kind.noun(count),
+                        )
+                    }
+                }
+                _ => format!(
+                    "{sep}{} {count} {}",
+                    bucket.kind.verb(self.running),
+                    bucket.kind.noun(count),
+                ),
+            };
             text.push_str(&segment);
             spans.push(Span::styled(segment, text_style));
         }
@@ -332,18 +355,11 @@ impl<'e> BucketAccumulator<'e> {
             text.push_str(&suffix);
             spans.push(Span::styled(suffix, theme.fg(theme.accent_error)));
         }
-        if let Some(hook_spans) = render_group_hook_counts_inline_suffix(self.hook_counts, theme) {
-            for span in &hook_spans {
-                text.push_str(span.content.as_ref());
-            }
-            spans.extend(hook_spans);
-        }
-
         VerbGroupHeaderLabel {
             line: Line::from(spans),
             text,
             running: self.running,
-            failed: self.failed_count > 0 || self.hook_counts.has_failures(),
+            failed: self.failed_count > 0,
         }
     }
 }
@@ -366,7 +382,6 @@ fn block_failed(block: &ToolCallBlock) -> bool {
         ToolCallBlock::UseTool(b) => !b.is_success(),
         ToolCallBlock::SentMessage(b) => b.is_failure(),
         ToolCallBlock::Other(b) => !b.is_success(),
-        ToolCallBlock::Lifecycle(_) => false,
     }
 }
 
@@ -375,8 +390,7 @@ mod tests {
     use super::*;
     use crate::scrollback::blocks::SubagentBlock;
     use crate::scrollback::blocks::tool::{
-        HookRunEntry, HookRunStatus, ListDirToolCallBlock, ReadToolCallBlock, SearchToolCallBlock,
-        ToolCallHookData, WebSearchToolCallBlock,
+        ListDirToolCallBlock, ReadToolCallBlock, SearchToolCallBlock, WebSearchToolCallBlock,
     };
 
     fn entry(block: ToolCallBlock) -> ScrollbackEntry {
@@ -387,22 +401,6 @@ mod tests {
         entry(ToolCallBlock::Read(ReadToolCallBlock::new(path)))
     }
 
-    fn hook(name: &str, status: HookRunStatus) -> HookRunEntry {
-        HookRunEntry {
-            name: name.to_owned(),
-            status,
-            output: None,
-        }
-    }
-
-    fn hooked(mut entry: ScrollbackEntry, post_hooks: Vec<HookRunEntry>) -> ScrollbackEntry {
-        entry.hook_data = Some(ToolCallHookData {
-            post_hooks,
-            ..ToolCallHookData::default()
-        });
-        entry
-    }
-
     fn subagent(block: SubagentBlock) -> ScrollbackEntry {
         ScrollbackEntry::new(RenderBlock::Subagent(block))
     }
@@ -411,6 +409,12 @@ mod tests {
         subagent(SubagentBlock::started(
             "task", child_sid, "explore", None, None, None, /*is_background=*/ true,
         ))
+    }
+
+    fn running_sub(child_sid: &str) -> ScrollbackEntry {
+        let mut entry = sub_started(child_sid);
+        entry.is_running = true;
+        entry
     }
 
     fn sub_completed(child_sid: &str) -> ScrollbackEntry {
@@ -474,68 +478,23 @@ mod tests {
     }
 
     #[test]
-    fn hooked_members_aggregate_non_skipped_outcomes_once() {
-        let elapsed = std::time::Duration::from_millis(1);
-        let entries = vec![
-            hooked(
-                read("a.rs"),
-                vec![
-                    hook("ok", HookRunStatus::Success { elapsed }),
-                    hook("skip", HookRunStatus::Skipped),
-                ],
-            ),
-            hooked(
-                read("b.rs"),
-                vec![hook(
-                    "blocked",
-                    HookRunStatus::Blocked {
-                        detail: "denied".to_owned(),
-                        elapsed,
-                    },
-                )],
-            ),
-            hooked(
-                read("c.rs"),
-                vec![hook(
-                    "bad",
-                    HookRunStatus::Failed {
-                        error: "exit 1".to_owned(),
-                        elapsed,
-                    },
-                )],
-            ),
-        ];
-        let l = label(&entries);
-        assert_eq!(l.text, "Read 3 files  [hooks: 1 ok, 1 blocked, 1 failed]");
-        assert!(l.failed, "failed hooks give the group error accent");
-        let dimmed = Modifier::DIM;
-        assert_eq!(
-            l.line.spans[2].style.fg,
-            Some(Theme::current().accent_success)
-        );
-        assert!(l.line.spans[2].style.add_modifier.contains(dimmed));
-        assert_eq!(
-            l.line.spans[4].style.fg,
-            Some(Theme::current().accent_running)
-        );
-        assert_eq!(
-            l.line.spans[6].style.fg,
-            Some(Theme::current().accent_error)
-        );
-    }
-
-    #[test]
     fn running_flips_tense_only() {
         let mut entries = vec![
             read("a.rs"),
             entry(ToolCallBlock::Search(SearchToolCallBlock::new("todo"))),
         ];
-        entries[1].is_running = true;
+        let Some(search) = entries.get_mut(1) else {
+            panic!("expected two entries: {entries:?}");
+        };
+        search.is_running = true;
         let l = label(&entries);
         assert_eq!(l.text, "Reading 1 file, Searching 1 pattern");
         assert!(l.running);
 
-        entries[1].is_running = false;
+        let Some(search) = entries.get_mut(1) else {
+            panic!("expected two entries: {entries:?}");
+        };
+        search.is_running = false;
         let l = label(&entries);
         assert_eq!(l.text, "Read 1 file, Searched 1 pattern");
         assert!(!l.running);
@@ -765,10 +724,38 @@ mod tests {
 
     #[test]
     fn running_subagent_flips_group_tense() {
-        let mut entries = vec![read("a.rs"), sub_started("child-A")];
-        entries[1].is_running = true;
+        let entries = vec![read("a.rs"), running_sub("child-A")];
         let l = label(&entries);
         assert_eq!(l.text, "Reading 1 file, Running 1 subagent");
+        assert!(l.running);
+    }
+
+    #[test]
+    fn mixed_subagents_show_running_and_completed_counts() {
+        let l = label(&[
+            running_sub("a"),
+            running_sub("b"),
+            sub_completed("c"),
+            sub_completed("d"),
+            sub_completed("e"),
+        ]);
+        assert_eq!(l.text, "Running 2 subagents, 3 completed");
+        assert!(l.running);
+
+        let l = label(&[running_sub("a"), sub_completed("b")]);
+        assert_eq!(l.text, "Running 1 subagent, 1 completed");
+        assert!(l.running);
+    }
+
+    #[test]
+    fn finished_subagents_do_not_claim_running_when_another_kind_is() {
+        let mut entries = vec![read("a.rs"), sub_completed("child-A")];
+        let Some(file) = entries.get_mut(0) else {
+            panic!("expected two entries: {entries:?}");
+        };
+        file.is_running = true;
+        let l = label(&entries);
+        assert_eq!(l.text, "Reading 1 file, Ran 1 subagent");
         assert!(l.running);
     }
 }

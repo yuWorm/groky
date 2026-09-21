@@ -109,6 +109,18 @@ pub(crate) async fn upload_memory_state(ctx: &PromptTraceContext, wait: UploadWa
         );
         return;
     }
+    if ctx.memory_mode == Some(crate::config::MemoryMode::V2) {
+        // The current replay archive contract understands the legacy layout
+        // only. Uploading a partial v2 snapshot (just its generated manifests)
+        // would silently produce an unrestorable memory state.
+        tracing::debug!("memory upload skipped: v2 archive format is not supported");
+        super::manifest::skip_artifact(
+            &ctx.artifact_tracker,
+            "memory.tar.gz",
+            "memory_v2_archive_unsupported",
+        );
+        return;
+    }
     let mut build =
         join_or_start_memory_archive_build(ctx.session_info.cwd.clone(), /*memory_root*/ None);
     match wait {

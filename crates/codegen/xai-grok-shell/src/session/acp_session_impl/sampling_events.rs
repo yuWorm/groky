@@ -11,18 +11,34 @@ impl SessionActor {
         .await;
     }
 
+    /// Stamp ttft on the first token of any channel (reasoning, text, or tool call).
+    pub(crate) fn record_turn_first_token(&self, request_id: Option<&xai_grok_sampler::RequestId>) {
+        let Some(generation) = self.turn_generation(request_id) else {
+            return;
+        };
+        self.turn_phases.record_first_token(generation);
+    }
+
+    /// Stamp ttfm on the first assistant text; reasoning and tool calls are excluded.
     pub(crate) fn record_turn_first_meaningful_output(
         &self,
         request_id: Option<&xai_grok_sampler::RequestId>,
     ) {
-        let generation = match request_id {
-            Some(id) => match self.turn_stream_drained.lock().get(id) {
-                Some(ownership) => ownership.generation,
-                None => return,
-            },
-            None => self.turn_phases.current_generation(),
+        let Some(generation) = self.turn_generation(request_id) else {
+            return;
         };
         self.turn_phases.record_first_meaningful_output(generation);
+    }
+
+    fn turn_generation(&self, request_id: Option<&xai_grok_sampler::RequestId>) -> Option<u64> {
+        match request_id {
+            Some(id) => self
+                .turn_stream_drained
+                .lock()
+                .get(id)
+                .map(|ownership| ownership.generation),
+            None => Some(self.turn_phases.current_generation()),
+        }
     }
 
     fn open_stream_apply_span(&self, request_id: &xai_grok_sampler::RequestId) {
@@ -178,6 +194,7 @@ impl SessionActor {
                         cap.append(false, &text);
                     }
 
+                    self.record_turn_first_token(Some(&request_id));
                     self.record_turn_first_meaningful_output(Some(&request_id));
 
                     // The phase change is emitted alongside each text delta so the UI flips to "streaming text" the moment content starts arriving
@@ -213,7 +230,8 @@ impl SessionActor {
                         cap.append(true, &text);
                     }
 
-                    self.record_turn_first_meaningful_output(Some(&request_id));
+                    // Reasoning is a token (ttft) but not meaningful output (ttfm).
+                    self.record_turn_first_token(Some(&request_id));
 
                     self.emit_event(crate::session::events::Event::PhaseChanged {
                         phase: crate::session::events::Phase::StreamingReasoning,
@@ -238,7 +256,8 @@ impl SessionActor {
                     }
                 }
 
-                self.record_turn_first_meaningful_output(Some(&request_id));
+                // A tool call is a token (ttft) but not meaningful text output (ttfm).
+                self.record_turn_first_token(Some(&request_id));
 
                 self.send_buffered_xai_update(XaiSessionUpdate::ToolCallDeltaChunk {
                     tool_call_id: id,
@@ -293,15 +312,9 @@ impl SessionActor {
             } => {
                 let request_updates_turn = request_owned;
 
-                // Retry succeeded: the detached persistence task acquires rewrite ownership before it claims URLs
-                // Rewind either clears queued work first, or waits until the durable strip finishes
-                if self.pending_image_strip.lock().contains_key(&request_id) {
-                    let session = Arc::clone(self);
-                    let rid = request_id.clone();
-                    tokio::task::spawn_local(async move {
-                        session.apply_pending_image_strip(&rid).await;
-                    });
-                }
+                // Persist before the drain waiter is released so the next prompt cannot
+                // reread the rejected image, and LocalSet shutdown cannot abort the write.
+                self.apply_pending_image_strip(&request_id).await;
                 // The awaited result is the authoritative source for which doom-loop signals fired
                 // This merge on the event side keeps direct-event tests working, and it is request-bound so a late event cannot enter the next turn
                 if request_updates_turn {
@@ -451,9 +464,8 @@ impl SessionActor {
                 .await;
             }
             SamplingEvent::Failed { request_id, error } => {
-                // The stripped retry (if any) did not rescue the turn: nothing durable may come of it
-                // A timeout-owned failure may drop only this request's strip and record its terminal metric; fully unowned failures remain stale
-                self.drop_pending_image_strip(&request_id);
+                // Persist before releasing the drain waiter / waking the turn.
+                self.apply_pending_image_strip(&request_id).await;
                 if !request_owned {
                     self.turn_stream_drained.lock().remove(&request_id);
                     return;
@@ -504,7 +516,8 @@ impl SessionActor {
                 name,
             } => {
                 self.signals_handle().record_tool_call(&name);
-                self.record_turn_first_meaningful_output(Some(&request_id));
+                // A backend tool start is a token (ttft) but not meaningful text output (ttfm).
+                self.record_turn_first_token(Some(&request_id));
                 let (title, kind, raw_input) = backend_tool_display(&name);
                 self.send_update(
                     acp::SessionUpdate::ToolCall(

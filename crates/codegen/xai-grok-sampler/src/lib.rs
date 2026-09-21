@@ -9,6 +9,8 @@
 //! - **Layer 2**: [`stream`] transforms raw streams into [`SamplingEvent`]s.
 //! - **Layer 3**: [`SamplerHandle`] manages concurrent requests with retry, cancellation, and event-based coordination via the actor.
 
+#![deny(clippy::indexing_slicing)]
+
 pub mod actor;
 pub mod attribution;
 pub mod client;
@@ -21,6 +23,7 @@ pub mod events;
 pub mod handle;
 pub mod metrics;
 mod prewarm;
+mod request_compression;
 pub mod retry;
 pub mod sampling_log;
 mod shared_http;
@@ -37,8 +40,8 @@ pub use attribution::{
 };
 pub use client::{ApiBackend, SamplingClient, user_agent_string_for};
 pub use config::{
-    AuthScheme, BearerResolver, HeaderInjector, OriginClientInfo, RetryPolicy, SamplerConfig,
-    SharedBearerResolver, SharedHeaderInjector,
+    AuthScheme, BearerResolver, HeaderInjector, OriginClientInfo, RequestCompression, RetryPolicy,
+    SamplerConfig, SharedBearerResolver, SharedHeaderInjector,
 };
 pub use doom_loop::DoomLoopSignalCollector;
 pub use events::{

@@ -97,8 +97,6 @@ impl<R: ChildRunner> SubagentCoordinator<R> {
                 spawner_session_id,
                 None,
                 None,
-                None,
-                None,
             ),
             AdmissionDecision::Enqueue => {
                 debug_assert!(
@@ -135,9 +133,7 @@ impl<R: ChildRunner> SubagentCoordinator<R> {
                     },
                     agent_address,
                     spawner_session_id,
-                    wake_agent_id: None,
-                    wake_message_source: None,
-                    wake_message_id: None,
+                    wake_origin: None,
                     wake: None,
                 });
                 // `Hold` already cleared `registered_tx`; fire iff the policy
@@ -155,13 +151,7 @@ impl<R: ChildRunner> SubagentCoordinator<R> {
                         }
                     },
                 );
-                let result = SubagentResult {
-                    success: false,
-                    error: Some(error.message()),
-                    subagent_id: id.clone(),
-                    child_session_id: id,
-                    ..Default::default()
-                };
+                let result = SubagentResult::failed(id.clone(), id, error.message());
                 self.finish_never_started(
                     *request,
                     Some(result_tx),
@@ -257,7 +247,12 @@ impl<R: ChildRunner> SubagentCoordinator<R> {
                 foreground_deadline: None,
                 handle_only: request.run_in_background,
                 explicitly_killed: false,
+                disposition: Default::default(),
                 launched: false,
+                attempt_id: xai_message_delivery_core::AttemptId::mint(
+                    uuid::Uuid::new_v4().as_u128(),
+                ),
+                generation: super::ActiveChildGeneration::new(),
                 agent_address: None,
                 spawner_session_id: None,
                 wake_of: None,
@@ -286,12 +281,9 @@ pub(super) enum BackgroundStartAck {
 
 /// A spawn refused before it ever became a child record.
 fn rejected_spawn_result(id: &str, error: &str, cancelled: bool) -> SubagentResult {
-    SubagentResult {
-        success: false,
-        cancelled,
-        error: Some(error.to_owned()),
-        subagent_id: id.to_owned(),
-        child_session_id: id.to_owned(),
-        ..Default::default()
+    if cancelled {
+        SubagentResult::cancelled(id, id, error)
+    } else {
+        SubagentResult::failed(id, id, error)
     }
 }

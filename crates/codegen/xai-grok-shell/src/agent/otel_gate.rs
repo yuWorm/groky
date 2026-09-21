@@ -93,7 +93,7 @@ impl OtelGate {
         }
     }
     /// Drives the gate from a settings-fetch `outcome` for `identity`.
-    /// Every outcome for the live identity is definitive and opens the gate; only the `Fetched` one carries a policy (and settings) to apply.
+    /// Completed outcomes for the live identity are definitive and open the gate; only the `Fetched` one carries a policy (and settings) to apply.
     pub(crate) fn resolve(
         &self,
         identity: &str,

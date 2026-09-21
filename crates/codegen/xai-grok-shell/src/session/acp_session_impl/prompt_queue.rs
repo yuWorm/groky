@@ -537,7 +537,7 @@ impl SessionActor {
     /// True when `prompt_id` is the in-flight turn, which a queue edit must never remove or reorder.
     /// Keys on `state.running_task` (race-free under the caller's state lock), not the `current_prompt_id` pin.
     /// `handle_completion` clears the pin while the finished front is still unpopped; a queue edit in that window must still refuse the front.
-    fn is_running_prompt(state: &State, prompt_id: &str) -> bool {
+    pub(super) fn is_running_prompt(state: &State, prompt_id: &str) -> bool {
         state.running_prompt_id() == Some(prompt_id)
     }
 
@@ -696,7 +696,9 @@ impl SessionActor {
             }) else {
                 break;
             };
-            let item = &state.pending_inputs[pos];
+            let Some(item) = state.pending_inputs.get(pos) else {
+                break;
+            };
             let item_owner = item
                 .queue_meta
                 .as_ref()
@@ -754,32 +756,43 @@ impl SessionActor {
         owner: Option<&str>,
     ) -> bool {
         let mut state = self.state.lock().await;
-        let mut removed = false;
-        if !Self::is_running_prompt(&state, id)
+        let removed = if !Self::is_running_prompt(&state, id)
             && let Some(pos) = state
                 .pending_inputs
                 .iter()
                 .position(|item| item.editable_queue_meta_matches(id, expected_version, owner))
         {
-            if let Some(item) = state.pending_inputs.remove(pos) {
-                Self::respond_removed_prompt(item.respond_to);
+            Self::remove_pending_row(&mut state, pos);
+            true
+        } else {
+            // A remove that misses (row gone or version stale) still clears a leaked hold; a protected row is a no-op
+            if !Self::has_protected_row(&state, id) {
+                state.edit_holds.remove(id);
             }
-            removed = true;
-        }
-        // A remove that misses (row gone or version stale) still clears a leaked hold; a protected row is a no-op
-        if !Self::has_protected_row(&state, id) {
-            state.edit_holds.remove(id);
-        }
-        if !removed {
             tracing::debug!(
                 queued_id = %id,
                 expected_version,
                 "queue remove was a no-op (drained / stale / not owner); rebroadcasting"
             );
-        }
+            false
+        };
         // Always re-broadcast the authoritative queue so the client reconciles.
         self.broadcast_queue_changed(&state);
         removed
+    }
+
+    /// Drop the queued row at `pos`, resolve its RPC as `RemovedFromQueue`, and release the edit hold it may have leaked.
+    /// A protected row keeps its hold. Callers rebroadcast the queue.
+    pub(super) fn remove_pending_row(state: &mut State, pos: usize) {
+        let Some(item) = state.pending_inputs.remove(pos) else {
+            return;
+        };
+        // Holds are keyed by the queue id, which `queue_input` mints as the prompt id
+        let id = item.prompt_id.clone();
+        Self::respond_removed_prompt(item.respond_to);
+        if !Self::has_protected_row(state, &id) {
+            state.edit_holds.remove(&id);
+        }
     }
 
     /// Atomically interject a queued (not-yet-running) prompt into the running turn.

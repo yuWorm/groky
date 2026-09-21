@@ -472,7 +472,7 @@ pub(super) fn dispatch_rewind_success(
             agent.prompt.restore(draft);
         }
     } else if let Some(ref prompt_text) = response.prompt_text {
-        agent.prompt.set_text(prompt_text);
+        agent.prompt.set_text_discarding_images(prompt_text);
     } else if let Some(draft) = stashed_draft {
         agent.prompt.restore(draft);
     }

@@ -38,8 +38,8 @@ use xai_acp_lib::{
 };
 
 use crate::agent::config::{Config as AgentConfig, ModelEntry};
-use crate::agent::models::{ModelFetchAuth, prefetch_models_blocking};
 use crate::agent::mvp_agent::MvpAgent;
+use crate::agent::remote_config::{ModelFetchAuth, prefetch_models_blocking};
 
 use indexmap::IndexMap;
 
@@ -449,7 +449,7 @@ async fn handle_connection(ws: WebSocket, state: Arc<ServerState>, peer_addr: So
 /// Session actors hold cloned `GatewaySender` handles onto a persistent gateway channel, so they can always send notifications.
 /// A relay task forwards those messages to the *current* ACP connection's channel, so they reach whichever client is connected.
 async fn run_persistent_agent(
-    agent_config: AgentConfig,
+    mut agent_config: AgentConfig,
     mut connection_rx: mpsc::UnboundedReceiver<NewConnectionChannels>,
     prefetched_models: Option<IndexMap<String, ModelEntry>>,
 ) {
@@ -462,10 +462,30 @@ async fn run_persistent_agent(
     let _cancel_on_exit = agent_cancel.clone().drop_guard();
     auth_manager.start_proactive_refresh(agent_cancel.clone());
     crate::managed_config::ensure_managed_policy_present(&auth_manager).await;
+    // Current-thread boot: resolve settings before sync bootstrap.
+    let boot = match crate::agent::init::resolve_boot_startup_settings(
+        &mut agent_config,
+        &agent_cancel,
+        prefetched_models.is_none(),
+        auth_manager.current(),
+    )
+    .await
+    {
+        Ok(boot) => boot,
+        // A cancelled boot unwinds; only a real config error exits.
+        Err(crate::agent::init::BootstrapError::Cancelled) => return,
+        Err(err) => crate::agent::init::exit_on_config_error(err),
+    };
     crate::agent::app::apply_otel_config(&auth_manager, &agent_config.grok_com_config);
     let agent = Rc::new(
-        MvpAgent::new(gateway, &agent_config, auth_manager, prefetched_models)
-            .unwrap_or_else(crate::agent::init::exit_on_config_error),
+        MvpAgent::new(
+            gateway,
+            &agent_config,
+            auth_manager,
+            prefetched_models,
+            Some(boot),
+        )
+        .unwrap_or_else(crate::agent::init::exit_on_config_error),
     );
     agent.models_manager.spawn_background_refresh();
 

@@ -14,10 +14,13 @@ use super::attempt_runner::{
     run_one_turn_attempt, usage_is_incomplete,
 };
 use super::handle_request::{
-    CHILD_ACTOR_ACK_TIMEOUT, PARENT_ACK_TIMEOUT, child_actor_query,
-    mark_child_usage_not_applied_with_fallback, reparent_surviving_child_tasks,
-    resolve_child_model, take_child_streaming_partial, take_child_turn_messages,
+    CHILD_ACTOR_ACK_TIMEOUT, PARENT_ACK_TIMEOUT, TaskModelAdmissionError,
+    admit_explicit_tool_model, agent_memory_scope_for_mode, child_actor_query,
+    explicit_tool_model, mark_child_usage_not_applied_with_fallback,
+    reparent_surviving_child_tasks, resolve_child_model, take_child_streaming_partial,
+    take_child_turn_messages,
 };
+use crate::agent::remote_config::task_model_policy::TaskModelSelection;
 use crate::test_support::lsp_runtime::{ctx_with_toggle, test_gateway_with_receiver};
 use xai_grok_subagent_resolution::resolve_effective_overrides;
 use xai_grok_tools::implementations::grok_build::task::coordinator::{
@@ -30,6 +33,18 @@ fn test_snapshot(
     result: &SubagentResult,
 ) -> SubagentSnapshot {
     terminal_snapshot(request, result, None, None, 0)
+}
+#[test]
+fn v2_disables_legacy_agent_memory_scope() {
+    let scope = Some(xai_grok_agent::config::MemoryScope::Project);
+    assert_eq!(
+            agent_memory_scope_for_mode(scope, crate::config::MemoryMode::V2),
+            None
+        );
+    assert_eq!(
+            agent_memory_scope_for_mode(scope, crate::config::MemoryMode::Legacy),
+            scope
+        );
 }
 #[test]
 fn canonical_total_tokens_does_not_double_count_reasoning() {
@@ -87,7 +102,11 @@ async fn usage_ack_precedes_terminal_presentation() {
     let (gateway, _gateway_rx) = test_gateway_with_receiver();
     let mut request = auto_wake_test_request("usage-order");
     request.run_in_background = false;
-    let completion_data = ShellCompletionData::from_context(&ctx);
+    let completion_data = ShellCompletionData::from_context(
+        &ctx,
+        xai_message_delivery_core::AttemptId::mint(1),
+        None,
+    );
     completion_data.mark_spawned_notification_emitted();
     let result = SubagentResult {
         success: true,
@@ -216,14 +235,16 @@ fn wedged_child_handle() -> (
         resolved_tool_overrides: std::sync::Arc::new(arc_swap::ArcSwapOption::empty()),
         spawn_snapshot: crate::session::SpawnSnapshot {
             applied_tool_overrides: None,
+            memory_mode: None,
         },
         hunk_tracker_handle,
         chat_state_handle: xai_chat_state::ChatStateHandle::noop(),
         signals_handle,
         gateway_enabled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
-        status_line_enabled: std::sync::Arc::new(
-            std::sync::atomic::AtomicBool::new(false),
+        emit_local_background_tasks: std::sync::Arc::new(
+            std::sync::atomic::AtomicBool::new(true),
         ),
+        client_caps: crate::session::notifications::SessionClientCaps::new(false, true),
         mcp_servers: vec![],
         initial_client_mcp_servers: vec![],
         display_cwd: None,
@@ -551,11 +572,11 @@ async fn subagent_inherits_session_cli_overrides() {
         .expect("cli agent resolves");
     assert_eq!(
             def.session_tools_allowlist.as_deref(),
-            Some(&["read_file".into(), "grep".into()][..])
+            Some(["read_file".into(), "grep".into()].as_slice())
         );
     assert_eq!(
             def.session_tools_denylist.as_deref(),
-            Some(&["web_search".into(), "write".into()][..])
+            Some(["web_search".into(), "write".into()].as_slice())
         );
     assert_eq!(def.disallowed_tools, vec!["write"]);
     assert_eq!(def.permission_mode, PermissionMode::AcceptEdits);
@@ -626,7 +647,12 @@ async fn emit_subagent_notification_stamps_one_event_id_on_both_paths() {
                     args.request.params.get(),
                 )
                 .unwrap();
-            params["_meta"]["eventId"].as_str().unwrap().to_string()
+            params
+                .get("_meta")
+                .and_then(|m| m.get("eventId"))
+                .and_then(|v| v.as_str())
+                .expect("broadcast must carry eventId")
+                .to_string()
         }
         _ => panic!("expected ExtNotification"),
     };
@@ -885,7 +911,11 @@ fn inject_subagent_completed_prompt_copies_capped_task_output() {
                  <subagent_meta>id=sa-1, "
             )),
             "{}",
-            &prompt[prompt.len() - 400..]
+            prompt
+                .len()
+                .checked_sub(400)
+                .and_then(|i| prompt.get(i..))
+                .unwrap_or(prompt.as_str())
         );
     let len = prompt.len();
     let threshold = crate::session::acp_session::LARGE_PROMPT_THRESHOLD;
@@ -1273,7 +1303,7 @@ fn forked_initial_context_normalizes_parent_history() {
     assert!(ctx.copy_error.is_none());
     assert_eq!(ctx.prefix_len, Some(2));
     assert_eq!(ctx.conversation.len(), 2);
-    if let ConversationItem::User(ref u) = ctx.conversation[1] {
+    if let Some(ConversationItem::User(u)) = ctx.conversation.get(1) {
         let text: String = u
             .content
             .iter()
@@ -1308,7 +1338,7 @@ fn forked_initial_context_inherits_parent_across_reasoning() {
     assert_eq!(ctx.source, InitialContextSource::Forked);
     assert_eq!(ctx.prefix_len, Some(2));
     assert_eq!(ctx.conversation.len(), 2);
-    if let ConversationItem::User(ref u) = ctx.conversation[1] {
+    if let Some(ConversationItem::User(u)) = ctx.conversation.get(1) {
         let text: String = u
             .content
             .iter()
@@ -1372,7 +1402,7 @@ fn forked_initial_context_applies_fork_filter_before_normalize() {
         ];
     let ctx = forked_initial_context(items);
     assert_eq!(ctx.source, InitialContextSource::Forked);
-    if let ConversationItem::User(ref u) = ctx.conversation[1] {
+    if let Some(ConversationItem::User(u)) = ctx.conversation.get(1) {
         let text: String = u
             .content
             .iter()
@@ -1404,7 +1434,7 @@ fn verbatim_fork_keeps_items_byte_for_byte_when_small() {
                 content: vec![ContentPart::Text {
                     text: "SYNTHETIC_KEEP_ME".into(),
                 }],
-                synthetic_reason: Some(SyntheticReason::SystemReminder),
+                synthetic_reason: SyntheticReason::SystemReminder,
                 ..Default::default()
             }),
             ConversationItem::Reasoning(xai_grok_sampling_types::synthesized_reasoning_item(
@@ -1420,7 +1450,10 @@ fn verbatim_fork_keeps_items_byte_for_byte_when_small() {
         );
     assert_eq!(ctx.prefix_len, Some(5));
     assert_eq!(ctx.conversation.len(), 5);
-    assert!(matches!(ctx.conversation[0], ConversationItem::System(_)));
+    assert!(matches!(
+            ctx.conversation.first(),
+            Some(ConversationItem::System(_))
+        ));
     assert!(matches!(
             ctx.conversation.last(),
             Some(ConversationItem::Assistant(_))
@@ -1446,7 +1479,7 @@ fn verbatim_fork_keeps_items_byte_for_byte_when_small() {
     assert!(
             ctx.conversation
                 .iter()
-                .any(|i| matches!(i, ConversationItem::User(u) if u.synthetic_reason.is_some())),
+                .any(|i| matches!(i, ConversationItem::User(u) if !u.synthetic_reason.is_human())),
             "the synthetic_reason marker itself must remain in the verbatim mirror"
         );
     assert!(
@@ -1780,9 +1813,18 @@ async fn bootstrap_fork_live_parent_chat_state_is_forked_with_marker() {
                 );
             assert_eq!(ic.conversation.len(), 3);
             assert_eq!(ic.prefix_len, Some(3));
-            assert!(matches!(ic.conversation[0], ConversationItem::System(_)));
-            assert!(matches!(ic.conversation[1], ConversationItem::User(_)));
-            assert!(matches!(ic.conversation[2], ConversationItem::Assistant(_)));
+            assert!(matches!(
+                    ic.conversation.first(),
+                    Some(ConversationItem::System(_))
+                ));
+            assert!(matches!(
+                    ic.conversation.get(1),
+                    Some(ConversationItem::User(_))
+                ));
+            assert!(matches!(
+                    ic.conversation.get(2),
+                    Some(ConversationItem::Assistant(_))
+                ));
             let text: String = ic
                 .conversation
                 .iter()
@@ -2155,7 +2197,11 @@ async fn cancel_pending_shell_child_presents_one_cancelled_finish() {
         ));
     assert!(result.cancelled);
     assert!(!result.success);
-    let completion_data = ShellCompletionData::from_context(&ctx);
+    let completion_data = ShellCompletionData::from_context(
+        &ctx,
+        xai_message_delivery_core::AttemptId::mint(1),
+        None,
+    );
     completion_data.mark_spawned_notification_emitted();
     let completion = ChildCompletion {
         snapshot: test_snapshot(&request, &result),
@@ -2378,7 +2424,11 @@ async fn startup_admission_timeout_is_failed_not_cancelled() {
         )
         .expect("parse meta");
     assert_eq!(meta.status, "failed");
-    let completion_data = ShellCompletionData::from_context(&ctx);
+    let completion_data = ShellCompletionData::from_context(
+        &ctx,
+        xai_message_delivery_core::AttemptId::mint(1),
+        None,
+    );
     completion_data.mark_spawned_notification_emitted();
     let completion = ChildCompletion {
         snapshot: test_snapshot(&request, &result),
@@ -2425,42 +2475,9 @@ async fn startup_admission_timeout_is_failed_not_cancelled() {
 fn test_model_entry(model_id: &str) -> crate::agent::config::ModelEntry {
     crate::agent::config::ModelEntry {
         info: crate::agent::config::ModelInfo {
-            user_selectable: true,
-            id: None,
-            model_family: None,
             model: model_id.to_string(),
-            base_url: String::new(),
-            name: None,
-            description: None,
-            max_completion_tokens: None,
-            temperature: None,
-            top_p: None,
-            api_backend: Default::default(),
-            auth_scheme: Default::default(),
-            extra_headers: Default::default(),
-            query_params: Default::default(),
-            env_http_headers: Default::default(),
             context_window: std::num::NonZeroU64::new(256_000).unwrap(),
-            auto_compact_threshold_percent: None,
-            system_prompt_label: None,
-            use_concise: false,
-            agent_type: crate::agent::config::default_agent_type(),
-            inference_idle_timeout_secs: None,
-            max_retries: None,
-            rate_limit_retry_threshold: None,
-            subagent_rate_limit_max_attempts: None,
-            hidden: false,
-            supported_in_api: true,
-            reasoning_effort: None,
-            supports_reasoning_effort: false,
-            reasoning_efforts: Vec::new(),
-            supports_backend_search: false,
-            compactions_remaining: None,
-            compaction_at_tokens: None,
-            show_model_fingerprint: false,
-            stream_tool_calls: None,
-            laziness_detector: crate::agent::config::LazinessDetectorPerModelConfig::default(),
-            variants: Vec::new(),
+            ..Default::default()
         },
         mtls_cert_dir: None,
         api_key: None,
@@ -2505,31 +2522,36 @@ fn subagent_auth_type_rule() {
         );
     assert_eq!(super::subagent_auth_type(None, &api_key), AuthType::ApiKey);
 }
+const SELECTABLE_TOOL: ModelOverrideProvenance = ModelOverrideProvenance::Tool {
+    selection: TaskModelSelection::Selectable,
+};
 #[test]
 fn fresh_tool_model_accepts_visible_key_and_internal_id() {
     let mut models = indexmap::IndexMap::new();
     models.insert("grok-3".to_string(), test_model_entry("grok-3-2025-02-15"));
     assert!(
-            super::handle_request::task_model_override_error(
-                Some("grok-3"),
-                ModelOverrideProvenance::Tool,
-                false,
+            admit_explicit_tool_model(
+                "grok-3",
+                TaskModelSelection::Selectable,
                 &models,
                 false,
             )
-            .is_none(),
+            .is_ok(),
             "key lookup should succeed"
         );
     assert!(
-            super::handle_request::task_model_override_error(
-                Some("grok-3-2025-02-15"),
-                ModelOverrideProvenance::Tool,
-                false,
+            admit_explicit_tool_model(
+                "grok-3-2025-02-15",
+                TaskModelSelection::Selectable,
                 &models,
                 false,
             )
-            .is_none(),
+            .is_ok(),
             "info().model lookup should succeed"
+        );
+    assert_eq!(
+            admit_explicit_tool_model("grok-3", TaskModelSelection::Inherited, &models, false),
+            Err(TaskModelAdmissionError::HiddenSelection),
         );
 }
 #[test]
@@ -2540,18 +2562,17 @@ fn fresh_tool_model_rejects_unavailable_exact_key_over_visible_slug_collision() 
     unavailable_exact.info.hidden = true;
     models.insert("collision".to_string(), unavailable_exact);
     assert_eq!(
-            super::handle_request::task_model_override_error(
-                Some("collision"),
-                ModelOverrideProvenance::Tool,
-                false,
+            admit_explicit_tool_model(
+                "collision",
+                TaskModelSelection::Selectable,
                 &models,
                 false,
-            )
-            .as_deref(),
-            Some(
+            ),
+            Err(TaskModelAdmissionError::Unavailable(
                 "Unknown Task.model slug 'collision'. Valid model slugs: visible-alias. \
                  Omit `model` to inherit the parent model."
-            ),
+                    .to_string()
+            )),
             "validation must inspect the unavailable exact-key entry selected by execution"
         );
 }
@@ -2563,18 +2584,17 @@ fn fresh_tool_model_rejects_unavailable_first_slug_collision() {
     models.insert("blocked-first".to_string(), unavailable_first);
     models.insert("visible-second".to_string(), test_model_entry("shared-routing-slug"));
     assert_eq!(
-            super::handle_request::task_model_override_error(
-                Some("shared-routing-slug"),
-                ModelOverrideProvenance::Tool,
-                false,
+            admit_explicit_tool_model(
+                "shared-routing-slug",
+                TaskModelSelection::Selectable,
                 &models,
                 false,
-            )
-            .as_deref(),
-            Some(
+            ),
+            Err(TaskModelAdmissionError::Unavailable(
                 "Unknown Task.model slug 'shared-routing-slug'. Valid model slugs: \
                  visible-second. Omit `model` to inherit the parent model."
-            ),
+                    .to_string()
+            )),
             "validation must inspect the first routing-slug entry selected by execution"
         );
 }
@@ -2601,62 +2621,53 @@ fn fresh_tool_model_rejects_unknown_and_nonavailable_entries() {
         "oauth-only",
         "oauth-only-internal",
     ] {
-        let error = super::handle_request::task_model_override_error(
-                Some(requested),
-                ModelOverrideProvenance::Tool,
-                false,
+        let error = admit_explicit_tool_model(
+                requested,
+                TaskModelSelection::Selectable,
                 &models,
                 false,
             )
-            .unwrap();
+            .unwrap_err();
         assert_eq!(
                 error,
-                format!(
+                TaskModelAdmissionError::Unavailable(format!(
                     "Unknown Task.model slug '{requested}'. Valid model slugs: alpha, zeta. \
                      Omit `model` to inherit the parent model."
-                )
+                ))
             );
-        assert!(!error.contains("grok models"));
     }
     assert!(
-            super::handle_request::task_model_override_error(
-                Some("oauth-only"),
-                ModelOverrideProvenance::Tool,
-                false,
+            admit_explicit_tool_model(
+                "oauth-only",
+                TaskModelSelection::Selectable,
                 &models,
                 true,
             )
-            .is_none(),
+            .is_ok(),
             "OAuth-only model should resolve for session auth"
         );
 }
 #[test]
 fn resumed_tool_model_override_is_ignored() {
-    let empty = indexmap::IndexMap::new();
+    let overrides = SubagentRuntimeOverrides {
+        model: Some("stale-model".to_string()),
+        model_override_provenance: SELECTABLE_TOOL,
+        ..Default::default()
+    };
     assert!(
-            super::handle_request::task_model_override_error(
-                Some("stale-model"),
-                ModelOverrideProvenance::Tool,
-                true,
-                &empty,
-                false,
-            )
-            .is_none(),
+            explicit_tool_model(&overrides, true).is_none(),
             "resume must preserve source-model pinning"
         );
 }
 #[test]
 fn harness_model_override_keeps_internal_fallback_behavior() {
-    let empty = indexmap::IndexMap::new();
+    let overrides = SubagentRuntimeOverrides {
+        model: Some("internal-model".to_string()),
+        model_override_provenance: ModelOverrideProvenance::Harness,
+        ..Default::default()
+    };
     assert!(
-            super::handle_request::task_model_override_error(
-                Some("internal-model"),
-                ModelOverrideProvenance::Harness,
-                false,
-                &empty,
-                false,
-            )
-            .is_none(),
+            explicit_tool_model(&overrides, false).is_none(),
             "internal role/config pins must retain downstream soft fallback"
         );
 }
@@ -2669,27 +2680,15 @@ fn normalize_forked_context_empty_parent() {
     );
     assert_eq!(conv.len(), 1);
     assert_eq!(prefix_len, 1);
-    assert!(matches!(conv[0], ConversationItem::System(_)));
+    assert!(matches!(conv.first(), Some(ConversationItem::System(_))));
 }
 fn test_sampling_config(model_slug: &str) -> xai_grok_sampling_types::SamplingConfig {
     use std::num::NonZeroU64;
     xai_grok_sampling_types::SamplingConfig {
         base_url: "https://api.test/v1".to_string(),
-        mtls_cert_dir: None,
         model: model_slug.to_string(),
-        max_completion_tokens: None,
-        temperature: None,
-        top_p: None,
-        max_retries: None,
-        rate_limit_retry_threshold: None,
-        api_backend: Default::default(),
-        extra_headers: Default::default(),
-        conversation_group_id: None,
-        query_params: Default::default(),
-        env_http_headers: Default::default(),
         context_window: NonZeroU64::new(256_000).expect("non-zero context window"),
-        reasoning_effort: None,
-        stream_tool_calls: None,
+        ..Default::default()
     }
 }
 fn spawn_test_parent_chat_state(model_slug: &str) -> xai_chat_state::ChatStateHandle {
@@ -2714,7 +2713,7 @@ async fn panicked_announced_foreground_child_emits_one_typed_finish() {
     request.run_in_background = false;
     let completion_data = ShellCompletionData {
         parent_cmd_tx: Some(parent_cmd_tx),
-        attempt_id: Some("at1.panic".to_owned()),
+        attempt_id: Some(xai_message_delivery_core::AttemptId::mint(0xface)),
         ..Default::default()
     };
     let worker_completion_data = completion_data.clone();
@@ -2768,7 +2767,7 @@ async fn panicked_announced_foreground_child_emits_one_typed_finish() {
             _ => None,
         })
         .collect::<Vec<_>>();
-    assert_eq!(finishes, vec![Some("at1.panic".to_owned())]);
+    assert_eq!(finishes, vec![Some("at1.face".to_owned())]);
 }
 #[tokio::test]
 async fn join_worker_task_drop_aborts_worker() {

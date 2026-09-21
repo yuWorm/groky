@@ -61,6 +61,14 @@ pub fn write_direct_info(msg: &str, ctx: Option<serde_json::Value>) {
     );
 }
 
+/// [`write_direct_info`] at warn level, for failure reports that must land even when the ACP forwarder is wedged.
+pub fn write_direct_warn(msg: &str, sid: Option<&str>, ctx: Option<serde_json::Value>) {
+    xai_grok_telemetry::unified_log::ingest_client_entries(
+        LogSource::GrokPager,
+        &[make_entry(LogLevel::Warn, msg, sid, ctx)],
+    );
+}
+
 fn push_entry(lvl: LogLevel, msg: &str, sid: Option<&str>, ctx: Option<serde_json::Value>) {
     let entry = make_entry(lvl, msg, sid, ctx);
     if let Ok(mut buf) = BUFFER.lock() {

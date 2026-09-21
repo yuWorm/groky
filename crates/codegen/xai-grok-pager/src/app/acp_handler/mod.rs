@@ -55,12 +55,15 @@ use permissions::{
     should_drop_late_auto_recap,
 };
 
+pub(crate) use routing::task_view_by_session_id;
 use routing::{
     SessionMatch, find_session_match, interaction_target_agent, is_matched_agent_active,
-    mcp_target_agent, resolve_notif_agent, resolve_target_view,
+    mcp_target_agent, resolve_notif_agent, resolve_target_view, setup_phase_target_agent,
 };
 
-use prompt_origin::{finish_wake_turn, viewer_turn_anchor};
+use prompt_origin::{
+    backdate_child_turn_clock, finish_wake_turn, note_child_live_prompt, viewer_turn_anchor,
+};
 pub(crate) use prompt_origin::{
     is_scheduler_fired_prompt, is_server_initiated_prompt, is_wake_prompt,
     should_adopt_running_prompt,
@@ -77,9 +80,10 @@ use workflow_ingest::ingest_workflow_update;
 pub(crate) use session_notification::apply_child_view_session_event;
 #[cfg(test)]
 pub(crate) use session_notification::apply_session_event_for_test;
+pub(crate) use session_notification::detect_plan_mode_change_replayed;
 pub(crate) use session_notification::drop_unexpected_replay;
 use session_notification::{
-    PlanModeTransition, advance_reconnect_cursor, confirm_context_used, detect_plan_mode_change,
+    PlanModeTransition, advance_reconnect_cursor, confirm_context_used,
     handle_session_notification, handle_session_notification_with_origin,
 };
 
@@ -148,7 +152,26 @@ fn is_replay_bash_execute(update: &acp::SessionUpdate) -> bool {
         == Some(true)
 }
 
+/// Any live update stamped with the awaited prompt id proves the shell accepted it, whichever branch applies it.
+fn ack_prompt_from_update(view: &mut AgentView, meta: &NotificationMeta) {
+    if !meta.is_replay {
+        view.ack_prompt_if_named(
+            meta.prompt_id.as_deref(),
+            crate::app::prompt_ack::AckSignal::SessionUpdate,
+            std::time::Instant::now(),
+        );
+    }
+}
+
 pub(crate) fn handle(msg: AcpClientMessage, app: &mut AppView) -> bool {
+    let state_changed = handle_inner(msg, app);
+    // Queue drains driven by session updates run outside any dispatched action. A notice landing on the
+    // visible view from a background session's update is a change even when the update itself was not.
+    let flushed = app.flush_image_notices_if_root();
+    state_changed || flushed
+}
+
+fn handle_inner(msg: AcpClientMessage, app: &mut AppView) -> bool {
     match msg {
         AcpClientMessage::SessionNotification(notif) => {
             let mut meta = NotificationMeta::from_json(notif.request.meta.as_ref());
@@ -175,6 +198,7 @@ pub(crate) fn handle(msg: AcpClientMessage, app: &mut AppView) -> bool {
                     {
                         agent.last_applied_event_seq = Some(seq);
                     }
+                    ack_prompt_from_update(agent, &meta);
 
                     if drop_unexpected_replay(
                         agent,
@@ -227,6 +251,12 @@ pub(crate) fn handle(msg: AcpClientMessage, app: &mut AppView) -> bool {
                         agent.mark_reload_todo_update();
                         advance_reconnect_cursor(agent, &mut meta);
                         !meta.is_replay && !agent.session.loading_replay
+                    } else if let acp::SessionUpdate::UsageUpdate(ref usage) = notif.request.update
+                    {
+                        // The context bar reads this; a replayed one is as current as the history it closes
+                        agent.apply_context_used(usage.used, usage.size);
+                        advance_reconnect_cursor(agent, &mut meta);
+                        is_active
                     } else if let acp::SessionUpdate::ToolCallUpdate(ref tcu) = notif.request.update
                         && route_bg_task_stdout(tcu, &mut agent.session)
                     {
@@ -297,7 +327,11 @@ pub(crate) fn handle(msg: AcpClientMessage, app: &mut AppView) -> bool {
                             agent.note_streaming_wake_turn(notif_pid);
                         }
 
-                        let plan_transition = detect_plan_mode_change(&notif.request.update, agent);
+                        let plan_transition = detect_plan_mode_change_replayed(
+                            &notif.request.update,
+                            agent,
+                            meta.is_replay,
+                        );
                         plan_mode_modal_refresh_needed |= plan_transition.is_some();
                         // User-driven entries already got a banner or toast; a replay must not duplicate the row
                         if plan_transition == Some(PlanModeTransition::EnteredByAgent)
@@ -322,10 +356,18 @@ pub(crate) fn handle(msg: AcpClientMessage, app: &mut AppView) -> bool {
                             (false, false)
                         };
                         let user_echo = matches!(update, acp::SessionUpdate::UserMessageChunk(_));
-                        let changed =
+                        let swallow_send_now_echo = user_echo
+                            && !meta.is_replay
+                            && user_message_text(&update).is_some_and(|text| {
+                                agent.take_send_now_user_echo(text, meta.prompt_id.as_deref())
+                            });
+                        let changed = if swallow_send_now_echo {
+                            false
+                        } else {
                             agent
                                 .session
-                                .handle_update(update, &meta, &mut agent.scrollback);
+                                .handle_update(update, &meta, &mut agent.scrollback)
+                        };
                         if meta.is_replay
                             && let Some(pid) = meta.prompt_id.as_ref()
                         {
@@ -391,6 +433,17 @@ pub(crate) fn handle(msg: AcpClientMessage, app: &mut AppView) -> bool {
                     if workflows_modal_refresh {
                         queue_open_workflows_modal_refresh(app, id);
                     }
+                    if mutated
+                        && !meta.is_replay
+                        && app
+                            .agents
+                            .get(&id)
+                            .is_some_and(|agent| !agent.session.loading_replay)
+                    {
+                        let flush =
+                            crate::app::dispatch::flush_held_local_queue_into_wait(app, Some(id));
+                        app.pending_effects.extend(flush);
+                    }
 
                     mutated && is_active
                 }
@@ -406,19 +459,59 @@ pub(crate) fn handle(msg: AcpClientMessage, app: &mut AppView) -> bool {
                         let child_view = parent
                             .child_view_for_live_update_mut(child_key)
                             .expect("find_session_match returned an existing subagent_views key");
+                        // An overlay prompt arms the watch on this child, so the child's own updates must disarm it
+                        ack_prompt_from_update(child_view, &meta);
                         if let Some(tokens) = meta.total_tokens {
                             confirm_context_used(child_view, tokens);
                         }
-                        if let Some(ts) = meta.turn_start_ms {
-                            child_view.turn_start_ms = Some(ts);
+                        if let acp::SessionUpdate::UsageUpdate(ref usage) = notif.request.update {
+                            child_view.apply_context_used(usage.used, usage.size);
                         }
-                        child_view.session.handle_update(
-                            notif.request.update,
-                            &meta,
-                            &mut child_view.scrollback,
-                        );
-                        for entry_id in child_view.session.tracker.take_pending_edit_hl() {
-                            child_view.submit_edit_highlight(entry_id);
+                        let ended = !meta.is_replay
+                            && meta.prompt_id.as_deref().is_some_and(|pid| {
+                                child_view.ended_child_prompt_ids.contains(pid)
+                                    || child_view.superseded_child_prompt_ids.contains(pid)
+                            });
+                        if !ended {
+                            let is_live = !meta.is_replay && !child_view.session.loading_replay;
+                            let apply = !is_live
+                                || note_child_live_prompt(
+                                    child_view,
+                                    meta.prompt_id.as_deref(),
+                                    meta.turn_start_ms,
+                                    meta.is_replay,
+                                );
+                            if apply {
+                                if is_live {
+                                    if let Some(ts) = meta.turn_start_ms {
+                                        // Nameless chunks must not replace a named turn's wall
+                                        // anchor. `honest_turn_elapsed` trusts the pair.
+                                        let named = meta
+                                            .prompt_id
+                                            .as_deref()
+                                            .is_some_and(|pid| !pid.is_empty());
+                                        if named
+                                            || child_view.turn_start_ms_prompt.is_none()
+                                            || child_view.turn_start_ms == Some(ts)
+                                        {
+                                            child_view.turn_start_ms = Some(ts);
+                                            if named {
+                                                child_view.turn_start_ms_prompt =
+                                                    meta.prompt_id.clone();
+                                            }
+                                        }
+                                    }
+                                    backdate_child_turn_clock(child_view);
+                                }
+                                child_view.session.handle_update(
+                                    notif.request.update,
+                                    &meta,
+                                    &mut child_view.scrollback,
+                                );
+                                for entry_id in child_view.session.tracker.take_pending_edit_hl() {
+                                    child_view.submit_edit_highlight(entry_id);
+                                }
+                            }
                         }
                         subagent_activity_label(child_view)
                     };
@@ -583,6 +676,7 @@ fn handle_ext_notification(notif: &acp::ExtNotification, app: &mut AppView) -> b
         "x.ai/git_head_changed" => handle_git_head_changed(notif, app),
         "x.ai/leader/version_mismatch" => handle_version_mismatch(notif, app),
         "x.ai/mcp/init_progress" => handle_mcp_init_progress(notif, app),
+        "x.ai/session/setup" => handle_session_setup_phase(notif, app),
         "x.ai/mcp/tools_changed" | "x.ai/mcp_initialized" => handle_mcp_tools_changed(notif, app),
         "x.ai/mcp/server_status" if push_server_status_enabled() => {
             handle_mcp_server_status(notif, app)
@@ -593,6 +687,40 @@ fn handle_ext_notification(notif: &acp::ExtNotification, app: &mut AppView) -> b
     }
 }
 
+/// Record the shell's latest `session/new` setup step so a create timeout can name where it stalled.
+fn handle_session_setup_phase(notif: &acp::ExtNotification, app: &mut AppView) -> bool {
+    #[derive(serde::Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct Payload {
+        #[serde(default)]
+        method: Option<String>,
+        phase: String,
+        #[serde(default)]
+        session_id: Option<String>,
+    }
+    let Ok(payload) = serde_json::from_str::<Payload>(notif.params.get()) else {
+        return false;
+    };
+    if payload.method.as_deref() != Some("session/new") {
+        return false;
+    }
+    // Ignore any phase not in the allowlist so the pager never renders arbitrary wire text.
+    let Ok(phase) = payload
+        .phase
+        .parse::<xai_grok_shell::agent::SessionSetupPhase>()
+    else {
+        return false;
+    };
+    let Some(session_id) = payload.session_id.as_deref() else {
+        return false;
+    };
+    let Some(agent) = setup_phase_target_agent(app, session_id) else {
+        return false;
+    };
+    agent.session_new_phase = Some(phase);
+    false
+}
+
 fn handle_version_mismatch(notif: &acp::ExtNotification, app: &mut AppView) -> bool {
     let Some(banner) = crate::acp::version_mismatch_banner(notif.params.get()) else {
         tracing::warn!("ignoring x.ai/leader/version_mismatch without usable versions");
@@ -600,6 +728,16 @@ fn handle_version_mismatch(notif: &acp::ExtNotification, app: &mut AppView) -> b
     };
     app.show_toast(&banner);
     true
+}
+
+fn user_message_text(update: &acp::SessionUpdate) -> Option<&str> {
+    let acp::SessionUpdate::UserMessageChunk(chunk) = update else {
+        return None;
+    };
+    match &chunk.content {
+        acp::ContentBlock::Text(text) => Some(text.text.as_str()),
+        _ => None,
+    }
 }
 
 fn handle_interjection(notif: &acp::ExtNotification, app: &mut AppView) -> bool {
@@ -626,11 +764,14 @@ fn handle_interjection(notif: &acp::ExtNotification, app: &mut AppView) -> bool 
 
     if let Some(iid) = interjection_id {
         if agent.self_interjection_ids.remove(iid) {
+            agent.interjection_painted_blocks.remove(iid);
+            agent.interjection_retry_images.remove(iid);
             return false;
         }
         if agent.is_self_originated_prompt(iid)
             && let Some((entry_id, _)) = agent.send_now_painted_blocks.remove(iid)
         {
+            agent.send_now_echo_pending.remove(iid);
             agent.clear_send_now_expectation();
             if let Some(index) = agent.scrollback.index_of_id(entry_id)
                 && let Some(RenderBlock::UserPrompt(block)) = agent

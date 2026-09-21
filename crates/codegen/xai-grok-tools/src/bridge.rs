@@ -117,6 +117,11 @@ impl ToolBridge {
         self.registry.tool_definitions_builtins_only()
     }
 
+    /// Built-in tool definitions with `use_tool` advertised inline-only (no MCP file forms).
+    pub async fn tool_definitions_builtins_only_inline_mcp(&self) -> Vec<ToolDefinition> {
+        self.registry.tool_definitions_builtins_only_inline_mcp()
+    }
+
     /// Render a prompt template through [`TemplateRenderer`] with extra agent-specific context fields. The template can use
     /// both `${{ tools.by_kind.* }}` (resolved from the finalized tool registry) and caller-provided fields like `${{
     /// os_name }}`, `${{ memory_enabled }}`, etc. Returns `None` if the renderer is not yet available.
@@ -635,6 +640,15 @@ impl ToolBridge {
     pub async fn list_tasks(&self) -> Option<Vec<TaskSnapshot>> {
         if let Some(terminal) = &self.terminal {
             Some(terminal.list_tasks().await)
+        } else {
+            None
+        }
+    }
+
+    /// Metadata-only task listing for background_tasks snapshots (no stdout).
+    pub async fn list_tasks_metadata(&self) -> Option<Vec<TaskSnapshot>> {
+        if let Some(terminal) = &self.terminal {
+            Some(terminal.list_tasks_metadata().await)
         } else {
             None
         }

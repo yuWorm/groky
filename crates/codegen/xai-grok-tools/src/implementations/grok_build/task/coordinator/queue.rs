@@ -4,7 +4,7 @@ use std::collections::VecDeque;
 
 use tokio::sync::oneshot;
 
-use super::super::coordinator_state::DisplacedCompletedChild;
+use super::super::coordinator_state::{DisplacedCompletedChild, WakeOrigin};
 use super::super::types::{SubagentRequest, SubagentResult};
 
 use super::{ChildRunner, SubagentCoordinator};
@@ -65,9 +65,7 @@ pub(super) struct QueuedSpawn {
     pub(super) caller: QueuedCaller,
     pub(super) agent_address: Option<super::super::types::AgentAddress>,
     pub(super) spawner_session_id: Option<String>,
-    pub(super) wake_agent_id: Option<String>,
-    pub(super) wake_message_source: Option<super::super::types::ActiveAgentMessageSource>,
-    pub(super) wake_message_id: Option<String>,
+    pub(super) wake_origin: Option<WakeOrigin>,
     pub(super) wake: Option<DisplacedCompletedChild>,
 }
 
@@ -116,9 +114,6 @@ impl<R: ChildRunner> SubagentCoordinator<R> {
     }
 
     pub(super) fn start_queued_within_capacity(&mut self) {
-        // Finishing a cancelled entry below re-enters through `finish_child`;
-        // the latch makes that inner sweep a no-op instead of a recursion
-        // (a cancelled entry frees no running slot, so it admits nothing).
         if self.draining_queued {
             return;
         }
@@ -139,9 +134,7 @@ impl<R: ChildRunner> SubagentCoordinator<R> {
                     caller,
                     agent_address,
                     spawner_session_id,
-                    wake_agent_id,
-                    wake_message_source,
-                    wake_message_id,
+                    wake_origin,
                     wake,
                 } = queued;
                 let (spawn_reply, deadline) = match caller {
@@ -161,9 +154,7 @@ impl<R: ChildRunner> SubagentCoordinator<R> {
                     },
                     agent_address,
                     spawner_session_id,
-                    wake_agent_id,
-                    wake_message_source,
-                    wake_message_id,
+                    wake_origin,
                     wake,
                 );
             } else {
@@ -203,7 +194,9 @@ impl<R: ChildRunner> SubagentCoordinator<R> {
             wake,
             ..
         } = queued;
-        if let Some(wake) = wake {
+        if let Some(mut wake) = wake {
+            // The user withdrew this wake; the prior record must not be re-woken.
+            wake.completed.wake_eligible = false;
             self.restore_displaced_completion(wake);
             return;
         }
@@ -232,12 +225,9 @@ impl<R: ChildRunner> SubagentCoordinator<R> {
 }
 
 fn cancelled_while_queued_result(request: &SubagentRequest) -> SubagentResult {
-    SubagentResult {
-        success: false,
-        cancelled: true,
-        error: Some("cancelled while queued for a subagent slot".to_owned()),
-        subagent_id: request.id.clone(),
-        child_session_id: request.id.clone(),
-        ..Default::default()
-    }
+    SubagentResult::cancelled(
+        request.id.clone(),
+        request.id.clone(),
+        "cancelled while queued for a subagent slot",
+    )
 }

@@ -488,6 +488,7 @@ fn method_serialises_with_dot_notation_for_dotted_methods() {
         (Method::BotVncDescriptor, "bot.vncDescriptor"),
         (Method::BotTranscriptOffbox, "bot.transcript.offbox"),
         (Method::BotBindConversation, "bot.bindConversation"),
+        (Method::BotPresence, "bot.presence"),
         (Method::BotEvent, "bot.event"),
     ];
     for (m, expected) in cases {

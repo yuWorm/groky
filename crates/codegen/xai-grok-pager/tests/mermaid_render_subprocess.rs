@@ -9,15 +9,30 @@
 //! These exercise the cross-platform `Command`, `current_exe()`, and `Child::kill` code against the actual binary.
 //! The in-process worker unit tests cannot (under `cargo test` the harness binary is not the pager).
 //!
-//! Every test is `#[ignore]` (like `pty_e2e`): it needs the built binary, so `cargo test` skips it by default and CI opts in via `-- --ignored`.
-//! The binary path is resolved at runtime by [`pager_binary`], so the file still compiles where `CARGO_BIN_EXE_*` is unset (e.g. Bazel).
-//! There the tests are skipped.
+//! Every test is `#[ignore]`: it needs the built binary, so `cargo test` skips it by default. Opt in with
+//! `PAGER_BINARY=target/debug/xai-grok-pager cargo test -p xai-grok-pager --test mermaid_render_subprocess -- --ignored`
+//! (Bazel wires `PAGER_BINARY` from `//crates/codegen/xai-grok-pager-bin:xai-grok-pager`).
+//! Unlike the spawn-only suites in `xai-grok-pager-pty-harness`, this test stays here because it exercises pager library code.
 
+use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use xai_grok_pager::app::mermaid_worker::render_via_subprocess;
 use xai_grok_pager::scrollback::blocks::mermaid_content::MermaidRenderQuality;
-use xai_grok_pager_pty_harness::pager_binary;
+
+/// `PAGER_BINARY` (absolutized: Bazel sets a runfiles-relative path) or `CARGO_BIN_EXE_xai-grok-pager`.
+fn pager_binary() -> Result<PathBuf, String> {
+    for key in ["PAGER_BINARY", "CARGO_BIN_EXE_xai-grok-pager"] {
+        if let Some(value) = std::env::var_os(key) {
+            let path = PathBuf::from(value);
+            if path.exists() {
+                return std::path::absolute(&path)
+                    .map_err(|e| format!("failed to absolutize {key}={}: {e}", path.display()));
+            }
+        }
+    }
+    Err("PAGER_BINARY/CARGO_BIN_EXE_xai-grok-pager not set; build xai-grok-pager-bin and export PAGER_BINARY".to_owned())
+}
 
 /// A cyclic login-flow whose back-edge (`Attempts -->|No| Enter`) routes back into the cycle, the tricky case for flowchart edge routing.
 const LOGIN_FLOW: &str = "flowchart TD\n\

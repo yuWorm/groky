@@ -1,4 +1,4 @@
-use crate::agent::mvp_agent::MvpAgent;
+use crate::extensions::agent_runtime::AgentRuntime;
 use crate::extensions::routing::RequestMeta;
 use crate::session::ExtMethodResult;
 use crate::terminal::{self, KillOutcome};
@@ -180,7 +180,7 @@ impl From<KillOutcome> for KillOutcomeResponse {
     }
 }
 
-pub async fn handle(agent: &MvpAgent, args: &acp::ExtRequest) -> ExtResult {
+pub async fn handle(agent: &dyn AgentRuntime, args: &acp::ExtRequest) -> ExtResult {
     match args.method.as_ref() {
         "x.ai/terminal/create" => {
             let req: CreateTerminalRequest = parse(args)?;
@@ -309,7 +309,7 @@ pub async fn handle(agent: &MvpAgent, args: &acp::ExtRequest) -> ExtResult {
                 req.rows.unwrap_or(24),
                 req.cols.unwrap_or(80),
                 req.name.as_deref(),
-                agent.gateway.clone(),
+                agent.gateway().clone(),
                 target_client_id,
             )
             .await
@@ -322,7 +322,7 @@ pub async fn handle(agent: &MvpAgent, args: &acp::ExtRequest) -> ExtResult {
             let req: PtyLoadRequest = parse(args)?;
             let target_client_id = req.meta.map(|m| m.client_id).unwrap_or_default();
             let result =
-                terminal::pty_session::load(&req.terminal_id, &agent.gateway, target_client_id)
+                terminal::pty_session::load(&req.terminal_id, agent.gateway(), target_client_id)
                     .await;
             respond_pty(result)
         }

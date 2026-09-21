@@ -274,6 +274,15 @@ impl PullDiagnostics {
                     if confirming {
                         confirming = false;
                         tokio::time::sleep(CONFIRM_DELAY).await;
+                        // A publish during the wait is the full picture;
+                        // another pull only occupies the server.
+                        if self.store.server_publishes() {
+                            tracing::debug!(
+                                server = %self.server_name, uri = %key,
+                                "server published during confirmation wait; not asking again"
+                            );
+                            return;
+                        }
                         continue;
                     }
                     // An empty answer about text that has since been replaced is the weakest evidence there is: old text, and nothing to report about it. Writing

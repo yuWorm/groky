@@ -52,6 +52,24 @@ impl From<std::io::Error> for ComputerError {
 pub trait AsyncFileSystem: Send + Sync {
     async fn read_file(&self, path: &Path) -> Result<Vec<u8>, ComputerError>;
 
+    fn supports_bounded_read(&self) -> bool {
+        false
+    }
+
+    /// Read a complete regular file without acquiring more than `max_bytes + 1` bytes.
+    /// Unsupported backends must not fall back to an unbounded read.
+    async fn read_file_bounded(
+        &self,
+        path: &Path,
+        max_bytes: usize,
+    ) -> Result<Vec<u8>, ComputerError> {
+        let _ = (path, max_bytes);
+        Err(ComputerError::io_with_kind(
+            "bounded file reads are not supported by this backend",
+            std::io::ErrorKind::Unsupported,
+        ))
+    }
+
     async fn write_file(&self, path: &Path, data: &[u8]) -> Result<(), ComputerError>;
 
     async fn delete_file(&self, path: &Path) -> Result<(), ComputerError>;
@@ -167,6 +185,9 @@ pub struct BackgroundHandle {
     /// captured.
     pub pid: Option<u32>,
 }
+
+/// The `signal` of a task that was lost, not failed. The pager finalizes it without a failed block
+pub const SESSION_RESTART_SIGNAL: &str = "session_restart";
 
 /// Full snapshot of a task's state.
 /// Used by both local and ACP backends.
@@ -394,6 +415,19 @@ pub trait TerminalBackend: Send + Sync {
     /// List all known background tasks (running and completed).
     /// Used for context compaction to include task state in summaries.
     async fn list_tasks(&self) -> Vec<TaskSnapshot>;
+
+    /// Metadata-only listing for durable background_tasks snapshots.
+    /// Skips log reads and omits stdout; default clears output after
+    /// [`Self::list_tasks`].
+    async fn list_tasks_metadata(&self) -> Vec<TaskSnapshot> {
+        let mut tasks = self.list_tasks().await;
+        for task in &mut tasks {
+            task.output.clear();
+            task.output_total_bytes = 0;
+            task.truncated = false;
+        }
+        tasks
+    }
 
     /// Return the persistent shell's current working directory, if persistent
     /// shell state is enabled. Returns `None` when persistence is off or the

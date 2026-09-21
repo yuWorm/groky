@@ -576,10 +576,15 @@ impl AgentView {
                                 return InputOutcome::Changed;
                             }
                             // Drain images BEFORE set_text("") wipes the chip elements.
+                            let image_notice = self.unbound_image_placeholder_notice();
                             let images = self.prompt.drain_images();
                             self.prompt.set_text("");
                             self.note_draft_consumed();
-                            return InputOutcome::Action(Action::SendPromptNow { text, images });
+                            return InputOutcome::Action(Action::SendPromptNow {
+                                text,
+                                images,
+                                image_notice,
+                            });
                         }
                     } else if let Some(outcome) = self.try_send_now_queued_from_prompt() {
                         return outcome;
@@ -855,10 +860,10 @@ impl AgentView {
     fn populate_prompt_from_history(&mut self, text: &str) {
         if let Some(cmd) = text.strip_prefix("! ") {
             self.prompt_input_mode = PromptInputMode::Bash;
-            self.prompt.set_text(cmd);
+            self.prompt.set_text_discarding_images(cmd);
         } else {
             self.prompt_input_mode = PromptInputMode::Normal;
-            self.prompt.set_text(text);
+            self.prompt.set_text_discarding_images(text);
         }
         let len = self.prompt.textarea.text().len();
         self.prompt.textarea.set_cursor(len);
@@ -887,12 +892,12 @@ impl AgentView {
             && let Some(cmd) = text.strip_prefix("! ")
         {
             self.prompt_input_mode = PromptInputMode::Bash;
-            self.prompt.set_text(cmd);
+            self.prompt.set_text_discarding_images(cmd);
         } else if self.prompt_input_mode == PromptInputMode::Bash {
             self.prompt_input_mode = PromptInputMode::Normal;
-            self.prompt.set_text(text);
+            self.prompt.set_text_discarding_images(text);
         } else {
-            self.prompt.set_text(text);
+            self.prompt.set_text_discarding_images(text);
         }
 
         let len = self.prompt.textarea.text().len();
@@ -1168,6 +1173,47 @@ mod slash_menu_enter_tests {
             "got {outcome:?}; prompt={:?}",
             agent.prompt.text()
         );
+    }
+}
+
+#[cfg(test)]
+mod delivered_super_enter_tests {
+    use crate::app::app_view::InputOutcome;
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    fn agent_with_draft() -> super::AgentView {
+        let mut agent = super::test_fixtures::make_agent();
+        agent.prompt.set_text("hello");
+        agent.prompt.set_cursor(agent.prompt.text().len());
+        agent
+    }
+
+    /// Delivered SUPER+Enter misses SendPrompt (bare Enter) and is_mod_enter;
+    /// the composer inserts a newline instead of sending.
+    #[test]
+    fn delivered_super_enter_inserts_newline_and_does_not_send() {
+        let mut agent = agent_with_draft();
+        let outcome =
+            agent.handle_prompt_key_for_test(&KeyEvent::new(KeyCode::Enter, KeyModifiers::SUPER));
+        assert!(
+            matches!(outcome, InputOutcome::Changed),
+            "SUPER+Enter must not send, got {outcome:?}"
+        );
+        assert_eq!(agent.prompt.text(), "hello\n");
+    }
+
+    /// Multiline swap is Shift/Alt only. SUPER+Enter must stay a newline, not send.
+    #[test]
+    fn delivered_super_enter_stays_newline_in_multiline_mode() {
+        let mut agent = agent_with_draft();
+        agent.multiline_mode = true;
+        let outcome =
+            agent.handle_prompt_key_for_test(&KeyEvent::new(KeyCode::Enter, KeyModifiers::SUPER));
+        assert!(
+            matches!(outcome, InputOutcome::Changed),
+            "multiline SUPER+Enter must not send, got {outcome:?}"
+        );
+        assert_eq!(agent.prompt.text(), "hello\n");
     }
 }
 

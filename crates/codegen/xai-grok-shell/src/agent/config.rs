@@ -16,7 +16,7 @@ use xai_grok_login::{AuthManager, GrokComConfig, OidcAuthConfig};
 use xai_grok_sampler::{AuthScheme, SamplerConfig};
 use xai_grok_sampling_types::{
     CompactionAtTokens, CompactionsRemaining, REASONING_EFFORT_META_KEY,
-    REASONING_EFFORTS_META_KEY, ReasoningEffort, ReasoningEffortOption,
+    REASONING_EFFORTS_META_KEY, ReasoningEffort, ReasoningEffortOption, ReasoningSummary,
     reasoning_effort_meta_value, reasoning_efforts_meta_value,
 };
 use xai_grok_tools::types::compat::{
@@ -1065,6 +1065,7 @@ impl HubConfig {
         self.url.as_ref().is_some_and(|u| !u.trim().is_empty())
     }
 }
+pub use crate::agent::cursor_worker_config::CursorWorkerConfig;
 /// Deprecated `[worktree_pool]` section. The pre-warmed worktree pool was deleted (never wired into production).
 /// The section is still parsed so existing user configs don't trip unknown-key warnings.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -1157,19 +1158,10 @@ pub struct MarketplaceSourceEntry {
 #[derive(Clone, Debug, Default, Deserialize)]
 #[serde(default)]
 pub struct StorageConfig {
-    /// Number of days to keep stale sessions before cleanup. Default: 30.
+    /// Unset or `0` disables cleanup; there is no default TTL.
     pub cleanup_ttl_days: Option<u32>,
 }
-/// `[paths]` configuration: extra directories to scan for skills, rules, etc.
-/// These supplement the built-in scan locations (`.grok/skills/`, `.agents/skills/`, `~/.grok/skills/`). They're written by `/import-claude` to preserve previously-discovered Claude directories after the runtime `.claude/` cutoff (see `[claude_compat] imported`).
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
-#[serde(default)]
-pub struct PathsConfig {
-    /// Additional directories to scan for skills (each contains `<skill>/SKILL.md`).
-    pub extra_skill_dirs: Vec<String>,
-    /// Additional directories to scan for rules (each contains `*.md`).
-    pub extra_rule_dirs: Vec<String>,
-}
+pub use xai_grok_agent::prompt::paths::PathsConfig;
 /// `[permission]` known keys, declared for the unrecognized-key scan only; consumed out-of-band.
 /// Keys stay typed so a typo (e.g. `denny`) still warns.
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -1279,6 +1271,8 @@ pub struct Config {
     #[serde(default, skip_serializing)]
     pub hub: HubConfig,
     #[serde(default, skip_serializing)]
+    pub cursor_worker: CursorWorkerConfig,
+    #[serde(default, skip_serializing)]
     pub worktree_pool: WorktreePoolConfig,
     #[serde(default, skip_serializing)]
     pub sandbox: SandboxSettingsConfig,
@@ -1292,6 +1286,8 @@ pub struct Config {
     pub subagents: crate::config::SubagentsConfig,
     #[serde(default, skip_serializing)]
     pub memory: crate::config::MemorySettings,
+    #[serde(default, skip_serializing)]
+    pub memory_v2: crate::config::MemoryV2Settings,
     #[serde(default, skip_serializing)]
     pub compaction: CompactionConfig,
     #[serde(default, skip_serializing)]
@@ -1352,7 +1348,8 @@ pub struct Config {
     /// Original CLI `--subagents` tri-state, preserved for re-resolution when remote settings are refreshed on /new.
     #[serde(skip)]
     pub cli_subagents: Option<bool>,
-    /// Resolved memory configuration. `None` when memory is disabled.
+    /// Resolved memory configuration, including the disabled state so mode is
+    /// pinned when a session is spawned.
     /// Resolved by [`RuntimeResolutionContext`] in [`Config::resolve_runtime_fields`].
     #[serde(skip)]
     pub memory_config: Option<crate::config::MemoryConfig>,
@@ -1628,6 +1625,7 @@ impl Default for Config {
             harness: HarnessConfig::default(),
             relay: RelayConfig::default(),
             hub: HubConfig::default(),
+            cursor_worker: CursorWorkerConfig::default(),
             worktree_pool: WorktreePoolConfig::default(),
             sandbox: SandboxSettingsConfig::default(),
             mcp_servers: std::collections::HashMap::new(),
@@ -1635,6 +1633,7 @@ impl Default for Config {
             disabled_mcp_tools: std::collections::HashMap::new(),
             subagents: crate::config::SubagentsConfig::default(),
             memory: crate::config::MemorySettings::default(),
+            memory_v2: crate::config::MemoryV2Settings::default(),
             compaction: CompactionConfig::default(),
             managed_mcps: crate::config::ManagedMcpsConfig::default(),
             auth: None,
@@ -1732,6 +1731,9 @@ fn non_boolean_feature_error(path: &str, value: &toml::Value) -> String {
 const NON_SERDE_CONFIG_PATHS: &[&str] = &[
     crate::util::config::SLASH_COMMAND_TAGS_CONFIG_PATH,
     "grok_com_config.login_device_flow",
+    "cli.grove",
+    "cli.grove_worktree",
+    "cli.nfs_worktree",
 ];
 /// [`NON_SERDE_CONFIG_PATHS`] plus the multi-path groups, every registered feature, every
 /// [`UNMIRRORED_BOOLEAN_FEATURES`] key, and the managed policy pins (no-op in plain config.toml).
@@ -1817,7 +1819,7 @@ impl Config {
             ("disabled_models", &self.models.disabled_models),
             ("hidden_models", &self.models.hidden_models),
         ] {
-            if let Err(bad) = crate::agent::models::ModelGlobSet::compile(list.as_deref()) {
+            if let Err(bad) = crate::agent::remote_config::ModelGlobSet::compile(list.as_deref()) {
                 return Err(format!(
                     "{field} has an invalid pattern: {}. Patterns use * and ? wildcards.",
                     bad.join(", ")
@@ -2221,7 +2223,7 @@ impl Config {
         self.prompt_suggest_model_pin = models.prompt_suggestion;
         self.memory_enabled_override = ctx.memory_enabled_override;
         let mem = self.resolve_memory(ctx.memory_enabled_override, ctx.remote_settings);
-        self.memory_config = if mem.enabled { Some(mem) } else { None };
+        self.memory_config = Some(mem);
         self.disable_web_search = self.disable_web_search || ctx.disable_web_search;
         self.todo_gate = ctx.todo_gate;
         self.laziness_debug_log = ctx.laziness_debug_log.map(std::path::Path::to_path_buf);
@@ -2242,6 +2244,7 @@ impl Config {
         crate::config::MemoryConfig::resolve_settings(
             memory_enabled_override,
             &self.memory,
+            &self.memory_v2,
             self.compaction
                 .memory_flush
                 .as_ref()
@@ -2257,6 +2260,7 @@ impl Config {
         match Self::new_from_toml_cfg(raw_config) {
             Ok(parsed_config) => {
                 self.memory = parsed_config.memory;
+                self.memory_v2 = parsed_config.memory_v2;
                 self.compaction = parsed_config.compaction;
             }
             Err(error) => {
@@ -2316,13 +2320,17 @@ impl Config {
             self.grok_com_config.force_login_team_uuid.take(),
         );
     }
+    /// Whether product analytics may run. Every product analytics check calls this.
+    pub fn product_analytics_enabled(&self, auth: Option<&xai_grok_login::GrokAuth>) -> bool {
+        self.is_telemetry_enabled() && !auth.is_some_and(|auth| auth.is_zdr_team())
+    }
     pub(crate) fn is_telemetry_enabled(&self) -> bool {
         self.resolve_telemetry_mode().value.is_enabled()
     }
     pub fn is_trace_upload_enabled(&self) -> bool {
         self.resolve_trace_upload().value
     }
-    pub(crate) fn is_feedback_enabled(&self) -> bool {
+    pub fn is_feedback_enabled(&self) -> bool {
         self.is_feature_enabled(Feature::Feedback)
     }
     pub(crate) fn is_session_recap_enabled(&self) -> bool {
@@ -3253,7 +3261,11 @@ pub(crate) fn apply_external_otel_remote_policy(
 /// Seed free-function remote caches after writing `Config.remote_settings`. Called from `init.rs` at boot and from the agent when backgrounded settings arrive later.
 /// So every side effect here must be idempotent and safe to re-apply. The emission-gate flip is owned by [`crate::agent::otel_gate::OtelGate`], not here.
 /// The `force_disable` write here is `Relaxed`; the synchronizing publish is `OtelGate::apply_and_open`. That publish applies the same tighten-only policy and then opens the gate with a `Release` swap. Removing that second application to deduplicate would leave only the `Relaxed` store and reopen an ARM visibility hole.
-pub fn apply_remote_settings_side_effects(settings: Option<&crate::util::config::RemoteSettings>) {
+/// `origin` is the cli-chat-proxy base URL `settings` were fetched from; per-origin caches key on it.
+pub fn apply_remote_settings_side_effects(
+    settings: Option<&crate::util::config::RemoteSettings>,
+    origin: &str,
+) {
     let Some(s) = settings else { return };
     let origin_trusted = crate::util::is_prod_cli_chat_proxy_url(
         &EndpointsConfig::from_effective_config().proxy_url(),
@@ -3268,6 +3280,7 @@ pub fn apply_remote_settings_side_effects(settings: Option<&crate::util::config:
     crate::util::config::cache_remote_prompt_suggestions(s.prompt_suggestions.clone());
     crate::util::config::cache_remote_remember_tool_approvals(s.remember_tool_approvals);
     crate::util::config::cache_remote_crash_handler_enabled(s.crash_handler_enabled);
+    crate::util::config::cache_remote_accept_request_encodings(origin, &s.accept_request_encodings);
     apply_external_otel_remote_policy(settings);
     crate::session::normalize_cache::NormalizeCache::global()
         .set_enabled(s.image_normalize_cache_enabled.unwrap_or(false));
@@ -3649,6 +3662,7 @@ fn default_models(endpoints: &EndpointsConfig) -> IndexMap<String, ModelEntryCon
                 compaction_at_tokens: m.compaction_at_tokens,
                 show_model_fingerprint: m.show_model_fingerprint,
                 stream_tool_calls: None,
+                reasoning_summary: None,
                 laziness_detector: LazinessDetectorPerModelConfig::default(),
             };
             (key, config)
@@ -3768,10 +3782,60 @@ pub struct ModelEntryConfig {
     /// Per-model opt-in: BYOK endpoints that don't understand the flag should leave this unset to avoid request errors.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stream_tool_calls: Option<bool>,
+    /// Responses API `reasoning.summary` for this model; unset keeps the built-in `concise`.
+    /// `none` omits the field for BYOK gateways that reject it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_summary: Option<ReasoningSummary>,
     /// Per-model Layer-3 LazinessDetector configuration.
     /// Defaults to the all-disabled state via `#[serde(default)]`.
     #[serde(default, skip_serializing_if = "is_default_laziness_detector")]
     pub laziness_detector: LazinessDetectorPerModelConfig,
+}
+impl Default for ModelEntryConfig {
+    /// Matches the per-field serde defaults so construction sites (tests especially) can use `..Default::default()`
+    /// and new fields don't ripple through every literal. `model`, `base_url`, and `context_window` have no serde
+    /// default (they are required in config.toml); here they are empty / the inert minimum and real entries must set them.
+    fn default() -> Self {
+        Self {
+            id: None,
+            model: String::new(),
+            model_family: None,
+            base_url: String::new(),
+            name: None,
+            description: None,
+            max_completion_tokens: None,
+            temperature: None,
+            top_p: None,
+            api_key: None,
+            env_key: None,
+            api_backend: ApiBackend::default(),
+            auth_scheme: None,
+            reasoning_effort: None,
+            supports_reasoning_effort: false,
+            reasoning_efforts: Vec::new(),
+            variants: Vec::new(),
+            extra_headers: IndexMap::new(),
+            context_window: NonZeroU64::MIN,
+            auto_compact_threshold_percent: None,
+            system_prompt_label: None,
+            api_base_url: None,
+            use_concise: false,
+            agent_type: default_agent_type(),
+            inference_idle_timeout_secs: None,
+            max_retries: None,
+            rate_limit_retry_threshold: None,
+            subagent_rate_limit_max_attempts: None,
+            hidden: false,
+            supported_in_api: true,
+            supports_backend_search: false,
+            compactions_remaining: None,
+            compaction_at_tokens: None,
+            show_model_fingerprint: false,
+            stream_tool_calls: None,
+            reasoning_summary: None,
+            laziness_detector: LazinessDetectorPerModelConfig::default(),
+        }
+    }
 }
 /// Derives `PartialEq` on `f32`, which is fine for the current shape. Both `f32` fields default to `None`, so there's no parsed-vs-literal `0.7` float equality footgun.
 /// If a future default introduces `Some(0.7)`, this helper must be reworked (e.g. compare on tolerance, or switch to a bit-pattern compare).
@@ -3836,6 +3900,7 @@ pub struct ConfigModelOverride {
     pub compaction_at_tokens: Option<CompactionAtTokens>,
     pub show_model_fingerprint: Option<bool>,
     pub stream_tool_calls: Option<bool>,
+    pub reasoning_summary: Option<ReasoningSummary>,
 }
 impl ConfigModelOverride {
     pub(crate) fn apply(
@@ -3942,6 +4007,9 @@ impl ConfigModelOverride {
         if self.stream_tool_calls.is_some() {
             entry.info.stream_tool_calls = self.stream_tool_calls;
         }
+        if self.reasoning_summary.is_some() {
+            entry.info.reasoning_summary = self.reasoning_summary;
+        }
         if self.api_key.is_some() {
             entry.api_key.clone_from(&self.api_key);
         }
@@ -4035,11 +4103,21 @@ pub struct ModelInfo {
     pub show_model_fingerprint: bool,
     /// When `Some(true)`, the sampler injects `stream_tool_calls: true`
     pub stream_tool_calls: Option<bool>,
+    /// Responses API `reasoning.summary` override; `None` keeps the request builder's default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_summary: Option<ReasoningSummary>,
     /// Per-model Layer-3 LazinessDetector configuration. Defaults to the all-disabled state.
     /// The feature is per-model opt-in, with a second-step `max_nudges_per_session > 0` opt-in for actually injecting nudges.
     /// See [`LazinessDetectorPerModelConfig`].
     #[serde(default)]
     pub laziness_detector: LazinessDetectorPerModelConfig,
+}
+impl Default for ModelInfo {
+    /// [`Self::fallback`] with an empty slug, so construction sites (tests especially) can use `..Default::default()`
+    /// and new fields don't ripple through every literal.
+    fn default() -> Self {
+        Self::fallback("")
+    }
 }
 impl ModelInfo {
     /// Minimal fallback descriptor for an unknown model slug.
@@ -4081,6 +4159,7 @@ impl ModelInfo {
             compaction_at_tokens: None,
             show_model_fingerprint: false,
             stream_tool_calls: None,
+            reasoning_summary: None,
             laziness_detector: LazinessDetectorPerModelConfig::default(),
         }
     }
@@ -4121,6 +4200,7 @@ impl ModelInfo {
             compaction_at_tokens: entry.compaction_at_tokens,
             show_model_fingerprint: entry.show_model_fingerprint,
             stream_tool_calls: entry.stream_tool_calls,
+            reasoning_summary: entry.reasoning_summary,
             laziness_detector: entry.laziness_detector.clone(),
         }
     }
@@ -4170,6 +4250,10 @@ impl ModelInfo {
     /// | `hidden` | `supported_in_api` | OAuth user | API-key user | |----------|--------------------|------------|--------------| | true | _ | hidden | hidden | | false | true | visible | visible | | false | false | visible | **hidden** |
     pub(crate) fn visible_for_auth(&self, is_session_auth: bool) -> bool {
         !self.hidden && (is_session_auth || self.supported_in_api)
+    }
+    /// One rule for the model list, explicit task-model admission, and the task-model presentation.
+    pub(crate) fn is_picker_eligible(&self, is_session_auth: bool) -> bool {
+        self.user_selectable && self.visible_for_auth(is_session_auth)
     }
 }
 /// Flat struct so credential and endpoint fields coexist after deep-merge.
@@ -4835,6 +4919,7 @@ pub(crate) fn resolve_aux_model_sampling_config(
                 compaction_at_tokens: None,
                 show_model_fingerprint: false,
                 stream_tool_calls: None,
+                reasoning_summary: None,
                 laziness_detector: LazinessDetectorPerModelConfig::default(),
             },
             mtls_cert_dir: None,
@@ -4960,6 +5045,8 @@ pub(crate) fn sampling_config_for_model(
         &api_backend,
         &credentials.base_url,
     );
+    let request_compression =
+        crate::util::config::request_compression_for_url(&credentials.base_url);
     SamplerConfig {
         api_key: credentials.api_key,
         model: model_name,
@@ -4970,6 +5057,7 @@ pub(crate) fn sampling_config_for_model(
         top_p,
         api_backend,
         auth_scheme: credentials.auth_scheme,
+        request_compression,
         extra_headers,
         extra_response_includes,
         query_params: info.query_params.clone(),
@@ -4977,6 +5065,7 @@ pub(crate) fn sampling_config_for_model(
         context_window: info.context_window.get(),
         client_version,
         reasoning_effort: info.reasoning_effort,
+        reasoning_summary: info.reasoning_summary,
         force_http1: false,
         max_retries: info.max_retries,
         rate_limit_retry_threshold: info.rate_limit_retry_threshold,
@@ -5062,6 +5151,7 @@ fn resolve_hidden_default_web_search_sampling_config(
             compaction_at_tokens: None,
             show_model_fingerprint: false,
             stream_tool_calls: None,
+            reasoning_summary: None,
             laziness_detector: LazinessDetectorPerModelConfig::default(),
         },
         mtls_cert_dir: None,

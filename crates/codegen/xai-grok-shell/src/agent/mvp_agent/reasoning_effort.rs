@@ -4,16 +4,9 @@ use agent_client_protocol as acp;
 use xai_grok_sampler::SamplerConfig;
 use xai_grok_sampling_types::ReasoningEffort;
 
-use crate::agent::models::ModelsManager;
+use crate::agent::remote_config::ModelsManager;
+use crate::sampling::EffortTarget;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, strum::AsRefStr, strum::IntoStaticStr)]
-#[strum(serialize_all = "snake_case")]
-pub(crate) enum EffortTarget {
-    NewSession,
-    ModelSwitch,
-    #[strum(serialize = "summary")]
-    SummaryClient,
-}
 impl ModelsManager {
     pub(crate) fn apply_supported_effort(
         &self,

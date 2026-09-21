@@ -430,28 +430,7 @@ async fn apply_retry_decision(
                 send_completion(completion, Err(clone_error(err)), terminal_event_queued);
                 return false;
             }
-            // Only the deterministic signal (a 400 stamped with the invalid-image code) is a server rejection
-            // Everything else that reaches this arm is a heuristic that must stay request-local
-            // Exhaustive: a new error variant must choose its strip label here instead of silently landing on the heuristic branch
-            let reason = match err {
-                SamplingError::Api {
-                    status,
-                    error_code: Some(ApiErrorCode::InvalidImage),
-                    ..
-                } if status.as_u16() == 400 => StripReason::ServerRejected,
-                SamplingError::Api { .. }
-                | SamplingError::StreamError { .. }
-                | SamplingError::Auth { .. }
-                | SamplingError::InvalidConfiguration(_)
-                | SamplingError::MtlsConfiguration(_)
-                | SamplingError::Http(_)
-                | SamplingError::Serialization(_)
-                | SamplingError::EventStreamError(_)
-                | SamplingError::IdleTimeout { .. }
-                | SamplingError::EmptyResponse { .. }
-                | SamplingError::MaxTokensTruncation
-                | SamplingError::DoomLoopDetected { .. } => StripReason::PayloadHeuristic,
-            };
+            let reason = strip_reason_for_image_error(err);
             tracing::warn!(
                 stripped = stripped_urls.len(),
                 reason = reason.as_ref(),
@@ -958,6 +937,34 @@ fn emit_retrying(
     });
 }
 
+/// Coded `invalid_image` is `ServerRejected` at any status, including a
+/// synthesized Responses 500. Exhaustive so a new `SamplingError` variant
+/// must pick a label instead of falling through.
+fn strip_reason_for_image_error(err: &SamplingError) -> StripReason {
+    match err {
+        SamplingError::Api {
+            error_code: Some(ApiErrorCode::InvalidImage),
+            ..
+        }
+        | SamplingError::StreamError {
+            code: Some(ApiErrorCode::InvalidImage),
+            ..
+        } => StripReason::ServerRejected,
+        SamplingError::Api { .. }
+        | SamplingError::StreamError { .. }
+        | SamplingError::Auth { .. }
+        | SamplingError::InvalidConfiguration(_)
+        | SamplingError::MtlsConfiguration(_)
+        | SamplingError::Http(_)
+        | SamplingError::Serialization(_)
+        | SamplingError::EventStreamError(_)
+        | SamplingError::IdleTimeout { .. }
+        | SamplingError::EmptyResponse { .. }
+        | SamplingError::MaxTokensTruncation
+        | SamplingError::DoomLoopDetected { .. } => StripReason::PayloadHeuristic,
+    }
+}
+
 fn emit_images_stripped(
     event_tx: &mpsc::UnboundedSender<SamplingEvent>,
     request_id: &RequestId,
@@ -1017,7 +1024,58 @@ fn send_completion(
 mod tests {
     use super::*;
     use futures_util::stream;
+    use reqwest::StatusCode;
     use xai_grok_sampling_types::ApiErrorCode;
+
+    #[test]
+    fn strip_reason_invalid_image_is_server_rejected_on_api_and_stream() {
+        let api_400 = SamplingError::Api {
+            status: StatusCode::BAD_REQUEST,
+            message: "Invalid PNG image.".into(),
+            model_metadata: None,
+            retry_after_secs: None,
+            should_retry: None,
+            error_code: Some(ApiErrorCode::InvalidImage),
+        };
+        assert_eq!(
+            strip_reason_for_image_error(&api_400),
+            StripReason::ServerRejected
+        );
+
+        // Responses `response.failed` is synthesized as Api 500 with the wire code.
+        let api_500 = SamplingError::Api {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            message: "invalid_image: Invalid PNG image.".into(),
+            model_metadata: None,
+            retry_after_secs: None,
+            should_retry: None,
+            error_code: Some(ApiErrorCode::InvalidImage),
+        };
+        assert_eq!(
+            strip_reason_for_image_error(&api_500),
+            StripReason::ServerRejected
+        );
+
+        let stream = SamplingError::StreamError {
+            error_type: "invalid_request_error".into(),
+            message: "Invalid PNG image.".into(),
+            code: Some(ApiErrorCode::InvalidImage),
+        };
+        assert_eq!(
+            strip_reason_for_image_error(&stream),
+            StripReason::ServerRejected
+        );
+
+        let heuristic = SamplingError::StreamError {
+            error_type: "overloaded_error".into(),
+            message: "The server is overloaded.".into(),
+            code: None,
+        };
+        assert_eq!(
+            strip_reason_for_image_error(&heuristic),
+            StripReason::PayloadHeuristic
+        );
+    }
 
     fn completed_response(
         stop_reason: Option<xai_grok_sampling_types::StopReason>,
@@ -1253,7 +1311,10 @@ mod tests {
         match outcome {
             AttemptOutcome::Completed { response, .. } => {
                 assert_eq!(response.tool_calls().len(), 1);
-                assert_eq!(response.tool_calls()[0].arguments.as_ref(), "{\"x\": 1}");
+                let Some(call) = response.tool_calls().first() else {
+                    panic!("expected a tool call");
+                };
+                assert_eq!(call.arguments.as_ref(), "{\"x\": 1}");
                 assert_eq!(
                     response.stop_reason,
                     Some(xai_grok_sampling_types::StopReason::Length)

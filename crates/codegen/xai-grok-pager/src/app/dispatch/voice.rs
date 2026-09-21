@@ -4,17 +4,23 @@ use crate::app::actions::Effect;
 use crate::app::app_view::{ActiveView, AppView, VoiceState, VoiceTarget};
 
 /// Promote live interim into the bound prompt, then hard-reset (no trailing final).
-/// Returns the fragment for callers that captured text earlier.
-pub(super) fn voice_stop_on_submit(app: &mut AppView) -> Option<String> {
+/// Returns the promoted fragment and its caret for callers that captured text earlier.
+pub(super) fn voice_stop_on_submit(app: &mut AppView) -> Option<crate::voice::VoiceInterimCommit> {
     let interim = crate::voice::commit_interim_into_prompt(app);
     app.voice_reset();
     interim
 }
 
 /// Merge interim into a payload captured before [`voice_stop_on_submit`].
-pub(super) fn merge_prompt_with_voice_interim(existing: String, interim: Option<String>) -> String {
+/// The fragment lands at the caret it was committed at, matching where a final would insert.
+pub(super) fn merge_prompt_with_voice_interim(
+    existing: String,
+    interim: Option<crate::voice::VoiceInterimCommit>,
+) -> String {
     match interim {
-        Some(interim) => crate::voice::combine_prompt_with_voice_text(&existing, &interim),
+        Some(commit) => {
+            crate::voice::merge_voice_fragment(&existing, commit.replace, &commit.fragment)
+        }
         None => existing,
     }
 }

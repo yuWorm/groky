@@ -88,6 +88,11 @@ pub async fn fork_session(
         target_prompt_index: request.target_prompt_index,
         session_kind: request.session_kind.clone(),
         source_workspace_dir: request.source_workspace_dir.clone(),
+        prompt_display_cwd: request
+            .source_workspace_dir
+            .clone()
+            .filter(|display| display != &request.new_cwd),
+        skip_cwd_transform: request.session_kind.as_deref() == Some("worktree"),
         // Carry the parent's compaction segment archive into the fork so the child retains pre-compaction history
         // The live summary is already copied via chat_history.jsonl
         copy_compaction_segments: true,
@@ -341,8 +346,10 @@ mod tests {
                 "newCwd": "/dst",
                 "newSessionId": format!("child-{expected}-{}", wire.unwrap_or("omit")),
             });
-            if let Some(kind) = wire {
-                body["sessionKind"] = serde_json::Value::String(kind.into());
+            if let Some(kind) = wire
+                && let Some(obj) = body.as_object_mut()
+            {
+                obj.insert("sessionKind".into(), serde_json::Value::String(kind.into()));
             }
             let request: ForkSessionRequest = serde_json::from_value(body).unwrap();
             let target = Info {

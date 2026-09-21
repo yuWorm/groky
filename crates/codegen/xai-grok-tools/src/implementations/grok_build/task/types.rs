@@ -29,9 +29,12 @@ use crate::register_resource;
 
 pub use super::active_message::{
     ActiveAgentMessage, ActiveAgentMessageDelivery, ActiveAgentMessageOperation,
-    ActiveAgentMessageOutcome, ActiveAgentMessageRequest, ActiveAgentMessageSource,
-    ActiveMessageTarget, AgentAddress, MAX_ACTIVE_AGENT_MESSAGE_BYTES,
-    SubagentActiveMessageRequest,
+    ActiveAgentMessageOutcome, ActiveAgentMessageQuotaKind, ActiveAgentMessageRequest,
+    ActiveAgentMessageSource, ActiveMessageRoute, ActiveMessageSenderContext, ActiveMessageTarget,
+    AgentAddress, MAX_ACTIVE_AGENT_MESSAGE_BYTES, SubagentActiveMessageRequest,
+};
+pub use super::agent_message_sender::{
+    AgentMessageHolder, AgentMessageSender, AgentMessageSenderResource,
 };
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -196,8 +199,10 @@ pub enum ModelOverrideProvenance {
     /// Internal harness, role, persona, or config resolution.
     #[default]
     Harness,
-    /// A model-facing `Task.model` argument.
-    Tool,
+    /// A model-facing task call, carrying the selection mode its tool schema advertised.
+    Tool {
+        selection: super::model_policy::TaskModelSelection,
+    },
 }
 
 #[derive(Debug, Clone, Default)]
@@ -243,12 +248,6 @@ pub fn sanitize_cwd_value(s: &str) -> Option<String> {
     Some(shellexpand::tilde(cleaned).into_owned())
 }
 
-/// Returns `true` if the string looks like a real subagent ID rather than a
-/// model-emitted placeholder (`""`, `"null"`, `"none"`, `"undefined"`, whitespace).
-pub fn is_valid_resume_id(s: &str) -> bool {
-    is_not_sentinel(s)
-}
-
 /// Extension methods for [`SubagentCapabilityMode`] that depend on this crate's
 /// tool-config internals (`ToolKind` / `ToolServerConfig`).
 pub trait SubagentCapabilityModeExt {
@@ -259,6 +258,9 @@ pub trait SubagentCapabilityModeExt {
 
     /// Return the set of `ToolKind`s allowed under this capability mode.
     fn allowed_tool_kinds(self) -> &'static [crate::types::tool::ToolKind];
+
+    /// Whether a tool of `kind` survives [`Self::filter_tool_config`] (`All` filters nothing).
+    fn allows_tool_kind(self, kind: crate::types::tool::ToolKind) -> bool;
 }
 
 /// Prune background-task lifecycle tools (`get_task_output` / `kill_task`) when
@@ -309,6 +311,10 @@ impl SubagentCapabilityModeExt for SubagentCapabilityMode {
         prune_orphaned_background_task_tools(config);
     }
 
+    fn allows_tool_kind(self, kind: crate::types::tool::ToolKind) -> bool {
+        self == Self::All || self.allowed_tool_kinds().contains(&kind)
+    }
+
     /// Return the set of `ToolKind`s allowed under this capability mode.
     fn allowed_tool_kinds(self) -> &'static [crate::types::tool::ToolKind] {
         use crate::types::tool::ToolKind;
@@ -355,6 +361,7 @@ impl SubagentCapabilityModeExt for SubagentCapabilityMode {
                 ToolKind::BackgroundTaskAction,
                 ToolKind::KillTaskAction,
                 ToolKind::Task,
+                ToolKind::ActiveAgentMessage,
                 ToolKind::EnterPlan,
                 ToolKind::ExitPlan,
                 ToolKind::AskUser,
@@ -375,6 +382,7 @@ impl SubagentCapabilityModeExt for SubagentCapabilityMode {
                 ToolKind::BackgroundTaskAction,
                 ToolKind::KillTaskAction,
                 ToolKind::Task,
+                ToolKind::ActiveAgentMessage,
                 ToolKind::EnterPlan,
                 ToolKind::ExitPlan,
                 ToolKind::AskUser,
@@ -467,6 +475,45 @@ impl Default for SubagentResult {
 }
 
 impl SubagentResult {
+    #[must_use]
+    pub fn failed(
+        subagent_id: impl Into<String>,
+        child_session_id: impl Into<String>,
+        error: impl Into<String>,
+    ) -> Self {
+        SubagentResult {
+            error: Some(error.into()),
+            subagent_id: subagent_id.into(),
+            child_session_id: child_session_id.into(),
+            ..SubagentResult::default()
+        }
+    }
+
+    #[must_use]
+    pub fn cancelled(
+        subagent_id: impl Into<String>,
+        child_session_id: impl Into<String>,
+        error: impl Into<String>,
+    ) -> Self {
+        SubagentResult {
+            cancelled: true,
+            ..SubagentResult::failed(subagent_id, child_session_id, error)
+        }
+    }
+
+    #[must_use]
+    pub fn backgrounded(
+        subagent_id: impl Into<String>,
+        child_session_id: impl Into<String>,
+    ) -> Self {
+        SubagentResult {
+            backgrounded: true,
+            subagent_id: subagent_id.into(),
+            child_session_id: child_session_id.into(),
+            ..SubagentResult::default()
+        }
+    }
+
     /// Terminal status string: `"cancelled"`, `"completed"`, or `"failed"`.
     pub fn status(&self) -> &'static str {
         if self.cancelled {
@@ -891,7 +938,6 @@ pub struct SubagentDescribeRequest {
 pub enum SubagentEvent {
     Spawn(SubagentSpawnRequest),
     Query(SubagentQueryRequest),
-    SendActiveMessage(SubagentActiveMessageRequest),
     Cancel(SubagentCancelRequest),
     ListActive(SubagentListActiveRequest),
     ListRunning(SubagentListRunningRequest),
@@ -1149,7 +1195,6 @@ mod tests {
 
     use super::SubagentCapabilityMode;
     use super::SubagentCapabilityModeExt;
-    use super::is_valid_resume_id;
 
     /// Create a `ToolConfig` with the given id and kind set.
     fn tc(id: &str, kind: ToolKind) -> ToolConfig {
@@ -1253,31 +1298,6 @@ mod tests {
             config.tools.is_empty(),
             "execute tools should still be filtered out"
         );
-    }
-
-    #[test]
-    fn is_valid_resume_id_rejects_sentinels() {
-        for bad in [
-            "",
-            "  ",
-            "null",
-            "Null",
-            "NULL",
-            "none",
-            "None",
-            "NONE",
-            "undefined",
-            "  null  ",
-        ] {
-            assert!(!is_valid_resume_id(bad), "{bad:?} should be invalid");
-        }
-    }
-
-    #[test]
-    fn is_valid_resume_id_accepts_real_ids() {
-        for good in ["019e0000-0000-7000-8000-0000000000bb", "abc-123", "prev-id"] {
-            assert!(is_valid_resume_id(good), "{good:?} should be valid");
-        }
     }
 
     #[test]
@@ -1507,12 +1527,14 @@ mod tests {
         req.respond_to.send(summaries).unwrap();
 
         let result = response_rx.try_recv().unwrap();
-        assert_eq!(result.len(), 1);
-        assert_eq!(result[0].subagent_id(), "sub-1");
-        assert_eq!(result[0].snapshot.duration_ms, 1500);
-        assert_eq!(result[0].tool_calls, 7);
+        let [first] = result.as_slice() else {
+            panic!("expected exactly one result, got {}", result.len());
+        };
+        assert_eq!(first.subagent_id(), "sub-1");
+        assert_eq!(first.snapshot.duration_ms, 1500);
+        assert_eq!(first.tool_calls, 7);
         assert!(matches!(
-            result[0].snapshot.status,
+            first.snapshot.status,
             super::SubagentSnapshotStatus::Completed { turns: 3, .. }
         ));
     }
@@ -1558,10 +1580,12 @@ mod tests {
         req.respond_to.send(snapshots).unwrap();
 
         let result = response_rx.try_recv().unwrap();
-        assert_eq!(result.len(), 2);
-        assert!(result[0].is_some());
-        assert!(result[0].as_ref().unwrap().status.is_terminal());
-        assert!(result[1].is_none());
+        let [first, second] = result.as_slice() else {
+            panic!("expected two items: {result:?}");
+        };
+        assert!(first.is_some());
+        assert!(first.as_ref().is_some_and(|s| s.status.is_terminal()));
+        assert!(second.is_none());
     }
 
     #[test]

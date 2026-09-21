@@ -2,7 +2,8 @@
 //!
 //! - Only `ServerRejected` with unambiguous blame (exactly one unique URL in the rejected request) may touch history.
 //!   The server's verdict names the request, not an image.
-//! - The rewrite is deferred until that request's `Completed` proves the strip helped; `Failed` drops the buffer.
+//! - The rewrite waits for that request to terminal (`Completed` or `Failed`). The write is awaited
+//!   before the drain barrier releases so the next prompt cannot reread the image. Heuristic strips stay request-local.
 //! - The write is gated on a backup and acknowledged from disk ([`StripOutcome`]); only `Applied` claims the stored conversation changed.
 //! - Scope: `chat_history.jsonl` only.
 //!   A rebuild replaying `updates.jsonl` (e.g. a remote pull) restores the image and pays one more strip cycle.
@@ -198,8 +199,7 @@ impl SessionActor {
         }
     }
 
-    /// On `Completed`: the stripped retry succeeded, so the buffered strip is now blamed with evidence.
-    /// Persist it and tell the user once the disk write is acknowledged.
+    /// Persist a buffered `ServerRejected` strip once the stripped retry terminals (`Completed` or `Failed`).
     pub(crate) async fn apply_pending_image_strip(&self, request_id: &RequestId) {
         // Acquire rewrite ownership before claiming URLs
         // Rewind either clears queued work first, or waits until this proven strip finishes
@@ -260,16 +260,5 @@ impl SessionActor {
         };
         self.send_xai_notification(XaiSessionUpdate::ImageDropped { notes })
             .await;
-    }
-
-    /// On `Failed`: the stripped retry did not rescue the turn, so the buffered strip proves nothing and is dropped.
-    /// Stored history keeps its images; the next turn starts fresh.
-    pub(crate) fn drop_pending_image_strip(&self, request_id: &RequestId) {
-        if self.pending_image_strip.lock().remove(request_id).is_some() {
-            tracing::debug!(
-                sampler_request_id = request_id.as_str(),
-                "dropping buffered image strip: the stripped retry did not complete"
-            );
-        }
     }
 }

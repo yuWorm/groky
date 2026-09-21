@@ -1,7 +1,7 @@
 use super::support::*;
 use super::*;
 use std::time::Duration;
-use xai_grok_mcp::servers::McpInitStrategy;
+use xai_grok_mcp::servers::{McpInitStrategy, SharedMcpState};
 
 async fn timed<F: Future>(f: F) -> (F::Output, Duration) {
     let start = tokio::time::Instant::now();
@@ -84,8 +84,7 @@ async fn grace_body() {
         tokio::time::sleep(ms(10)).await;
         let mut st = state.lock().await;
         std::mem::forget(st.try_start_init().expect("reclaim after bump"));
-        let generation = st.generation();
-        st.mark_servers_initializing(generation, vec!["other".to_string()]);
+        st.mark_servers_initializing(vec!["other".to_string()]);
     });
     let (_, restart_wait) = timed(restarted.wait_for_mcp_startup_grace()).await;
     assert!(
@@ -138,6 +137,29 @@ async fn grace_body() {
 }
 
 #[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn gate_re_owns_an_abandoned_init_instead_of_waiting_on_it() {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            // The dropped owner had seeded an empty set and never completed.
+            let a = plain_actor().await;
+            {
+                let mut st = a.mcp_state.lock().await;
+                assert!(st.update_configs(vec![stdio("fast", "true")]));
+                let owner = st.try_start_init().expect("claims init");
+                st.mark_servers_initializing(std::iter::empty::<String>());
+                drop(owner);
+                assert!(st.is_init_abandoned());
+            }
+            a.wait_for_mcp_startup_grace().await;
+            assert!(
+                a.mcp_state.lock().await.has_finished_init(),
+                "the gate re-owns an abandoned init rather than waiting on it"
+            );
+        })
+        .await;
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
 async fn delivery_tool_sessions_wait_fully_under_progressive_strategy() {
     tokio::task::LocalSet::new()
         .run_until(progressive_body())
@@ -151,10 +173,7 @@ async fn progressive_body() {
     let state = Arc::clone(&a.mcp_state);
     tokio::task::spawn_local(async move {
         tokio::time::sleep(ms(300)).await;
-        let mut st = state.lock().await;
-        let generation = st.generation();
-        st.mark_all_servers_ready(generation);
-        st.notify_init_waiters();
+        state.lock().await.complete_init();
     });
     let (_prefix, prefix_wait) =
         timed(a.build_prefix_after_mcp_wait(a.requires_full_mcp_wait())).await;
@@ -167,12 +186,19 @@ async fn progressive_body() {
         "settle wakes the gate"
     );
 
+    // A fresh, still-running pass for the second gate.
+    let _second_pass = {
+        let mut st = a.mcp_state.lock().await;
+        let claim = st.restart_init();
+        st.mark_servers_initializing(["linear".to_owned()]);
+        claim
+    };
     let state = Arc::clone(&a.mcp_state);
     tokio::task::spawn_local(async move {
         tokio::time::sleep(ms(300)).await;
         let mut st = state.lock().await;
-        let generation = st.generation();
-        st.finish_init(generation);
+        st.finish_init();
+        st.complete_init();
     });
     let ((_defs, wait_ms), gate) = timed(a.prepare_tool_definitions_timed()).await;
     assert!(
@@ -201,15 +227,40 @@ async fn progressive_body() {
     assert!(!wedged.chat_state_handle.get_conversation().await.is_empty());
 
     // A zero-turn rebuild rebuilds the prefix through the same policy, so a delivery-tools session still holds the wait.
-    let (_, rebuild_wait) =
-        timed(wedged.handle_rebuild_agent_for_definition(
-            xai_grok_agent::AgentDefinition::default_grok_build(),
-        ))
-        .await;
+    let (_, rebuild_wait) = timed(wedged.handle_rebuild_agent_for_definition(
+        xai_grok_agent::AgentDefinition::default_grok_build(),
+        xai_grok_agent::DEFAULT_SYSTEM_PROMPT_LABEL.to_owned(),
+    ))
+    .await;
     assert!(
         rebuild_wait >= DELIVERY_TOOLS_DEFAULT_PREFIX_WAIT,
         "the rebuilt prefix runs the full delivery wait, got {rebuild_wait:?}"
     );
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn delivery_policy_applied_after_the_deferred_build_started_still_waits_fully() {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let a = Arc::new(
+                actor_with_mcp(vec![stdio("linear", "sleep")], false, vec!["linear".into()]).await,
+            );
+            a.mcp_strategy.set(McpInitStrategy::Progressive);
+            let bg = Arc::clone(&a);
+            a.deferred_prefix.arm(
+                tokio::task::spawn_local(async move {
+                    bg.build_prefix_after_mcp_wait(/*full_wait*/ false).await
+                }),
+                false,
+            );
+            *a.delivery_tools.borrow_mut() = vec!["linear__post".to_string()];
+            let (_, wait) = timed(a.ensure_prefix_ready()).await;
+            assert!(
+                wait >= DELIVERY_TOOLS_DEFAULT_PREFIX_WAIT,
+                "the policy arriving late still holds the full wait, got {wait:?}"
+            );
+        })
+        .await;
 }
 
 #[tokio::test(flavor = "current_thread", start_paused = true)]
@@ -218,23 +269,21 @@ async fn delivery_wait_is_paid_once_per_generation_when_init_wedges() {
 }
 
 async fn budget_body() {
-    let owner = actor_with_mcp(vec![stdio("linear", "true")], false, vec![]).await;
-    {
-        let init = owner.ensure_mcp_tools_initialized();
-        tokio::pin!(init);
-        assert!(futures::poll!(init.as_mut()).is_pending());
-        assert!(
-            owner.mcp_state.lock().await.is_initializing(),
-            "owner holds the claim"
-        );
-    }
-    assert!(
-        !owner.mcp_state.lock().await.is_initializing(),
-        "a dropped init owner must release the claim, not wedge Starting"
+    let abandoned = actor_with_mcp(vec![stdio("linear", "true")], false, vec![]).await;
+    drop(
+        abandoned
+            .mcp_state
+            .lock()
+            .await
+            .try_start_init()
+            .expect("claims init"),
     );
-    tokio::time::timeout(Duration::from_secs(600), owner.wait_for_mcp_initialized())
-        .await
-        .expect("the next waiter must be able to re-initiate and settle init");
+    tokio::time::timeout(
+        Duration::from_secs(600),
+        abandoned.wait_for_mcp_initialized(),
+    )
+    .await
+    .expect("the full wait re-owns an abandoned init instead of waiting on it");
 
     let starter = actor_with_mcp(vec![stdio("slow", "sleep")], false, vec![]).await;
     starter.mcp_strategy.set(McpInitStrategy::Blocking);
@@ -272,27 +321,23 @@ async fn budget_body() {
             .is_err(),
         "supersession must not conclude the wait"
     );
+    assert!(
+        superseded
+            .mcp_state
+            .write_if_owner(stale_claim, |st, _| st.cancel_any_init())
+            .await
+            .is_err(),
+        "a stale claim cannot release the successor's init"
+    );
     {
         let mut st = superseded.mcp_state.lock().await;
-        assert!(
-            !st.cancel_init(&stale_claim),
-            "a stale cancel must not release the successor's init"
-        );
-        assert!(
-            st.is_initializing(),
-            "init stays live across a stale cancel"
-        );
-        assert!(
-            st.try_start_init().is_none(),
-            "a stale cancel must not free the claim"
-        );
+        assert!(st.is_initializing() && st.try_start_init().is_none());
     }
-    drop(stale_claim);
-    assert!(!superseded.full_mcp_wait_timed_out().await);
+    assert!(!superseded.full_mcp_wait_timed_out());
     tokio::time::timeout(Duration::from_secs(200), &mut wait)
         .await
         .expect("the wait concludes at the new generation's settle");
-    assert!(!superseded.full_mcp_wait_timed_out().await);
+    assert!(!superseded.full_mcp_wait_timed_out());
 
     let a = pending_linear_actor(McpInitStrategy::Blocking).await;
     *a.delivery_tools.borrow_mut() = vec!["linear__post".to_string()];
@@ -320,8 +365,7 @@ async fn budget_body() {
         let mut st = a.mcp_state.lock().await;
         assert!(st.update_configs(vec![stdio("other", "true")]));
         std::mem::forget(st.try_start_init().expect("fresh generation claims"));
-        let generation = st.generation();
-        st.mark_servers_initializing(generation, vec!["other".to_string()]);
+        st.mark_servers_initializing(vec!["other".to_string()]);
     }
     let (_defs, third_ms) = a.prepare_tool_definitions_timed().await;
     assert!(
@@ -353,7 +397,7 @@ async fn dispatch_body() {
                 .unwrap_or(serde_json::Value::Null);
             let result = match message.get("method").and_then(|m| m.as_str()) {
                 Some("initialize") => serde_json::json!({
-                    "protocolVersion": message["params"]["protocolVersion"],
+                    "protocolVersion": message.get("params").and_then(|p| p.get("protocolVersion")).cloned().unwrap_or(serde_json::Value::Null),
                     "capabilities": { "tools": {} },
                     "serverInfo": { "name": "ready", "version": "0.0.0" },
                 }),
@@ -398,13 +442,12 @@ async fn dispatch_body() {
         took < ms(100),
         "ready must not wait on the wedged handshake, took {took:?}"
     );
-    assert!(!a.full_mcp_wait_timed_out().await);
+    assert!(!a.full_mcp_wait_timed_out());
 
     // Auth-required is recoverable, not terminal: the call must still dispatch so the surfaced auth error can drive re-auth.
     {
         let mut st = a.mcp_state.lock().await;
-        let generation = st.generation();
-        st.record_init_failure(generation, "ready", true, None);
+        st.record_init_failure("ready", true, None);
     }
     let (auth_gated, took) = timed(prepare(&a, "call-auth", "ready__echo")).await;
     assert!(
@@ -426,127 +469,14 @@ async fn dispatch_body() {
 
     {
         let mut st = a.mcp_state.lock().await;
-        let generation = st.generation();
-        st.record_init_failure(generation, "flaky", false, Some("boom".to_string()));
-        st.mark_server_ready(generation, "flaky");
+        st.record_init_failure("flaky", false, Some("boom".to_string()));
+        st.mark_server_ready("flaky");
     }
     let flaky = prepare(&a, "call-flaky", "flaky__do").await;
     assert!(
         matches!(flaky, Err(ToolLoop::NonExistingTool)),
         "a failed server's call rejects, got {flaky:?}"
     );
-}
-
-/// The abort path strips only namespaces with no live claimant: a still-configured or SDK-registered server belongs to the successor, even before its client lands in owned_clients.
-#[tokio::test(flavor = "current_thread", start_paused = true)]
-async fn superseded_abort_strips_only_unclaimed_server_tools() {
-    struct NoopInvoker;
-    #[async_trait::async_trait]
-    impl xai_grok_mcp::acp_transport::AcpReverseInvoker for NoopInvoker {
-        async fn invoke(
-            &self,
-            _server_id: &str,
-            _message: serde_json::Value,
-            _timeout: Duration,
-        ) -> Result<serde_json::Value, String> {
-            Err("unused".to_string())
-        }
-    }
-
-    let bridge = crate::tools::bridge::ToolBridge::for_test();
-    register_stub(&bridge, "kept__post").await;
-    register_stub(&bridge, "sdk__post").await;
-    register_stub(&bridge, "gone__post").await;
-
-    let mut state = crate::session::mcp_servers::McpState::new(vec![stdio("kept", "true")]);
-    state.set_acp_servers(
-        vec![xai_grok_mcp::servers::AcpServerEntry {
-            name: "sdk".to_string(),
-            server_id: "sdk-1".to_string(),
-        }],
-        Arc::new(NoopInvoker),
-    );
-    super::mcp::unregister_dropped_server_tools(
-        &bridge,
-        &state,
-        &["kept".to_string(), "sdk".to_string(), "gone".to_string()],
-    );
-
-    let names: Vec<String> = bridge
-        .tool_definitions()
-        .await
-        .iter()
-        .map(|d| d.function.name.clone())
-        .collect();
-    assert!(
-        names.contains(&"kept__post".to_string()),
-        "a still-configured server's tools must survive a stale pass's abort"
-    );
-    assert!(
-        names.contains(&"sdk__post".to_string()),
-        "an SDK-registered server's tools must survive: its registry outlives config bumps"
-    );
-    assert!(
-        !names.contains(&"gone__post".to_string()),
-        "a dropped server's tools must not survive the abort"
-    );
-}
-#[tokio::test(flavor = "current_thread")]
-async fn resolved_repo_status_prefetch_builds_first_prefix_with_zero_wait() {
-    use crate::session::repo_status_prefix::{
-        RepoStatusInputs, RepoStatusPlan, RepoStatusPrefetch, RepoStatusPrefetchState,
-        RepoStatusSnapshot,
-    };
-    use xai_grok_workspace::session::git::VcsKind;
-
-    let local = tokio::task::LocalSet::new();
-    local
-        .run_until(async {
-            let (gw_tx, _gw_rx) = tokio::sync::mpsc::unbounded_channel();
-            let (persist_tx, _persist_rx) = tokio::sync::mpsc::unbounded_channel();
-            let mut actor = create_test_actor(100, 256_000, 80, gw_tx, persist_tx).await;
-
-            let (snapshot_tx, snapshot_rx) = tokio::sync::watch::channel(None);
-            snapshot_tx
-                .send(Some(RepoStatusSnapshot {
-                    root: None,
-                    raw_status: Some("## main\n M src/lib.rs\n".to_string()),
-                    vcs_kind: VcsKind::Git,
-                }))
-                .unwrap();
-            actor.repo_status_prefetch = RepoStatusPrefetchState::new(RepoStatusPlan::Gather {
-                inputs: RepoStatusInputs {
-                    cwd: std::path::PathBuf::from("."),
-                    vcs_kind: VcsKind::Git,
-                    root: None,
-                },
-                prefetch: std::cell::RefCell::new(Some(RepoStatusPrefetch::from_snapshot_rx(
-                    snapshot_rx,
-                ))),
-            });
-
-            let prefix = actor.build_user_message_prefix().await;
-
-            assert!(
-                prefix.contains("<git_status>") && prefix.contains(" M src/lib.rs"),
-                "prefix must render the prefetched status, got: {prefix}"
-            );
-            assert!(
-                actor
-                    .repo_status_prefetch
-                    .take_wait_ms()
-                    .is_some_and(|ms| ms < 100),
-                "resolved prefetch must not consume the wait budget"
-            );
-            assert!(
-                matches!(
-                    actor.repo_status_prefetch.plan(),
-                    RepoStatusPlan::Gather { prefetch, .. } if prefetch.borrow().is_none()
-                ),
-                "prefetch handle is consumed exactly once"
-            );
-        })
-        .await;
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -569,11 +499,8 @@ async fn absent_inputs_omit_the_status_block() {
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn resumed_session_gathers_status_inline_without_a_prefetch() {
-    use crate::session::repo_status_prefix::{
-        RepoStatusInputs, RepoStatusPlan, RepoStatusPrefetchState,
-    };
-    use xai_grok_workspace::session::git::VcsKind;
+async fn discovered_repo_root_omits_the_status_block() {
+    use crate::session::repo_status_prefix::discover_vcs_root;
 
     let local = tokio::task::LocalSet::new();
     local
@@ -586,69 +513,214 @@ async fn resumed_session_gathers_status_inline_without_a_prefetch() {
                 .status()
                 .expect("spawn git init");
             assert!(init.success(), "git init failed");
-            std::fs::write(repo.path().join("untracked.txt"), b"x").unwrap();
 
             let (gw_tx, _gw_rx) = tokio::sync::mpsc::unbounded_channel();
             let (persist_tx, _persist_rx) = tokio::sync::mpsc::unbounded_channel();
             let mut actor = create_test_actor(100, 256_000, 80, gw_tx, persist_tx).await;
-            actor.repo_status_prefetch = RepoStatusPrefetchState::new(RepoStatusPlan::Gather {
-                inputs: RepoStatusInputs {
-                    cwd: repo.path().to_path_buf(),
-                    vcs_kind: VcsKind::Git,
-                    root: Some(repo.path().to_path_buf()),
-                },
-                prefetch: std::cell::RefCell::new(None),
-            });
+            actor.vcs_root = discover_vcs_root(repo.path());
 
             let prefix = actor.build_user_message_prefix().await;
 
             assert!(
-                prefix.contains("<git_status>") && prefix.contains("untracked.txt"),
-                "inline gather (no prefetch) must render the status block, got: {prefix}"
+                !prefix.contains("<git_status>") && !prefix.contains("<jj_status>"),
+                "first-message prefix must not include a VCS status block, got: {prefix}"
+            );
+            assert!(
+                actor.vcs_root.is_some(),
+                "discovered repo root must still be available to templated prefixes"
             );
         })
         .await;
 }
 
-#[tokio::test(flavor = "current_thread")]
-async fn suppressed_status_omits_the_body_but_keeps_the_repo_root() {
-    use crate::session::repo_status_prefix::{
-        RepoStatusPlan, RepoStatusPrefetchState, discover_vcs_root,
-    };
-    use xai_grok_workspace::session::git::VcsKind;
-
-    let local = tokio::task::LocalSet::new();
-    local
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn replaced_pass_ends_at_once_and_frees_its_server_process() {
+    tokio::task::LocalSet::new()
         .run_until(async {
-            crate::test_support::ensure_hermetic_git_on_path();
-            let repo = tempfile::tempdir().unwrap();
-            let init = std::process::Command::new("git")
-                .args(["init", "--quiet"])
-                .current_dir(repo.path())
-                .status()
-                .expect("spawn git init");
-            assert!(init.success(), "git init failed");
-
-            let (gw_tx, _gw_rx) = tokio::sync::mpsc::unbounded_channel();
-            let (persist_tx, _persist_rx) = tokio::sync::mpsc::unbounded_channel();
-            let mut actor = create_test_actor(100, 256_000, 80, gw_tx, persist_tx).await;
-            actor.repo_status_prefetch = RepoStatusPrefetchState::new(RepoStatusPlan::RootOnly {
-                root: discover_vcs_root(repo.path()),
-                vcs_kind: VcsKind::Git,
-            });
-
-            let prefix = actor.build_user_message_prefix().await;
+            // A pass whose only server never answers: the spawn lands, the handshake hangs.
+            let mut a = actor_with_mcp(vec![], true, vec![]).await;
+            let scope = xai_tty_utils::ProcessScope::new();
+            a.tool_context.process_scope = Some(scope.clone());
+            assert!(
+                a.mcp_state
+                    .lock()
+                    .await
+                    .update_configs(vec![stdio("slow", "sleep")])
+            );
+            a.ensure_mcp_tools_initialized().await;
+            tokio::task::yield_now().await;
+            assert_eq!(scope.live_count(), 1, "the pass holds its server process");
+            assert!(
+                a.mcp_state.lock().await.owned_clients.get("slow").is_none(),
+                "nothing is handed to the state before its handshake lands"
+            );
 
             assert!(
-                !prefix.contains("<git_status>"),
-                "suppressed status must omit the body, got: {prefix}"
+                a.mcp_state
+                    .lock()
+                    .await
+                    .update_configs(vec![stdio("other", "true")])
+            );
+            // A pass that waits for its handshake would idle to the 30s startup timeout; only one that ends at the change passes.
+            tokio::time::timeout(ms(1), a.mcp_init_tasks.borrow_mut().join_next())
+                .await
+                .expect("a replaced pass ends at the change, not at its handshake's timeout")
+                .expect("the replaced pass ends")
+                .expect("the replaced pass ends cleanly");
+            assert_eq!(
+                scope.live_count(),
+                0,
+                "a replaced pass frees its server process when it ends"
+            );
+        })
+        .await;
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn startup_outlives_the_caller_that_triggered_it() {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let (a, _run_loop) =
+                with_run_loop(actor_with_mcp(vec![stdio("slow", "sleep")], false, vec![]).await);
+            {
+                let init = a.ensure_mcp_tools_initialized();
+                tokio::pin!(init);
+                assert!(futures::poll!(init.as_mut()).is_pending());
+            }
+            tokio::task::yield_now().await;
+            let st = a.mcp_state.lock().await;
+            assert!(
+                st.is_initializing() && !st.is_init_abandoned(),
+                "startup keeps its owner when the future that triggered it is dropped"
+            );
+        })
+        .await;
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn startup_ends_with_the_run_loop() {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let (a, run_loop) =
+                with_run_loop(actor_with_mcp(vec![stdio("slow", "sleep")], false, vec![]).await);
+            let init = a.ensure_mcp_tools_initialized();
+            tokio::pin!(init);
+            // Polled once: the startup task is queued on the set and has not run.
+            assert!(futures::poll!(init.as_mut()).is_pending());
+            drop(run_loop);
+            init.await;
+            assert!(
+                !a.mcp_state.lock().await.is_initializing(),
+                "a startup task still queued when the run loop ends never runs"
             );
             assert!(
-                matches!(
-                    actor.repo_status_prefetch.plan(),
-                    RepoStatusPlan::RootOnly { root: Some(_), .. }
-                ),
-                "suppressed status must keep the discovered repo root"
+                !a.ensure_mcp_tools_initialized().await
+                    && !a.mcp_state.lock().await.is_initializing(),
+                "a startup handed over after the run loop ended does not run inline either"
+            );
+            tokio::time::timeout(ms(1), a.wait_for_mcp_initialized())
+                .await
+                .expect("a waiter ends when no run loop can start init");
+            assert_eq!(
+                Arc::strong_count(&a),
+                1,
+                "no startup task holds the actor once its owner is gone"
+            );
+        })
+        .await;
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn waiters_are_released_only_after_the_final_snapshot() {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let a = actor_with_mcp(vec![stdio("fast", "true")], false, vec![]).await;
+            a.wait_for_mcp_initialized().await;
+            assert!(
+                a.tool_metadata_snapshot.lock().unwrap().mcp_initialized,
+                "a turn released on completion must already see the completed snapshot"
+            );
+        })
+        .await;
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn sign_in_waits_for_the_servers_handshake_to_settle() {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let a = actor_with_mcp(
+                vec![stdio("s", "sleep"), stdio("t", "sleep")],
+                false,
+                vec![],
+            )
+            .await;
+            a.ensure_mcp_tools_initialized().await;
+            let settled = a.wait_for_server_settled("s");
+            tokio::pin!(settled);
+            assert!(
+                futures::poll!(settled.as_mut()).is_pending(),
+                "while the pass is handshaking the server, no one else touches its slot"
+            );
+            let change = a
+                .update_mcp_configs(&mut *a.mcp_state.lock().await, vec![stdio("s", "sleep")])
+                .expect("the set changed");
+            assert!(
+                futures::poll!(settled.as_mut()).is_pending(),
+                "a server-set change hands its successor the claim before the wait can end"
+            );
+            drop(change);
+            tokio::time::timeout(ms(1), settled)
+                .await
+                .expect("the wait ends once no live pass can hand the server a client");
+        })
+        .await;
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn seeding_the_pass_releases_waiters_on_servers_it_leaves_alone() {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let a = actor_with_mcp(
+                vec![stdio("a", "sleep"), stdio("b", "sleep")],
+                false,
+                vec![],
+            )
+            .await;
+            let claim = a.mcp_state.lock().await.restart_init();
+            let settled = a.wait_for_server_settled("b");
+            tokio::pin!(settled);
+            assert!(
+                futures::poll!(settled.as_mut()).is_pending(),
+                "before the pass seeds its set, any server may still be handed a client"
+            );
+            a.mcp_state
+                .lock()
+                .await
+                .mark_servers_initializing(["a".to_owned()]);
+            tokio::time::timeout(ms(1), settled)
+                .await
+                .expect("a server the pass leaves alone is released as soon as the pass says so");
+            drop(claim);
+        })
+        .await;
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn rebuild_pass_yields_to_a_config_change_during_its_relist() {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let a = actor_with_mcp(vec![stdio("a", "true")], false, vec![]).await;
+            let claim = a.mcp_state.lock().await.restart_init();
+            assert!(
+                a.mcp_state
+                    .lock()
+                    .await
+                    .update_configs(vec![stdio("b", "true")])
+            );
+            a.run_mcp_init_with_claim(claim).await;
+            assert!(
+                !a.mcp_state.lock().await.has_finished_init(),
+                "a rebuild whose claim was released by a config change starts no pass of its own"
             );
         })
         .await;

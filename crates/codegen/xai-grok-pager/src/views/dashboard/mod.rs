@@ -7,8 +7,12 @@
 //!
 //! - [`state`]: public `DashboardState`, `DashboardRowId`, `RowState`, `Grouping`, `Filter`, `FilterValue`, `PersistedDashboard`.
 //! - [`row`]: `DashboardRow`, `build_rows()`, classifiers, sort.
+//! - [`row_activity`]: parent activity, secondary-line text, and live-work badge counts.
+//! - [`row_title`]: title, subtitle, and chip painting for wide and narrow rows.
 //! - [`layout`]: pure rect computation.
 //! - [`render`]: `Widget`-style rendering routine.
+//! - [`chrome`]: the header row and the primary actions row above the list.
+//! - [`actions_focus`]: the keyboard cursor on the actions row and its `←`/`→` walk.
 //! - [`peek`]: peek panel state and rendering.
 //! - [`usage_modal`]: input routing for the dashboard-hosted `/usage` modal.
 //!
@@ -17,19 +21,26 @@
 //! Rows are rebuilt every render frame off `app.agents`; nothing is cached.
 //! The per-row sort key (state and last_change_at) is recomputed each frame; with single-digit agent counts in one pager process this is free.
 
+mod actions_focus;
+pub(crate) mod animation;
+mod chrome;
 pub mod layout;
 pub mod peek;
 pub mod peek_tail;
+mod preview;
 pub mod render;
 pub mod row;
+mod row_activity;
+mod row_title;
+mod search;
 pub mod state;
+#[cfg(test)]
+mod test_support;
 mod usage_modal;
 
+pub use chrome::HeaderUpgradeCta;
 pub(crate) use render::render_dashboard;
-pub use render::{
-    DashboardOverlayChrome, HeaderUpgradeCta, popup_rect, render_dashboard_session_header,
-    render_dashboard_session_overlay, render_popup_overlay,
-};
+pub use render::{popup_rect, render_popup_overlay};
 pub use row::{
     DashboardRow, RowBadge, build_rows, build_rows_with_roster, classify_subagent,
     classify_top_level, roster_activity_to_state, sort_rows,

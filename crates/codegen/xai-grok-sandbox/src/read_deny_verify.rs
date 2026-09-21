@@ -20,9 +20,10 @@ const STATX_REQUIRED_MASK: u32 = 0x1003;
 const FILE_TYPE_MASK: u16 = 0o170000;
 #[cfg(target_os = "linux")]
 const FILE_TYPE_SYMLINK: u16 = 0o120000;
-#[cfg(target_os = "linux")]
+// Read only by the enforce-gated `verify_path_masked`.
+#[cfg(all(feature = "enforce", target_os = "linux"))]
 const FILE_TYPE_SOCKET: u16 = 0o140000;
-#[cfg(target_os = "linux")]
+#[cfg(all(feature = "enforce", target_os = "linux"))]
 const PERMISSION_MASK: u16 = 0o7777;
 
 #[cfg(target_os = "linux")]
@@ -199,24 +200,28 @@ fn unescape_mountinfo_field(field: &str) -> Result<PathBuf, String> {
     let mut decoded = Vec::with_capacity(bytes.len());
     let mut index = 0;
     while index < bytes.len() {
-        if bytes[index] == b'\\' {
-            if index + 3 >= bytes.len()
-                || !bytes[index + 1..index + 4]
-                    .iter()
-                    .all(|digit| (b'0'..=b'7').contains(digit))
+        let Some(&b) = bytes.get(index) else { break };
+        if b == b'\\' {
+            let Some(octal) = bytes.get(index + 1..index + 4) else {
+                return Err(format!("invalid mountinfo escape in {field:?}"));
+            };
+            let [d1, d2, d3] = octal else {
+                return Err(format!("invalid mountinfo escape in {field:?}"));
+            };
+            if !((b'0'..=b'7').contains(d1)
+                && (b'0'..=b'7').contains(d2)
+                && (b'0'..=b'7').contains(d3))
             {
                 return Err(format!("invalid mountinfo escape in {field:?}"));
             }
-            let decoded_byte = (bytes[index + 1] - b'0') * 64
-                + (bytes[index + 2] - b'0') * 8
-                + (bytes[index + 3] - b'0');
+            let decoded_byte = (*d1 - b'0') * 64 + (*d2 - b'0') * 8 + (*d3 - b'0');
             if !matches!(decoded_byte, b' ' | b'\t' | b'\n' | b'\\') {
                 return Err(format!("unsupported mountinfo escape in {field:?}"));
             }
             decoded.push(decoded_byte);
             index += 4;
         } else {
-            decoded.push(bytes[index]);
+            decoded.push(b);
             index += 1;
         }
     }

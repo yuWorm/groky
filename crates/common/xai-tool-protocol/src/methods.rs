@@ -167,6 +167,9 @@ define_methods! {
     BotUnsubscribe => "bot.unsubscribe",
     /// Record a conversation → agents index. Does not route by conversation.
     BotBindConversation => "bot.bindConversation",
+    /// Report whether this connection has the agent on screen, so the
+    /// harness can hold that agent's turn-finished push.
+    BotPresence => "bot.presence",
     /// Hub → client event notification (not a client-callable verb).
     BotEvent => "bot.event",
 }

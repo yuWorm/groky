@@ -228,13 +228,17 @@ pub enum PersistenceMsg {
         messages: Vec<ConversationItem>,
         respond_to: tokio::sync::oneshot::Sender<io::Result<()>>,
     },
+    /// Persist the attach winner's identity and seed the writeback cache.
+    StampSessionIdentity {
+        identity: SessionIdentity,
+        respond_to: tokio::sync::oneshot::Sender<io::Result<SessionIdentity>>,
+    },
     /// Push a just-minted logical agent into the writeback cache.
     SetRemoteAgentId(String),
     CurrentModel {
         model_id: acp::ModelId,
-        /// The active agent definition name (e.g. `"grok-build"`).
-        /// Persisted in `summary.agent_name` so session resume doesn't depend on the mutable model catalog.
-        agent_name: Option<String>,
+        /// The active agent, persisted so session resume doesn't depend on the mutable model catalog.
+        agent: PersistedAgent,
         reasoning_effort: Option<Option<ReasoningEffort>>,
     },
     PlanState(TodoState),
@@ -259,12 +263,7 @@ pub enum PersistenceMsg {
         request_id: Option<String>,
     },
     WakeStart {
-        prior: WakeSummaryState,
-        attempt_id: String,
-        next_trace_turn: u64,
-        model_id: acp::ModelId,
-        agent_name: Option<String>,
-        reasoning_effort: Option<Option<ReasoningEffort>>,
+        start: WakeStart,
         abort: tokio_util::sync::CancellationToken,
         respond_to: tokio::sync::oneshot::Sender<io::Result<()>>,
     },
@@ -624,6 +623,13 @@ pub(crate) fn set_find_summary_by_session_id_forbidden(forbidden: bool) {
     FIND_SUMMARY_BY_SESSION_ID_FORBIDDEN.set(forbidden);
 }
 
+#[cfg(test)]
+thread_local! {
+    // Per-thread so a current-thread test runtime observes only the actors it spawned.
+    pub(crate) static STAMPS_SERVED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    pub(crate) static FAIL_NEXT_STAMP: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 /// Find and read a session summary given only its ID (scans all CWD directories).
 pub(crate) fn find_summary_by_session_id(session_id: &str) -> Option<Summary> {
     #[cfg(test)]
@@ -657,6 +663,16 @@ fn read_summary_from_dir(session_dir: &Path) -> RelocationResult<Summary> {
     serde_json::from_slice(&bytes).map_err(|source| RelocationError::Json { path, source })
 }
 
+#[derive(Clone, Debug)]
+pub struct WakeStart {
+    pub prior: WakeSummaryState,
+    pub attempt_id: String,
+    pub next_trace_turn: u64,
+    pub model_id: acp::ModelId,
+    pub agent_name: Option<String>,
+    pub reasoning_effort: Option<Option<ReasoningEffort>>,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct WakeSummaryState {
     pub(crate) attempt_id: Option<String>,
@@ -674,13 +690,16 @@ pub(crate) async fn read_wake_summary_state_from_dir(
         let path = session_dir.join("summary.json");
         let bytes = std::fs::read(&path)?;
         serde_json::from_slice::<Summary>(&bytes)
-            .map(|summary| WakeSummaryState {
-                attempt_id: summary.attempt_id,
-                next_trace_turn: summary.next_trace_turn,
-                current_model_id: summary.current_model_id,
-                agent_name: summary.agent_name,
-                reasoning_effort: summary.reasoning_effort,
-                summary_bytes: bytes,
+            .map(|summary| {
+                let agent_name = summary.agent_name().map(String::from);
+                WakeSummaryState {
+                    attempt_id: summary.attempt_id,
+                    next_trace_turn: summary.next_trace_turn,
+                    current_model_id: summary.current_model_id,
+                    agent_name,
+                    reasoning_effort: summary.reasoning_effort,
+                    summary_bytes: bytes,
+                }
             })
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
     })
@@ -866,7 +885,7 @@ fn resumed_session_sandbox_profile_in_root(
 
 /// Owner-only and durable session dir for writers that bypass `init_session` (chat-kind, pre-init fork stamp).
 /// A later occupied `init_session` will not re-sync the encoded-cwd direntry.
-pub(crate) fn ensure_owner_only_session_dir(info: &Info) -> std::io::Result<PathBuf> {
+pub fn ensure_owner_only_session_dir(info: &Info) -> std::io::Result<PathBuf> {
     ensure_owner_only_session_dir_in(&grok_home(), info)
 }
 
@@ -941,9 +960,9 @@ pub struct PendingCwdSwitchReminder {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct SessionIdentity {
-    pub(crate) agent_id: String,
-    pub(crate) attempt_id: String,
+pub struct SessionIdentity {
+    pub agent_id: String,
+    pub attempt_id: String,
 }
 
 pub(crate) struct ExplicitSessionIdentity {
@@ -974,26 +993,8 @@ pub(crate) fn next_session_identity(
     }
 }
 
-/// Mint and persist a new attempt only after this process won cold actor creation.
-/// A non-empty on-disk agent id remains stable across activations.
-pub(crate) async fn persist_cold_spawn_identity(
-    info: &Info,
-    previous_agent_id: Option<&str>,
-) -> io::Result<SessionIdentity> {
-    let storage = JsonlStorageAdapter::with_root(grok_home());
-    stamp_session_identity(&storage, info, previous_agent_id).await
-}
-
-/// Parseable agent id currently on disk, without minting.
-/// For a loader whose insert displaced the cold-spawn winner: its writeback cache was seeded from a summary read that may predate the winner's stamp.
-pub(crate) async fn persisted_agent_id(info: &Info) -> io::Result<Option<String>> {
-    let storage = JsonlStorageAdapter::with_root(grok_home());
-    let summary = storage.load_summary(info).await?;
-    Ok(summary
-        .agent_id
-        .as_deref()
-        .and_then(xai_message_delivery_core::AgentId::parse)
-        .map(|id| id.as_str().to_owned()))
+pub(crate) fn mint_loaded_session_identity(previous_agent_id: Option<&str>) -> SessionIdentity {
+    mint_next_session_identity(previous_agent_id, false)
 }
 
 /// Mint a new attempt under the summary lock, keeping a parseable live agent id.
@@ -1023,6 +1024,88 @@ pub(crate) fn mint_next_session_identity(
             uuid::Uuid::new_v4().as_u128(),
         ),
     )
+}
+
+/// The session's selected agent, persisted so resume doesn't re-derive it from the mutable model catalog.
+#[derive(Debug, Clone)]
+pub enum PersistedAgent {
+    /// Rebuilt from the catalog, plugin, or on-disk source by name on restore.
+    Named(String),
+    /// A client-supplied definition with no other provenance to rebuild from, so its full definition is carried.
+    Inline(Box<xai_grok_agent::AgentDefinition>),
+}
+
+impl PersistedAgent {
+    pub(crate) fn name(&self) -> &str {
+        match self {
+            PersistedAgent::Named(name) => name,
+            PersistedAgent::Inline(def) => &def.name,
+        }
+    }
+
+    pub(crate) fn inline_definition(&self) -> Option<&xai_grok_agent::AgentDefinition> {
+        match self {
+            PersistedAgent::Named(_) => None,
+            PersistedAgent::Inline(def) => Some(def),
+        }
+    }
+}
+
+impl From<&xai_grok_agent::AgentDefinition> for PersistedAgent {
+    fn from(def: &xai_grok_agent::AgentDefinition) -> Self {
+        if def.is_inline_profile() {
+            PersistedAgent::Inline(Box::new(def.clone()))
+        } else {
+            PersistedAgent::Named(def.name.clone())
+        }
+    }
+}
+
+/// Serializes as the legacy `agent_name`/`agent_profile` summary keys; a malformed or name-mismatched profile is dropped so the pair can never load as an inconsistent selection.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct PersistedAgentSelection {
+    selected: Option<PersistedAgent>,
+}
+
+impl serde::Serialize for PersistedAgentSelection {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeMap;
+        let mut map = serializer.serialize_map(None)?;
+        match &self.selected {
+            None => {}
+            Some(PersistedAgent::Named(name)) => map.serialize_entry("agent_name", name)?,
+            Some(PersistedAgent::Inline(def)) => {
+                map.serialize_entry("agent_name", &def.name)?;
+                map.serialize_entry("agent_profile", &def.to_json_value())?;
+            }
+        }
+        map.end()
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for PersistedAgentSelection {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(serde::Deserialize)]
+        struct Raw {
+            #[serde(default)]
+            agent_name: Option<String>,
+            #[serde(default)]
+            agent_profile: Option<serde_json::Value>,
+        }
+        let raw = Raw::deserialize(deserializer)?;
+        let selected = match raw.agent_name {
+            None => None,
+            Some(name) => {
+                let inline = raw
+                    .agent_profile
+                    .and_then(|value| xai_grok_agent::AgentDefinition::from_json(&value).ok())
+                    .filter(|def| def.name == name)
+                    .map(|def| PersistedAgent::Inline(Box::new(def)));
+                Some(inline.unwrap_or(PersistedAgent::Named(name)))
+            }
+        };
+        Ok(PersistedAgentSelection { selected })
+    }
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -1124,11 +1207,9 @@ pub struct Summary {
     /// Human-readable label for the worktree directory (e.g. "nuke-v-tables").
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub worktree_label: Option<String>,
-    /// The agent definition name that was active when the session was last saved.
-    /// Used during session resume to avoid re-deriving from the (mutable) model catalog.
-    /// If the model is removed or its `agent_type` changes between sessions, the persisted value still restores the correct harness.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub agent_name: Option<String>,
+    /// The agent active when the session was last saved, persisted so resume doesn't re-derive it from the mutable model catalog.
+    #[serde(flatten)]
+    pub(crate) agent: PersistedAgentSelection,
     /// Persisted so a resumed session is restored to the same profile instead of silently falling back to the config default.
     /// A fallback would break commands that worked before (a stricter profile denies filesystem/network the session relied on).
     /// `None` for sessions created before this field existed.
@@ -1166,6 +1247,32 @@ pub fn default_model_id() -> acp::ModelId {
 }
 
 impl Summary {
+    /// Re-asserting the current agent's name is a no-op: a model or reasoning-effort switch carries only
+    /// the (built) name, and persisting that built definition would double-expand an inline agent on
+    /// reload, so a same-name update must preserve the existing selection. Any other selection replaces it.
+    pub(crate) fn set_agent(&mut self, agent: PersistedAgent) {
+        let reasserts_current = matches!(&agent, PersistedAgent::Named(name)
+            if self.agent_name() == Some(name.as_str()));
+        if !reasserts_current {
+            self.agent.selected = Some(agent);
+        }
+    }
+
+    pub(crate) fn agent_name(&self) -> Option<&str> {
+        self.agent.selected.as_ref().map(PersistedAgent::name)
+    }
+
+    pub(crate) fn agent_profile(&self) -> Option<&xai_grok_agent::AgentDefinition> {
+        self.agent
+            .selected
+            .as_ref()
+            .and_then(PersistedAgent::inline_definition)
+    }
+
+    pub(crate) fn persisted_agent(&self) -> Option<&PersistedAgent> {
+        self.agent.selected.as_ref()
+    }
+
     pub(crate) fn new(info: &Info, model_id: acp::ModelId) -> std::io::Result<Self> {
         let git_metadata =
             xai_grok_workspace::session::git::resolve_persisted_session_git_metadata_sync(
@@ -1207,7 +1314,7 @@ impl Summary {
             generated_title: None,
             title_is_manual: false,
             worktree_label: None,
-            agent_name: None,
+            agent: PersistedAgentSelection::default(),
             sandbox_profile: None,
             reasoning_effort: None,
             last_turn_summary: None,
@@ -1239,14 +1346,16 @@ impl Summary {
         )
     }
 
-    /// Unused TUI-open husk: no title, no turns, not an explicit worktree/fork.
-    /// Hidden from `grok -c` / `--resume` as well as `grok sessions list`.
+    /// Unused TUI-open husk: untitled, 0 messages, and no fork provenance.
+    /// Worktree stamps do not exempt. `session_kind == "fork"` or
+    /// `parent_session_id` / `forked_at` do (worktree forks keep kind `worktree`).
     pub fn is_unused_optimistic_husk(&self) -> bool {
-        if matches!(self.session_kind.as_deref(), Some("worktree" | "fork"))
+        if matches!(self.session_kind.as_deref(), Some("fork"))
             || self
-                .worktree_label
+                .parent_session_id
                 .as_deref()
-                .is_some_and(|label| !label.is_empty())
+                .is_some_and(|id| !id.is_empty())
+            || self.forked_at.is_some()
         {
             return false;
         }
@@ -2060,6 +2169,31 @@ impl SessionPersistence {
                     }
                     let _ = respond_to.send(result);
                 }
+                PersistenceMsg::StampSessionIdentity {
+                    identity,
+                    respond_to,
+                } => {
+                    #[cfg(test)]
+                    {
+                        STAMPS_SERVED.set(STAMPS_SERVED.get() + 1);
+                        if FAIL_NEXT_STAMP.replace(false) {
+                            let _ =
+                                respond_to.send(Err(io::Error::other("injected stamp failure")));
+                            continue;
+                        }
+                    }
+                    let result = self
+                        .storage
+                        .stamp_session_identity(&self.info, identity)
+                        .await;
+                    self.observe_io(&result);
+                    if let Ok(identity) = &result
+                        && let Some(sync) = &self.remote_sync
+                    {
+                        sync.set_agent_id(identity.agent_id.clone());
+                    }
+                    let _ = respond_to.send(result);
+                }
                 PersistenceMsg::SetRemoteAgentId(agent_id) => {
                     if let Some(sync) = &self.remote_sync {
                         sync.set_agent_id(agent_id);
@@ -2067,7 +2201,7 @@ impl SessionPersistence {
                 }
                 PersistenceMsg::CurrentModel {
                     model_id,
-                    agent_name,
+                    agent,
                     reasoning_effort,
                 } => {
                     if let Err(e) = self
@@ -2075,7 +2209,7 @@ impl SessionPersistence {
                         .update_current_model_and_agent(
                             &self.info,
                             &model_id,
-                            agent_name.as_deref(),
+                            Some(&agent),
                             reasoning_effort,
                         )
                         .await
@@ -2275,27 +2409,13 @@ impl SessionPersistence {
                     }
                 }
                 PersistenceMsg::WakeStart {
-                    prior,
-                    attempt_id,
-                    next_trace_turn,
-                    model_id,
-                    agent_name,
-                    reasoning_effort,
+                    start,
                     abort,
                     respond_to,
                 } => {
                     let result = self
                         .storage
-                        .update_wake_start(
-                            &self.info,
-                            prior,
-                            attempt_id,
-                            next_trace_turn,
-                            model_id,
-                            agent_name,
-                            reasoning_effort,
-                            abort,
-                        )
+                        .update_wake_start(&self.info, start, abort)
                         .await;
                     let result = if result.is_ok() {
                         self.flush_and_sync().await
@@ -2657,7 +2777,12 @@ pub(crate) fn io_error_to_acp(e: &io::Error) -> acp::Error {
         }
     };
     let mut data = serde_json::json!({ "detail": e.to_string() });
-    data[crate::sampling::error::ERROR_CODE_DATA_KEY] = serde_json::json!(code);
+    if let Some(obj) = data.as_object_mut() {
+        obj.insert(
+            crate::sampling::error::ERROR_CODE_DATA_KEY.to_string(),
+            serde_json::json!(code),
+        );
+    }
     acp::Error::new(acp::ErrorCode::InternalError.into(), message.to_string()).data(Some(data))
 }
 
@@ -2716,7 +2841,7 @@ pub(crate) async fn new(
     info: &Info,
     model_id: acp::ModelId,
     deps: SessionDeps,
-) -> io::Result<PersistenceHandle> {
+) -> io::Result<(PersistenceHandle, SessionIdentity)> {
     let SessionDeps {
         sampling_client,
         storage_mode,
@@ -2736,8 +2861,8 @@ pub(crate) async fn new(
     // Mint under the summary lock against the live on-disk id, not the pre-lock snapshot:
     // a concurrent cold-spawn stamp that already persisted a parseable agent must survive
     let identity = stamp_session_identity(&storage, info, summary.agent_id.as_deref()).await?;
-    summary.agent_id = Some(identity.agent_id);
-    summary.attempt_id = Some(identity.attempt_id);
+    summary.agent_id = Some(identity.agent_id.clone());
+    summary.attempt_id = Some(identity.attempt_id.clone());
 
     // Stamp the claimed kind only on a summary that has none yet: a dir left by a crash keeps its persisted kind (init_session already loaded it)
     // Goes through the locked atomic summary writer so it cannot clobber a concurrent writer's fields or leave a torn summary.json
@@ -2790,7 +2915,7 @@ pub(crate) async fn new(
         persistence.run().await;
     });
 
-    Ok(handle)
+    Ok((handle, identity))
 }
 
 pub(crate) enum ExplicitSessionOpen {
@@ -3193,29 +3318,32 @@ pub async fn list_recent_summaries(limit: usize) -> io::Result<Vec<Summary>> {
 
 static CLEANUP_SESSIONS_ONCE: std::sync::Once = std::sync::Once::new();
 
-const DEFAULT_CLEANUP_TTL_DAYS: u32 = 30;
+/// The only files swept inside a live session: everything else there is a write-once artifact
+/// `updates.jsonl` still references, so its own age says nothing about whether it is needed.
+const SWEPT_BLOB_DIRS: [&str; 4] = ["images", "videos", "downloads", "terminal"];
 
-/// Walk `~/.grok/sessions/` and delete files with mtime older than `ttl_days`.
-/// Removes empty session directories after file cleanup.
-/// Skips `skip_session_dir` if provided (current session).
+/// Mid-attach `live_session_dir` is never deleted whole; callers `mark_session_live` first so
+/// other processes do not treat it as idle.
 #[tracing::instrument(skip_all)]
-pub(crate) fn cleanup_stale_sessions(skip_session_dir: Option<&Path>) {
+pub(crate) fn cleanup_stale_sessions(live_session_dir: &Path) {
     CLEANUP_SESSIONS_ONCE.call_once(|| {
-        let ttl_days = resolve_cleanup_ttl_days();
+        let Some(ttl_days) = resolve_cleanup_ttl_days() else {
+            return;
+        };
         let sessions_root = grok_home().join("sessions");
 
         tracing::info!(
             target: "xai_grok_shell::session::persistence",
             sessions_root = %sessions_root.display(),
             ttl_days,
-            skip = ?skip_session_dir.map(|p| p.display().to_string()),
-            "SESSION_CLEANUP_START: scanning for stale session files"
+            live = %live_session_dir.display(),
+            "SESSION_CLEANUP_START: scanning for stale sessions"
         );
 
         let stats = cleanup_stale_sessions_inner(
             &sessions_root,
             ttl_days,
-            skip_session_dir,
+            live_session_dir,
             CleanupLevel::SessionsRoot,
         );
 
@@ -3224,61 +3352,110 @@ pub(crate) fn cleanup_stale_sessions(skip_session_dir: Option<&Path>) {
             sessions_root = %sessions_root.display(),
             files_deleted = stats.files_deleted,
             dirs_removed = stats.dirs_removed,
+            sessions_removed = stats.sessions_removed,
             errors = stats.errors,
             "SESSION_CLEANUP_DONE"
         );
     });
 }
 
-/// Resolve TTL from config.toml `[storage] cleanup_ttl_days`, falling back to 30.
-fn resolve_cleanup_ttl_days() -> u32 {
-    if let Ok(layers) = crate::config::ConfigLayers::load() {
-        let effective = layers.effective_config_disk_only();
-        if let Some(storage) = effective.get("storage")
-            && let Some(ttl) = storage.get("cleanup_ttl_days")
-            && let Some(days) = ttl.as_integer()
-            && days > 0
-        {
-            return days as u32;
-        }
-    }
-    DEFAULT_CLEANUP_TTL_DAYS
+pub(crate) fn session_sweep_done() -> bool {
+    CLEANUP_SESSIONS_ONCE.is_completed()
 }
 
-#[derive(Default)]
+/// Bumps `summary.json`'s mtime so `session_last_activity` sees the attach that is about to
+/// read this dir. Must run synchronously before the sweep is spawned: the sweep's live-dir
+/// exclusion only covers one dir in one process, and neither `load_light` nor `init_session`
+/// rewrites the summary. A dir without a summary (fresh `session/new`, stub) has nothing to bump.
+pub(crate) fn mark_session_live(session_dir: &Path) {
+    let summary = session_dir.join("summary.json");
+    let Ok(metadata) = std::fs::symlink_metadata(&summary) else {
+        return;
+    };
+    if !metadata.file_type().is_file() {
+        return;
+    }
+    // Write access is required for `set_modified` on Windows; nothing is written
+    let touched = std::fs::OpenOptions::new()
+        .write(true)
+        .open(&summary)
+        .and_then(|file| file.set_modified(std::time::SystemTime::now()));
+    if let Err(error) = touched {
+        tracing::debug!(
+            target: "xai_grok_shell::session::persistence",
+            file = %summary.display(),
+            %error,
+            "SESSION_MARK_LIVE_ERROR"
+        );
+    }
+}
+
+/// Config load failure is `None` (no sweep), not a fallback TTL.
+fn resolve_cleanup_ttl_days() -> Option<u32> {
+    match crate::config::ConfigLayers::load() {
+        Ok(layers) => {
+            let ttl = cleanup_ttl_days_from_effective(&layers.effective_config_disk_only());
+            if ttl.is_none() {
+                tracing::info!(
+                    target: "xai_grok_shell::session::persistence",
+                    "SESSION_CLEANUP_SKIPPED: no positive [storage] cleanup_ttl_days"
+                );
+            }
+            ttl
+        }
+        Err(error) => {
+            tracing::info!(
+                target: "xai_grok_shell::session::persistence",
+                %error,
+                "SESSION_CLEANUP_SKIPPED: config load failed"
+            );
+            None
+        }
+    }
+}
+
+fn cleanup_ttl_days_from_effective(effective: &toml::Value) -> Option<u32> {
+    effective
+        .get("storage")
+        .and_then(|storage| storage.get("cleanup_ttl_days"))
+        .and_then(toml::Value::as_integer)
+        .and_then(|days| u32::try_from(days).ok())
+        .filter(|&days| days > 0)
+}
+
+#[derive(Debug, Default, PartialEq)]
 struct CleanupStats {
     files_deleted: u32,
     dirs_removed: u32,
+    sessions_removed: u32,
     errors: u32,
 }
 
+impl CleanupStats {
+    fn absorb(&mut self, other: CleanupStats) {
+        self.files_deleted += other.files_deleted;
+        self.dirs_removed += other.dirs_removed;
+        self.sessions_removed += other.sessions_removed;
+        self.errors += other.errors;
+    }
+}
+
+/// `sessions/` holds one dir per encoded cwd, each holding session dirs.
 #[derive(Clone, Copy)]
 enum CleanupLevel {
     SessionsRoot,
     Cwd,
-    Session,
 }
 
-/// Recursive cleanup: delete stale files, then rmdir empty dirs (post-order).
+/// Stray files at these two levels (`session_search.sqlite`, `prompt_history.jsonl`) keep the
+/// per-file mtime rule; dot entries are the `.cwd` markers.
 fn cleanup_stale_sessions_inner(
     root: &Path,
     ttl_days: u32,
-    skip: Option<&Path>,
+    live_session_dir: &Path,
     level: CleanupLevel,
 ) -> CleanupStats {
     let mut stats = CleanupStats::default();
-
-    if root
-        .file_name()
-        .is_some_and(|name| name.to_string_lossy().starts_with('.'))
-    {
-        return stats;
-    }
-    if let Some(skip_dir) = skip
-        && root == skip_dir
-    {
-        return stats;
-    }
 
     let Ok(entries) = std::fs::read_dir(root) else {
         return stats;
@@ -3297,13 +3474,10 @@ fn cleanup_stale_sessions_inner(
                 continue;
             }
         };
-        let path = entry.path();
-
-        if let Some(skip_dir) = skip
-            && path == skip_dir
-        {
+        if entry.file_name().to_string_lossy().starts_with('.') {
             continue;
         }
+        let path = entry.path();
 
         let metadata = match std::fs::symlink_metadata(&path) {
             Ok(metadata) => metadata,
@@ -3312,83 +3486,169 @@ fn cleanup_stale_sessions_inner(
                 continue;
             }
         };
-        if metadata.file_type().is_dir() && !metadata.file_type().is_symlink() {
-            if matches!(level, CleanupLevel::Cwd) {
-                let summary = path.join("summary.json");
-                match std::fs::symlink_metadata(&summary) {
-                    Ok(metadata)
-                        if metadata.file_type().is_file() && !metadata.file_type().is_symlink() => {
-                    }
-                    Ok(_) => continue,
-                    Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                        let child_stats = cleanup_stale_sessions_inner(
-                            &path,
-                            ttl_days,
-                            skip,
-                            CleanupLevel::Session,
-                        );
-                        stats.files_deleted += child_stats.files_deleted;
-                        stats.dirs_removed += child_stats.dirs_removed;
-                        stats.errors += child_stats.errors;
-                        if child_stats.files_deleted > 0 && std::fs::remove_dir(&path).is_ok() {
-                            stats.dirs_removed += 1;
-                        }
-                        continue;
-                    }
-                    Err(error) => {
-                        stats.errors += 1;
+        let file_type = metadata.file_type();
+        if file_type.is_symlink() {
+            continue;
+        }
+        if file_type.is_dir() {
+            match level {
+                CleanupLevel::SessionsRoot => {
+                    let child = cleanup_stale_sessions_inner(
+                        &path,
+                        ttl_days,
+                        live_session_dir,
+                        CleanupLevel::Cwd,
+                    );
+                    let removed_session = child.sessions_removed > 0;
+                    stats.absorb(child);
+                    // A cwd dir we did not empty may belong to a session being created right now
+                    if removed_session && std::fs::remove_dir(&path).is_ok() {
+                        stats.dirs_removed += 1;
                         tracing::debug!(
                             target: "xai_grok_shell::session::persistence",
-                            path = %summary.display(),
-                            %error,
-                            "SESSION_CLEANUP_METADATA_ERROR"
+                            dir = %path.display(),
+                            "SESSION_CLEANUP_RMDIR"
                         );
-                        continue;
                     }
                 }
-            }
-            let next = match level {
-                CleanupLevel::SessionsRoot => CleanupLevel::Cwd,
-                CleanupLevel::Cwd | CleanupLevel::Session => CleanupLevel::Session,
-            };
-            let child_stats = cleanup_stale_sessions_inner(&path, ttl_days, skip, next);
-            stats.files_deleted += child_stats.files_deleted;
-            stats.dirs_removed += child_stats.dirs_removed;
-            stats.errors += child_stats.errors;
-
-            // Only attempt remove_dir if this subtree actually had stale files deleted in this pass
-            // Otherwise we risk removing dirs that were deliberately created for use by concurrent sessions
-            if child_stats.files_deleted > 0 && std::fs::remove_dir(&path).is_ok() {
-                stats.dirs_removed += 1;
-                tracing::debug!(
-                    target: "xai_grok_shell::session::persistence",
-                    dir = %path.display(),
-                    "SESSION_CLEANUP_RMDIR"
-                );
+                CleanupLevel::Cwd => {
+                    if path == live_session_dir {
+                        // Interactive grok usually has one session and it is this one, so
+                        // skipping the prune here would mean its media never ages out
+                        prune_blob_dirs(&path, ttl_days, &mut stats);
+                    } else {
+                        stats.absorb(cleanup_session_dir(&path, ttl_days));
+                    }
+                }
             }
         } else if let Ok(mtime) = metadata.modified()
             && is_stale(mtime, ttl_days)
         {
-            if std::fs::remove_file(&path).is_ok() {
-                stats.files_deleted += 1;
-                tracing::debug!(
-                    target: "xai_grok_shell::session::persistence",
-                    file = %path.display(),
-                    "SESSION_CLEANUP_DELETE"
-                );
-            } else {
-                stats.errors += 1;
-            }
+            remove_stale_file(&path, &mut stats);
         }
     }
 
     stats
 }
 
+fn cleanup_session_dir(session_dir: &Path, ttl_days: u32) -> CleanupStats {
+    let mut stats = CleanupStats::default();
+    let last_activity = match session_last_activity(session_dir) {
+        Ok(t) => t,
+        Err(error) => {
+            stats.errors += 1;
+            tracing::debug!(
+                target: "xai_grok_shell::session::persistence",
+                dir = %session_dir.display(),
+                %error,
+                "SESSION_CLEANUP_METADATA_ERROR"
+            );
+            return stats;
+        }
+    };
+    if is_stale(last_activity, ttl_days) {
+        match std::fs::remove_dir_all(session_dir) {
+            Ok(()) => {
+                stats.sessions_removed += 1;
+                tracing::info!(
+                    target: "xai_grok_shell::session::persistence",
+                    dir = %session_dir.display(),
+                    "SESSION_CLEANUP_RM_SESSION"
+                );
+            }
+            Err(error) => {
+                stats.errors += 1;
+                tracing::warn!(
+                    target: "xai_grok_shell::session::persistence",
+                    dir = %session_dir.display(),
+                    %error,
+                    "SESSION_CLEANUP_RM_SESSION_ERROR"
+                );
+            }
+        }
+        return stats;
+    }
+
+    prune_blob_dirs(session_dir, ttl_days, &mut stats);
+    stats
+}
+
+/// Deletes regular files older than `ttl_days` from the session's `SWEPT_BLOB_DIRS`.
+/// Never rmdir: `SessionFileWriter::save` may sit between its `create_dir_all` and `persist`.
+fn prune_blob_dirs(session_dir: &Path, ttl_days: u32, stats: &mut CleanupStats) {
+    for dir_name in SWEPT_BLOB_DIRS {
+        let Ok(entries) = std::fs::read_dir(session_dir.join(dir_name)) else {
+            continue;
+        };
+        for entry_result in entries {
+            let Ok(entry) = entry_result else {
+                stats.errors += 1;
+                continue;
+            };
+            let path = entry.path();
+            let Ok(metadata) = std::fs::symlink_metadata(&path) else {
+                stats.errors += 1;
+                continue;
+            };
+            if metadata.file_type().is_file()
+                && let Ok(mtime) = metadata.modified()
+                && is_stale(mtime, ttl_days)
+            {
+                remove_stale_file(&path, stats);
+            }
+        }
+    }
+}
+
+/// Newest mtime among the session dir's own regular files (the dir's own mtime if it has none).
+/// `updates.jsonl` grows with every persisted update and `mark_session_live` bumps `summary.json`
+/// on every attach; loading alone rewrites neither.
+fn session_last_activity(session_dir: &Path) -> io::Result<std::time::SystemTime> {
+    let mut newest: Option<std::time::SystemTime> = None;
+    for entry in std::fs::read_dir(session_dir)? {
+        let metadata = std::fs::symlink_metadata(entry?.path())?;
+        if metadata.file_type().is_file()
+            && let Ok(mtime) = metadata.modified()
+        {
+            newest = Some(newest.map_or(mtime, |n| n.max(mtime)));
+        }
+    }
+    match newest {
+        Some(mtime) => Ok(mtime),
+        None => std::fs::symlink_metadata(session_dir)?.modified(),
+    }
+}
+
+fn remove_stale_file(path: &Path, stats: &mut CleanupStats) {
+    match std::fs::remove_file(path) {
+        Ok(()) => {
+            stats.files_deleted += 1;
+            tracing::debug!(
+                target: "xai_grok_shell::session::persistence",
+                file = %path.display(),
+                "SESSION_CLEANUP_DELETE"
+            );
+        }
+        Err(error) => {
+            stats.errors += 1;
+            tracing::debug!(
+                target: "xai_grok_shell::session::persistence",
+                file = %path.display(),
+                %error,
+                "SESSION_CLEANUP_DELETE_ERROR"
+            );
+        }
+    }
+}
+
 fn is_stale(mtime: std::time::SystemTime, ttl_days: u32) -> bool {
     let ttl = std::time::Duration::from_secs(u64::from(ttl_days) * 86400);
     mtime.elapsed().is_ok_and(|age| age > ttl)
 }
+
+#[cfg(test)]
+#[path = "persistence_cleanup_stale_sessions_tests.rs"]
+mod cleanup_stale_sessions_tests;
 
 #[cfg(test)]
 #[path = "persistence_agent_name_persistence_tests.rs"]

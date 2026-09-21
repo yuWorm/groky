@@ -2,6 +2,7 @@
 //! Co-located child of `mvp_agent` (`use super::*`).
 
 use super::*;
+use crate::extensions::code_nav::CodeNavEligibility;
 
 impl MvpAgent {
     /// Parse the `x.ai/codeNavigation.enabled` capability from an initialize request.

@@ -50,7 +50,7 @@ fn spawn_persistence_drain(
                     let _ = respond_to.send(Ok(()));
                 }
                 PersistenceMsg::Update(crate::session::storage::SessionUpdate::Xai(n)) => {
-                    if let XaiSessionUpdate::HookAnnotation { message } = n.update {
+                    if let XaiSessionUpdate::HookAnnotation { message, .. } = n.update {
                         sink.borrow_mut().push(message);
                     }
                 }

@@ -5,6 +5,8 @@
 //! process-wide clients owned by `xai_grok_sampler::shared_http`. TLS policy
 //! (backend pin, roots, provider) lives in `xai_grok_extra_ca`.
 
+#![deny(clippy::indexing_slicing)]
+
 use std::sync::OnceLock;
 
 use xai_grok_workspace::permission::ClientType;
@@ -34,8 +36,9 @@ const _: () = assert!(
     STARTUP_SETTINGS_WAIT_DEADLINE.as_millis() < SETTINGS_REAPPLY_TIMEOUT.as_millis(),
     "STARTUP_SETTINGS_WAIT_DEADLINE must stay under SETTINGS_REAPPLY_TIMEOUT"
 );
-/// Covers the models fetch that runs ahead of the settings ladder on the prefetch thread plus the
-/// worst-case three-attempt ladder with backoff; must exceed `STARTUP_SETTINGS_WAIT_DEADLINE`.
+/// Covers the worst-case three-attempt settings ladder with backoff. Settings and
+/// models run concurrently, each on its own budget, so a slow models fetch cannot
+/// consume this window; must exceed `STARTUP_SETTINGS_WAIT_DEADLINE`.
 pub const MANAGED_STARTUP_SETTINGS_WAIT_DEADLINE: std::time::Duration =
     std::time::Duration::from_secs(25);
 const _: () = assert!(

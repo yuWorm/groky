@@ -23,6 +23,12 @@ pub struct CancellationContext {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub trigger: Option<String>,
 }
+/// The parent's exact tool schema paired with the selection mode it advertised.
+#[derive(Debug, Clone)]
+pub struct ForkedToolSnapshot {
+    pub specs: Vec<xai_grok_sampling_types::ToolSpec>,
+    pub task_model_selection: crate::agent::remote_config::task_model_policy::TaskModelSelection,
+}
 /// The ways a `/btw` side question can fail.
 /// Kept typed until the ACP boundary so model errors keep their typed rate-limit and auth codes instead of flattening to a string.
 /// `handle_btw` maps them with [`map_sampling_err_to_acp`](crate::sampling::error::map_sampling_err_to_acp).
@@ -67,6 +73,12 @@ pub const HOOK_DENIED_CATEGORY: &str = "HookDenied";
 pub const MAX_TURNS_REACHED_CATEGORY: &str = "max_turns_reached";
 /// `_meta.cancellationCategory` of a stationarity end.
 pub const ACTION_STATIONARITY_CATEGORY: &str = "action_stationarity";
+/// `_meta.cancellationCategory` of a permission reject that ended the turn.
+pub const PERMISSION_REJECTED_CATEGORY: &str = "PermissionRejected";
+/// `_meta.cancellationCategory` of a dismissed permission prompt that ended the turn.
+pub const PERMISSION_CANCELLED_CATEGORY: &str = "PermissionCancelled";
+/// `_meta.cancellationCategory` of a mid-turn abort (user stop or unnamed interrupt).
+pub const MID_TURN_ABORT_CATEGORY: &str = "MidTurnAbort";
 /// `_meta.cancellationCategory` wire name of a cancel category: an explicit match so a variant rename cannot silently change the wire.
 /// This is deliberately a second vocabulary next to the serde snake_case of the events.jsonl / after-turn rails.
 /// `_meta` shipped PascalCase and clients match it.
@@ -76,9 +88,9 @@ pub fn meta_category_str(
     use xai_grok_session_events::types::CancellationCategory;
     match category {
         CancellationCategory::HookDenied => HOOK_DENIED_CATEGORY,
-        CancellationCategory::PermissionRejected => "PermissionRejected",
-        CancellationCategory::PermissionCancelled => "PermissionCancelled",
-        CancellationCategory::MidTurnAbort => "MidTurnAbort",
+        CancellationCategory::PermissionRejected => PERMISSION_REJECTED_CATEGORY,
+        CancellationCategory::PermissionCancelled => PERMISSION_CANCELLED_CATEGORY,
+        CancellationCategory::MidTurnAbort => MID_TURN_ABORT_CATEGORY,
     }
 }
 impl PromptCompletionKind {
@@ -230,6 +242,14 @@ impl CancelTrigger {
             Self::Client(s) => s,
         }
     }
+    /// Wire names that are a user Stop. One list for the shell and the pager banner.
+    pub fn is_user_gesture_name(name: &str) -> bool {
+        matches!(name, "esc" | "ctrl_c" | "mouse" | "dashboard_stop")
+    }
+    /// Stop click / key only. Unknown `Client` strings stay programmatic so a new wire name cannot claim "by user".
+    pub fn is_user_gesture(&self) -> bool {
+        Self::is_user_gesture_name(self.as_str())
+    }
 }
 /// What a cancel does to the in-memory conversation history.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -287,6 +307,29 @@ impl From<SkillUpdateKind> for AdvertiseTrigger {
             SkillUpdateKind::BaselineChange => Self::SkillsReload,
         }
     }
+}
+pub struct SessionModelSwitch {
+    pub sampling_config: xai_grok_sampler::SamplerConfig,
+    pub use_concise: bool,
+    /// The two models declare differing `model_family`s, so a lossy compaction runs at switch end.
+    pub is_family_switch: bool,
+    /// When `false`, skip the system prompt rewrite (concise/default swap).
+    /// Set to `false` for forked sessions so mid-session model switches cannot contaminate the inherited prompt configuration.
+    pub apply_prompt_override: bool,
+    /// When `true`, suppress the system prompt rewrite even though `apply_prompt_override` may be `true`.
+    /// Set by the model-switch orchestrator immediately after a successful `RebuildAgentForDefinition`.
+    /// The rebuild handler already installed the fresh harness's prompt; the concise/default swap must not clobber it.
+    pub skip_prompt_rewrite: bool,
+    /// Computed by `MvpAgent` against the new model id.
+    /// Per-model remote settings and per-model user TOML overrides then target the right model after a `/model` switch.
+    /// The session actor stores this on `compaction.threshold_percent` (which is `Cell<u8>` so it can update without `&mut self`).
+    pub auto_compact_threshold_percent: u8,
+    pub system_prompt_label: String,
+}
+#[derive(Debug, Clone, Default)]
+pub struct CurrentModel {
+    pub id: String,
+    pub reasoning_effort: Option<xai_grok_sampling_types::ReasoningEffort>,
 }
 pub enum SessionCommand {
     Initialize {
@@ -357,8 +400,6 @@ pub enum SessionCommand {
     },
     /// Admit an owning parent's message as an ordinary protected turn or running-turn Steer.
     ParentAgentMessage {
-        #[allow(private_interfaces)]
-        principal: crate::session::message_delivery::ActiveMessagePrincipal,
         delivery:
             xai_grok_tools::implementations::grok_build::task::types::ActiveAgentMessageDelivery,
         #[allow(private_interfaces)]
@@ -373,21 +414,7 @@ pub enum SessionCommand {
         responds_to: oneshot::Sender<()>,
     },
     SetSessionModel {
-        sampling_config: xai_grok_sampler::SamplerConfig,
-        use_concise: bool,
-        /// The two models declare differing `model_family`s, so a lossy compaction runs at switch end.
-        is_family_switch: bool,
-        /// When `false`, skip the system prompt rewrite (concise/default swap).
-        /// Set to `false` for forked sessions so mid-session model switches cannot contaminate the inherited prompt configuration.
-        apply_prompt_override: bool,
-        /// When `true`, suppress the system prompt rewrite even though `apply_prompt_override` may be `true`.
-        /// Set by the model-switch orchestrator immediately after a successful `RebuildAgentForDefinition`.
-        /// The rebuild handler already installed the fresh harness's prompt; the concise/default swap must not clobber it.
-        skip_prompt_rewrite: bool,
-        /// Computed by `MvpAgent` against the new model id.
-        /// Per-model remote settings and per-model user TOML overrides then target the right model after a `/model` switch.
-        /// The session actor stores this on `compaction.threshold_percent` (which is `Cell<u8>` so it can update without `&mut self`).
-        auto_compact_threshold_percent: u8,
+        switch: SessionModelSwitch,
         responds_to: oneshot::Sender<Result<acp::ModelId, acp::Error>>,
     },
     /// Set only the reasoning effort on the session's live model. Carrying no
@@ -401,6 +428,7 @@ pub enum SessionCommand {
     /// Triggered by `MvpAgent::set_session_model` when the new model's `agent_type` differs from the session's current one.
     RebuildAgentForDefinition {
         definition: xai_grok_agent::AgentDefinition,
+        system_prompt_label: String,
         responds_to: oneshot::Sender<Result<(), acp::Error>>,
     },
     /// Signals then report the override model rather than the agent-level default.
@@ -415,7 +443,7 @@ pub enum SessionCommand {
         context_window: Option<std::num::NonZeroU64>,
     },
     GetCurrentModel {
-        responds_to: oneshot::Sender<String>,
+        responds_to: oneshot::Sender<CurrentModel>,
     },
     GetCurrentPromptMode {
         responds_to: oneshot::Sender<PromptMode>,
@@ -441,11 +469,28 @@ pub enum SessionCommand {
     ReloadHooks,
     /// Re-discover skills from disk and update the session's skill baseline.
     RefreshSkillBaseline,
-    /// Calls `run_memory_flush("user_requested", None)` on the session actor.
-    /// Returns an error if memory is not enabled for this session.
-    /// Otherwise returns `Ok(true/false)`: whether a flush actually ran (false if another flush was already in progress).
+    /// Capture every completed turn now for `x.ai/memory/flush`.
     FlushMemory {
-        respond_to: oneshot::Sender<acp::Result<bool>>,
+        respond_to: oneshot::Sender<crate::extensions::memory::MemoryFlushResponse>,
+    },
+    /// Consolidate memory now for `x.ai/memory/dream`, bypassing the automatic gates.
+    MemoryDream {
+        respond_to: oneshot::Sender<crate::extensions::memory::MemoryDreamResponse>,
+    },
+    /// List memory files and state for `x.ai/memory/list`.
+    MemoryList {
+        respond_to: oneshot::Sender<Result<crate::extensions::memory::MemoryListing, String>>,
+    },
+    /// Turn memory on or off for `x.ai/memory/toggle`.
+    MemoryToggle {
+        enabled: bool,
+        respond_to: oneshot::Sender<crate::extensions::memory::MemoryToggleResponse>,
+    },
+    /// Delete one memory note for `x.ai/memory/forget`.
+    MemoryForget {
+        path: String,
+        expected_content_hash: String,
+        respond_to: oneshot::Sender<crate::extensions::memory::MemoryForgetResponse>,
     },
     /// Auto-approve all permission prompts when `enabled`.
     SetYoloMode {
@@ -597,7 +642,7 @@ pub enum SessionCommand {
     /// Snapshot the session's resolved tool schema (the same list the parent's own turn sends).
     /// A verbatim-fork child can then present a byte-identical tool prefix.
     SnapshotToolDefinitions {
-        respond_to: oneshot::Sender<Vec<xai_grok_sampling_types::ToolSpec>>,
+        respond_to: oneshot::Sender<ForkedToolSnapshot>,
     },
     /// Replace the session's client-registered hooks.
     /// Sent on `load_session` reconnect to a live actor so a client can re-register (or clear) its hooks without a fresh session.
@@ -649,8 +694,23 @@ pub enum SessionCommand {
     ListTasks {
         respond_to: oneshot::Sender<Option<Vec<xai_grok_tools::types::TaskSnapshot>>>,
     },
-    /// Query whether the session has work in flight: a running turn (`running_task.is_some()`) **or** queued inputs (`pending_inputs` non-empty).
-    /// Used by the leader's idle-unload decision on client disconnect to avoid unloading a session that still has pending work.
+    /// Persist + broadcast the current background-task list via
+    /// `x.ai/session_notification` (`SessionUpdate::BackgroundTasks`).
+    ///
+    /// `respond_to` means load enqueued the persist+broadcast before returning.
+    /// It is not a client-delivery ack. Live incremental follow-ups leave it `None`.
+    ///
+    /// `pending` is the bridge coalesce bit. Live incrementals pass `Some` so
+    /// a burst collapses to one emit; load leaves it `None` (forced flush).
+    EmitBackgroundTasksSnapshot {
+        respond_to: Option<oneshot::Sender<()>>,
+        pending: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    },
+    /// Query whether the session has work in flight: a running turn
+    /// (`running_task.is_some()`) **or** queued inputs
+    /// (`pending_inputs` non-empty). Used by the leader's idle-unload decision
+    /// on client disconnect (the no-evict keystone) to avoid unloading a
+    /// session that still has pending work.
     IsBusy {
         respond_to: oneshot::Sender<bool>,
     },
@@ -797,6 +857,8 @@ pub enum SessionCommand {
     /// The session snapshots the conversation context, makes a single tool-free model call, and returns the response text.
     SideQuestion {
         question: String,
+        /// Images attached to this side question. Empty for the legacy text-only path.
+        images: Vec<acp::ImageContent>,
         respond_to: oneshot::Sender<Result<String, SideQuestionError>>,
     },
     /// Generate a session recap (a short "where was I" summary) and broadcast it to clients via `SessionUpdate::SessionRecap`.
@@ -886,6 +948,10 @@ mod cancellation_category_meta_tests {
     /// Pins every `_meta.cancellationCategory` wire name: shipped clients string-match these, so a rename is a wire break the compiler can't see.
     #[test]
     fn pins_every_wire_name() {
+        use super::{
+            HOOK_DENIED_CATEGORY, MID_TURN_ABORT_CATEGORY, PERMISSION_CANCELLED_CATEGORY,
+            PERMISSION_REJECTED_CATEGORY,
+        };
         let cancelled = |category| PromptCompletionKind::Cancelled {
             category,
             context: None,
@@ -893,19 +959,19 @@ mod cancellation_category_meta_tests {
         for (kind, expected) in [
             (
                 cancelled(Some(CancellationCategory::HookDenied)),
-                Some("HookDenied"),
+                Some(HOOK_DENIED_CATEGORY),
             ),
             (
                 cancelled(Some(CancellationCategory::MidTurnAbort)),
-                Some("MidTurnAbort"),
+                Some(MID_TURN_ABORT_CATEGORY),
             ),
             (
                 cancelled(Some(CancellationCategory::PermissionRejected)),
-                Some("PermissionRejected"),
+                Some(PERMISSION_REJECTED_CATEGORY),
             ),
             (
                 cancelled(Some(CancellationCategory::PermissionCancelled)),
-                Some("PermissionCancelled"),
+                Some(PERMISSION_CANCELLED_CATEGORY),
             ),
             (cancelled(None), None),
             (
@@ -948,5 +1014,21 @@ mod cancel_trigger_tests {
         ] {
             assert_eq!(trigger.kind(), expected, "{trigger:?}");
         }
+    }
+    #[test]
+    fn user_gesture_is_stop_clicks_and_keys_only() {
+        assert!(CancelTrigger::is_user_gesture_name("esc"));
+        assert!(CancelTrigger::is_user_gesture_name("mouse"));
+        assert!(!CancelTrigger::is_user_gesture_name("send_now"));
+        assert!(CancelTrigger::Esc.is_user_gesture());
+        assert!(CancelTrigger::CtrlC.is_user_gesture());
+        assert!(CancelTrigger::from_client("mouse").is_user_gesture());
+        assert!(CancelTrigger::from_client("dashboard_stop").is_user_gesture());
+        assert!(!CancelTrigger::from_client("some_future_gesture").is_user_gesture());
+        assert!(!CancelTrigger::from_client("host_interrupt").is_user_gesture());
+        assert!(!CancelTrigger::SendNow.is_user_gesture());
+        assert!(!CancelTrigger::Shutdown.is_user_gesture());
+        assert!(!CancelTrigger::SessionClose.is_user_gesture());
+        assert!(!CancelTrigger::SessionDelete.is_user_gesture());
     }
 }

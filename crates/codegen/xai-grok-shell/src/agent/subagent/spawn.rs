@@ -18,9 +18,7 @@ use agent_client_protocol as acp;
 use tokio::sync::mpsc;
 use xai_acp_lib::AcpAgentGatewaySender as GatewaySender;
 use xai_grok_telemetry::region::Region;
-pub(crate) use xai_grok_tools::implementations::grok_build::task::coordinator::{
-    self, ChildCompletion, ChildRunOutput, StartedChild,
-};
+use xai_grok_tools::implementations::grok_build::task::coordinator::{self, ChildCompletion};
 use xai_grok_tools::implementations::grok_build::task::types::{
     SubagentRequest, SubagentResult, SubagentSnapshot,
 };
@@ -91,6 +89,8 @@ pub(crate) async fn join_worker_task<T>(task: tokio::task::JoinHandle<T>, panic_
 }
 impl coordinator::ChildRunner for ShellChildRunner {
     type Control = crate::agent::subagent::ShellChildRuntime;
+    type RootControl =
+        xai_grok_tools::implementations::grok_build::task::root_control::NoRootControl;
     type CompletionData = crate::agent::subagent::ShellCompletionData;
     type RunFuture = coordinator::LocalBoxFuture<coordinator::ChildRunOutput<Self::CompletionData>>;
     type ValidateFuture = coordinator::LocalBoxFuture<
@@ -130,16 +130,11 @@ impl coordinator::ChildRunner for ShellChildRunner {
                     "Spawn for unknown or evicted parent session"
                 );
                 return coordinator::ChildRunOutput {
-                    result: xai_grok_tools::implementations::grok_build::task::types::SubagentResult {
-                        success: false,
-                        error: Some(
-                            "Parent session not found (evicted or torn down); cannot spawn subagent."
-                                .to_owned(),
-                        ),
-                        subagent_id: run.request.id.clone(),
-                        child_session_id: run.request.id,
-                        ..Default::default()
-                    },
+                    result: SubagentResult::failed(
+                        run.request.id.clone(),
+                        run.request.id,
+                        "Parent session not found (evicted or torn down); cannot spawn subagent.",
+                    ),
                     completion_data: Default::default(),
                     snapshot_ref: None,
                 };
@@ -151,16 +146,14 @@ impl coordinator::ChildRunner for ShellChildRunner {
                     "subagent.parent_snapshot",
                     parent_session_id = %parent_sid,
                 ));
-                let (pool, hooks, mut definitions) = tokio::join!(
+                let (pool, hooks, definitions) = tokio::join!(
                     handle.snapshot_mcp_pool(),
                     handle.snapshot_client_hooks(),
                     handle.snapshot_tool_definitions()
                 );
                 ctx.parent_mcp_pool = pool;
                 ctx.client_hooks = hooks;
-                super::strip_ask_user_question_tool(&mut definitions);
-                super::strip_workflow_tool(&mut definitions);
-                ctx.parent_tool_definitions = (!definitions.is_empty()).then_some(definitions);
+                ctx.parent_tool_definitions = definitions;
             }
             if let Some(spawner) = spawner_session_id.as_deref() {
                 if this.is_resident(&acp::SessionId::new(spawner)) {
@@ -184,36 +177,25 @@ impl coordinator::ChildRunner for ShellChildRunner {
                         "subagent worker runtime failed to build"
                     );
                     return coordinator::ChildRunOutput {
-                        result: xai_grok_tools::implementations::grok_build::task::types::SubagentResult {
-                            success: false,
-                            error: Some(
-                                format!(
-                                "Failed to start the subagent worker runtime: {err}"
-                            ),
-                            ),
-                            subagent_id: run.request.id.clone(),
-                            child_session_id: run.request.id,
-                            ..Default::default()
-                        },
+                        result: SubagentResult::failed(
+                            run.request.id.clone(),
+                            run.request.id,
+                            format!("Failed to start the subagent worker runtime: {err}"),
+                        ),
                         completion_data: Default::default(),
                         snapshot_ref: None,
                     };
                 }
             };
             let panic_request = run.request.clone();
-            let attempt_id = Some(
-                xai_message_delivery_core::AttemptId::mint(uuid::Uuid::new_v4().as_u128())
-                    .to_string(),
-            );
             let child_session_id = acp::SessionId::new(run.request.id.clone());
-            let turn_number = if run.wake_agent_id.is_some() {
+            let turn_number = if run.wake_origin.is_some() {
                 None
             } else {
-                Some(this.allocate_subagent_turn_number(&child_session_id))
+                Some(this.allocate_turn_number(&child_session_id))
             };
-            let mut completion_data = ShellCompletionData::from_context(&ctx);
-            completion_data.attempt_id = attempt_id;
-            completion_data.turn_number = turn_number;
+            let completion_data =
+                ShellCompletionData::from_context(&ctx, run.attempt_id.clone(), turn_number);
             let panic_completion_data = completion_data.clone();
             let task = {
                 let _region = Region::from_span(tracing::info_span!(
@@ -233,14 +215,11 @@ impl coordinator::ChildRunner for ShellChildRunner {
             join_worker_task(
                 task,
                 coordinator::ChildRunOutput {
-                    result:
-                        xai_grok_tools::implementations::grok_build::task::types::SubagentResult {
-                            success: false,
-                            error: Some("Subagent runtime panicked".to_owned()),
-                            subagent_id: panic_request.id.clone(),
-                            child_session_id: panic_request.id,
-                            ..Default::default()
-                        },
+                    result: SubagentResult::failed(
+                        panic_request.id.clone(),
+                        panic_request.id,
+                        "Subagent runtime panicked",
+                    ),
                     completion_data: panic_completion_data,
                     snapshot_ref: None,
                 },
@@ -287,6 +266,9 @@ impl coordinator::ChildRunner for ShellChildRunner {
         })
     }
     fn supports_wake(&self) -> bool {
+        true
+    }
+    fn supports_agent_message_sender(&self) -> bool {
         true
     }
     fn on_completed(
@@ -414,7 +396,7 @@ pub(crate) fn present_child_completion(
             &request.parent_session_id,
             SessionUpdate::SubagentFinished {
                 subagent_id: request.id.clone(),
-                attempt_id: completion_data.attempt_id.clone(),
+                attempt_id: completion_data.attempt_id.as_ref().map(ToString::to_string),
                 child_session_id: result.child_session_id.clone(),
                 status: result.status().to_owned(),
                 error: result.error.clone(),
@@ -654,7 +636,12 @@ mod address_tests {
                     other => panic!("expected SubagentSpawned, got {other:?}"),
                 }
                 let durable = notification.to_durable_value().unwrap();
-                assert!(durable["update"].get("agentAddress").is_none());
+                assert!(
+                    durable
+                        .get("update")
+                        .and_then(|u| u.get("agentAddress"))
+                        .is_none()
+                );
             }
             _ => panic!("expected XaiSessionNotification"),
         }
@@ -662,7 +649,13 @@ mod address_tests {
             xai_acp_lib::AcpClientMessage::ExtNotification(args) => {
                 let params: serde_json::Value =
                     serde_json::from_str(args.request.params.get()).unwrap();
-                assert_eq!(params["update"]["agentAddress"], "opaque-address");
+                assert_eq!(
+                    params
+                        .get("update")
+                        .and_then(|u| u.get("agentAddress"))
+                        .and_then(|v| v.as_str()),
+                    Some("opaque-address")
+                );
             }
             _ => panic!("expected ExtNotification"),
         }

@@ -374,6 +374,8 @@ struct FinalizedTool {
     output_converter:
         Arc<dyn Fn(serde_json::Value) -> Result<ToolOutput, serde_json::Error> + Send + Sync>,
     definition: ToolDefinition,
+    /// `use_tool` re-exported without the MCP file forms, for sampling backends that must not see them. `None` elsewhere.
+    inline_mcp_definition: Option<ToolDefinition>,
     /// Effective params (defaults merged with client overrides).
     /// Kept for building `ProposedTool` during reminder evaluation and for
     /// params-aware finalized definition construction.
@@ -478,6 +480,7 @@ pub struct ToolRegistryBuilder {
     /// model. Exposed to description templates as `system_reminders_enabled` so "you are notified on completion" promises
     /// are only rendered when the client actually delivers them.
     system_reminders_enabled: bool,
+    mcp_file_input_preparation: bool,
 }
 impl Default for ToolRegistryBuilder {
     fn default() -> Self {
@@ -542,7 +545,13 @@ impl ToolRegistryBuilder {
                 kind,
                 requires,
                 default_params: serde_json::to_value(P::default()).unwrap_or_default(),
-                input_schema: generate_schema_cached::<T::Args>(),
+                input_schema: if kind == ToolKind::UseTool {
+                    serde_json::json!(
+                        crate::implementations::use_tool::UseToolInput::input_schema(true)
+                    )
+                } else {
+                    generate_schema_cached::<T::Args>()
+                },
                 metadata: Box::new(tool),
                 output_converter: Box::new(|value| {
                     let typed: T::Output = serde_json::from_value(value)?;
@@ -605,6 +614,7 @@ impl ToolRegistryBuilder {
             reminders: Vec::new(),
             shared_local_registry: None,
             system_reminders_enabled: true,
+            mcp_file_input_preparation: false,
         };
         b.register_with_params::<grok_build::BashTool, grok_build::bash::BashParams>();
         b.register_with_params::<grok_build::ReadFileTool, grok_build::read_file::ReadFileParams>();
@@ -622,7 +632,7 @@ impl ToolRegistryBuilder {
         b.register::<grok_build::TaskOutputTool>();
         b.register::<grok_build::GetTerminalCommandOutputTool>();
         b.register::<grok_build::WaitTasksTool>();
-        b.register::<grok_build::TaskTool>();
+        b.register_with_params::<grok_build::TaskTool, grok_build::task::TaskParams>();
         b.register::<grok_build::SendSubagentMessageTool>();
         b.register::<grok_build::SendFeedbackTool>();
         b.register::<grok_build::WebSearchTool>();
@@ -702,19 +712,21 @@ impl ToolRegistryBuilder {
         let out: HashMap<&str, serde_json::Value> = self
             .tools
             .iter()
-            .map(|(name, e)| {
-                (
-                    name.as_str(),
-                    serde_json::json!({
+            .map(|(name, e)| (
+                name.as_str(),
+                serde_json::json!({
                         "namespace": e.namespace,
                         "id": e.id,
                         "kind": e.kind,
                         "default_params": e.default_params,
-                        "input_schema": e.input_schema,
+                        "input_schema": if e.kind == ToolKind::UseTool {
+                            serde_json::json!(crate::implementations::use_tool::UseToolInput::input_schema(false))
+                        } else {
+                            e.input_schema.clone()
+                        },
                         "requires": e.requires,
                     }),
-                )
-            })
+            ))
             .collect();
         serde_json::to_value(&out).expect("tool_config_raw_to_not_fail")
     }
@@ -765,6 +777,30 @@ impl ToolRegistryBuilder {
                         .with_category("behavior_version"),
                 );
                 continue;
+            }
+            if entry.metadata.kind() == ToolKind::UseTool
+                && let Some(mapping) = &tool_config.params_name_overrides
+            {
+                let fields = ["tool_name", "tool_input", "tool_input_file", "file"];
+                let mut destinations = std::collections::HashSet::new();
+                let has_collision = mapping.iter().any(|(canonical, client)| {
+                    !destinations.insert(client.as_str())
+                        || (canonical != client && fields.contains(&client.as_str()))
+                }) || fields
+                    .iter()
+                    .filter(|field| !mapping.contains_key(**field))
+                    .any(|field| !destinations.insert(*field));
+                if has_collision {
+                    errors.push(
+                        RequirementError::new(
+                            tool_config.id.clone(),
+                            "ambiguous MCP wrapper parameter mapping",
+                        )
+                        .with_field_path("params_name_overrides")
+                        .with_category("parameter_mapping"),
+                    );
+                    continue;
+                }
             }
             let effective = match compute_effective_params(entry, tool_config) {
                 Ok(effective) => effective,
@@ -868,6 +904,11 @@ impl ToolRegistryBuilder {
     pub fn set_system_reminders_enabled(&mut self, enabled: bool) {
         self.system_reminders_enabled = enabled;
     }
+    /// Opt in only when the host prepares file-backed MCP calls before tool dispatch.
+    pub fn with_mcp_file_input_preparation(mut self) -> Self {
+        self.mcp_file_input_preparation = true;
+        self
+    }
     pub fn finalize(
         self,
         config: ToolServerConfig,
@@ -894,15 +935,21 @@ impl ToolRegistryBuilder {
         if !errors.is_empty() {
             return Err(errors);
         }
+        let mcp_file_input_supported =
+            self.mcp_file_input_preparation && ctx.fs.supports_bounded_read();
         let mut kind_to_name: HashMap<ToolKind, String> = HashMap::new();
         for tool_config in &config.tools {
-            let entry = &self.tools[&tool_config.id];
+            let Some(entry) = self.tools.get(&tool_config.id) else {
+                continue;
+            };
             let client_name = tool_config.resolve_client_name(&entry.id);
             kind_to_name.entry(entry.kind).or_insert(client_name);
         }
         let mut kind_params: HashMap<ToolKind, HashMap<String, String>> = HashMap::new();
         for tool_config in &config.tools {
-            let entry = &self.tools[&tool_config.id];
+            let Some(entry) = self.tools.get(&tool_config.id) else {
+                continue;
+            };
             let map = kind_params.entry(entry.kind).or_default();
             if let Some(props) = entry
                 .input_schema
@@ -1081,32 +1128,51 @@ impl ToolRegistryBuilder {
                 .iter()
                 .map(|(canonical, client)| (client.clone(), canonical.clone()))
                 .collect();
-            let effective_params = compute_effective_params(&entry, tool_config)
+            let mut effective_params = compute_effective_params(&entry, tool_config)
                 .map_err(|e| vec![requirement_error_from_param_error(&tool_config.id, e)])?;
-            let mut definition = entry.metadata.versioned_definition(
-                contract_version.as_deref(),
-                &client_name,
-                tool_config.description_override.as_deref(),
-                &renderer,
-                &param_map,
-                &entry.input_schema,
-                &effective_params,
-            );
-            if let Some(desc) = &definition.function.description {
-                definition.function.description = Some(truncation_config.interpolate_description(
-                    desc,
+            if entry.kind == ToolKind::UseTool {
+                effective_params = merge_json(
+                    &effective_params,
+                    &serde_json::json!({crate::implementations::use_tool::FILE_INPUT_SUPPORTED: mcp_file_input_supported}),
+                );
+            }
+            let build_definition = |effective_params: &serde_json::Value| {
+                let mut definition = entry.metadata.versioned_definition(
+                    contract_version.as_deref(),
+                    &client_name,
+                    tool_config.description_override.as_deref(),
+                    &renderer,
+                    &param_map,
+                    &entry.input_schema,
+                    effective_params,
+                );
+                if let Some(desc) = &definition.function.description {
+                    definition.function.description =
+                        Some(truncation_config.interpolate_description(
+                            desc,
+                            &client_name,
+                            crate::DEFAULT_TOOL_OUTPUT_BYTES,
+                            xai_tool_types::max_wait_block_ms(),
+                        ));
+                }
+                renderer.render_schema_descriptions(&mut definition.function.parameters);
+                truncation_config.apply_to_schema(
+                    &mut definition.function.parameters,
                     &client_name,
                     crate::DEFAULT_TOOL_OUTPUT_BYTES,
                     xai_tool_types::max_wait_block_ms(),
+                );
+                definition
+            };
+            let definition = build_definition(&effective_params);
+            let inline_mcp_definition = (entry.kind == ToolKind::UseTool
+                && mcp_file_input_supported)
+                .then(|| build_definition(
+                    &merge_json(
+                        &effective_params,
+                        &serde_json::json!({crate::implementations::use_tool::FILE_INPUT_SUPPORTED: false}),
+                    ),
                 ));
-            }
-            renderer.render_schema_descriptions(&mut definition.function.parameters);
-            truncation_config.apply_to_schema(
-                &mut definition.function.parameters,
-                &client_name,
-                crate::DEFAULT_TOOL_OUTPUT_BYTES,
-                xai_tool_types::max_wait_block_ms(),
-            );
             (entry.apply_params)(&effective_params, &mut resources);
             tools.push(FinalizedTool {
                 namespace: entry.namespace,
@@ -1116,6 +1182,7 @@ impl ToolRegistryBuilder {
                 metadata: Arc::from(entry.metadata),
                 output_converter: Arc::from(entry.output_converter),
                 definition,
+                inline_mcp_definition,
                 effective_params,
                 input_schema: entry.input_schema,
                 reverse_params,
@@ -1342,6 +1409,20 @@ impl FinalizedToolset {
             .map(|t| t.definition.clone())
             .collect()
     }
+    /// Built-in definitions with `use_tool` advertised inline-only. The Anthropic Messages API rejects the file-form
+    /// schema's root-level union, and Messages-backed models must not see the file forms at all.
+    pub fn tool_definitions_builtins_only_inline_mcp(&self) -> Vec<ToolDefinition> {
+        self.tools
+            .read()
+            .iter()
+            .filter(|t| !t.client_name.contains("__"))
+            .map(|t| {
+                t.inline_mcp_definition
+                    .clone()
+                    .unwrap_or_else(|| t.definition.clone())
+            })
+            .collect()
+    }
     /// Get the resolved contract version for a tool by its client-facing name. Returns `None` if
     /// the tool is not found or is not version-managed. Returns an owned `String` because the
     /// internal `RwLock` read guard cannot outlive this call.
@@ -1375,20 +1456,70 @@ impl FinalizedToolset {
             .unwrap_or_else(|_| xai_tool_protocol::ToolId::new("unknown").expect("valid"));
         xai_tool_runtime::ToolError::not_found(tid, format!("Tool not found: {tool_name}"))
     }
+    /// Whether a registered target is an MCP tool; absence permits a managed-catalog lookup.
+    pub fn is_mcp_target(&self, tool_name: &str) -> Option<bool> {
+        self.tools
+            .read()
+            .iter()
+            .find(|tool| tool.client_name == tool_name)
+            .map(|tool| tool.metadata.tool_namespace() == ToolNamespace::MCP)
+    }
+    /// Parse an MCP wrapper from original JSON before key remapping loses duplicates.
+    pub fn parse_mcp_wrapper_json(
+        &self,
+        tool_name: &str,
+        arguments: &str,
+    ) -> Result<crate::implementations::UseToolInput, xai_tool_runtime::ToolError> {
+        let tools = self.tools.read();
+        let tool = tools
+            .iter()
+            .find(|t| t.client_name == tool_name)
+            .ok_or_else(|| Self::tool_not_found_error(tool_name))?;
+        crate::implementations::UseToolInput::from_model_json(arguments, &tool.reverse_params)
+            .map_err(|error| xai_tool_runtime::ToolError::invalid_arguments(error.to_string()))
+    }
+    /// Convert only this finalized wrapper's canonical keys into its model-facing keys.
+    pub fn model_mcp_arguments(
+        &self,
+        tool_name: &str,
+        input: &crate::implementations::UseToolInput,
+    ) -> Result<serde_json::Value, xai_tool_runtime::ToolError> {
+        let tools = self.tools.read();
+        let tool = tools
+            .iter()
+            .find(|t| t.client_name == tool_name)
+            .ok_or_else(|| Self::tool_not_found_error(tool_name))?;
+        let forward: HashMap<_, _> = tool
+            .reverse_params
+            .iter()
+            .map(|(client, canonical)| (canonical.clone(), client.clone()))
+            .collect();
+        let value = serde_json::to_value(input)
+            .map_err(|e| xai_tool_runtime::ToolError::invalid_arguments(e.to_string()))?;
+        crate::util::remap::remap_json_keys_checked(value, &forward)
+            .map_err(xai_tool_runtime::ToolError::invalid_arguments)
+    }
     pub async fn try_parse(
         &self,
         tool_name: &str,
         tool_params: &serde_json::Value,
     ) -> Result<ToolInput, xai_tool_runtime::ToolError> {
-        let (reverse_params, parse_input) = {
+        let (reverse_params, parse_input, is_mcp_wrapper) = {
             let tools = self.tools.read();
             let tool = tools
                 .iter()
                 .find(|t| t.client_name == tool_name)
                 .ok_or_else(|| Self::tool_not_found_error(tool_name))?;
-            (tool.reverse_params.clone(), tool.parse_input.clone())
+            (
+                tool.reverse_params.clone(),
+                tool.parse_input.clone(),
+                tool.metadata.kind() == ToolKind::UseTool,
+            )
         };
-        let canonical_params = if reverse_params.is_empty() {
+        let canonical_params = if is_mcp_wrapper {
+            crate::util::remap::remap_json_keys_checked(tool_params.clone(), &reverse_params)
+                .map_err(xai_tool_runtime::ToolError::invalid_arguments)?
+        } else if reverse_params.is_empty() {
             tool_params.clone()
         } else {
             remap_json_keys(tool_params.clone(), &reverse_params)
@@ -1570,7 +1701,7 @@ impl FinalizedToolset {
         cwd_override: Option<std::path::PathBuf>,
         cancellation: Option<tokio_util::sync::CancellationToken>,
     ) -> Result<DispatchParts, xai_tool_runtime::ToolError> {
-        let (registry_id, output_converter, reverse_params) = {
+        let (registry_id, output_converter, reverse_params, is_mcp_wrapper) = {
             let tools = self.tools.read();
             let entry = tools
                 .iter()
@@ -1580,19 +1711,23 @@ impl FinalizedToolset {
                 entry.registry_id.clone(),
                 entry.output_converter.clone(),
                 entry.reverse_params.clone(),
+                entry.metadata.kind() == ToolKind::UseTool,
             )
         };
-        let canonical_params = if reverse_params.is_empty() {
+        let canonical_params = if is_mcp_wrapper {
+            crate::util::remap::remap_json_keys_checked(tool_args, &reverse_params)
+                .map_err(xai_tool_runtime::ToolError::invalid_arguments)?
+        } else if reverse_params.is_empty() {
             tool_args
         } else {
             remap_json_keys(tool_args, &reverse_params)
         };
-        let effective_tool_name = if tool_name == "use_tool" {
+        let effective_tool_name = if is_mcp_wrapper {
             serde_json::from_value::<crate::implementations::use_tool::UseToolInput>(
                 canonical_params.clone(),
             )
             .ok()
-            .map(|input| input.tool_name)
+            .and_then(|input| input.target_name().map(str::to_owned))
         } else {
             None
         };
@@ -1739,6 +1874,7 @@ impl FinalizedToolset {
             id: name.clone(),
             registry_id,
             client_name: name.clone(),
+            inline_mcp_definition: None,
             metadata: Arc::new(DefaultToolMetadata {
                 kind,
                 description: description.clone(),
@@ -2413,9 +2549,17 @@ mod tests {
             Some(&bash),
         )
         .unwrap();
-        assert_eq!(merged["bash_mode"], true);
-        assert_eq!(merged[TOOL_META_KEY]["kind"], "execute");
-        assert_eq!(merged[TOOL_META_KEY]["input"]["command"], "ls");
+        assert_eq!(merged.get("bash_mode"), Some(&serde_json::json!(true)));
+        assert_eq!(
+            merged.get(TOOL_META_KEY).and_then(|v| v.get("kind")),
+            Some(&serde_json::json!("execute"))
+        );
+        assert_eq!(
+            merged
+                .get(TOOL_META_KEY)
+                .and_then(|v| v.pointer("/input/command")),
+            Some(&serde_json::json!("ls"))
+        );
         let unchanged = merge_tool_meta(
             &toolset,
             Some(serde_json::json!({"backend": true})),
@@ -2423,7 +2567,7 @@ mod tests {
             None,
         )
         .unwrap();
-        assert_eq!(unchanged["backend"], true);
+        assert_eq!(unchanged.get("backend"), Some(&serde_json::json!(true)));
         assert!(unchanged.get(TOOL_META_KEY).is_none());
     }
     /// The wire (`ToolMetadata::is_read_only`) and doom-loop (`Tool::capabilities().is_read_only`)
@@ -2554,15 +2698,19 @@ mod tests {
             "old_string should be renamed to find"
         );
         assert!(!props.contains_key("old_string"));
-        let new_desc = props["new_string"]["description"]
-            .as_str()
+        let new_desc = props
+            .get("new_string")
+            .and_then(|v| v.get("description"))
+            .and_then(|v| v.as_str())
             .unwrap_or_default();
         assert!(
             new_desc.contains("find") && !new_desc.contains("old_string"),
             "new_string description should reference the renamed param: {new_desc}"
         );
-        let replace_all_desc = props["replace_all"]["description"]
-            .as_str()
+        let replace_all_desc = props
+            .get("replace_all")
+            .and_then(|v| v.get("description"))
+            .and_then(|v| v.as_str())
             .unwrap_or_default();
         assert!(
             replace_all_desc.contains("find") && !replace_all_desc.contains("old_string"),
@@ -2589,8 +2737,11 @@ mod tests {
                 .expect("run_terminal_cmd definition not found")
                 .clone();
             let desc = bash.function.description.clone().unwrap_or_default();
-            let field_desc = bash.function.parameters["properties"]["is_background"]["description"]
-                .as_str()
+            let field_desc = bash
+                .function
+                .parameters
+                .pointer("/properties/is_background/description")
+                .and_then(|v| v.as_str())
                 .unwrap_or_default()
                 .to_string();
             (desc, field_desc)
@@ -2919,7 +3070,9 @@ mod tests {
         };
         let errors = builder.validate_config(&config);
         assert_eq!(errors.len(), 1);
-        let error = &errors[0];
+        let Some(error) = errors.first() else {
+            panic!("expected one validation error");
+        };
         assert_eq!(error.tool, "GrokBuild:run_terminal_cmd");
         assert_eq!(
             error.field_path.as_deref(),
@@ -2950,7 +3103,9 @@ mod tests {
         };
         let errors = builder.validate_config(&config);
         assert_eq!(errors.len(), 1);
-        let error = &errors[0];
+        let Some(error) = errors.first() else {
+            panic!("expected one validation error");
+        };
         assert_eq!(error.field_path.as_deref(), Some("params.hash_len"));
         assert_eq!(error.category.as_deref(), Some("params_constraint"));
         assert_eq!(error.expected.as_deref(), Some("1..=4"));
@@ -3035,6 +3190,45 @@ mod tests {
                 .any(|e| e.message.contains("duplicate client_name")),
             "finalize error should mention duplicate client_name: {errors:?}",
         );
+    }
+    #[tokio::test]
+    async fn mcp_mapping_collisions_fail_validation_and_finalization() {
+        let tmp = TempDir::new().unwrap();
+        for pairs in [
+            vec![("file", "source"), ("unused", "source")],
+            vec![("file", "source"), ("tool_input_file", "source")],
+            vec![("unused", "file")],
+            vec![("unused", "source"), ("another", "source")],
+        ] {
+            for pairs in [pairs.clone(), pairs.into_iter().rev().collect()] {
+                let builder = ToolRegistryBuilder::new();
+                let mut tool = ToolConfig::for_tool::<crate::implementations::UseTool>();
+                tool.params_name_overrides = Some(
+                    pairs
+                        .into_iter()
+                        .map(|(canonical, client)| (canonical.to_owned(), client.to_owned()))
+                        .collect(),
+                );
+                let config = ToolServerConfig {
+                    tools: vec![tool],
+                    behavior_preset: None,
+                };
+                let validated = builder.validate_config(&config);
+                assert_eq!(1, validated.len());
+                assert_eq!(
+                    "ambiguous MCP wrapper parameter mapping",
+                    validated.first().unwrap().message
+                );
+                let finalized = match builder.finalize(config, test_session_context(&tmp)) {
+                    Ok(_) => panic!("ambiguous mappings must not finalize"),
+                    Err(errors) => errors,
+                };
+                assert_eq!(
+                    serde_json::to_value(validated).unwrap(),
+                    serde_json::to_value(finalized).unwrap()
+                );
+            }
+        }
     }
     #[derive(Debug)]
     struct FakeMcpTool {
@@ -3380,7 +3574,11 @@ mod tests {
                 })
             })
             .collect();
-        contracts.sort_by(|a, b| a["name"].as_str().cmp(&b["name"].as_str()));
+        contracts.sort_by(|a, b| {
+            a.get("name")
+                .and_then(|v| v.as_str())
+                .cmp(&b.get("name").and_then(|v| v.as_str()))
+        });
         let expected: serde_json::Value = serde_json::from_str(
                 r##"
         [
@@ -3895,15 +4093,16 @@ mod tests {
             let timeout = defs
                 .iter()
                 .find(|d| d.function.name == name)
-                .map(|d| &d.function.parameters["properties"]["timeout_ms"])
+                .and_then(|d| d.function.parameters.pointer("/properties/timeout_ms"))
                 .unwrap_or_else(|| panic!("`{name}` should expose timeout_ms"));
             assert!(
                 timeout.get("maximum").is_some(),
                 "`{name}`.timeout_ms must carry the resolved wait ceiling: {timeout}"
             );
             assert!(
-                !timeout["description"]
-                    .as_str()
+                !timeout
+                    .get("description")
+                    .and_then(|v| v.as_str())
                     .unwrap_or("")
                     .contains("{max_"),
                 "`{name}`.timeout_ms has an unresolved placeholder: {timeout}"
@@ -3932,7 +4131,9 @@ mod tests {
         };
         let errors = builder.validate_config(&config);
         assert_eq!(errors.len(), 1, "expected exactly one validation error");
-        let error = &errors[0];
+        let Some(error) = errors.first() else {
+            panic!("expected one validation error");
+        };
         assert_eq!(
             error.field_path.as_deref(),
             Some("params.auto_background_on_timeout")
@@ -4038,7 +4239,9 @@ mod tests {
             1,
             "expected one bash requirement error: {errors:?}"
         );
-        let error = &errors[0];
+        let Some(error) = errors.first() else {
+            panic!("expected one bash requirement error: {errors:?}");
+        };
         assert_eq!(error.tool, "GrokBuild:run_terminal_cmd");
         assert_eq!(error.category.as_deref(), Some("requirements"));
         assert_eq!(
@@ -4077,7 +4280,9 @@ mod tests {
             1,
             "expected one task requirement error: {errors:?}"
         );
-        let error = &errors[0];
+        let Some(error) = errors.first() else {
+            panic!("expected one task requirement error: {errors:?}");
+        };
         assert_eq!(error.tool, "GrokBuild:task");
         assert!(error.message.contains("GrokBuild:get_task_output"));
         assert!(error.message.contains("GrokBuild:kill_task"));
@@ -4104,7 +4309,9 @@ mod tests {
             1,
             "expected one get_task_output requirement error: {errors:?}"
         );
-        let error = &errors[0];
+        let Some(error) = errors.first() else {
+            panic!("expected one get_task_output requirement error: {errors:?}");
+        };
         assert_eq!(error.tool, "GrokBuild:get_task_output");
         assert!(error.message.contains("background-capable bash tool"));
         assert!(error.message.contains("OpenCode:bash"));
@@ -4702,7 +4909,10 @@ mod tests {
                 .get::<crate::types::resources::AvailableSkills>()
                 .unwrap();
             assert_eq!(skills.0.len(), 1);
-            assert_eq!(skills.0[0].name, "boot-skill");
+            assert_eq!(
+                skills.0.first().map(|s| s.name.as_str()),
+                Some("boot-skill")
+            );
         }
         {
             let mut res = toolset.resources.lock().await;
@@ -4760,8 +4970,9 @@ mod tests {
         );
         assert!(schema.get("$schema").is_some(), "$schema must be retained");
         assert!(
-            schema["properties"]
-                .as_object()
+            schema
+                .get("properties")
+                .and_then(|v| v.as_object())
                 .is_some_and(|p| !p.is_empty()),
             "per-property schema must be retained: {schema}"
         );

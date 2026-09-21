@@ -7,10 +7,6 @@ use xai_grok_shell::agent::config::UiConfig;
 use xai_grok_shell::util::config::DISPLAY_REFRESH_DEFAULT_AUTO_CADENCE_ENABLED;
 use xai_grok_tools::implementations::grok_build::ask_user_question;
 
-// ---------------------------------------------------------------------------
-// Types
-// ---------------------------------------------------------------------------
-
 /// Stable identity for a setting. We deliberately do NOT use a `SettingId` enum: enum renames would ripple through
 /// call sites.
 pub type SettingKey = &'static str;
@@ -366,10 +362,6 @@ impl PagerLocalSnapshot {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Registry
-// ---------------------------------------------------------------------------
-
 /// Process-wide settings registry.
 /// Built in `main` and stored on `AppView::settings_registry: Arc<SettingsRegistry>`.
 #[derive(Debug, Clone)]
@@ -459,9 +451,7 @@ fn build_search_haystack(m: &SettingMeta) -> String {
     s
 }
 
-// ---------------------------------------------------------------------------
 // Snapshot reads: the one place that maps a SettingKey to its live field
-// ---------------------------------------------------------------------------
 
 /// Read the current value of `key` from `UiConfig` (SHELL/SHARED) or the pager snapshot (PAGER-owned).
 /// Returns `None` for unknown keys.
@@ -476,6 +466,7 @@ pub fn current_value_for(
         "compact_mode" => Some(SettingValue::Bool(ui.compact_mode)),
         "show_timestamps" => Some(SettingValue::Bool(ui.show_timestamps.unwrap_or(true))),
         "show_timeline" => Some(SettingValue::Bool(ui.show_timeline_enabled())),
+        "dashboard_preview" => Some(SettingValue::Bool(ui.dashboard_preview_enabled())),
         // The cache is the send-path source of truth (same pattern as group_tool_verbs)
         "page_flip_on_send" => Some(SettingValue::Bool(
             crate::appearance::cache::load_page_flip_on_send(),
@@ -685,7 +676,7 @@ pub fn current_value_for(
     }
 }
 
-/// Consent chooser: no docs tip, and no `d` reset (hint or key).
+/// Consent chooser: no docs tip, and no `d` reset inside the chooser (hint or key).
 pub fn is_consent_chooser(key: &str) -> bool {
     key == "coding_data_sharing"
 }
@@ -703,10 +694,6 @@ pub fn default_value_for(meta: &SettingMeta) -> SettingValue {
         SettingKind::Group { .. } => SettingValue::Bool(false),
     }
 }
-
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
@@ -804,6 +791,9 @@ mod tests {
                         ui.show_timeline_enabled(),
                         "show_timeline default drifts from UiConfig::default()"
                     );
+                }
+                ("dashboard_preview", SettingKind::Bool { default }) => {
+                    assert_eq!(ui.dashboard_preview_enabled(), *default);
                 }
                 ("page_flip_on_send", SettingKind::Bool { default }) => {
                     assert_eq!(
@@ -1554,7 +1544,7 @@ mod tests {
         let reg = SettingsRegistry::defaults();
         let hits = reg.search("compact density");
         assert_eq!(hits.len(), 1, "expected 1 match for 'compact density'");
-        assert_eq!(hits[0].key, "compact_mode");
+        assert_eq!(hits.first().map(|h| h.key), Some("compact_mode"));
 
         let empty = reg.search("xyzzy-no-match");
         assert!(empty.is_empty(), "expected no match for 'xyzzy-no-match'");

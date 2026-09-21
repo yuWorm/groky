@@ -481,6 +481,7 @@ impl ToolHarnessBuilder {
             None, // on_disconnect (unused for harness connections)
             None, // on_connect (unused for harness connections)
             None, // on_terminal_close (unused for harness connections)
+            None, // on_handshake_refused (unused for harness connections)
             None,
             None,
             None,
@@ -1163,6 +1164,7 @@ impl ToolHarness {
                     self.inner
                         .last_bind_report
                         .store(Some(Arc::new(SessionBindReport::from(&bind_result))));
+                    connection.record_session_bind(&self.inner.session, req.params);
                     Ok(bind_result)
                 }
                 ResponseOutcome::Error(err) => Err(ClientError::from_jsonrpc_error(err)),
@@ -1263,6 +1265,7 @@ impl ToolHarness {
                 // Clear cached remote tools — the server's tools are no
                 // longer available after unbind.
                 self.inner.remote_tools.store(Arc::new(Vec::new()));
+                connection.forget_session_bind(&self.inner.session, Some(&req.params.server_id));
                 Ok(())
             }
             ResponseOutcome::Error(err) => Err(ClientError::from_jsonrpc_error(err)),
@@ -1288,7 +1291,10 @@ impl ToolHarness {
         };
         let resp = connection.call_request(request_id, &req).await?;
         match resp.outcome {
-            ResponseOutcome::Result(_) => Ok(()),
+            ResponseOutcome::Result(_) => {
+                connection.forget_session_bind(&self.inner.session, None);
+                Ok(())
+            }
             ResponseOutcome::Error(err) => Err(ClientError::from_jsonrpc_error(err)),
         }
     }
@@ -2406,7 +2412,7 @@ fn client_error_to_tool_error(err: ClientError) -> ToolError {
         ClientError::NetworkError(message) => ToolError::network_error(message),
         ClientError::ProtocolError(message) => ToolError::custom("protocol_error", message),
         ClientError::AuthError(message) => ToolError::permission_denied(message),
-        ClientError::HandshakeAuthFailed { status } => {
+        ClientError::HandshakeAuthFailed { status, .. } => {
             ToolError::permission_denied(format!("handshake auth failed (HTTP {status})"))
         }
         ClientError::RegistrationConflict(message) => {

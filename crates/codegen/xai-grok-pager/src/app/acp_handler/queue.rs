@@ -87,6 +87,15 @@ impl PromptCompletePayload {
     }
 }
 
+/// Decided on the raw broadcast (before it moves into the queue mirror): listing the awaited prompt, queued or running, proves the shell holds it.
+fn broadcast_acks_watch(
+    view: Option<&AgentView>,
+    changed: &crate::app::prompt_queue::QueueChanged,
+) -> bool {
+    view.and_then(|v| v.prompt_ack.as_ref())
+        .is_some_and(|watch| crate::app::prompt_ack::queue_changed_acks(changed, watch.prompt_id()))
+}
+
 pub(super) fn handle_queue_changed(notif: &acp::ExtNotification, app: &mut AppView) -> bool {
     let Ok(changed) =
         serde_json::from_str::<crate::app::prompt_queue::QueueChanged>(notif.params.get())
@@ -101,6 +110,13 @@ pub(super) fn handle_queue_changed(notif: &acp::ExtNotification, app: &mut AppVi
     let sid = acp::SessionId::new(session_id.clone());
     let session_match = find_session_match(app, &sid);
     if let Some(SessionMatch::Child(parent_id)) = session_match {
+        let acks_watch = broadcast_acks_watch(
+            app.agents
+                .get(&parent_id)
+                .and_then(|parent| parent.subagent_views.get(&session_id))
+                .map(|child| &**child),
+            &changed,
+        );
         let snapshot = changed.entries;
         if snapshot.is_empty() {
             app.shared_prompt_queues.remove(&session_id);
@@ -120,6 +136,12 @@ pub(super) fn handle_queue_changed(notif: &acp::ExtNotification, app: &mut AppVi
         };
         child.shared_queue = snapshot;
         child.sync_queue_pane();
+        if acks_watch {
+            child.note_prompt_ack(
+                crate::app::prompt_ack::AckSignal::QueueChanged,
+                std::time::Instant::now(),
+            );
+        }
         return is_active;
     }
 
@@ -178,6 +200,7 @@ pub(super) fn handle_queue_changed(notif: &acp::ExtNotification, app: &mut AppVi
         "received x.ai/queue/changed broadcast",
     );
 
+    let acks_watch = broadcast_acks_watch(agent_id.and_then(|aid| app.agents.get(&aid)), &changed);
     let rekeyed_echo_ids = app.apply_queue_changed(changed);
 
     // Mirror the reconciled shared queue into the owning agent
@@ -194,6 +217,12 @@ pub(super) fn handle_queue_changed(notif: &acp::ExtNotification, app: &mut AppVi
             .map(|p| p.prompt_id.clone());
         if let Some(agent) = app.agents.get_mut(&aid) {
             agent.shared_queue = snapshot;
+            if acks_watch {
+                agent.note_prompt_ack(
+                    crate::app::prompt_ack::AckSignal::QueueChanged,
+                    std::time::Instant::now(),
+                );
+            }
             // A re-keyed echo's old id is dead everywhere; only its content matched the broadcast
             // Drop it from the optimistic set and any send-now parked on it
             // The row is visible under its new id, so a fresh Enter sends it normally
@@ -374,27 +403,25 @@ pub(super) fn handle_queue_changed(notif: &acp::ExtNotification, app: &mut AppVi
                         prompt_id = %pid,
                         "stashing running-prompt adoption (FIFO handoff race)",
                     );
-                    // A rebroadcast for the SAME running prompt (every queue edit or no-op rebroadcasts) must not clobber the stash
-                    // The first broadcast consumed the drained row from the mirror, so this pass re-derives `text: None`
-                    // The deferred shim would then render no user block (and the echo-skip set above already swallowed the shell's echo)
-                    if app
+                    // Same-prompt rebroadcast must not clobber the stash (`text` is already None).
+                    // Still fall through to local flush: promote may have just cleared the server front.
+                    let same_stashed_prompt = app
                         .pending_running_adoptions
                         .get(&aid)
-                        .is_some_and(|p| p.prompt_id == pid)
-                    {
-                        return true;
-                    }
+                        .is_some_and(|p| p.prompt_id == pid);
                     // A newer running prompt supersedes any earlier stash.
-                    if let Some(prev) = app.pending_running_adoptions.insert(
-                        aid,
-                        PendingRunningAdoption {
-                            prompt_id: pid.clone(),
-                            text: running_text,
-                            combined_texts: running_combined,
-                            kind: running_kind,
-                            turn_ended: false,
-                        },
-                    ) && let Some(agent) = app.agents.get_mut(&aid)
+                    if !same_stashed_prompt
+                        && let Some(prev) = app.pending_running_adoptions.insert(
+                            aid,
+                            PendingRunningAdoption {
+                                prompt_id: pid.clone(),
+                                text: running_text,
+                                combined_texts: running_combined,
+                                kind: running_kind,
+                                turn_ended: false,
+                            },
+                        )
+                        && let Some(agent) = app.agents.get_mut(&aid)
                     {
                         agent.discard_pending_adoption_updates(&prev.prompt_id);
                     }
@@ -402,6 +429,16 @@ pub(super) fn handle_queue_changed(notif: &acp::ExtNotification, app: &mut AppVi
             }
         }
         _ => {}
+    }
+    // Retry local flush after server-queue rows clear (wait-start can arrive before promote).
+    if let Some(aid) = agent_id
+        && app
+            .agents
+            .get(&aid)
+            .is_some_and(|agent| !agent.session.loading_replay)
+    {
+        let flush = crate::app::dispatch::flush_held_local_queue_into_wait(app, Some(aid));
+        app.pending_effects.extend(flush);
     }
     true
 }
@@ -417,29 +454,46 @@ pub(super) fn handle_prompt_complete(notif: &acp::ExtNotification, app: &mut App
     let session_id = payload.session_id.as_str();
 
     let sid = acp::SessionId::new(session_id.to_string());
-    let Some(SessionMatch::Root(id)) = find_session_match(app, &sid) else {
+    let Some(matched) = find_session_match(app, &sid) else {
         return false;
     };
+    let id = matched.agent_id();
     let is_active = is_matched_agent_active(app, id);
+    let signal = super::super::turn_completion::TerminalSignal {
+        prompt_id: payload.prompt_id.as_deref(),
+        stop_reason: payload.stop_reason.as_deref(),
+        agent_result: payload.agent_result.as_deref(),
+        cancel_trigger: payload.cancel_trigger(),
+        cancellation_category: payload.cancellation_category(),
+        cancellation_context: payload.cancellation_context(),
+        error_kind: payload.error_kind(),
+    };
+    if let SessionMatch::Child(_) = matched {
+        let Some(agent) = app.agents.get_mut(&id) else {
+            return false;
+        };
+        let (finished, label) = {
+            let Some(child) = agent.child_view_for_live_update_mut(session_id) else {
+                return false;
+            };
+            let finished =
+                super::super::turn_completion::finalize_child_view_turn(child, signal, None);
+            let label = finished.then(|| subagent_activity_label(child));
+            (finished, label)
+        };
+        if let Some(label) = label {
+            sync_subagent_activity(agent, session_id, label);
+        }
+        return finished && is_active;
+    }
     let Some(agent) = app.agents.get_mut(&id) else {
         return false;
     };
 
     // Finalize on the agent, then map the outcome to the return bool in the one shared place both terminal rails use
     // The outcome is returned directly; arming reports a change unconditionally so a background tab still wakes the reconcile tick
-    let outcome = super::super::turn_completion::finalize_turn_from_terminal(
-        agent,
-        session_id,
-        super::super::turn_completion::TerminalSignal {
-            prompt_id: payload.prompt_id.as_deref(),
-            stop_reason: payload.stop_reason.as_deref(),
-            agent_result: payload.agent_result.as_deref(),
-            cancel_trigger: payload.cancel_trigger(),
-            cancellation_category: payload.cancellation_category(),
-            cancellation_context: payload.cancellation_context(),
-            error_kind: payload.error_kind(),
-        },
-    );
+    let outcome =
+        super::super::turn_completion::finalize_turn_from_terminal(agent, session_id, signal);
     super::super::turn_completion::apply_terminal_outcome(outcome, app, id, is_active)
 }
 

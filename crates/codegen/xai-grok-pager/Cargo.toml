@@ -1,6 +1,6 @@
 [package]
 name = "xai-grok-pager"
-version = "1.0.24"
+version = "1.0.38"
 edition.workspace = true
 license = "Apache-2.0"
 authors = ["xAI"]
@@ -59,6 +59,7 @@ portable-pty = "0.9"
 
 # Utilities
 anyhow = { workspace = true }
+thiserror = { workspace = true }
 shlex = { workspace = true }
 clap = { workspace = true, features = ["derive"] }
 clap_complete = { workspace = true }
@@ -74,6 +75,7 @@ tokio = { workspace = true, features = [
 ] }
 tokio-stream = { workspace = true, optional = true }
 tokio-util = { workspace = true, features = ["compat"] }
+tempfile = { workspace = true, optional = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 
@@ -95,11 +97,14 @@ xai-grok-update = { path = "../xai-grok-update" }
 # ACP
 agent-client-protocol = { workspace = true }
 xai-acp-lib = { workspace = true }
+xai-chat-state = { path = "../xai-chat-state", optional = true }
 xai-file-utils = { path = "../xai-file-utils" }
 # Crash-recovery registry of open TUI sessions.
 xai-grok-active-sessions = { workspace = true }
 xai-grok-config = { workspace = true }
 xai-grok-feedback = { workspace = true }
+xai-grok-sampling-types = { path = "../xai-grok-sampling-types", optional = true }
+xai-tool-types = { workspace = true }
 xai-dirs = { workspace = true }
 xai-grok-dashboard-store = { workspace = true }
 # Voice dictation. `audio` (mic capture) is enabled on every target. On
@@ -120,6 +125,7 @@ xai-token-estimation = { workspace = true }
 xai-grok-telemetry = { workspace = true }
 xai-grok-otel = { workspace = true }
 xai-fast-worktree = { path = "../xai-fast-worktree", features = ["metadata"] }
+gethostname = { workspace = true, optional = true }
 backon = { workspace = true }
 chrono = { workspace = true }
 flate2 = { workspace = true }
@@ -140,7 +146,7 @@ base64 = { workspace = true }
 image = { workspace = true, features = ["png", "jpeg", "tiff", "gif", "webp"] }
 
 # ID generation
-uuid = { workspace = true, features = ["v4"] }
+uuid = { workspace = true, features = ["v4", "v7"] }
 
 # Path computation (plan file, etc.)
 shellexpand = "3.1"
@@ -181,19 +187,21 @@ core-foundation = { workspace = true }
 windows-sys = { version = "0.59", features = ["Win32_System_Console"] }
 
 [dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
 # The fixture that builds a `[ui.status_line]` section field by field.
 xai-grok-status-line = { workspace = true, features = ["test-support"] }
 xai-grok-pager-render = { path = "../xai-grok-pager-render", features = ["test-support"] }
+xai-ratatui-inline = { workspace = true, features = ["test-support"] }
 xai-grok-gboom = { path = "../xai-grok-gboom", features = ["test-support"] }
 xai-grok-login = { workspace = true, features = ["test-support"] }
 xai-grok-shell = { workspace = true, features = ["test-support"] }
 pretty_assertions = { workspace = true }
+wiremock = { workspace = true }
 insta = { workspace = true }
 criterion = { workspace = true }
 tempfile = { workspace = true }
 serial_test = { workspace = true }
 xai-grok-agent = { workspace = true }
-xai-grok-pager-pty-harness = { path = "../xai-grok-pager-pty-harness" }
 # In-process leader-cluster harness (mock inference server; no cycle:
 # xai-grok-test-support depends on neither the pager nor the shell).
 xai-grok-test-support = { workspace = true, features = [] }
@@ -216,67 +224,12 @@ harness = false
 name = "resize"
 harness = false
 
-# PTY integration tests are split into coherent scheduling families. The test
-# modules remain under tests/pty_e2e/; these roots only define which cases share
-# one Cargo/Bazel process. All cases stay #[ignore]d for ordinary Cargo runs.
-# Selected Cargo runs must provide PAGER_BINARY; Bazel wires the sibling binary.
-[[test]]
-name = "doctor_early_dispatch"
-path = "tests/doctor_early_dispatch.rs"
-
-[[test]]
-name = "pty_e2e_smoke"
-path = "tests/pty_e2e_smoke.rs"
-
-[[test]]
-name = "pty_e2e_queue"
-path = "tests/pty_e2e_queue.rs"
-
-[[test]]
-name = "pty_e2e_scroll_selection"
-path = "tests/pty_e2e_scroll_selection.rs"
-
-[[test]]
-name = "pty_e2e_minimal"
-path = "tests/pty_e2e_minimal.rs"
-
-[[test]]
-name = "pty_e2e_config_ui"
-path = "tests/pty_e2e_config_ui.rs"
-
-[[test]]
-name = "pty_e2e_shell_tools"
-path = "tests/pty_e2e_shell_tools.rs"
-
-[[test]]
-name = "pty_e2e_persistence"
-path = "tests/pty_e2e_persistence.rs"
-
-[[test]]
-name = "pty_e2e_clipboard"
-path = "tests/pty_e2e_clipboard.rs"
-
-# Leader-mode PTY e2e — split from ordinary PTY families so multi-process
-# cluster bring-up never contends with their bounded pools.
-[[test]]
-name = "leader_pty_e2e"
-path = "tests/leader_pty_e2e/mod.rs"
-
 # Settings modal regression tests — keyboard/mouse dispatch + registry
 # contracts. Not gated by `--ignored`; runs on every `cargo test`.
+# Spawn-only pager tests live in `xai-grok-pager-pty-harness`.
 [[test]]
 name = "settings_e2e"
 path = "tests/settings_e2e.rs"
-
-# Declarative scripted TUI scenarios — opt-in because they spawn the real pager.
-[[test]]
-name = "scripted_scenarios"
-path = "tests/scripted_scenarios.rs"
-
-# Permission Auto mode PTY e2e (Shift+Tab → Auto banner via PtyHarness).
-[[test]]
-name = "pty_auto_mode"
-path = "tests/pty_auto_mode.rs"
 
 # Opt into [workspace.lints.clippy] (too_many_arguments etc.). Without this,
 # `cargo clippy --workspace -- -D warnings` on this package is stricter than

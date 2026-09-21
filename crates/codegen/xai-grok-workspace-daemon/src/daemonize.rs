@@ -518,8 +518,8 @@ impl PredecessorTarget {
         if result.is_err() {
             return None;
         }
-        basename_contains(&String::from_utf16_lossy(&buf[..size as usize]), fragment)
-            .then_some(target)
+        let name = buf.get(..size as usize).unwrap_or(buf.as_slice());
+        basename_contains(&String::from_utf16_lossy(name), fragment).then_some(target)
     }
 
     /// `TerminateProcess` on the pinned handle (Windows has no graceful signal for a detached process).
@@ -855,6 +855,31 @@ mod tests {
         false
     }
 
+    /// `/proc/<pid>/cmdline` can lag after spawn; wait until argv0 basename is
+    /// readable (busybox-as-sleep is `"busybox"`, not `"sleep"`).
+    #[cfg(target_os = "linux")]
+    fn wait_for_predecessor_fragment(child: &Child) -> String {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            if let Ok(cmdline) = fs::read(format!("/proc/{}/cmdline", child.id())) {
+                let argv0 = cmdline.split(|&b| b == 0).next().unwrap_or_default();
+                let basename = String::from_utf8_lossy(argv0)
+                    .rsplit(['/', '\\'])
+                    .next()
+                    .unwrap_or("")
+                    .to_owned();
+                if !basename.is_empty() {
+                    return basename;
+                }
+            }
+            assert!(
+                Instant::now() < deadline,
+                "child cmdline never became readable"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
     fn take_over_declines_non_matching_holder() {
@@ -863,6 +888,8 @@ mod tests {
 
         let _holder = PidFile::acquire(&path).unwrap().unwrap();
         let mut child = spawn_predecessor();
+        // Wait until cmdline is readable so a late match cannot kill the child.
+        let _ = wait_for_predecessor_fragment(&child);
         fs::write(&path, child.id().to_string()).unwrap();
 
         let taken = PidFile::acquire_or_take_over_matching(
@@ -893,10 +920,11 @@ mod tests {
         let _holder = PidFile::acquire(&path).unwrap().unwrap();
         let mut child = spawn_predecessor();
         let child_pid = child.id();
+        let fragment = wait_for_predecessor_fragment(&child);
         fs::write(&path, child_pid.to_string()).unwrap();
 
         let taken =
-            PidFile::acquire_or_take_over_matching(&path, Duration::from_millis(300), "sleep")
+            PidFile::acquire_or_take_over_matching(&path, Duration::from_millis(300), &fragment)
                 .unwrap();
 
         assert!(
@@ -977,6 +1005,7 @@ mod tests {
 
         let holder = PidFile::acquire(&path).unwrap().unwrap();
         let mut child = spawn_predecessor();
+        let fragment = wait_for_predecessor_fragment(&child);
         fs::write(&path, child.id().to_string()).unwrap();
 
         // Release the lock shortly after the takeover starts waiting, simulating the predecessor finishing its drain within grace
@@ -986,7 +1015,8 @@ mod tests {
         });
 
         let taken =
-            PidFile::acquire_or_take_over_matching(&path, Duration::from_secs(5), "sleep").unwrap();
+            PidFile::acquire_or_take_over_matching(&path, Duration::from_secs(5), &fragment)
+                .unwrap();
         release.join().expect("release thread");
 
         assert!(
@@ -1029,28 +1059,7 @@ mod tests {
             "a non-matching name must not produce a target"
         );
 
-        // /proc/<pid>/cmdline can lag briefly after spawn under remote CI executors
-        // Derive the fragment from the live cmdline (which handles busybox providing `sleep`) and retry the pin open instead of expecting it once
-        let fragment = {
-            let deadline = Instant::now() + Duration::from_secs(2);
-            loop {
-                if let Ok(cmdline) = fs::read(format!("/proc/{}/cmdline", child.id())) {
-                    let argv0 = cmdline.split(|&b| b == 0).next().unwrap_or_default();
-                    let basename = String::from_utf8_lossy(argv0)
-                        .rsplit(['/', '\\'])
-                        .next()
-                        .unwrap_or("")
-                        .to_owned();
-                    if !basename.is_empty() {
-                        break basename;
-                    }
-                }
-                if Instant::now() >= deadline {
-                    panic!("child cmdline never became readable");
-                }
-                thread::sleep(Duration::from_millis(10));
-            }
-        };
+        let fragment = wait_for_predecessor_fragment(&child);
 
         let target = {
             let deadline = Instant::now() + Duration::from_secs(2);

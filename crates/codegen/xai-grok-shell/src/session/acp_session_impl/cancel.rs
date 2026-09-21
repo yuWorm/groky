@@ -187,7 +187,7 @@ impl SessionActor {
         );
     }
 
-    /// One line per rewind-requested cancel: `rewound | legacy_rewound | stale_prompt_id | window_closed | non_user_front`.
+    /// One line per rewind-requested cancel: `rewound | legacy_rewound | queued_row_removed | stale_prompt_id | window_closed | non_user_front`.
     fn log_rewind_decision(
         &self,
         requested_prompt_id: Option<&str>,
@@ -284,11 +284,29 @@ impl SessionActor {
             let mut state = self.state.lock().await;
             let front_prompt_id = state.pending_inputs.front().map(|f| f.prompt_id.clone());
             if front_prompt_id.as_deref() != Some(requested) {
+                // The client gave up on a prompt that landed behind the running turn: drop the row now,
+                // regardless of the rewind window, or it runs later against a client that shows Idle
+                let queued_behind_front = if Self::is_running_prompt(&state, requested) {
+                    None
+                } else {
+                    state
+                        .pending_inputs
+                        .iter()
+                        .position(|item| item.prompt_id == requested)
+                };
+                let rewind_disposition = match queued_behind_front {
+                    Some(pos) => {
+                        Self::remove_pending_row(&mut state, pos);
+                        self.broadcast_queue_changed(&state);
+                        "queued_row_removed"
+                    }
+                    None => "stale_prompt_id",
+                };
                 drop(state);
                 self.log_rewind_decision(
                     Some(requested),
                     front_prompt_id.as_deref(),
-                    "stale_prompt_id",
+                    rewind_disposition,
                 );
                 return CancelOutcome::noop();
             }

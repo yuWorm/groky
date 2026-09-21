@@ -712,126 +712,6 @@ impl ScrollbackState {
         removed
     }
 
-    /// Find the EntryId of the last real tool call block in the scrollback.
-    ///
-    /// Skips `ToolCallBlock::Lifecycle` entries (e.g. `user_prompt_submit`) so that tool-associated hooks only attach to actual tool calls.
-    pub fn last_tool_call_entry_id(&self) -> Option<EntryId> {
-        self.entries.iter().rev().find_map(|(id, entry)| {
-            if let RenderBlock::ToolCall(ref tcb) = entry.block {
-                // Skip lifecycle event blocks (e.g. user_prompt_submit): they are not real tool calls and shouldn't receive tool hooks.
-                if matches!(tcb, ToolCallBlock::Lifecycle(_)) {
-                    return None;
-                }
-                Some(*id)
-            } else {
-                None
-            }
-        })
-    }
-
-    /// Attach hook data to a tool call entry.
-    pub fn attach_hooks(
-        &mut self,
-        id: EntryId,
-        phase: super::blocks::tool::HookPhase,
-        hook_entries: Vec<super::blocks::tool::HookRunEntry>,
-    ) {
-        if let Some(entry) = self.entries.get_mut(&id) {
-            let data = entry.hook_data.get_or_insert_with(Default::default);
-            match phase {
-                super::blocks::tool::HookPhase::Pre => data.pre_hooks = hook_entries,
-                super::blocks::tool::HookPhase::Post => data.post_hooks = hook_entries,
-            }
-            entry.invalidate_cache();
-            // A height remeasure would revive a folded member whose cached height is zero; reapplying folds keeps hidden members hidden
-            self.mark_structurally_dirty(id);
-        }
-    }
-
-    /// Push a standalone lifecycle hook block (`session_start`, replayed `stop`, …).
-    /// It renders as a collapsed tool-like row with the event name as header and the runs as fold-out detail.
-    pub fn push_lifecycle_hooks(
-        &mut self,
-        event_name: String,
-        hook_entries: Vec<super::blocks::tool::HookRunEntry>,
-    ) -> EntryId {
-        use super::blocks::tool::{LifecycleEventBlock, ToolCallHookData};
-        let block = LifecycleEventBlock::new(&event_name);
-        let mut entry = super::entry::ScrollbackEntry::new(RenderBlock::ToolCall(
-            ToolCallBlock::Lifecycle(block),
-        ));
-        entry.hook_data = Some(ToolCallHookData {
-            pre_hooks: Vec::new(),
-            post_hooks: Vec::new(),
-            lifecycle: vec![(event_name, hook_entries)],
-        });
-        self.push(entry)
-    }
-
-    /// The most recent turn-terminal marker ("Turn completed/cancelled/failed") that can accept a live
-    /// `stop`/`stop_failure` batch. An unstamped batch is positional (tail only) and stops at any terminal-event
-    /// marker. without a pid there is no proof it belongs further back. A same-name repeat is always refused.
-    pub fn latest_turn_marker_accepting(
-        &self,
-        event_name: &str,
-        batch_prompt_id: Option<&str>,
-    ) -> Option<EntryId> {
-        for (position_from_tail, (id, entry)) in self.entries.iter().rev().enumerate() {
-            let RenderBlock::SessionEvent(b) = &entry.block else {
-                continue;
-            };
-            if !b.event.is_turn_terminal() {
-                continue;
-            }
-            if b.stop_hooks.iter().any(|(name, _)| name == event_name) {
-                return None;
-            }
-            let accept = match (batch_prompt_id, b.prompt_id.as_deref()) {
-                (Some(batch), Some(marker)) => batch == marker,
-                (Some(_), None) => false,
-                (None, _) => position_from_tail == 0,
-            };
-            return accept.then_some(*id);
-        }
-        None
-    }
-
-    /// Fold a turn-end hook batch into a turn-terminal marker and collapse it, so the summary rather than the detail is the resting state.
-    /// `false` unless the entry is such a marker (see [`Self::latest_turn_marker_accepting`]).
-    /// Re-checked here so a stray caller can't attach hooks to the wrong entry.
-    pub fn attach_stop_hooks_to_marker(
-        &mut self,
-        id: EntryId,
-        event_name: String,
-        hook_entries: Vec<super::blocks::tool::HookRunEntry>,
-        batch_prompt_id: Option<&str>,
-    ) -> bool {
-        let Some(entry) = self.entries.get_mut(&id) else {
-            return false;
-        };
-        let RenderBlock::SessionEvent(ref mut block) = entry.block else {
-            return false;
-        };
-        if !block.event.is_turn_terminal() {
-            return false;
-        }
-        let attributable = match (batch_prompt_id, block.prompt_id.as_deref()) {
-            (Some(batch), Some(marker)) => batch == marker,
-            (Some(_), None) => false,
-            (None, _) => true,
-        };
-        if !attributable {
-            return false;
-        }
-        block.stop_hooks.push((event_name, hook_entries));
-        if !entry.display_mode_pinned {
-            entry.display_mode = DisplayMode::Collapsed;
-        }
-        entry.invalidate_cache();
-        self.mark_structurally_dirty(id);
-        true
-    }
-
     /// Preferred streaming append: writes the chunk, invalidates the render cache, and marks height dirty.
     /// Returns false if the entry is missing or is not an agent message.
     pub fn push_chunk_to_agent(&mut self, id: EntryId, chunk: &str) -> bool {
@@ -1969,8 +1849,13 @@ pub(super) mod test_util {
                 .as_ref()
                 .expect("cache must be valid");
             let range = self.state.visible_entry_range();
-            let base_y = cache.virtual_y[range.start];
-            let entry_y = cache.virtual_y[idx] - base_y;
+            let Some(&base_y) = cache.virtual_y.get(range.start) else {
+                panic!("virtual_y missing range start {}", range.start);
+            };
+            let Some(&entry_y_abs) = cache.virtual_y.get(idx) else {
+                panic!("virtual_y missing entry {idx}");
+            };
+            let entry_y = entry_y_abs - base_y;
             assert_eq!(
                 entry_y, self.state.scroll_offset,
                 "{msg}: entry {idx} at vy={entry_y} should be at scroll_offset={}",
@@ -2489,153 +2374,6 @@ mod tests {
         })
         .join()
         .unwrap();
-    }
-
-    #[test]
-    fn stop_hooks_attach_only_to_turn_terminal_markers() {
-        use crate::scrollback::blocks::SessionEvent;
-        use crate::scrollback::blocks::tool::{HookRunEntry, HookRunStatus};
-        let entries = || {
-            vec![HookRunEntry {
-                name: "h".into(),
-                status: HookRunStatus::Success {
-                    elapsed: std::time::Duration::from_millis(1),
-                },
-                output: None,
-            }]
-        };
-
-        let mut state = ScrollbackState::new();
-        let marker = state.push_block(RenderBlock::session_event(SessionEvent::TurnCompleted {
-            elapsed: Some(std::time::Duration::from_secs(2)),
-        }));
-        // An unstamped marker can't confirm a stamped batch, so it is refused; an unstamped batch keeps the tail-only heuristic
-        assert_eq!(
-            state.latest_turn_marker_accepting("stop", Some("pid-a")),
-            None
-        );
-        assert!(!state.attach_stop_hooks_to_marker(
-            marker,
-            "stop".into(),
-            entries(),
-            Some("pid-a")
-        ));
-        assert_eq!(
-            state.latest_turn_marker_accepting("stop", None),
-            Some(marker)
-        );
-        assert!(state.attach_stop_hooks_to_marker(marker, "stop".into(), entries(), None));
-
-        // Same-name repeat is refused; a new event name is accepted.
-        assert_eq!(state.latest_turn_marker_accepting("stop", None), None);
-        assert_eq!(
-            state.latest_turn_marker_accepting("stop_failure", None),
-            Some(marker)
-        );
-    }
-
-    #[test]
-    fn stop_hooks_respect_marker_prompt_id() {
-        use crate::scrollback::blocks::tool::{HookRunEntry, HookRunStatus};
-        use crate::scrollback::blocks::{SessionEvent, SessionEventBlock};
-        let entries = || {
-            vec![HookRunEntry {
-                name: "h".into(),
-                status: HookRunStatus::Success {
-                    elapsed: std::time::Duration::from_millis(1),
-                },
-                output: None,
-            }]
-        };
-
-        let mut state = ScrollbackState::new();
-        let marker = state.push_block(RenderBlock::SessionEvent(
-            SessionEventBlock::with_stop_hooks(
-                SessionEvent::TurnCompleted {
-                    elapsed: Some(std::time::Duration::from_secs(2)),
-                },
-                Vec::new(),
-                Some("pid-new".into()),
-            ),
-        ));
-
-        // A batch stamped with another turn's pid is refused even though the marker has no same-name group
-        // An unstamped (legacy) batch and a matching pid are accepted
-        assert_eq!(
-            state.latest_turn_marker_accepting("stop", Some("pid-old")),
-            None
-        );
-        assert!(!state.attach_stop_hooks_to_marker(
-            marker,
-            "stop".into(),
-            entries(),
-            Some("pid-old")
-        ));
-        assert_eq!(
-            state.latest_turn_marker_accepting("stop", None),
-            Some(marker)
-        );
-        assert_eq!(
-            state.latest_turn_marker_accepting("stop", Some("pid-new")),
-            Some(marker)
-        );
-        assert!(state.attach_stop_hooks_to_marker(
-            marker,
-            "stop".into(),
-            entries(),
-            Some("pid-new")
-        ));
-    }
-
-    #[test]
-    fn stop_hooks_merge_walks_past_interleaved_tail_blocks() {
-        use crate::scrollback::blocks::{SessionEvent, SessionEventBlock};
-
-        let mut state = ScrollbackState::new();
-        let marker = state.push_block(RenderBlock::SessionEvent(
-            SessionEventBlock::with_stop_hooks(
-                SessionEvent::TurnCompleted {
-                    elapsed: Some(std::time::Duration::from_secs(2)),
-                },
-                Vec::new(),
-                Some("pid-new".into()),
-            ),
-        ));
-        // A block lands between the marker and the batch (compaction, recap, a previous batch's standalone fallback, …)
-        state.push_block(RenderBlock::session_event(
-            SessionEvent::CompactionCompleted {
-                tokens_before: Some(100),
-                tokens_after: 10,
-                elapsed_ms: Some(5),
-            },
-        ));
-
-        // An exact pid match merges across the interleaved block
-        // An unstamped batch can't be attributed off-tail and a foreign pid is refused outright
-        assert_eq!(
-            state.latest_turn_marker_accepting("stop", Some("pid-new")),
-            Some(marker)
-        );
-        assert_eq!(state.latest_turn_marker_accepting("stop", None), None);
-        assert_eq!(
-            state.latest_turn_marker_accepting("stop", Some("pid-old")),
-            None
-        );
-
-        // The walk never skips past a newer turn-terminal marker: the batch belongs to the latest turn or to nothing
-        state.push_block(RenderBlock::SessionEvent(
-            SessionEventBlock::with_stop_hooks(
-                SessionEvent::TurnCompleted {
-                    elapsed: Some(std::time::Duration::from_secs(3)),
-                },
-                Vec::new(),
-                Some("pid-newer".into()),
-            ),
-        ));
-        assert_eq!(
-            state.latest_turn_marker_accepting("stop", Some("pid-new")),
-            None
-        );
     }
 
     /// A finished user `!` command expands to its full output; a Collapsed entry keeps its fold (no snap-open at completion).
@@ -3628,7 +3366,14 @@ mod tests {
         assert!(state.prepare_layout(W1, H));
         assert_eq!(state.last_width, W1);
         assert_eq!(state.layout_cache.as_ref().unwrap().width, W1);
-        let peek_height = state.layout_cache.as_ref().unwrap().entries[1].height;
+        let Some(peek_height) = state
+            .layout_cache
+            .as_ref()
+            .and_then(|c| c.entries.get(1))
+            .map(|e| e.height)
+        else {
+            panic!("expected cached entry 1");
+        };
 
         state.restore_viewport_snapshot(snap);
         assert_eq!(state.last_width, W0);
@@ -3641,7 +3386,8 @@ mod tests {
         let cache = state.layout_cache.as_ref().unwrap();
         assert_eq!(cache.width, W0);
         assert_ne!(
-            cache.entries[1].height, peek_height,
+            cache.entries.get(1).map(|e| e.height),
+            Some(peek_height),
             "heights must be recomputed for W0, not left at W1 wrap"
         );
     }

@@ -51,9 +51,12 @@ pub(crate) fn format_hashline_content(
 
         // Build the anchor suffix: "local" or "local:context" (without line number,
         // since we format the line number separately with right-alignment).
-        let anchor_suffix = match &anchors[i].context {
-            Some(ctx) => format!("{}:{ctx}", anchors[i].local),
-            None => anchors[i].local.clone(),
+        let Some(anchor) = anchors.get(i) else {
+            continue;
+        };
+        let anchor_suffix = match &anchor.context {
+            Some(ctx) => format!("{}:{ctx}", anchor.local),
+            None => anchor.local.clone(),
         };
 
         // Format: "LINE:LOCAL:CONTEXT→CONTENT" (or "LINE:LOCAL→CONTENT" for A)
@@ -308,9 +311,11 @@ mod tests {
 
         // Should contain lines starting with "2:" and "3:"
         let content_lines: Vec<&str> = output.lines().collect();
-        assert_eq!(content_lines.len(), 2);
-        assert!(content_lines[0].starts_with("2:"));
-        assert!(content_lines[1].starts_with("3:"));
+        let [first, second] = content_lines.as_slice() else {
+            panic!("expected two content lines: {content_lines:?}");
+        };
+        assert!(first.starts_with("2:"));
+        assert!(second.starts_with("3:"));
     }
 
     #[test]
@@ -516,6 +521,42 @@ mod tests {
         }
     }
 
+    /// Memory v2 stale-read protection depends on every ordinary read tool
+    /// recording the bytes it observed; hashline_read inherits this from
+    /// `run_read_file` and must keep doing so.
+    #[tokio::test]
+    async fn read_records_memory_v2_snapshot() {
+        use crate::implementations::grok_build_hashline::memory_v2_test_support::FakeMemoryV2Access;
+        use crate::types::memory_v2::MemoryV2AccessResource;
+
+        let tmp = TempDir::new().unwrap();
+        let access = Arc::new(FakeMemoryV2Access::new(&tmp.path().join("memory")));
+        let topic = tmp.path().join("memory/topics/facts.md");
+        std::fs::write(&topic, "one\ntwo\n").unwrap();
+        let mut resources = test_resources(tmp.path());
+        resources.insert(MemoryV2AccessResource(access.clone()));
+
+        let result = xai_tool_runtime::Tool::run(
+            &HashlineReadTool,
+            test_ctx(resources.into_shared()),
+            ReadFileInput {
+                path: "memory/topics/facts.md".to_string(),
+                offset: None,
+                limit: None,
+                pages: None,
+                format: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            matches!(result, ReadFileOutput::FileContent(_)),
+            "expected FileContent, got {result:?}"
+        );
+        assert_eq!(access.recorded_reads(), vec![topic]);
+    }
+
     #[tokio::test]
     async fn read_nonexistent_file() {
         let tmp = TempDir::new().unwrap();
@@ -605,21 +646,22 @@ mod tests {
                     content_lines
                 );
 
+                let [first, second] = content_lines.as_slice() else {
+                    panic!("expected two content lines: {content_lines:?}");
+                };
                 // Line numbers should be 2 and 3 (original file positions).
                 assert!(
-                    content_lines[0].starts_with("2:"),
-                    "first line should start with '2:', got: {}",
-                    content_lines[0]
+                    first.starts_with("2:"),
+                    "first line should start with '2:', got: {first}"
                 );
                 assert!(
-                    content_lines[1].starts_with("3:"),
-                    "second line should start with '3:', got: {}",
-                    content_lines[1]
+                    second.starts_with("3:"),
+                    "second line should start with '3:', got: {second}"
                 );
 
                 // Content should be the original lines "beta" and "gamma".
-                let after_arrow_0 = content_lines[0].split('→').nth(1).unwrap();
-                let after_arrow_1 = content_lines[1].split('→').nth(1).unwrap();
+                let after_arrow_0 = first.split('→').nth(1).unwrap();
+                let after_arrow_1 = second.split('→').nth(1).unwrap();
                 assert_eq!(after_arrow_0, "beta", "line 2 content mismatch");
                 assert_eq!(after_arrow_1, "gamma", "line 3 content mismatch");
 
@@ -715,7 +757,10 @@ mod tests {
                     5,
                     "expected 5 content lines for small window"
                 );
-                assert!(content_lines[0].starts_with("100:"));
+                let Some(first) = content_lines.first() else {
+                    panic!("expected content lines: {content_lines:?}");
+                };
+                assert!(first.starts_with("100:"));
             }
             other => panic!("Expected FileContent for small window, got {:?}", other),
         }
@@ -780,7 +825,10 @@ mod tests {
             ReadFileOutput::FileContent(fc) => {
                 let content_lines: Vec<&str> = fc.content.lines().collect();
                 assert_eq!(content_lines.len(), MAX_LINES_READ);
-                assert!(content_lines[0].trim_start().starts_with("1:"));
+                let Some(first) = content_lines.first() else {
+                    panic!("expected content lines: {content_lines:?}");
+                };
+                assert!(first.trim_start().starts_with("1:"));
                 let last = content_lines.last().unwrap();
                 assert!(
                     last.trim_start()

@@ -4,6 +4,7 @@
 //! It tracks which entries are currently being streamed to (agent message, thinking) and which tool calls are pending.
 //! Each `handle_update()` call processes one event and mutates the scrollback.
 use crate::acp::meta::{NotificationMeta, user_message_chunk_meta, user_prompt_meta};
+use crate::acp::subagent_label_registry::SubagentLabelRegistry;
 use crate::scrollback::block::RenderBlock;
 use crate::scrollback::blocks::SessionEvent;
 use crate::scrollback::blocks::tool::list_dir::ListDirToolCallBlock;
@@ -22,13 +23,16 @@ use crate::scrollback::state::verb_group::verb_group_kind_changed;
 use agent_client_protocol as acp;
 use chrono::{DateTime, Local, TimeZone};
 use std::borrow::Cow;
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 use tracing::debug;
 use xai_grok_shell::session::storage::chunk_meta_flag;
 use xai_grok_tools::types::output::{BashOutput, ToolOutput};
 use xai_grok_tools::types::output::{ReadFileOutput, SearchToolOutput, WebFetchOutput};
 use xai_grok_tools::util::strip_redundant_session_cd;
+use xai_tool_types::ReadLineCounts;
 /// Convert a UTC millisecond timestamp to local time.
 fn utc_ms_to_local(ms: i64) -> DateTime<Local> {
     chrono::Utc
@@ -61,7 +65,14 @@ pub enum WaitingReason {
     TasksComplete,
     /// Explicit sleep / await (`Await` / `Sleep …`).
     Sleep,
+    /// Blocked on an awaited hook batch; shown only once it outlives [`HOOK_REVEAL_DELAY`], so a fast hook never flashes.
+    Hooks { event_name: String, count: usize },
+    /// The sent prompt has not been acknowledged by the agent yet (past the soft notice, see `app::prompt_ack`).
+    /// View-only like `Model`; the tracker never stores it.
+    PromptAck,
 }
+/// Batches younger than this stay hidden: most hooks finish well under it.
+pub const HOOK_REVEAL_DELAY: std::time::Duration = std::time::Duration::from_millis(300);
 /// Max chars for wait/tool *description* subjects in status UI (matches tool-title truncation in `format_activity_label`).
 pub const MAX_ACTIVITY_SUBJECT_CHARS: usize = 40;
 /// First non-empty trimmed line, clamped to [`MAX_ACTIVITY_SUBJECT_CHARS`].
@@ -116,6 +127,11 @@ impl WaitingReason {
             Self::TaskOutput { .. } => "Waiting on task output…".to_string(),
             Self::TasksComplete => "Waiting on tasks…".to_string(),
             Self::Sleep => "Sleeping…".to_string(),
+            Self::Hooks { event_name, count } if *count > 1 => {
+                format!("Running {count} {event_name} hooks…")
+            }
+            Self::Hooks { event_name, .. } => format!("Running {event_name} hook…"),
+            Self::PromptAck => "Waiting for the agent to accept the prompt…".to_string(),
         }
     }
     /// Short, stable snake_case label for telemetry / phase-transition logs.
@@ -126,6 +142,8 @@ impl WaitingReason {
             Self::TaskOutput { .. } => "waiting_task_output",
             Self::TasksComplete => "waiting_tasks_complete",
             Self::Sleep => "waiting_sleep",
+            Self::Hooks { .. } => "waiting_hooks",
+            Self::PromptAck => "waiting_prompt_ack",
         }
     }
 }
@@ -306,6 +324,22 @@ pub struct PendingCompaction {
     pub elapsed_ms: Option<i64>,
     pub last_used: Option<u64>,
 }
+/// Names one batch on both `HookRunStarted` and `HookExecution`; an outcome ends the phase only for the batch that armed it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HookBatchId {
+    pub event_name: String,
+    pub tool_name: Option<String>,
+}
+#[derive(Debug)]
+struct HooksRunning {
+    batch: HookBatchId,
+    reason: WaitingReason,
+    /// Local arrival, for the reveal delay and the phase timer.
+    since: std::time::Instant,
+    /// The announcement's shell `agentTimestampMs`. Chunks ride the shell's debounced buffer while the announcement is
+    /// sent direct, so a chunk stamped at or before this predates the gate.
+    started_at_ms: Option<i64>,
+}
 /// Tracks in-flight streaming state for one agent's turn.
 /// Converts ACP `SessionUpdate` variants into scrollback entry mutations.
 /// Does nothing else: no UI, no networking, just data transformation.
@@ -343,6 +377,10 @@ pub struct AcpUpdateTracker {
     /// Task tool `run_in_background` flags, keyed by `task_id` (subagent_id).
     /// Populated when a task tool call is detected (variant == "Task"), consumed by the acp_handler when `SubagentSpawned` arrives.
     pub(crate) task_tool_background: std::collections::HashMap<String, bool>,
+    /// Display labels of spawned subagents, recorded by the acp_handler on `SubagentSpawned` and read when a
+    /// `send_subagent_message` row is built or rebuilt. One handle per root session, shared with every child
+    /// tracker: a child's own sends name siblings the parent spawned.
+    pub(crate) subagent_labels: Rc<RefCell<SubagentLabelRegistry>>,
     /// Tool call IDs marked as background (`is_background=true`). Late-detection (Execute block already exists):
     /// suppresses further output streaming. `handle_task_backgrounded` demotes the existing block. Value is the
     /// optional description from `raw_input.description`.
@@ -365,6 +403,8 @@ pub struct AcpUpdateTracker {
     /// Set by `set_retry_activity()` from ExtNotification `RetryState::Retrying`.
     /// Auto-cleared when normal streaming data resumes (in `handle_update` and `note_tool_call_arguments_delta`) and on `finish_turn()`.
     retry_activity: Option<TurnActivity>,
+    /// The awaited hook batch the turn is blocked on; ended by its `HookExecution`, resumed model text, or turn end.
+    hooks_running: Option<HooksRunning>,
     /// Set per `ToolCallDeltaChunk` (streaming-only, never persisted, cannot replay).
     writing_tool_call: Option<(WritingToolCall, std::time::Instant)>,
     /// Per-`tool_index` names so interleaved deltas can restore a call's name when the stream switches back to it.
@@ -438,6 +478,14 @@ impl AcpUpdateTracker {
     pub fn new() -> Self {
         Self::default()
     }
+    /// Fresh streaming state over the root session's label registry, so a child tracker's and the reconnect staging
+    /// tracker's sent-message rows resolve the same labels as the root's.
+    pub(crate) fn sharing_labels(labels: &Rc<RefCell<SubagentLabelRegistry>>) -> AcpUpdateTracker {
+        AcpUpdateTracker {
+            subagent_labels: Rc::clone(labels),
+            ..AcpUpdateTracker::default()
+        }
+    }
     pub(crate) fn output_since_last_finish(&self) -> bool {
         self.agent_output_epoch != self.epoch_at_last_finish
     }
@@ -466,6 +514,9 @@ impl AcpUpdateTracker {
         }
         if self.compaction_activity.is_some() {
             return self.compaction_activity.clone();
+        }
+        if let Some(hooks) = self.revealed_hooks_running() {
+            return Some(hooks);
         }
         if let Some(waiting) = self.activity_known_blocking_wait() {
             return Some(waiting);
@@ -522,7 +573,7 @@ impl AcpUpdateTracker {
                 WaitingReason::TasksComplete => 1,
                 WaitingReason::Sleep => 2,
                 WaitingReason::Subagent { .. } => 3,
-                WaitingReason::Model => 4,
+                WaitingReason::Model | WaitingReason::PromptAck | WaitingReason::Hooks { .. } => 4,
             })
             .map(|w| w.reason.clone())
     }
@@ -584,6 +635,69 @@ impl AcpUpdateTracker {
     pub fn set_retry_activity(&mut self, activity: Option<TurnActivity>) {
         self.retry_activity = activity;
     }
+    /// Record the awaited batch from `HookRunStarted`; the spinner shows it after [`HOOK_REVEAL_DELAY`].
+    pub fn set_hooks_running(
+        &mut self,
+        batch: HookBatchId,
+        count: usize,
+        started_at_ms: Option<i64>,
+    ) {
+        self.set_hooks_running_since(batch, count, std::time::Instant::now(), started_at_ms);
+    }
+    /// [`Self::set_hooks_running`] with an explicit batch start, so the reveal delay can be tested without sleeping.
+    pub(crate) fn set_hooks_running_since(
+        &mut self,
+        batch: HookBatchId,
+        count: usize,
+        since: std::time::Instant,
+        started_at_ms: Option<i64>,
+    ) {
+        let reason = WaitingReason::Hooks {
+            event_name: batch.event_name.clone(),
+            count,
+        };
+        self.hooks_running = Some(HooksRunning {
+            batch,
+            reason,
+            since,
+            started_at_ms,
+        });
+    }
+    /// `batch`'s `HookExecution` arrived; ends the phase only for the batch that armed it. Returns whether a phase was showing.
+    pub fn clear_hooks_running(&mut self, batch: &HookBatchId) -> bool {
+        if self
+            .hooks_running
+            .as_ref()
+            .is_none_or(|hooks| hooks.batch != *batch)
+        {
+            return false;
+        }
+        self.hooks_running
+            .take()
+            .is_some_and(|hooks| hooks.since.elapsed() >= HOOK_REVEAL_DELAY)
+    }
+    /// The hook phase once its batch has outlived the reveal delay.
+    fn revealed_hooks_running(&self) -> Option<TurnActivity> {
+        let hooks = self.hooks_running.as_ref()?;
+        (hooks.since.elapsed() >= HOOK_REVEAL_DELAY)
+            .then(|| TurnActivity::Waiting(hooks.reason.clone()))
+    }
+    /// When the awaited hook batch started, so the phase timer counts the whole wait rather than from the reveal.
+    pub fn hooks_running_since(&self) -> Option<std::time::Instant> {
+        self.hooks_running.as_ref().map(|hooks| hooks.since)
+    }
+    /// Whether a model-text chunk was already queued in the shell's buffer when the awaited batch was announced.
+    fn chunk_predates_hook_batch(&self, meta: &NotificationMeta) -> bool {
+        match (
+            self.hooks_running
+                .as_ref()
+                .and_then(|hooks| hooks.started_at_ms),
+            meta.agent_timestamp_ms,
+        ) {
+            (Some(started), Some(stamped)) => stamped <= started,
+            _ => false,
+        }
+    }
     /// Record a `ToolCallDeltaChunk`; returns `true` only when the visible label changed (continuation deltas need no redraw).
     pub fn note_tool_call_arguments_delta(&mut self, name: Option<&str>, tool_index: u32) -> bool {
         let now = std::time::Instant::now();
@@ -631,6 +745,13 @@ impl AcpUpdateTracker {
     pub(crate) fn backdate_last_tool_call_delta(&mut self, age: std::time::Duration) {
         if let Some((_, at)) = &mut self.writing_tool_call {
             *at = std::time::Instant::now() - age;
+        }
+    }
+    /// Backdate the armed hook phase past the reveal delay without touching its batch identity (handler tests).
+    #[cfg(test)]
+    pub(crate) fn backdate_hooks_running(&mut self, age: std::time::Duration) {
+        if let Some(hooks) = &mut self.hooks_running {
+            hooks.since = std::time::Instant::now() - age;
         }
     }
     /// Take pending ACP commands, if any. Returns `None` if no update arrived since the last drain.
@@ -683,9 +804,9 @@ impl AcpUpdateTracker {
         id
     }
     /// The Edit block of `entry` if it qualifies for coalescing with an adjacent same-file Edit.
-    /// Qualifying means: completed successfully with hunks, a trustworthy one-liner summary, and no per-entry attachments a merge would misplace.
+    /// Qualifying means: completed successfully with hunks and a trustworthy one-liner summary.
     fn coalescable_edit(entry: &ScrollbackEntry) -> Option<&EditToolCallBlock> {
-        if entry.is_running || entry.is_pending_user_input || entry.hook_data.is_some() {
+        if entry.is_running || entry.is_pending_user_input {
             return None;
         }
         let RenderBlock::ToolCall(ToolCallBlock::Edit(edit)) = &entry.block else {
@@ -821,6 +942,13 @@ impl AcpUpdateTracker {
         if self.retry_activity.is_some() {
             self.retry_activity = None;
         }
+        if matches!(
+            update,
+            acp::SessionUpdate::AgentMessageChunk(_) | acp::SessionUpdate::AgentThoughtChunk(_)
+        ) && !self.chunk_predates_hook_batch(meta)
+        {
+            self.hooks_running = None;
+        }
         if let Some(new_start) = meta.stream_start_ms {
             if self
                 .last_stream_start_ms
@@ -915,6 +1043,7 @@ impl AcpUpdateTracker {
         self.last_stream_start_ms = None;
         self.compaction_activity = None;
         self.retry_activity = None;
+        self.hooks_running = None;
         self.writing_tool_call = None;
         self.writing_tool_names.clear();
         self.suppressed_tools.clear();
@@ -1104,7 +1233,11 @@ impl AcpUpdateTracker {
         let tc_id = tc.tool_call_id.0.to_string();
         if let Some(orphan) = self.orphan_updates.remove(&tc_id) {
             let merged = merge_tool_call_update(tc, orphan);
-            let block = tool_call_to_block(&merged, self.session_cwd.as_deref());
+            let block = tool_call_to_block(
+                &merged,
+                self.session_cwd.as_deref(),
+                &self.subagent_labels.borrow(),
+            );
             self.finish_completed_tool(block, scrollback, is_replay);
             return true;
         }
@@ -1113,10 +1246,18 @@ impl AcpUpdateTracker {
             acp::ToolCallStatus::Completed | acp::ToolCallStatus::Failed
         );
         if is_completed {
-            let block = tool_call_to_block(&tc, self.session_cwd.as_deref());
+            let block = tool_call_to_block(
+                &tc,
+                self.session_cwd.as_deref(),
+                &self.subagent_labels.borrow(),
+            );
             self.finish_completed_tool(block, scrollback, is_replay);
         } else {
-            let block = tool_call_to_block(&tc, self.session_cwd.as_deref());
+            let block = tool_call_to_block(
+                &tc,
+                self.session_cwd.as_deref(),
+                &self.subagent_labels.borrow(),
+            );
             let id = scrollback.push_block(block);
             scrollback.set_last_running(true);
             let started_at = Some(std::time::Instant::now());
@@ -1186,7 +1327,11 @@ impl AcpUpdateTracker {
                         && !is_bg_plumbing_tool(&base)
                     {
                         base.update(tcu.fields);
-                        let block = tool_call_to_block(&base, self.session_cwd.as_deref());
+                        let block = tool_call_to_block(
+                            &base,
+                            self.session_cwd.as_deref(),
+                            &self.subagent_labels.borrow(),
+                        );
                         self.finish_completed_tool(block, scrollback, is_replay);
                         return true;
                     }
@@ -1231,8 +1376,11 @@ impl AcpUpdateTracker {
                         Some((tc_id.clone(), desc, false))
                     } else {
                         if let Some(entry_id) = pending.entry_id {
-                            let mut block =
-                                tool_call_to_block(&pending.base, self.session_cwd.as_deref());
+                            let mut block = tool_call_to_block(
+                                &pending.base,
+                                self.session_cwd.as_deref(),
+                                &self.subagent_labels.borrow(),
+                            );
                             let mut kind_changed = false;
                             if let Some(entry) = scrollback.get_by_id_mut(entry_id) {
                                 if let RenderBlock::ToolCall(new_tc) = &mut block
@@ -1252,11 +1400,19 @@ impl AcpUpdateTracker {
                     }
                 } else {
                     let entry_id = if let Some(entry_id) = pending.entry_id {
-                        let block = tool_call_to_block(&pending.base, self.session_cwd.as_deref());
+                        let block = tool_call_to_block(
+                            &pending.base,
+                            self.session_cwd.as_deref(),
+                            &self.subagent_labels.borrow(),
+                        );
                         scrollback.replace_tool_block(entry_id, block, pending.started_at);
                         entry_id
                     } else {
-                        let block = tool_call_to_block(&pending.base, self.session_cwd.as_deref());
+                        let block = tool_call_to_block(
+                            &pending.base,
+                            self.session_cwd.as_deref(),
+                            &self.subagent_labels.borrow(),
+                        );
                         let id = scrollback.push_block(block);
                         scrollback.set_last_running(true);
                         pending.entry_id = Some(id);
@@ -1291,7 +1447,11 @@ impl AcpUpdateTracker {
         }
         if let Some(pending) = self.pending_tools.remove(&tc_id) {
             let merged = merge_tool_call_update(pending.base, tcu);
-            let block = tool_call_to_block(&merged, self.session_cwd.as_deref());
+            let block = tool_call_to_block(
+                &merged,
+                self.session_cwd.as_deref(),
+                &self.subagent_labels.borrow(),
+            );
             if let Some(entry_id) = pending.entry_id {
                 if scrollback.replace_tool_block(entry_id, block, pending.started_at)
                     && let Some(entry) = scrollback.get_by_id(entry_id)
@@ -1513,9 +1673,9 @@ fn extract_skill_header_command(text: &str) -> Option<String> {
     if !text.starts_with('/') {
         return None;
     }
-    let cmd_name = text.split(&[' ', '\n'][..]).next()?;
+    let cmd_name = text.split([' ', '\n']).next()?;
     if let Some(input_idx) = text.find("## Input\n") {
-        let args = text[input_idx + "## Input\n".len()..].trim();
+        let args = text.get(input_idx + "## Input\n".len()..)?.trim();
         if !args.is_empty() {
             return Some(format!("{cmd_name} {args}"));
         }
@@ -1556,11 +1716,11 @@ fn extract_cron_prompt_body(text: &str) -> Option<String> {
     }
     let end_tag = "</system-reminder>";
     let close = text.find(end_tag)?;
-    let header = &text[..close];
+    let header = text.get(..close)?;
     if !header.contains("scheduled task execution") {
         return None;
     }
-    let body = text[close + end_tag.len()..].trim();
+    let body = text.get(close + end_tag.len()..)?.trim();
     if body.is_empty() {
         return None;
     }
@@ -1634,7 +1794,12 @@ fn execute_command_from_tool_call(tc: &acp::ToolCall) -> String {
 /// Convert an ACP ToolCall to a RenderBlock.
 /// Parses `tool_call.kind` to create the appropriate block type, extracting fields from `raw_input` JSON when available.
 /// `session_cwd` sets execute `header_display` when a leading `cd <cwd>` is redundant.
-fn tool_call_to_block(tc: &acp::ToolCall, session_cwd: Option<&Path>) -> RenderBlock {
+/// `labels` names the target of a `send_subagent_message` row.
+fn tool_call_to_block(
+    tc: &acp::ToolCall,
+    session_cwd: Option<&Path>,
+    labels: &SubagentLabelRegistry,
+) -> RenderBlock {
     let success = !matches!(tc.status, acp::ToolCallStatus::Failed);
     match tc.kind {
         acp::ToolKind::Execute => {
@@ -1691,11 +1856,15 @@ fn tool_call_to_block(tc: &acp::ToolCall, session_cwd: Option<&Path>) -> RenderB
                 .or_else(|| extract_raw_field(tc, "path"))
                 .unwrap_or_else(|| tc.title.clone());
             let mut block = ReadToolCallBlock::new(&path);
-            if let Some(ref raw) = tc.raw_output
-                && let Ok(ToolOutput::ReadFile(read_output)) =
-                    serde_json::from_value::<ToolOutput>(raw.clone())
-            {
-                match read_output {
+            if is_memory_v2_activity(tc) {
+                block = block.with_memory_activity();
+            }
+            let structured = tc
+                .raw_output
+                .as_ref()
+                .map(|raw| serde_json::from_value::<ToolOutput>(raw.clone()));
+            match structured {
+                Some(Ok(ToolOutput::ReadFile(read_output))) => match read_output {
                     ReadFileOutput::FileContent(fc) => {
                         if fc.offset.is_some() || fc.limit.is_some() {
                             let off = fc.offset.unwrap_or(0);
@@ -1725,14 +1894,33 @@ fn tool_call_to_block(tc: &acp::ToolCall, session_cwd: Option<&Path>) -> RenderB
                             pages: pdf.total_pages,
                         });
                     }
+                },
+                _ if !success => {
+                    let text = content_text(tc);
+                    block = block.with_error(if text.is_empty() {
+                        "Read failed".to_string()
+                    } else {
+                        text
+                    });
                 }
-            } else if !success {
-                let text = content_text(tc);
-                block = block.with_error(if text.is_empty() {
-                    "Read failed".to_string()
-                } else {
-                    text
-                });
+                Some(Ok(_)) => {}
+                None | Some(Err(_)) => {
+                    let counts = tc
+                        .raw_output
+                        .as_ref()
+                        .and_then(|raw| serde_json::from_value::<ReadLineCounts>(raw.clone()).ok())
+                        .unwrap_or_default();
+                    if let Some(range) = counts.range {
+                        block = block.with_line_range(LineRange::new(range.start, range.end));
+                    }
+                    block.total_lines = counts.total_lines;
+                    if has_text_content(tc) {
+                        let text = content_text(tc);
+                        let total_lines =
+                            counts.total_lines.unwrap_or_else(|| text.lines().count());
+                        block = block.with_content(text, total_lines);
+                    }
+                }
             }
             RenderBlock::ToolCall(ToolCallBlock::Read(block))
         }
@@ -1764,6 +1952,9 @@ fn tool_call_to_block(tc: &acp::ToolCall, session_cwd: Option<&Path>) -> RenderB
             if is_write {
                 block = block.with_prefix("Creating ");
             }
+            if is_memory_v2_activity(tc) {
+                block = block.with_memory_activity();
+            }
             RenderBlock::ToolCall(ToolCallBlock::Edit(block))
         }
         acp::ToolKind::Search
@@ -1781,6 +1972,7 @@ fn tool_call_to_block(tc: &acp::ToolCall, session_cwd: Option<&Path>) -> RenderB
                     .and_then(|v| v.as_bool())
                     .unwrap_or(false);
             let query = extract_raw_field(tc, "query")
+                .or_else(|| extract_raw_field(tc, "search_term"))
                 .or_else(|| {
                     tc.title
                         .strip_prefix("Web search: ")
@@ -1891,7 +2083,7 @@ fn tool_call_to_block(tc: &acp::ToolCall, session_cwd: Option<&Path>) -> RenderB
                     }
                     block.citations = ws.citations;
                 }
-                if block.content.is_none() {
+                if success && block.content.is_none() {
                     let text = content_text(tc);
                     if !text.is_empty() {
                         block.content = Some(text);
@@ -1899,7 +2091,7 @@ fn tool_call_to_block(tc: &acp::ToolCall, session_cwd: Option<&Path>) -> RenderB
                 }
             }
             if !success {
-                block = block.with_error("Web search failed");
+                block = block.with_error(failure_reason(tc, "Web search failed"));
             }
             RenderBlock::ToolCall(ToolCallBlock::WebSearch(block))
         }
@@ -1910,12 +2102,15 @@ fn tool_call_to_block(tc: &acp::ToolCall, session_cwd: Option<&Path>) -> RenderB
             let meta = extract_search_meta(tc);
             let grep = extract_grep_output(&tc.raw_output).unwrap_or_default();
             let mut block = SearchToolCallBlock::new(pattern);
+            if is_memory_v2_activity(tc) {
+                block = block.with_memory_activity();
+            }
             block.meta = meta;
             block.match_count = grep.match_count;
             block.file_matches = grep.file_matches;
             block.file_paths = grep.file_paths;
             if !success {
-                block.error = Some("Search failed".into());
+                block.error = Some(failure_reason(tc, "Search failed"));
             }
             RenderBlock::ToolCall(ToolCallBlock::Search(block))
         }
@@ -1944,6 +2139,9 @@ fn tool_call_to_block(tc: &acp::ToolCall, session_cwd: Option<&Path>) -> RenderB
         _ if extract_raw_field(tc, "target_directory").is_some() => {
             let path = extract_raw_field(tc, "target_directory").unwrap();
             let mut block = ListDirToolCallBlock::new(make_relative_path(&path));
+            if is_memory_v2_activity(tc) {
+                block = block.with_memory_activity();
+            }
             if let Some(content) = extract_listdir_content(&tc.raw_output) {
                 block = block.with_output(content);
             }
@@ -1972,11 +2170,20 @@ fn tool_call_to_block(tc: &acp::ToolCall, session_cwd: Option<&Path>) -> RenderB
                 block.content = Some(content);
             }
             if !success {
-                block = block.with_error("Search failed");
+                let error = block
+                    .content
+                    .take()
+                    .filter(|_| block.results.is_empty())
+                    .unwrap_or_else(|| "Search failed".to_owned());
+                block = block.with_error(error);
             }
             RenderBlock::ToolCall(ToolCallBlock::IntegrationSearch(block))
         }
-        _ if extract_raw_field(tc, "variant").as_deref() == Some("UseTool") => {
+        _ if matches!(
+            extract_raw_field(tc, "variant").as_deref(),
+            Some("UseTool") | Some("MCPTool")
+        ) =>
+        {
             let tool_name = extract_raw_field(tc, "tool_name").unwrap_or_else(|| tc.title.clone());
             let mut block = UseToolCallBlock::new(tool_name);
             block.input_args = extract_use_tool_args(tc);
@@ -1997,7 +2204,7 @@ fn tool_call_to_block(tc: &acp::ToolCall, session_cwd: Option<&Path>) -> RenderB
             RenderBlock::ToolCall(ToolCallBlock::UseTool(block))
         }
         _ if crate::acp::subagent_message::is_tool(tc) => {
-            crate::acp::subagent_message::to_block(tc)
+            crate::acp::subagent_message::to_block(tc, labels)
         }
         _ if canonical_tool_name(tc)
             == Some(xai_grok_tools::implementations::grok_build::SEND_FEEDBACK_TOOL_NAME) =>
@@ -2091,24 +2298,25 @@ fn tool_call_to_block(tc: &acp::ToolCall, session_cwd: Option<&Path>) -> RenderB
                 .eq_ignore_ascii_case("skill")
                 || name.to_ascii_lowercase().starts_with("skill:")
             {
-                let label = match name.find(':') {
-                    Some(i) => format!("Skill{}", &name[i..]),
-                    None => "Skill".into(),
-                };
+                let label = name
+                    .find(':')
+                    .and_then(|i| name.get(i..))
+                    .map(|rest| format!("Skill{rest}"))
+                    .unwrap_or_else(|| "Skill".into());
                 (label, ToolCallBlock::Skill)
             } else {
                 (name.into_owned(), ToolCallBlock::Other)
             };
             let mut block = OtherToolCallBlock::new(label, summary);
-            let ct = content_text(tc);
-            if !success {
-                block.error = Some(if ct.is_empty() {
-                    "Failed".into()
-                } else {
-                    ct.clone()
-                });
+            let mut ct = content_text(tc);
+            if ct.is_empty()
+                && let Some(extracted) = extract_use_tool_output(&tc.raw_output)
+            {
+                ct = extracted;
             }
-            if !ct.is_empty() {
+            if !success {
+                block.error = Some(if ct.is_empty() { "Failed".into() } else { ct });
+            } else if !ct.is_empty() {
                 block.set_output_text(ct);
             }
             RenderBlock::ToolCall(ctor(block))
@@ -2121,6 +2329,13 @@ fn canonical_tool_name(tc: &acp::ToolCall) -> Option<&str> {
         .get(xai_grok_tools::tool_taxonomy::TOOL_META_KEY)?
         .get("name")?
         .as_str()
+}
+fn is_memory_v2_activity(tc: &acp::ToolCall) -> bool {
+    tc.meta
+        .as_ref()
+        .and_then(|meta| meta.get("memory_v2_activity"))
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false)
 }
 /// Display title for a tool call: its title, or the kind name when empty.
 fn tool_call_title(tc: &acp::ToolCall) -> Cow<'_, str> {
@@ -2177,6 +2392,27 @@ fn extract_text_from_content(content: &acp::ContentBlock) -> String {
 /// Extract text from tool call content blocks.
 fn content_text(tc: &acp::ToolCall) -> String {
     content_blocks_text(&tc.content)
+}
+/// A search streams nothing, so a failed one's content is the reason; `default` covers an empty one
+fn failure_reason(tc: &acp::ToolCall, default: &str) -> String {
+    let reason = content_text(tc);
+    if reason.is_empty() {
+        default.to_owned()
+    } else {
+        reason
+    }
+}
+/// True when at least one content block is text, even empty text (an empty file read)
+fn has_text_content(tc: &acp::ToolCall) -> bool {
+    tc.content.iter().any(|c| {
+        matches!(
+            c,
+            acp::ToolCallContent::Content(acp::Content {
+                content: acp::ContentBlock::Text(_),
+                ..
+            })
+        )
+    })
 }
 pub(crate) fn content_blocks_text(content: &[acp::ToolCallContent]) -> String {
     content
@@ -2380,7 +2616,7 @@ fn extract_raw_field(tc: &acp::ToolCall, field: &str) -> Option<String> {
         .and_then(|v| v.as_str())
         .map(|s| s.to_string())
 }
-/// Extract a short, user-friendly error label from a failed Edit tool call.
+/// The error shown on a failed Edit block: a short label for a structured search_replace output, else the text content
 fn extract_edit_error(tc: &acp::ToolCall) -> String {
     use xai_grok_tools::types::output::SearchReplaceOutput;
     if let Some(ref raw) = tc.raw_output
@@ -2396,7 +2632,10 @@ fn extract_edit_error(tc: &acp::ToolCall) -> String {
             SearchReplaceOutput::EditsApplied(_) => "Edit failed".to_owned(),
         };
     }
-    "Edit failed".to_owned()
+    match content_text(tc) {
+        text if text.is_empty() => "Edit failed".to_owned(),
+        text => text,
+    }
 }
 /// Extract search input metadata from a tool call's rawInput.
 fn extract_search_meta(tc: &acp::ToolCall) -> SearchInputMeta {
@@ -2566,6 +2805,9 @@ fn update_summary(update: &acp::SessionUpdate) -> String {
         acp::SessionUpdate::CurrentModeUpdate(u) => {
             format!("current_mode_update mode={}", u.current_mode_id.0)
         }
+        acp::SessionUpdate::UsageUpdate(u) => {
+            format!("usage_update used={} size={}", u.used, u.size)
+        }
         _ => "unknown_update".to_string(),
     }
 }
@@ -2660,8 +2902,9 @@ fn parse_search_tool_results(content: &str) -> Vec<DiscoveredTool> {
     }
     out
 }
-/// Extract output text from a use_tool's raw_output.
-/// MCP tools don't put content in ACP content blocks; they only set raw_output.
+/// Extract output text from a tool call's raw_output.
+/// MCP tools don't put content in ACP content blocks; they only set raw_output, whether
+/// called through use_tool or listed directly.
 /// This extracts the text from ToolOutput::MCP, ToolOutput::Text, or ToolOutput::Dynamic variants.
 fn extract_use_tool_output(raw: &Option<serde_json::Value>) -> Option<String> {
     let val = raw.as_ref()?;
@@ -2691,7 +2934,7 @@ fn maybe_pretty_json(s: &str) -> String {
         s.to_owned()
     }
 }
-/// Extract input arguments from a use_tool call's raw_input.tool_input.
+/// Extract input arguments from a use_tool or MCPTool call's raw_input.tool_input.
 /// Flattens the top-level JSON object into key-value string pairs for display.
 /// Nested objects/arrays are rendered as compact JSON strings.
 fn extract_use_tool_args(tc: &acp::ToolCall) -> Vec<(String, String)> {

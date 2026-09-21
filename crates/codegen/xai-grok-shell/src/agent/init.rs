@@ -4,14 +4,15 @@
 //! singletons, model catalog) and returns a resolved config + `ModelsManager`.
 //! [`update_telemetry_config`] re-initializes telemetry after auth changes.
 use crate::agent::config::{self, Config as AgentConfig, ModelEntry};
-use crate::agent::models::{ModelsManager, startup_prefetch};
+use crate::agent::remote_config::settings_get::SettingsWait;
+use crate::agent::remote_config::{ModelsManager, ResolvedModels, settings_get};
 use crate::config::StorageMode;
 use crate::managed_config::LaunchProfile;
 use indexmap::IndexMap;
 use std::sync::{Arc, Mutex, TryLockError};
 use std::time::Duration;
 use tokio_util::sync::CancellationToken;
-use xai_grok_login::AuthManager;
+use xai_grok_login::{AuthManager, GrokAuth};
 /// The policy refusal stays typed; stringify only at the process boundary.
 #[derive(Debug, thiserror::Error)]
 pub enum BootstrapError {
@@ -32,11 +33,21 @@ impl From<String> for BootstrapError {
         Self::Config(message)
     }
 }
+/// The owned handoff from the async boot pre-resolve to sync bootstrap: the
+/// settled settings wait and the pre-resolved catalog, moved by value so a
+/// concurrent boot in the same process cannot observe another boot's. Fields are
+/// private; only [`resolve_boot_startup_settings`] builds one and
+/// [`bootstrap_with_cancel`] consumes it.
+#[must_use]
+pub struct BootstrapPrefetch {
+    settings_wait: Option<SettingsWait>,
+    models: ResolvedModels,
+}
 /// One bootstrap at a time. A connect-timeout drop does not abort
 /// `spawn_blocking`, so the fallback connect would otherwise overlap
 /// `start_refresh_supervisor` / `init_process`.
 static BOOTSTRAP_GATE: Mutex<()> = Mutex::new(());
-struct BootstrapPermit<'a>(#[allow(dead_code)] std::sync::MutexGuard<'a, ()>);
+struct BootstrapPermit<'a>(#[expect(dead_code)] std::sync::MutexGuard<'a, ()>);
 fn ensure_bootstrap_not_cancelled(cancel: &CancellationToken) -> Result<(), BootstrapError> {
     if cancel.is_cancelled() {
         Err(BootstrapError::Cancelled)
@@ -79,7 +90,13 @@ pub fn bootstrap(
     auth_manager: &Arc<AuthManager>,
     prefetched: Option<IndexMap<String, ModelEntry>>,
 ) -> Result<(AgentConfig, ModelsManager), BootstrapError> {
-    bootstrap_with_cancel(cfg, auth_manager, prefetched, &CancellationToken::new())
+    bootstrap_with_cancel(
+        cfg,
+        auth_manager,
+        prefetched,
+        &CancellationToken::new(),
+        None,
+    )
 }
 /// [`bootstrap`] that stops at phase boundaries when `cancel` fires.
 /// Connect timeout drops the pager's `spawn_blocking` join; that does not abort the worker. The token is the stop signal, and [`BOOTSTRAP_GATE`] keeps a fallback connect from running `start_refresh_supervisor` / `init_process` beside the one that is still winding down.
@@ -88,17 +105,29 @@ pub fn bootstrap_with_cancel(
     auth_manager: &Arc<AuthManager>,
     prefetched: Option<IndexMap<String, ModelEntry>>,
     cancel: &CancellationToken,
+    boot: Option<BootstrapPrefetch>,
 ) -> Result<(AgentConfig, ModelsManager), BootstrapError> {
     let _permit = acquire_bootstrap_gate(cancel)?;
     ensure_bootstrap_not_cancelled(cancel)?;
+    let (boot_wait, boot_models) = match boot {
+        Some(b) => (b.settings_wait, Some(b.models)),
+        None => (None, None),
+    };
     xai_grok_telemetry::id::prefetch_agent_id();
     xai_grok_telemetry::startup::enter(xai_grok_telemetry::startup::StartupPhase::Bootstrap);
     let mut cfg = cfg.clone();
     let profile = crate::managed_config::startup_profile();
+    let warmed_auth = auth_manager.current();
     let pre_gate_prefetch = {
         let mut timer = crate::instrumentation_timer!("startup.bootstrap.remote_settings");
         timer.with_subphase(xai_grok_telemetry::startup::Subphase::RemoteSettings);
-        ensure_remote_settings_side_effects(&mut cfg, profile)
+        ensure_remote_settings_side_effects(
+            &mut cfg,
+            profile,
+            cancel,
+            warmed_auth.as_ref(),
+            boot_wait.as_ref(),
+        )?
     };
     ensure_bootstrap_not_cancelled(cancel)?;
     {
@@ -107,12 +136,20 @@ pub fn bootstrap_with_cancel(
     }
     ensure_bootstrap_not_cancelled(cancel)?;
     if !cfg!(test) {
+        let _timer = crate::instrumentation_timer!("startup.bootstrap.refresh_supervisor");
         crate::managed_config::start_refresh_supervisor(auth_manager);
     }
     let cfg = {
         let mut timer = crate::instrumentation_timer!("startup.bootstrap.resolve_config");
         timer.with_subphase(xai_grok_telemetry::startup::Subphase::ResolveConfig);
-        let cfg = resolve_config(&cfg, auth_manager, pre_gate_prefetch, profile);
+        let cfg = resolve_config(
+            &cfg,
+            auth_manager,
+            pre_gate_prefetch,
+            profile,
+            cancel,
+            boot_wait.as_ref(),
+        );
         cfg.validate_model_filters()?;
         cfg
     };
@@ -122,10 +159,25 @@ pub fn bootstrap_with_cancel(
         timer.with_subphase(xai_grok_telemetry::startup::Subphase::InitProcess);
         init_process(&cfg, auth_manager);
     }
+    ensure_bootstrap_not_cancelled(cancel)?;
     xai_grok_telemetry::startup::enter(xai_grok_telemetry::startup::StartupPhase::ModelCatalog);
     let models_manager = {
         let mut timer = crate::instrumentation_timer!("startup.model_catalog.models_manager");
         timer.with_subphase(xai_grok_telemetry::startup::Subphase::ModelsManager);
+        let prefetched = match prefetched {
+            Some(models) => Some(models),
+            None => match boot_models {
+                Some(resolved) => resolved,
+                None => crate::agent::remote_config::fetch_initial_models_blocking(
+                    cancel,
+                    Some(cfg.grok_com_config.clone()),
+                    warmed_auth.clone(),
+                ),
+            },
+        };
+        if cancel.is_cancelled() {
+            return Err(BootstrapError::Cancelled);
+        }
         ModelsManager::from_config(&cfg, prefetched, auth_manager.clone())?
     };
     models_manager.start_auth_refresh_watcher(auth_manager.refresh_notifier());
@@ -138,6 +190,7 @@ pub(crate) fn exit_on_config_error<T>(e: BootstrapError) -> T {
     std::process::exit(1);
 }
 #[must_use]
+#[derive(Debug)]
 enum StartupPrefetch {
     Ran,
     ClientSupplied,
@@ -146,50 +199,159 @@ enum StartupPrefetch {
 thread_local! {
     static PREFETCH_RUNS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
+/// Await the startup load on this async runtime and install any settings onto
+/// `cfg`. Leader, ACP, stdio, headless, and the websocket server must call
+/// this before sync bootstrap: those boots run on a current-thread runtime,
+/// where a sync wait cannot drive the load.
+///
+/// Returns the owned [`BootstrapPrefetch`] the caller threads into
+/// `bootstrap_with_cancel`, so a boot consumes only its own catalog and settled
+/// wait; nothing crosses through a process-global registry.
+pub async fn resolve_boot_startup_settings(
+    cfg: &mut AgentConfig,
+    cancel: &CancellationToken,
+    start_models_prefetch: bool,
+    warmed_auth: Option<GrokAuth>,
+) -> Result<BootstrapPrefetch, BootstrapError> {
+    let models_load = if start_models_prefetch {
+        crate::agent::remote_config::start_initial_models_load(
+            cancel.clone(),
+            Some(cfg.grok_com_config.clone()),
+            warmed_auth.clone(),
+        )
+    } else {
+        None
+    };
+    let profile = crate::managed_config::startup_profile();
+    let deadline = startup_settings_deadline(profile);
+    let started = std::time::Instant::now();
+    let need_settings = cfg.remote_settings.is_none();
+    let query =
+        need_settings.then(|| settings_get::SettingsQuery::from_config(cfg, warmed_auth.clone()));
+    let (wait, models) = tokio::join!(
+        async {
+            match query {
+                Some(query) => {
+                    Some(settings_get::await_startup_settings(query, deadline, cancel).await)
+                }
+                None => None,
+            }
+        },
+        async {
+            match models_load {
+                Some(load) => load.join(cancel, crate::http::STARTUP_FETCH_TIMEOUT).await,
+                None => None,
+            }
+        },
+    );
+    if cancel.is_cancelled() || matches!(wait, Some(SettingsWait::Cancelled)) {
+        return Err(BootstrapError::Cancelled);
+    }
+    if let Some(wait) = &wait {
+        install_settings_wait(
+            cfg,
+            profile,
+            deadline,
+            started.elapsed(),
+            wait,
+            warmed_auth.as_ref(),
+        );
+    }
+    Ok(BootstrapPrefetch {
+        settings_wait: wait,
+        models,
+    })
+}
+fn install_settings_wait(
+    cfg: &mut AgentConfig,
+    profile: LaunchProfile,
+    deadline: std::time::Duration,
+    waited: std::time::Duration,
+    wait: &settings_get::SettingsWait,
+    warmed_auth: Option<&GrokAuth>,
+) {
+    match wait {
+        settings_get::SettingsWait::Cancelled => {}
+        settings_get::SettingsWait::TimedOut => {
+            crate::agent::remote_config::record_degraded_start(
+                crate::agent::remote_config::DegradedStartCause::DeadlineMissed,
+                profile,
+                deadline,
+                waited,
+            );
+            tracing::info!("settings getter timed out; falling open to defaults");
+        }
+        settings_get::SettingsWait::Ready(outcome) => {
+            if !outcome.install_allowed(cfg, warmed_auth) {
+                tracing::info!("startup settings discarded at consume: policy or identity changed");
+            } else if let Some(settings) = outcome.settings.clone() {
+                cfg.remote_settings = Some(settings);
+                crate::util::config::set_remote_campaigns_from_settings(
+                    cfg.remote_settings.as_ref(),
+                );
+                tracing::info!(source = "getter", "remote_settings resolved at startup");
+            } else if outcome.attempted {
+                crate::agent::remote_config::record_degraded_start(
+                    crate::agent::remote_config::DegradedStartCause::FetchFailed,
+                    profile,
+                    deadline,
+                    waited,
+                );
+            }
+        }
+    }
+}
 /// Fill `remote_settings` if absent and apply process-global remote side effects.
 /// The boot spends at most one settings retry budget (#278686).
 fn ensure_remote_settings_side_effects(
     cfg: &mut AgentConfig,
     profile: LaunchProfile,
-) -> StartupPrefetch {
-    let ran_prefetch = cfg.remote_settings.is_none();
-    if ran_prefetch {
+    cancel: &CancellationToken,
+    warmed_auth: Option<&GrokAuth>,
+    boot_wait: Option<&SettingsWait>,
+) -> Result<StartupPrefetch, BootstrapError> {
+    let prefetch = if let Some(wait) = boot_wait {
+        if matches!(wait, SettingsWait::Cancelled) || cancel.is_cancelled() {
+            return Err(BootstrapError::Cancelled);
+        }
+        if cfg.remote_settings.is_none()
+            && let SettingsWait::Ready(outcome) = wait
+            && outcome.install_allowed(cfg, warmed_auth)
+            && let Some(settings) = outcome.settings.clone()
+        {
+            cfg.remote_settings = Some(settings);
+            crate::util::config::set_remote_campaigns_from_settings(cfg.remote_settings.as_ref());
+        }
+        StartupPrefetch::Ran
+    } else if cfg.remote_settings.is_none() {
         #[cfg(test)]
         PREFETCH_RUNS.with(|c| c.set(c.get() + 1));
         let deadline = startup_settings_deadline(profile);
         let started = std::time::Instant::now();
-        let (settings, source, degraded) = match startup_prefetch::accept_within(deadline) {
-            (startup_prefetch::Accept::Consumed(settings), degraded) => {
-                (settings.map(|s| *s), "prefetch", degraded)
-            }
-            (startup_prefetch::Accept::Miss, _) => {
-                let (settings, degraded) =
-                    startup_prefetch::fetch_now_before_policy_gate(cfg, deadline);
-                (settings, "fallback", degraded)
-            }
-        };
-        if let Some(cause) = degraded {
-            crate::agent::models::record_degraded_start(
-                cause,
-                profile,
-                deadline,
-                started.elapsed(),
-            );
+        let query = settings_get::SettingsQuery::from_config(cfg, warmed_auth.cloned());
+        let wait = settings_get::block_on_startup_settings(query, deadline, cancel);
+        if matches!(wait, settings_get::SettingsWait::Cancelled) {
+            return Err(BootstrapError::Cancelled);
         }
-        if settings.is_some() {
-            cfg.remote_settings = settings;
-            crate::util::config::set_remote_campaigns_from_settings(cfg.remote_settings.as_ref());
-            tracing::info!(source, "remote_settings resolved at startup");
-        }
-    } else {
-        let _ = startup_prefetch::accept_within(startup_settings_deadline(profile));
-    }
-    crate::agent::config::apply_remote_settings_side_effects(cfg.remote_settings.as_ref());
-    if ran_prefetch {
+        install_settings_wait(
+            cfg,
+            profile,
+            deadline,
+            started.elapsed(),
+            &wait,
+            warmed_auth,
+        );
         StartupPrefetch::Ran
+    } else if cancel.is_cancelled() {
+        return Err(BootstrapError::Cancelled);
     } else {
         StartupPrefetch::ClientSupplied
-    }
+    };
+    crate::agent::config::apply_remote_settings_side_effects(
+        cfg.remote_settings.as_ref(),
+        &config::EndpointsConfig::from_effective_config().proxy_url(),
+    );
+    Ok(prefetch)
 }
 fn startup_settings_deadline(profile: LaunchProfile) -> std::time::Duration {
     match profile {
@@ -203,11 +365,15 @@ fn apply_post_gate_settings(
     cfg: &mut AgentConfig,
     pre_gate: StartupPrefetch,
     profile: LaunchProfile,
+    cancel: &CancellationToken,
+    warmed_auth: Option<&GrokAuth>,
+    boot_wait: Option<&SettingsWait>,
 ) {
     match (cfg.remote_settings.is_some(), pre_gate) {
         (true, _) => {}
         (false, StartupPrefetch::ClientSupplied) => {
-            let _ = ensure_remote_settings_side_effects(cfg, profile);
+            let _ =
+                ensure_remote_settings_side_effects(cfg, profile, cancel, warmed_auth, boot_wait);
         }
         (false, StartupPrefetch::Ran) => {}
     }
@@ -217,6 +383,8 @@ fn resolve_config(
     auth_manager: &AuthManager,
     pre_gate_prefetch: StartupPrefetch,
     profile: LaunchProfile,
+    cancel: &CancellationToken,
+    boot_wait: Option<&SettingsWait>,
 ) -> AgentConfig {
     let mut cfg = cfg.clone();
     if let Ok(layers) = crate::config::ConfigLayers::load()
@@ -233,7 +401,15 @@ fn resolve_config(
         }
     }
     crate::config::apply_policy(&mut cfg);
-    apply_post_gate_settings(&mut cfg, pre_gate_prefetch, profile);
+    let warmed_auth = auth_manager.current();
+    apply_post_gate_settings(
+        &mut cfg,
+        pre_gate_prefetch,
+        profile,
+        cancel,
+        warmed_auth.as_ref(),
+        boot_wait,
+    );
     crate::util::config::sync_campaign_fields(&mut cfg);
     let has_xai_auth = auth_manager.current().is_some_and(|a| a.is_xai_auth());
     if cfg.storage_mode == StorageMode::Local

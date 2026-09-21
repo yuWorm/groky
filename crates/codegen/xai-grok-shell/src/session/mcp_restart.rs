@@ -112,6 +112,8 @@ pub(crate) enum SkipReason {
     /// A restart task for this server is already in flight ([`RestartActions::begin_restart`] returned `false`).
     /// A second `TransportClosed` / `HandshakeFailed` can arrive while the first respawn is still sleeping or mid-handshake.
     InProgress,
+    /// The server moved on under a newer owner (a sign-in, a fresh init pass, a removal) during the respawn.
+    Superseded,
 }
 
 impl SkipReason {
@@ -121,8 +123,17 @@ impl SkipReason {
             Self::NotConfigured => "not_configured",
             Self::Disabled => "disabled",
             Self::InProgress => "in_progress",
+            Self::Superseded => "superseded",
         }
     }
+}
+
+/// How a respawn ended when it did not fail.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Respawn {
+    Installed,
+    /// The server moved on under a newer owner, which reports its status; nothing was installed.
+    Superseded,
 }
 
 /// The production impl holds `Arc<SessionActor>` (!Send) and the dispatcher's `AcpAgentGatewaySender` (!Send via `acp::AgentSideConnection`).
@@ -140,8 +151,7 @@ pub(crate) trait RestartActions {
 
     /// Drive the handshake to completion, start the liveness watcher, and atomically swap the new `Arc<McpClient>` into `McpState::owned_clients`.
     /// Stdio-only. Callers gate on [`Self::is_stdio_server_configured`]; HTTP / HttpAuth never reach this method.
-    /// The new `Arc<McpClient>` is dropped, `kill_on_drop` SIGKILLs the spawned child, and a "raced with config change" error bubbles up.
-    async fn respawn_stdio(&self, server: &str) -> Result<(), String>;
+    async fn respawn_stdio(&self, server: &str) -> Result<Respawn, String>;
 
     /// Push an already-built `x.ai/mcp/server_status` payload to the pager.
     /// The production impl wraps the dispatcher's gateway sender via [`forward_status`].
@@ -311,7 +321,11 @@ pub(crate) async fn auto_restart_stdio(
         record_attempted(&server, attempt);
 
         match actions.respawn_stdio(&server).await {
-            Ok(()) => {
+            Ok(Respawn::Superseded) => {
+                record_skipped(&server, SkipReason::Superseded);
+                return;
+            }
+            Ok(Respawn::Installed) => {
                 tracing::info!(
                     server = %server,
                     attempt,
@@ -576,7 +590,7 @@ mod tests {
         /// Scripted respawn outcomes, one `pop_front` per attempt.
         /// If the deque empties before the loop completes, attempts past the scripted ones return `Err("not scripted")`.
         /// That surfaces a test bug rather than silently passing.
-        respawn_outcomes: RefCell<std::collections::VecDeque<Result<(), String>>>,
+        respawn_outcomes: RefCell<std::collections::VecDeque<Result<Respawn, String>>>,
         respawn_calls: RefCell<Vec<String>>,
         pushes: RefCell<Vec<McpServerStatusPayload>>,
         /// Servers with an in-flight restart claim (mirrors the production `ShutdownState::in_flight_restart` set).
@@ -605,7 +619,7 @@ mod tests {
         fn mark_shutting_down(&self, name: &str) {
             self.shutting_down.borrow_mut().insert(name.to_string());
         }
-        fn script_outcome(&self, outcome: Result<(), String>) {
+        fn script_outcome(&self, outcome: Result<Respawn, String>) {
             self.respawn_outcomes.borrow_mut().push_back(outcome);
         }
         fn respawn_call_count(&self) -> usize {
@@ -640,7 +654,7 @@ mod tests {
         fn is_in_shutting_down(&self, server: &str) -> bool {
             self.shutting_down.borrow().contains(server)
         }
-        async fn respawn_stdio(&self, server: &str) -> Result<(), String> {
+        async fn respawn_stdio(&self, server: &str) -> Result<Respawn, String> {
             self.respawn_calls.borrow_mut().push(server.to_string());
             self.respawn_outcomes
                 .borrow_mut()
@@ -756,8 +770,11 @@ mod tests {
             );
             let pushes = mock.pushes();
             assert_eq!(pushes.len(), 1);
-            assert_eq!(pushes[0].reason, McpServerStatusReason::Disabled);
-            assert_eq!(pushes[0].status, McpServerStatus::Unavailable);
+            let Some(first) = pushes.first() else {
+                panic!("expected one push: {pushes:?}");
+            };
+            assert_eq!(first.reason, McpServerStatusReason::Disabled);
+            assert_eq!(first.status, McpServerStatus::Unavailable);
         })
         .await;
     }
@@ -785,7 +802,10 @@ mod tests {
             assert_eq!(mock.respawn_call_count(), 0);
             let pushes = mock.pushes();
             assert_eq!(pushes.len(), 1);
-            assert_eq!(pushes[0].reason, McpServerStatusReason::Disabled);
+            assert_eq!(
+                pushes.first().map(|p| p.reason),
+                Some(McpServerStatusReason::Disabled)
+            );
         })
         .await;
     }
@@ -878,7 +898,7 @@ mod tests {
         run_in_local(async {
             let mock = Rc::new(MockActions::new());
             mock.configure("svr");
-            mock.script_outcome(Ok(()));
+            mock.script_outcome(Ok(Respawn::Installed));
             let cancel = tokio_util::sync::CancellationToken::new();
 
             let task = tokio::task::spawn_local(auto_restart_stdio(
@@ -915,7 +935,7 @@ mod tests {
         run_in_local(async {
             let mock = Rc::new(MockActions::new());
             mock.configure("svr");
-            mock.script_outcome(Ok(()));
+            mock.script_outcome(Ok(Respawn::Installed));
 
             let task = tokio::task::spawn_local(auto_restart_stdio(
                 dyn_actions(mock.clone()),
@@ -935,9 +955,42 @@ mod tests {
                 1,
                 "exactly one push per successful restart; got {pushes:?}"
             );
-            assert_eq!(pushes[0].reason, McpServerStatusReason::RestartSucceeded);
-            assert_ne!(pushes[0].reason, McpServerStatusReason::Initialized);
-            assert_eq!(pushes[0].status, McpServerStatus::Ready);
+            let Some(first) = pushes.first() else {
+                panic!("expected one push: {pushes:?}");
+            };
+            assert_eq!(first.reason, McpServerStatusReason::RestartSucceeded);
+            assert_ne!(first.reason, McpServerStatusReason::Initialized);
+            assert_eq!(first.status, McpServerStatus::Ready);
+        })
+        .await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn superseded_respawn_reports_nothing_and_stops() {
+        run_in_local(async {
+            let mock = Rc::new(MockActions::new());
+            mock.configure("svr");
+            mock.script_outcome(Ok(Respawn::Superseded));
+
+            let task = tokio::task::spawn_local(auto_restart_stdio(
+                dyn_actions(mock.clone()),
+                "sess-1".to_string(),
+                "svr".to_string(),
+                never_cancel(),
+            ));
+            tokio::time::advance(StdDuration::from_secs(120)).await;
+            tokio::task::yield_now().await;
+            task.await.unwrap();
+
+            assert_eq!(
+                mock.respawn_call_count(),
+                1,
+                "a newer owner's client is not retried over"
+            );
+            assert!(
+                mock.pushes().is_empty(),
+                "the newer owner reports the server's status, not the respawn"
+            );
         })
         .await;
     }
@@ -975,25 +1028,23 @@ mod tests {
             }
             // Per-attempt details encode their attempt index.
             assert!(
-                pushes[0]
-                    .detail
-                    .as_deref()
-                    .map(|s| s.starts_with("attempt 1 of 3"))
-                    .unwrap_or(false),
+                pushes
+                    .first()
+                    .and_then(|p| p.detail.as_deref())
+                    .is_some_and(|s| s.starts_with("attempt 1 of 3")),
                 "first push detail: {:?}",
-                pushes[0].detail,
+                pushes.first().and_then(|p| p.detail.as_ref()),
             );
             assert!(
-                pushes[2]
-                    .detail
-                    .as_deref()
-                    .map(|s| s.starts_with("attempt 3 of 3"))
-                    .unwrap_or(false),
+                pushes
+                    .get(2)
+                    .and_then(|p| p.detail.as_deref())
+                    .is_some_and(|s| s.starts_with("attempt 3 of 3")),
                 "third push detail: {:?}",
-                pushes[2].detail,
+                pushes.get(2).and_then(|p| p.detail.as_ref()),
             );
             assert_eq!(
-                pushes[3].detail.as_deref(),
+                pushes.get(3).and_then(|p| p.detail.as_deref()),
                 Some("exhausted after 3 attempts"),
             );
         })
@@ -1038,7 +1089,7 @@ mod tests {
         run_in_local(async {
             let mock = Rc::new(MockActions::new());
             mock.configure("svr");
-            mock.script_outcome(Ok(()));
+            mock.script_outcome(Ok(Respawn::Installed));
 
             let task = tokio::task::spawn_local(auto_restart_stdio(
                 dyn_actions(mock.clone()),

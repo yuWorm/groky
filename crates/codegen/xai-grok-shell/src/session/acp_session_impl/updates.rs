@@ -1,13 +1,16 @@
 //! Outbound updates for `SessionActor`: `send_update` and its buffered/transient/direct variants.
 //! Also xAI-notification handling and the gateway-bridge dispatch shims.
 use super::*;
-/// Hook / image-intake diagnostics leave the no-output rewind window open; every other variant closes it.
+/// Hook / image-intake diagnostics and background_tasks snapshots leave the no-output rewind window open; every other variant closes it.
+/// `HookRunStarted` fires for the prompt gate before any output, so a Ctrl+C during a slow gate must still rewind the prompt.
 pub(super) fn closes_cancel_rewind_window(update: &XaiSessionUpdate) -> bool {
     !matches!(
         update,
-        XaiSessionUpdate::HookExecution { .. }
+        XaiSessionUpdate::HookRunStarted { .. }
+            | XaiSessionUpdate::HookExecution { .. }
             | XaiSessionUpdate::ImageCompressed { .. }
             | XaiSessionUpdate::ImageDropped { .. }
+            | XaiSessionUpdate::BackgroundTasks { .. }
     )
 }
 fn scrub_inbound_session_summary(
@@ -439,10 +442,20 @@ impl SessionActor {
                     crate::session::storage::SessionUpdate::Acp(Box::new(notification.clone())),
                 ));
         }
+        let suppress_live_user_echo =
+            matches!(notification.update, acp::SessionUpdate::UserMessageChunk(_))
+                && !self.notifications.live_user_message_echo()
+                && !notification
+                    .meta
+                    .as_ref()
+                    .and_then(|m| m.get("isReplay"))
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
         if self
             .notifications
             .gateway_enabled
             .load(std::sync::atomic::Ordering::Relaxed)
+            && !suppress_live_user_echo
         {
             self.notifications
                 .gateway
@@ -977,7 +990,8 @@ impl SessionActor {
         )
         .await;
     }
-    /// Build the per-response boundary update, projecting the response's usage into the Messages API `message.usage` shape (uncached `input_tokens`).
+    /// Build the per-response boundary update, projecting the response's usage
+    /// into the Messages API `message.usage` shape (uncached `input_tokens`).
     pub(super) fn response_completed_update(
         &self,
         response: &xai_grok_sampling_types::ConversationResponse,
@@ -1108,6 +1122,7 @@ mod xai_event_id_stamping_tests {
                 actor
                     .send_xai_notification(XaiSessionUpdate::HookAnnotation {
                         message: "own emission".into(),
+                        kind: Default::default(),
                     })
                     .await;
                 let own_id = persisted_xai_event_id(&mut prx);
@@ -1117,6 +1132,7 @@ mod xai_event_id_stamping_tests {
                         session_id: acp::SessionId::new("test-actor"),
                         update: XaiSessionUpdate::HookAnnotation {
                             message: "inbound".into(),
+                            kind: Default::default(),
                         },
                         meta: None,
                     })
@@ -1126,6 +1142,7 @@ mod xai_event_id_stamping_tests {
                 assert_ne!(own_id, inbound_id);
                 actor.persist_xai_update_only(XaiSessionUpdate::HookAnnotation {
                     message: "persist-only".into(),
+                    kind: Default::default(),
                 });
                 let persist_only_id = persisted_xai_event_id(&mut prx);
                 assert!(persist_only_id.starts_with("test-actor-"));
@@ -1167,6 +1184,113 @@ mod xai_event_id_stamping_tests {
                     }
                     _ => panic!("expected Acp update"),
                 }
+            })
+            .await;
+    }
+    fn user_chunk_notification(replay: bool) -> acp::SessionNotification {
+        let update = acp::SessionUpdate::UserMessageChunk(acp::ContentChunk::new(
+            acp::ContentBlock::Text(acp::TextContent::new("hi")),
+        ));
+        let n = acp::SessionNotification::new(acp::SessionId::new("test-actor"), update);
+        if replay {
+            n.meta(serde_json::json!({ "isReplay": true }).as_object().cloned())
+        } else {
+            n
+        }
+    }
+    #[tokio::test]
+    async fn live_user_message_chunk_persists_without_forward_when_echo_cap_is_off() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let (gateway_tx, mut gateway_rx) =
+                    tokio::sync::mpsc::unbounded_channel::<xai_acp_lib::AcpClientMessage>();
+                let (persistence_tx, mut prx) =
+                    tokio::sync::mpsc::unbounded_channel::<PersistenceMsg>();
+                let actor = create_test_actor(0, 256_000, 85, gateway_tx, persistence_tx).await;
+                actor
+                    .notifications
+                    .gateway_enabled
+                    .store(true, std::sync::atomic::Ordering::Relaxed);
+                actor
+                    .notifications
+                    .client_caps
+                    .user_message_echo
+                    .store(false, std::sync::atomic::Ordering::Relaxed);
+                actor
+                    .emit_notification_direct(user_chunk_notification(false))
+                    .await;
+                assert!(
+                    matches!(
+                        prx.try_recv(),
+                        Ok(PersistenceMsg::Update(
+                            crate::session::storage::SessionUpdate::Acp(_)
+                        ))
+                    ),
+                    "persist-only echo still writes updates.jsonl"
+                );
+                assert!(
+                    gateway_rx.try_recv().is_err(),
+                    "vanilla ACP clients must not receive a live user-message echo"
+                );
+            })
+            .await;
+    }
+    #[tokio::test]
+    async fn live_user_message_chunk_forwards_when_echo_cap_is_on() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let (gateway_tx, mut gateway_rx) =
+                    tokio::sync::mpsc::unbounded_channel::<xai_acp_lib::AcpClientMessage>();
+                let (persistence_tx, _prx) =
+                    tokio::sync::mpsc::unbounded_channel::<PersistenceMsg>();
+                let actor = create_test_actor(0, 256_000, 85, gateway_tx, persistence_tx).await;
+                actor
+                    .notifications
+                    .gateway_enabled
+                    .store(true, std::sync::atomic::Ordering::Relaxed);
+                actor
+                    .notifications
+                    .client_caps
+                    .user_message_echo
+                    .store(true, std::sync::atomic::Ordering::Relaxed);
+                actor
+                    .emit_notification_direct(user_chunk_notification(false))
+                    .await;
+                assert!(matches!(
+                    gateway_rx.try_recv(),
+                    Ok(xai_acp_lib::AcpClientMessage::SessionNotification(_))
+                ));
+            })
+            .await;
+    }
+    #[tokio::test]
+    async fn replay_user_message_chunk_forwards_when_echo_cap_is_off() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let (gateway_tx, mut gateway_rx) =
+                    tokio::sync::mpsc::unbounded_channel::<xai_acp_lib::AcpClientMessage>();
+                let (persistence_tx, _prx) =
+                    tokio::sync::mpsc::unbounded_channel::<PersistenceMsg>();
+                let actor = create_test_actor(0, 256_000, 85, gateway_tx, persistence_tx).await;
+                actor
+                    .notifications
+                    .gateway_enabled
+                    .store(true, std::sync::atomic::Ordering::Relaxed);
+                actor
+                    .notifications
+                    .client_caps
+                    .user_message_echo
+                    .store(false, std::sync::atomic::Ordering::Relaxed);
+                actor
+                    .emit_notification_direct(user_chunk_notification(true))
+                    .await;
+                assert!(matches!(
+                    gateway_rx.try_recv(),
+                    Ok(xai_acp_lib::AcpClientMessage::SessionNotification(_))
+                ));
             })
             .await;
     }
@@ -1217,7 +1341,10 @@ mod xai_event_id_stamping_tests {
                     }
                 }
                 assert_eq!(queued.len(), 2, "chunk + mode update must be queued");
-                match &queued[1] {
+                let [_, mode_update] = queued.as_slice() else {
+                    panic!("chunk + mode update must be queued: {queued:?}");
+                };
+                match mode_update {
                     SessionNotification::Acp(n) => {
                         assert!(matches!(n.update, acp::SessionUpdate::CurrentModeUpdate(_)));
                         assert!(
@@ -1258,16 +1385,19 @@ mod xai_event_id_stamping_tests {
                     }
                 }
                 assert_eq!(persisted.len(), 2, "both lines must persist on drain");
+                let [chunk, mode] = persisted.as_slice() else {
+                    panic!("both lines must persist on drain: {persisted:?}");
+                };
                 assert!(matches!(
-                    persisted[0].update,
+                    chunk.update,
                     acp::SessionUpdate::AgentMessageChunk(_)
                 ));
                 assert!(matches!(
-                    persisted[1].update,
+                    mode.update,
                     acp::SessionUpdate::CurrentModeUpdate(_)
                 ));
                 assert!(
-                    numeric_seq(&persisted[0]) < numeric_seq(&persisted[1]),
+                    numeric_seq(chunk) < numeric_seq(mode),
                     "delivery order must match id order — the dedup premise"
                 );
                 actor
@@ -1297,7 +1427,10 @@ mod xai_event_id_stamping_tests {
                     }
                 }
                 assert_eq!(queued.len(), 2, "chunk + exit mode update must be queued");
-                match &queued[1] {
+                let [_, mode_update] = queued.as_slice() else {
+                    panic!("chunk + mode update must be queued: {queued:?}");
+                };
+                match mode_update {
                     SessionNotification::Acp(n) => match &n.update {
                         acp::SessionUpdate::CurrentModeUpdate(cmu) => {
                             assert_eq!(
@@ -1332,13 +1465,15 @@ mod xai_event_id_stamping_tests {
                         persisted.push(*n);
                     }
                 }
-                assert_eq!(persisted.len(), 2, "exit leg must persist both lines");
+                let [first, second] = persisted.as_slice() else {
+                    panic!("exit leg must persist both lines: {persisted:?}");
+                };
                 assert!(matches!(
-                    persisted[1].update,
+                    second.update,
                     acp::SessionUpdate::CurrentModeUpdate(_)
                 ));
                 assert!(
-                    numeric_seq(&persisted[0]) < numeric_seq(&persisted[1]),
+                    numeric_seq(first) < numeric_seq(second),
                     "exit-leg delivery order must match id order too"
                 );
             })

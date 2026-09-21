@@ -45,6 +45,10 @@ Location: `~/.grok/config.toml`. If the file is missing, Grok uses its built-in 
 [cli]
 auto_update = true                     # check for updates on launch
 
+[agent]
+# name = "grok-build"                  # default agent on interactive `grok` (no --plan / --agent-profile)
+# definition = "/path/to/agent.md"     # path wins over name if both are set
+
 [models]
 default = "grok-4.5"                   # model used for new sessions
 web_search = "grok-4.5"                # model used by the web_search tool
@@ -113,6 +117,18 @@ respect_gitignore = false              # default: false; set true to make every 
 # max_parallel_image_gen_calls = 8
 # max_parallel_video_gen_calls = 4
 ```
+
+### Default agent
+
+Interactive `grok` uses `[agent]` in `config.toml` when you do not pass `--plan`, `--ask-user`, or `--agent-profile`:
+
+```toml
+[agent]
+name = "my-custom-agent"
+# definition = "/path/to/agent.md"   # path wins over name
+```
+
+`definition` is a markdown file with YAML frontmatter. `name` is a built-in or discovered agent (`~/.grok/agents/`, `.grok/agents/`). If the named agent is missing, Grok uses `GROK_AGENT`, then the built-in default. `--agent-profile`, `--plan`, and `--ask-user` still override that session. Field list: [26-config-reference.md](26-config-reference.md).
 
 #### Input mode
 
@@ -311,11 +327,14 @@ Priority for `[mcp_servers]` and `[plugins]`: `.grok/config.toml` (current dir) 
 
 ### Memory
 
-Persist knowledge across sessions. Enable memory with `GROK_MEMORY=1`, `[memory] enabled = true`, or managed remote settings.
+Persist knowledge across sessions. Enable it with `[memory] enabled = true` or
+`GROK_MEMORY=1`; an explicit `[memory] enabled = false` turns it off even when a
+managed remote setting enables it. Notes recorded by earlier versions are
+carried over automatically. See [13-memory.md](13-memory.md).
 
 ```toml
 [memory]
-enabled = false                       # enable memory
+enabled = true
 
 [memory.session]
 save_on_end = true                    # write metadata summary on session end
@@ -834,6 +853,14 @@ The key ones. See the README for the complete list.
 | `.grok/agents/` | Project-scoped agent definitions |
 | `.grok/hooks/` | Project-scoped hooks |
 | `.grok/lsp.json` | LSP server configuration |
+
+### How Grok saves `config.toml`
+
+Writes to **`~/.grok/config.toml`** (`/settings`, `/vim-mode`, and other user-config saves) follow a leaf symlink. The atomic rename writes the referent (a file in your dotfiles repo). The link stays a link. If the link is dangling, the write creates the referent as a regular file.
+
+Writes to a **project** `.grok/config.toml` (MCP / plugin / permission edits) **replace** a leaf symlink with a regular file. That keeps a later save from following the link out of the repository.
+
+A user `config.toml` that cannot be parsed is not overwritten. Fix the syntax (or restore a backup) and save again.
 
 ---
 

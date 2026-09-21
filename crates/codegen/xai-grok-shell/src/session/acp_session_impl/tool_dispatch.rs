@@ -26,7 +26,7 @@ pub(super) async fn dispatch_tool(
     workspace_ops
         .call_tool(
             &prepared.tool_name,
-            prepared.parsed_args.clone(),
+            prepared.execution_arguments().clone(),
             &prepared.tool_call_id.0,
             Some(session_id),
         )
@@ -166,19 +166,8 @@ pub(super) fn resolve_session_shell() -> String {
 pub(crate) const HTTP_STATUS_DETAILS_KEY: &str = "status";
 
 impl SessionActor {
-    /// Extract the bash command from the prompt blocks if present in meta.
-    /// Returns Some(command) if the prompt is a direct bash command, None otherwise.
     pub(super) fn extract_bash_command(prompt_blocks: &[acp::ContentBlock]) -> Option<String> {
-        use crate::extensions::prompt_meta::PromptBlockMeta;
-        for block in prompt_blocks {
-            if let acp::ContentBlock::Text(text) = block
-                && let Some(meta_val) = &text.meta
-                && let Some(meta) = PromptBlockMeta::from_value(meta_val)
-            {
-                return meta.bash_command;
-            }
-        }
-        None
+        crate::extensions::prompt_meta::PromptBlockMeta::command_in(prompt_blocks)
     }
 
     /// Handle a direct bash command from bash mode.
@@ -288,31 +277,19 @@ impl SessionActor {
             Err(e) => (format!("Error running command: {}", e), -1, false, None),
         };
 
-        // Create final summary with last N lines
-        // Format: "... (X lines)\nlast\nfew\nlines"
-        let lines: Vec<&str> = output.lines().collect();
+        // Full stdout for the TUI; prompt/history keep a last-N tail so dumps do not inflate the next turn
+        let full_output = output.trim_end().to_string();
+        let lines: Vec<&str> = full_output.lines().collect();
         let total_lines = lines.len();
-        let displayed_output = if total_lines > BASH_MODE_FINAL_OUTPUT_LINES {
+        let history_output = if total_lines > BASH_MODE_FINAL_OUTPUT_LINES {
             let start = total_lines - BASH_MODE_FINAL_OUTPUT_LINES;
-            let last_lines = lines[start..].join("\n");
+            let last_lines = lines.get(start..).unwrap_or(&[]).join("\n");
             format!("... ({} lines)\n{}", total_lines, last_lines)
         } else {
-            output.trim_end().to_string()
+            full_output.clone()
         };
 
         let is_backgrounded = signal.as_deref() == Some("backgrounded");
-
-        // Build the final response text with output summary and exit code
-        let mut response_text = displayed_output.clone();
-        if is_backgrounded {
-            response_text.push_str("\n\n[command running in background]");
-        } else if timed_out {
-            response_text.push_str("\n\n[command timed out]");
-        } else if let Some(ref sig) = signal {
-            response_text.push_str(&format!("\n\n[killed by signal {}]", sig));
-        } else {
-            response_text.push_str(&format!("\n\n[exit code: {}]", exit_code));
-        }
 
         // Send final tool call update
         // For backgrounded commands, don't mark as completed/failed; let the background task do that
@@ -323,17 +300,17 @@ impl SessionActor {
                 acp::ToolCallStatus::Failed
             };
             let bash_output = BashOutput {
-                output_for_prompt: BashOutput::make_output_for_prompt(&displayed_output),
-                output: displayed_output.as_bytes().to_vec(),
+                output_for_prompt: BashOutput::make_output_for_prompt(&history_output),
+                output: full_output.as_bytes().to_vec(),
                 exit_code,
                 command: command.clone(),
-                truncated: total_lines > BASH_MODE_FINAL_OUTPUT_LINES,
+                truncated: false,
                 signal: signal.clone(),
                 timed_out,
                 description: None,
                 current_dir: self.tool_context.cwd.to_string(),
                 output_file: String::new(),
-                total_bytes: displayed_output.len(),
+                total_bytes: full_output.len(),
                 output_delta: None,
                 was_bare_echo: false,
             };
@@ -355,7 +332,7 @@ impl SessionActor {
         // Build a single user message for chat history that includes command, output, and exit code
         let user_message = format!(
             "I executed a terminal command: `{}`\n\nOutput:\n```\n{}\n```\n\n[exit code: {}]",
-            command, displayed_output, exit_code
+            command, history_output, exit_code
         );
 
         // Add to chat history as a user message only
@@ -440,7 +417,13 @@ mod tests {
     #[test]
     fn backend_failed_web_search_maps_to_failed_status() {
         let failed = web_search_payload(rs::WebSearchToolCallStatus::Failed);
-        assert_eq!(failed["status"], "failed", "wire field name is `status`");
+        assert_eq!(
+            failed
+                .pointer("/status")
+                .unwrap_or(&serde_json::Value::Null),
+            "failed",
+            "wire field name is `status`"
+        );
         assert_eq!(
             backend_tool_call_status(Some(&failed)),
             acp::ToolCallStatus::Failed

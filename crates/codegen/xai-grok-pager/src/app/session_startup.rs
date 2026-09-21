@@ -8,7 +8,14 @@ pub(crate) fn stamp_phase_traceparent(meta: &mut Option<agent_client_protocol::M
     let Some(span) = xai_grok_telemetry::startup::current_phase_span() else {
         return;
     };
-    if let Some(tp) = xai_grok_otel::traceparent_of_span(&span) {
+    stamp_span_traceparent(meta, &span);
+}
+/// Stamp `span`'s traceparent into `meta` so the agent-side leg of the send nests under `span`.
+pub(crate) fn stamp_span_traceparent(
+    meta: &mut Option<agent_client_protocol::Meta>,
+    span: &tracing::Span,
+) {
+    if let Some(tp) = xai_grok_otel::traceparent_of_span(span) {
         meta.get_or_insert_with(agent_client_protocol::Meta::new)
             .insert("traceparent".into(), serde_json::Value::String(tp));
     }
@@ -90,11 +97,19 @@ pub fn fork_session_params(
         "newCwd": parent_cwd_str.clone(),
         "sessionKind": "fork",
     });
-    if let Some(nid) = new_session_id {
-        payload["newSessionId"] = serde_json::Value::String(nid.to_string());
-    }
-    if parent_is_worktree {
-        payload["sourceWorkspaceDir"] = serde_json::Value::String(parent_cwd_str);
+    if let Some(obj) = payload.as_object_mut() {
+        if let Some(nid) = new_session_id {
+            obj.insert(
+                "newSessionId".into(),
+                serde_json::Value::String(nid.to_string()),
+            );
+        }
+        if parent_is_worktree {
+            obj.insert(
+                "sourceWorkspaceDir".into(),
+                serde_json::Value::String(parent_cwd_str),
+            );
+        }
     }
     payload
 }
@@ -1325,8 +1340,33 @@ async fn resolve_session_by_title(
 mod tests {
     use super::*;
     use clap::Parser;
+    fn j<'a>(v: &'a serde_json::Value, key: &str) -> &'a serde_json::Value {
+        let Some(got) = v.get(key) else {
+            panic!("missing json key {key}: {v}");
+        };
+        got
+    }
     fn parse(args: &[&str]) -> PagerArgs {
         PagerArgs::try_parse_from(args).unwrap()
+    }
+    #[test]
+    fn traceparent_of_span_captures_own_span_id_not_parent() {
+        let _guard = xai_grok_otel::set_local_trace_subscriber();
+        let parent = tracing::info_span!("startup");
+        let _entered = parent.enter();
+        let child = tracing::info_span!("startup.session_create.backend_rpc");
+        let mut meta: Option<agent_client_protocol::Meta> = None;
+        stamp_span_traceparent(&mut meta, &child);
+        let stamped = meta
+            .as_ref()
+            .and_then(|m| m.get("traceparent"))
+            .and_then(serde_json::Value::as_str)
+            .expect("stamp_span_traceparent writes a traceparent");
+        let span_id = |tp: &str| tp.split('-').nth(2).unwrap().to_owned();
+        let child_own = xai_grok_otel::traceparent_of_span(&child).expect("child traceparent");
+        let parent_own = xai_grok_otel::traceparent_of_span(&parent).expect("parent traceparent");
+        assert_eq!(span_id(stamped), span_id(&child_own));
+        assert_ne!(span_id(stamped), span_id(&parent_own));
     }
     #[test]
     fn parent_session_is_worktree_detects_standalone_marker() {
@@ -1613,11 +1653,11 @@ mod tests {
     fn fork_session_params_sets_new_session_id_and_workspace_dir() {
         let cwd = PathBuf::from("/wt");
         let p = fork_session_params("parent-1", &cwd, Some("child-uuid"), true);
-        assert_eq!(p["sourceSessionId"], "parent-1");
-        assert_eq!(p["newCwd"], "/wt");
-        assert_eq!(p["newSessionId"], "child-uuid");
-        assert_eq!(p["sourceWorkspaceDir"], "/wt");
-        assert_eq!(p["sessionKind"], "fork");
+        assert_eq!(j(&p, "sourceSessionId"), "parent-1");
+        assert_eq!(j(&p, "newCwd"), "/wt");
+        assert_eq!(j(&p, "newSessionId"), "child-uuid");
+        assert_eq!(j(&p, "sourceWorkspaceDir"), "/wt");
+        assert_eq!(j(&p, "sessionKind"), "fork");
     }
     #[test]
     fn fork_session_params_omits_workspace_dir_when_not_worktree() {
@@ -1696,6 +1736,92 @@ mod tests {
     }
     #[serial_test::serial(GROK_HOME)]
     #[tokio::test]
+    async fn continue_skips_empty_worktree_stamped_husk() {
+        let mut fx = crate::test_util::GrokHomeFixture::new();
+        let cwd = fx.cwd_str();
+        let real_id = "aaaaaaaa-1111-2222-3333-444444444444";
+        let husk_id = "bbbbbbbb-1111-2222-3333-444444444444";
+        fx.write_summary(
+            &cwd,
+            real_id,
+            serde_json::json!({
+                "updated_at": "2026-07-01T00:00:00Z",
+                "generated_title": "real work",
+                "num_messages": 3,
+            }),
+        );
+        fx.write_summary(
+            &cwd,
+            husk_id,
+            serde_json::json!({
+                "updated_at": "2026-07-02T00:00:00Z",
+                "session_kind": "worktree",
+                "worktree_label": "fix-bug",
+                "num_messages": 0,
+                "session_summary": "",
+            }),
+        );
+        let args = parse(&["grok", "-c"]);
+        let result = materialize_startup_for_cwd(
+            MaterializeCtx::from_pager_args(&args),
+            args.session_startup_intent().unwrap(),
+            &cwd,
+        )
+        .await
+        .unwrap();
+        match result {
+            MaterializedStartup::Resume { session_id, .. } => {
+                assert_eq!(session_id, real_id)
+            }
+            other => panic!("expected Resume of the prior session, got {other:?}"),
+        }
+    }
+    #[serial_test::serial(GROK_HOME)]
+    #[tokio::test]
+    async fn continue_keeps_empty_worktree_fork() {
+        let mut fx = crate::test_util::GrokHomeFixture::new();
+        let cwd = fx.cwd_str();
+        let older_id = "aaaaaaaa-1111-2222-3333-444444444444";
+        let fork_id = "bbbbbbbb-1111-2222-3333-444444444444";
+        fx.write_summary(
+            &cwd,
+            older_id,
+            serde_json::json!({
+                "updated_at": "2026-07-01T00:00:00Z",
+                "generated_title": "older",
+                "num_messages": 3,
+            }),
+        );
+        fx.write_summary(
+            &cwd,
+            fork_id,
+            serde_json::json!({
+                "updated_at": "2026-07-02T00:00:00Z",
+                "session_kind": "worktree",
+                "worktree_label": "fix-bug",
+                "parent_session_id": older_id,
+                "forked_at": "2026-07-02T00:00:00Z",
+                "num_messages": 0,
+                "session_summary": "",
+            }),
+        );
+        let args = parse(&["grok", "-c"]);
+        let result = materialize_startup_for_cwd(
+            MaterializeCtx::from_pager_args(&args),
+            args.session_startup_intent().unwrap(),
+            &cwd,
+        )
+        .await
+        .unwrap();
+        match result {
+            MaterializedStartup::Resume { session_id, .. } => {
+                assert_eq!(session_id, fork_id)
+            }
+            other => panic!("expected Resume of the empty worktree fork, got {other:?}"),
+        }
+    }
+    #[serial_test::serial(GROK_HOME)]
+    #[tokio::test]
     async fn most_recent_fork_selection_follows_surface() {
         let mut fx = crate::test_util::GrokHomeFixture::new();
         let cwd = fx.cwd_str();
@@ -1715,9 +1841,9 @@ mod tests {
             }),
         );
         for (args, expected_parent) in [
-            (&["grok", "-c", "--fork-session"][..], interactive_id),
+            (["grok", "-c", "--fork-session"].as_slice(), interactive_id),
             (
-                &["grok", "-p", "run", "-c", "--fork-session"][..],
+                ["grok", "-p", "run", "-c", "--fork-session"].as_slice(),
                 headless_id,
             ),
         ] {
@@ -1987,7 +2113,7 @@ mod tests {
     #[tokio::test]
     async fn remote_miss_worktree_without_restore_code_suppresses_snapshot() {
         let _fx = crate::test_util::GrokHomeFixture::new();
-        let id = "no such remote target";
+        let id = "99999999-9999-4999-8999-999999999998";
         let out = materialize_startup_for_cwd(
             remote_miss_ctx(false, true),
             SessionStartupIntent::Resume {
@@ -2002,10 +2128,15 @@ mod tests {
             MaterializedStartup::Resume {
                 session_id,
                 suppress_code_restore,
+                deferred_local_miss,
                 ..
             } => {
                 assert_eq!(session_id, id);
                 assert!(suppress_code_restore);
+                assert!(
+                    !deferred_local_miss,
+                    "uuid miss under worktree is not a title miss"
+                );
             }
             other => panic!("expected Resume, got {other:?}"),
         }

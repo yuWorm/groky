@@ -71,7 +71,7 @@ pub trait BtrfsDelegate: Send + Sync {
 }
 
 /// How to treat the source working tree when creating the destination worktree.
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum WorkingTreeMode {
     /// Replicate the working tree exactly as-is (including local modifications and untracked files).
     #[default]
@@ -177,7 +177,6 @@ pub struct WorktreeReport {
     pub strategy_metadata: Option<serde_json::Value>,
     /// Arms that declined before the one that ran.
     pub skipped: Vec<crate::ArmSkip>,
-    /// Grove daemon capability class: `current`, `old`, or `unknown`.
     pub daemon_capability_class: Option<&'static str>,
 }
 
@@ -203,6 +202,9 @@ pub struct WorktreeBuilder {
     worktree_id: Option<String>,
     #[cfg(feature = "metadata")]
     metadata: Option<serde_json::Value>,
+    /// Grok home whose `worktrees.db` receives the record; the resolved home when `None`.
+    #[cfg(feature = "metadata")]
+    registry_home: Option<PathBuf>,
     nfs: Option<NfsWorktreeOpts>,
 }
 
@@ -241,6 +243,8 @@ impl WorktreeBuilder {
             worktree_id: None,
             #[cfg(feature = "metadata")]
             metadata: None,
+            #[cfg(feature = "metadata")]
+            registry_home: None,
             nfs: None,
         }
     }
@@ -314,6 +318,14 @@ impl WorktreeBuilder {
         self
     }
 
+    /// Register the worktree in `<registry_home>/worktrees.db` instead of the
+    /// DB under the resolved grok home, for callers that inject their grok home.
+    #[cfg(feature = "metadata")]
+    pub fn registry_home(mut self, registry_home: impl Into<PathBuf>) -> Self {
+        self.registry_home = Some(registry_home.into());
+        self
+    }
+
     /// Shorthand for `.creation_mode(CreationMode::Standalone)`.
     pub fn standalone(mut self, standalone: bool) -> Self {
         if standalone {
@@ -380,6 +392,7 @@ impl WorktreeBuilder {
             self.source.clone(),
             self.git_ref.clone(),
             self.metadata,
+            self.registry_home,
         );
 
         let plan = crate::worktree::WorktreePlan {
@@ -402,12 +415,14 @@ impl WorktreeBuilder {
 
         #[cfg(feature = "metadata")]
         {
-            let (kind, session_id, wt_id, source, git_ref, mut metadata) = meta_fields;
+            let (kind, session_id, wt_id, source, git_ref, mut metadata, registry_home) =
+                meta_fields;
             if let Some(kind) = kind {
                 if let Some(sm) = result.strategy_metadata.clone() {
                     metadata = Some(merge_strategy_metadata(metadata, sm));
                 }
                 register_worktree(
+                    registry_home.as_deref(),
                     &result.worktree_path,
                     &source,
                     kind,
@@ -1355,6 +1370,7 @@ fn cleanup_orphaned_btrfs_snapshots_inner(
 
 #[cfg(feature = "metadata")]
 pub(crate) fn register_worktree(
+    registry_home: Option<&std::path::Path>,
     worktree_path: &std::path::Path,
     source: &std::path::Path,
     kind: crate::db::WorktreeKind,
@@ -1367,7 +1383,11 @@ pub(crate) fn register_worktree(
 ) {
     use crate::db;
 
-    let db = match db::WorktreeDb::open_default() {
+    let opened = match registry_home {
+        Some(home) => db::WorktreeDb::open(home),
+        None => db::WorktreeDb::open_default(),
+    };
+    let db = match opened {
         Ok(db) => db,
         Err(e) => {
             tracing::warn!(error = %e, "failed to open worktree DB for registration");

@@ -184,9 +184,22 @@ impl BlockContent for OtherToolCallBlock {
                 let keep = max_w.saturating_sub(3) / 2;
                 let end_keep = max_w.saturating_sub(3) - keep;
                 let chars: Vec<char> = path_str.chars().collect();
-                let head: String = chars[..keep].iter().collect();
-                let tail: String = chars[chars.len() - end_keep..].iter().collect();
-                format!("{head}...{tail}")
+                match (
+                    chars.get(..keep),
+                    chars
+                        .len()
+                        .checked_sub(end_keep)
+                        .and_then(|i| chars.get(i..)),
+                ) {
+                    (Some(head), Some(tail)) => {
+                        format!(
+                            "{}...{}",
+                            head.iter().collect::<String>(),
+                            tail.iter().collect::<String>()
+                        )
+                    }
+                    _ => path_str,
+                }
             } else {
                 path_str
             };
@@ -278,6 +291,22 @@ impl BlockContent for OtherToolCallBlock {
                     }
                 }
 
+                if let Some(error) = &self.error {
+                    lines.push(Line::from("").into());
+                    let styled: Vec<Line<'static>> = error
+                        .lines()
+                        .map(|line| {
+                            Line::from(Span::styled(
+                                format!("  {line}"),
+                                theme.fg(theme.accent_error),
+                            ))
+                        })
+                        .collect();
+                    for wrapped in word_wrap_lines(styled, width.saturating_sub(2).max(20)) {
+                        lines.push(BlockLine::styled(wrapped));
+                    }
+                }
+
                 BlockOutput { lines }
             }
         }
@@ -323,11 +352,7 @@ impl BlockContent for OtherToolCallBlock {
     }
 
     fn is_foldable(&self) -> bool {
-        // Not foldable if failed
-        if self.error.is_some() {
-            return false;
-        }
-        self.output.is_some()
+        self.output.is_some() || self.error.is_some()
     }
 
     fn default_display_mode(&self) -> DisplayMode {
@@ -430,19 +455,31 @@ fn parse_ask_user_qa_pairs(output: &str) -> Vec<(String, String)> {
             if !remaining.starts_with('"') {
                 break;
             }
-            remaining = &remaining[1..]; // skip opening "
+            let Some(rest) = remaining.get(1..) else {
+                break;
+            };
+            remaining = rest;
 
             // Find the closing " before =
             let Some(q_end) = remaining.find("\"=\"") else {
                 break;
             };
-            let question = remaining[..q_end].to_string();
-            remaining = &remaining[q_end + 3..]; // skip "="
+            let Some(question) = remaining.get(..q_end) else {
+                break;
+            };
+            let question = question.to_string();
+            let Some(rest) = remaining.get(q_end + 3..) else {
+                break;
+            };
+            remaining = rest;
 
             // Find the end of the answer: the next `", "` pair start, or end of string
             let answer_end = remaining.find(", \"").unwrap_or(remaining.len());
 
-            let mut answer_text = remaining[..answer_end].to_string();
+            let Some(answer_text) = remaining.get(..answer_end) else {
+                break;
+            };
+            let mut answer_text = answer_text.to_string();
             // Strip trailing quote if present (answer is quoted)
             if answer_text.ends_with('"') {
                 answer_text.pop();
@@ -459,9 +496,15 @@ fn parse_ask_user_qa_pairs(output: &str) -> Vec<(String, String)> {
             pairs.push((question, answer_text));
 
             // Advance past the separator
-            remaining = &remaining[answer_end..];
+            let Some(rest) = remaining.get(answer_end..) else {
+                break;
+            };
+            remaining = rest;
             if remaining.starts_with(", ") {
-                remaining = &remaining[2..];
+                let Some(rest) = remaining.get(2..) else {
+                    break;
+                };
+                remaining = rest;
             }
         }
 
@@ -480,12 +523,17 @@ fn parse_ask_user_qa_pairs(output: &str) -> Vec<(String, String)> {
         let lines: Vec<&str> = output.lines().collect();
         let mut i = 0;
         while i < lines.len() {
-            let line = lines[i].trim_start_matches([' ', '-']).trim();
+            let Some(line) = lines.get(i) else { break };
+            let line = line.trim_start_matches([' ', '-']).trim();
             // Check for "question text"
             if line.starts_with('"') && line.ends_with('"') {
-                let question = line[1..line.len() - 1].to_string();
-                let answer = if i + 1 < lines.len() {
-                    let next = lines[i + 1].trim();
+                let Some(inner) = line.len().checked_sub(1).and_then(|end| line.get(1..end)) else {
+                    i += 1;
+                    continue;
+                };
+                let question = inner.to_string();
+                let answer = if let Some(next) = lines.get(i + 1) {
+                    let next = next.trim();
                     if let Some(a) = next.strip_prefix("Answer: ") {
                         i += 1;
                         a.to_string()
@@ -509,3 +557,7 @@ fn parse_ask_user_qa_pairs(output: &str) -> Vec<(String, String)> {
 
     vec![]
 }
+
+#[cfg(test)]
+#[path = "other_tests.rs"]
+mod tests;

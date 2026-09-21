@@ -5,6 +5,8 @@
 //! On macOS and Linux the mic is opened in a short-lived subprocess, so the long-lived TUI never pays the audio stack's permanent memory cost.
 //! See [`audio`] and [`maybe_run_capture_subprocess`].
 
+#![deny(clippy::indexing_slicing)]
+
 #[cfg(feature = "audio")]
 pub mod audio;
 pub mod auth;
@@ -16,7 +18,7 @@ pub mod pipeline;
 pub mod probe;
 pub mod stt;
 
-pub use auth::{SharedVoiceAuth, StaticVoiceAuth, VoiceAuthProvider};
+pub use auth::{SharedVoiceAuth, StaticVoiceAuth, VoiceAuthError, VoiceAuthProvider};
 pub use config::VoiceConfig;
 pub use error::VoiceError;
 pub use event::VoiceEvent;

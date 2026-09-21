@@ -100,9 +100,8 @@ pub struct PeekPanelState {
     pub auto_approve: bool,
     /// Whether the peeked agent is in Auto (LLM classifier) mode. Shown as an `auto` flag (mutually exclusive with `always-approve`; yolo wins).
     pub auto: bool,
-    /// Whether the peeked agent is in plan mode. Set live by the render-time refresh.
-    /// Shown as a `plan` flag on the bottom border (so the Shift+Tab mode cycle's three states are all visible).
-    pub plan_mode: bool,
+    /// Session-mode flag on the bottom border (`plan`, `ask`). `None` in the default mode.
+    pub mode_label: Option<&'static str>,
 }
 
 impl PeekPanelState {
@@ -126,7 +125,7 @@ impl PeekPanelState {
             model_name: None,
             auto_approve: false,
             auto: false,
-            plan_mode: false,
+            mode_label: None,
         }
     }
 
@@ -207,7 +206,12 @@ pub fn compute_peek_fields(
                         .bash_highlights
                         .as_ref()
                         .filter(|_| p.bash_deny_selection_count > 0)
-                        .map(|h| h.highlighted_words[..p.bash_deny_selection_count].join(" "));
+                        .map(|h| {
+                            h.highlighted_words
+                                .get(..p.bash_deny_selection_count)
+                                .unwrap_or(&[])
+                                .join(" ")
+                        });
                     let opts = p
                         .options
                         .iter()
@@ -295,12 +299,11 @@ pub fn compute_peek_fields(
                 let (l, _) = crate::app::subagent::format_subagent_label(info);
                 sanitize_display_text(&l).into_owned()
             };
-            // `subagent_views` holds `Box<AgentView>`; the closures let deref coercion turn `&Box<AgentView>` into `&AgentView`
-            let child = parent_agent.subagent_views.get(child_session_id);
+            let child = parent_agent.subagent_view(child_session_id);
             let response_type = child
-                .map(|c| extract_last_response_type(c))
+                .map(extract_last_response_type)
                 .unwrap_or_else(|| "Subagent".to_string());
-            let last_user_message = child.and_then(|c| extract_last_user_message(c));
+            let last_user_message = child.and_then(extract_last_user_message);
             let time_ago = crate::util::format_time_ago(info.attempt.last_progress_at.elapsed());
             Some(PeekFields {
                 label,
@@ -319,14 +322,13 @@ pub fn compute_peek_fields(
     }
 }
 
-/// The peeked row's live config-badge state for the peek box's bottom border:
-/// model display name, always-approve (yolo), auto (classifier) mode, and plan mode.
-/// Named fields so the three adjacent bools can't be transposed at a call/return site.
+/// Live config-badge state for the peek box bottom border.
+/// Named fields so adjacent flags can't be transposed at a call site.
 pub struct PeekModeBadge {
     pub model: Option<String>,
     pub yolo: bool,
     pub auto: bool,
-    pub plan: bool,
+    pub mode_label: Option<&'static str>,
 }
 
 /// The peeked row's current config-badge state. Sourced live (not via [`PeekFields`]) so it always
@@ -340,20 +342,16 @@ pub fn peek_model_and_mode(
         model: None,
         yolo: false,
         auto: false,
-        plan: false,
+        mode_label: None,
     };
     match row {
         DashboardRowId::TopLevel(id) => match agents.get(id) {
-            Some(agent) => {
-                // Prefer the optimistic pending plan state over the confirmed one (matches `dispatch_cycle_mode`)
-                let plan = agent.plan_mode_pending.unwrap_or(agent.plan_mode_active);
-                PeekModeBadge {
-                    model: agent.session.models.current_model_name(),
-                    yolo: agent.session.yolo_mode,
-                    auto: agent.session.is_auto(),
-                    plan,
-                }
-            }
+            Some(agent) => PeekModeBadge {
+                model: agent.session.models.current_model_name(),
+                yolo: agent.session.yolo_mode,
+                auto: agent.session.is_auto(),
+                mode_label: agent.prompt_row_mode_label(),
+            },
             None => default(),
         },
         DashboardRowId::Subagent {
@@ -362,17 +360,14 @@ pub fn peek_model_and_mode(
         } => match agents.get(parent) {
             Some(parent_agent) => {
                 let model = parent_agent
-                    .subagent_views
-                    .get(child_session_id)
+                    .subagent_view(child_session_id)
                     .and_then(|c| c.session.models.current_model_name())
                     .or_else(|| parent_agent.session.models.current_model_name());
-                // Auto (like always-approve) follows the parent: subagents run under the parent's permission mode
-                // Plan stays false (subagents have no plan mode of their own)
                 PeekModeBadge {
                     model,
                     yolo: parent_agent.session.yolo_mode,
                     auto: parent_agent.session.is_auto(),
-                    plan: false,
+                    mode_label: None,
                 }
             }
             None => default(),
@@ -416,7 +411,7 @@ fn paint_peek_config_badge(
     } else {
         PermissionLabel::Ask
     };
-    let flags = mode_flags(panel.plan_mode.then_some("plan"), permission, theme);
+    let flags = mode_flags(panel.mode_label, permission, theme);
     if model_label.is_empty() && flags.is_empty() && !multiline {
         return;
     }
@@ -797,8 +792,6 @@ pub fn extract_last_response_type(agent: &AgentView) -> String {
                     ToolCallBlock::SentMessage(_) => Some("Message"),
                     ToolCallBlock::Skill(_) => Some("Skill"),
                     ToolCallBlock::Other(_) => Some("Tool"),
-                    // Lifecycle events aren't real tool calls; keep scanning
-                    ToolCallBlock::Lifecycle(_) => None,
                 };
                 if let Some(label) = label {
                     return label.to_string();
@@ -812,7 +805,10 @@ pub fn extract_last_response_type(agent: &AgentView) -> String {
             // The user's latest input marks the turn boundary; there's no agent response after it yet
             RenderBlock::UserPrompt(_) => break,
             // Structural blocks carry no response type; keep scanning
-            RenderBlock::System(_) | RenderBlock::SessionEvent(_) | RenderBlock::Stub(_) => {}
+            RenderBlock::System(_)
+            | RenderBlock::SessionEvent(_)
+            | RenderBlock::MemoryCapture(_)
+            | RenderBlock::Stub(_) => {}
         }
     }
     if running {
@@ -901,6 +897,7 @@ fn block_short_text(block: &crate::scrollback::block::RenderBlock) -> Option<Str
         RenderBlock::Workflow(_) => Some("(workflow)".to_string()),
         RenderBlock::Btw(_) => Some("(btw)".to_string()),
         RenderBlock::ContextInfo(_) => Some("(context info)".to_string()),
+        RenderBlock::MemoryCapture(_) => Some("(memory capture)".to_string()),
         RenderBlock::Stub(_) => None,
     }
 }
@@ -1017,7 +1014,9 @@ mod tests {
         let mut content = String::new();
         for y in 0..buf.area.height {
             for x in 0..buf.area.width {
-                content.push_str(buf[(x, y)].symbol());
+                if let Some(cell) = buf.cell((x, y)) {
+                    content.push_str(cell.symbol());
+                }
             }
             content.push('\n');
         }
@@ -1058,18 +1057,26 @@ mod tests {
         };
         // Inner content sits two cells in (1 border, 1 pad inset): status at (2,1)
         let working = render("Working");
-        assert_eq!(working[(2, 1)].symbol(), "W", "status label is `Working`");
         assert_eq!(
-            working[(2, 1)].fg,
-            theme.text_secondary,
+            working.cell((2, 1)).map(|c| c.symbol()),
+            Some("W"),
+            "status label is `Working`"
+        );
+        assert_eq!(
+            working.cell((2, 1)).map(|c| c.fg),
+            Some(theme.text_secondary),
             "the `Working` status must render in the secondary colour",
         );
 
         let idle = render("Response");
-        assert_eq!(idle[(2, 1)].symbol(), "R", "status label is `Response`");
         assert_eq!(
-            idle[(2, 1)].fg,
-            theme.gray_dim,
+            idle.cell((2, 1)).map(|c| c.symbol()),
+            Some("R"),
+            "status label is `Response`"
+        );
+        assert_eq!(
+            idle.cell((2, 1)).map(|c| c.fg),
+            Some(theme.gray_dim),
             "a non-working status stays dim chrome",
         );
     }
@@ -1099,7 +1106,7 @@ mod tests {
                 None,
             );
             (0..80)
-                .map(|x| buf[(x, h - 1)].symbol().to_string())
+                .filter_map(|x| buf.cell((x, h - 1)).map(|c| c.symbol().to_string()))
                 .collect()
         };
 
@@ -1149,7 +1156,7 @@ mod tests {
         let mut planp =
             PeekPanelState::new(DashboardRowId::TopLevel(AgentId(0)), fields("Response"));
         planp.model_name = Some("Grok 4 Fast".to_string());
-        planp.plan_mode = true;
+        planp.mode_label = Some("plan");
         let plan_bottom = badge_row(&planp, 6);
         assert!(
             plan_bottom.contains("plan"),
@@ -1171,7 +1178,7 @@ mod tests {
             "plan must not hide auto: {plan_auto_bottom:?}",
         );
 
-        planp.plan_mode = false;
+        planp.mode_label = None;
         planp.auto_approve = true;
         let yolo_bottom = badge_row(&planp, 6);
         assert!(
@@ -1205,14 +1212,14 @@ mod tests {
         );
         // Badge `" ● rec "` starts at x = area.x + 2, so the dot is at x = 3.
         assert_eq!(
-            buf[(3, 0)].symbol(),
-            "\u{25CF}",
+            buf.cell((3, 0)).map(|c| c.symbol()),
+            Some("\u{25CF}"),
             "record dot must paint on the peek top border while listening"
         );
         // The interim transcript renders somewhere in the box body.
         let body: String = (0..6)
             .flat_map(|y| (0..80).map(move |x| (x, y)))
-            .map(|(x, y)| buf[(x, y)].symbol().to_string())
+            .filter_map(|(x, y)| buf.cell((x, y)).map(|c| c.symbol().to_string()))
             .collect();
         assert!(
             body.contains("hello there"),
@@ -1276,7 +1283,9 @@ mod tests {
         let mut content = String::new();
         for y in 0..buf.area.height {
             for x in 0..buf.area.width {
-                content.push_str(buf[(x, y)].symbol());
+                if let Some(cell) = buf.cell((x, y)) {
+                    content.push_str(cell.symbol());
+                }
             }
             content.push('\n');
         }
@@ -1340,7 +1349,9 @@ mod tests {
         let mut content = String::new();
         for y in 0..buf.area.height {
             for x in 0..buf.area.width {
-                content.push_str(buf[(x, y)].symbol());
+                if let Some(cell) = buf.cell((x, y)) {
+                    content.push_str(cell.symbol());
+                }
             }
             content.push('\n');
         }
@@ -1382,7 +1393,9 @@ mod tests {
         let mut content = String::new();
         for y in 0..buf.area.height {
             for x in 0..buf.area.width {
-                content.push_str(buf[(x, y)].symbol());
+                if let Some(cell) = buf.cell((x, y)) {
+                    content.push_str(cell.symbol());
+                }
             }
             content.push('\n');
         }
@@ -1421,7 +1434,9 @@ mod tests {
         let mut content = String::new();
         for y in 0..buf.area.height {
             for x in 0..buf.area.width {
-                content.push_str(buf[(x, y)].symbol());
+                if let Some(cell) = buf.cell((x, y)) {
+                    content.push_str(cell.symbol());
+                }
             }
             content.push('\n');
         }
@@ -1466,7 +1481,7 @@ mod tests {
         let mut content_differs = false;
         for y in 1..focused.area.height - 1 {
             for x in 1..focused.area.width - 1 {
-                if focused[(x, y)].fg != unfocused[(x, y)].fg {
+                if focused.cell((x, y)).map(|c| c.fg) != unfocused.cell((x, y)).map(|c| c.fg) {
                     content_differs = true;
                 }
             }
@@ -1525,7 +1540,9 @@ mod tests {
         let mut content = String::new();
         for y in 0..buf.area.height {
             for x in 0..buf.area.width {
-                content.push_str(buf[(x, y)].symbol());
+                if let Some(cell) = buf.cell((x, y)) {
+                    content.push_str(cell.symbol());
+                }
             }
             content.push('\n');
         }
@@ -1578,7 +1595,9 @@ mod tests {
         let mut content = String::new();
         for y in 0..buf.area.height {
             for x in 0..buf.area.width {
-                content.push_str(buf[(x, y)].symbol());
+                if let Some(cell) = buf.cell((x, y)) {
+                    content.push_str(cell.symbol());
+                }
             }
             content.push('\n');
         }
@@ -1630,7 +1649,9 @@ mod tests {
         let mut content = String::new();
         for y in 0..buf.area.height {
             for x in 0..buf.area.width {
-                content.push_str(buf[(x, y)].symbol());
+                if let Some(cell) = buf.cell((x, y)) {
+                    content.push_str(cell.symbol());
+                }
             }
             content.push('\n');
         }
@@ -1687,7 +1708,9 @@ mod tests {
         let mut content = String::new();
         for y in 0..buf.area.height {
             for x in 0..buf.area.width {
-                content.push_str(buf[(x, y)].symbol());
+                if let Some(cell) = buf.cell((x, y)) {
+                    content.push_str(cell.symbol());
+                }
             }
             content.push('\n');
         }
@@ -1749,7 +1772,9 @@ mod tests {
         let mut content = String::new();
         for y in 0..buf.area.height {
             for x in 0..buf.area.width {
-                content.push_str(buf[(x, y)].symbol());
+                if let Some(cell) = buf.cell((x, y)) {
+                    content.push_str(cell.symbol());
+                }
             }
             content.push('\n');
         }
@@ -1803,7 +1828,9 @@ mod tests {
         let mut content = String::new();
         for y in 0..buf.area.height {
             for x in 0..buf.area.width {
-                content.push_str(buf[(x, y)].symbol());
+                if let Some(cell) = buf.cell((x, y)) {
+                    content.push_str(cell.symbol());
+                }
             }
             content.push('\n');
         }
@@ -1844,7 +1871,9 @@ mod tests {
         let mut content = String::new();
         for y in 0..buf.area.height {
             for x in 0..buf.area.width {
-                content.push_str(buf[(x, y)].symbol());
+                if let Some(cell) = buf.cell((x, y)) {
+                    content.push_str(cell.symbol());
+                }
             }
             content.push('\n');
         }
@@ -1889,7 +1918,9 @@ mod tests {
         let mut content = String::new();
         for y in 0..buf.area.height {
             for x in 0..buf.area.width {
-                content.push_str(buf[(x, y)].symbol());
+                if let Some(cell) = buf.cell((x, y)) {
+                    content.push_str(cell.symbol());
+                }
             }
             content.push('\n');
         }
@@ -1952,7 +1983,9 @@ mod tests {
         let mut content = String::new();
         for y in 0..buf.area.height {
             for x in 0..buf.area.width {
-                content.push_str(buf[(x, y)].symbol());
+                if let Some(cell) = buf.cell((x, y)) {
+                    content.push_str(cell.symbol());
+                }
             }
             content.push('\n');
         }

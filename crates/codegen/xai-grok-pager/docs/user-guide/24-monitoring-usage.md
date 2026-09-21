@@ -229,6 +229,8 @@ events only, never metrics.
 | `grok_code.session.count` | `{session}` | base attrs only |
 | `grok_code.token.usage` | `{token}` | `type` = `input` \| `output` \| `reasoning` \| `cache_read`; `model` |
 | `grok_code.turn.count` | `{turn}` | `outcome` = `completed` \| `cancelled` \| `error`; `model` |
+| `grok_code.turn.ttft` | `ms` | `model` |
+| `grok_code.turn.ttfm` | `ms` | `model` |
 | `grok_code.tool.decision` | `{decision}` | `tool_name`, `decision` = `allow` \| `deny` \| `cancelled` \| `followup`, `access_kind`, `permission_mode` |
 | `grok_code.tool.usage` | `{call}` | `tool_name`, `outcome` |
 | `grok_code.error.count` | `{error}` | `error_category`, `model` |
@@ -254,6 +256,13 @@ message Grok prints names the longest step instead, so the two can name
 different steps for the same timeout. Use `phase_duration` to compare them.
 `auth_mode` is `personal`, `team`, `deployment`, or `unknown`:
 startup cost differs by kind, so split by it before comparing.
+
+`turn.ttft` is the time from turn start to the first token of any channel
+(reasoning, text, or a tool call) and `turn.ttfm` the time from turn start to the
+first assistant text message (reasoning and tool calls excluded), one sample per
+turn on the same clock, so `ttft` never exceeds `ttfm`. A turn that produced no
+model output records no `ttft`; a reasoning-only or tool-only turn records `ttft`
+but no `ttfm`.
 
 There is no `cost.usage` metric: join `grok_code.token.usage` with your own
 price sheet. `lines_of_code.count` and `active_time.total` are planned for a

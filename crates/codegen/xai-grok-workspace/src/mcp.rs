@@ -16,9 +16,10 @@ use xai_computer_hub_mcp_adapter::{
 use xai_computer_hub_sdk::ToolServerHandler;
 use xai_grok_mcp::rmcp;
 use xai_grok_mcp::servers::{
-    MCP_TOOL_NAME_DELIMITER, McpClient, McpClientTimeoutOverrides, McpSpawnCtx, OauthInteractivity,
-    parse_mcp_qualified_name,
+    InitClaimGuard, LivenessCheck, MCP_TOOL_NAME_DELIMITER, McpClient, McpClientTimeoutOverrides,
+    McpSpawnCtx, OauthInteractivity, SharedMcpState, parse_mcp_qualified_name,
 };
+use xai_grok_tools::util::mcp_structured_content::render_structured_content;
 use xai_tool_protocol::{SessionId, ToolId};
 use xai_tool_runtime::{ToolCallContext, ToolStream, TypedToolOutput};
 use xai_tool_types::ToolDescription;
@@ -69,12 +70,21 @@ impl HubToolRegistry for xai_computer_hub_sdk::ToolServer {
 
 /// Adapts [`McpClient`] to the [`McpTransport`] trait for [`McpBridge`].
 pub(crate) struct McpClientTransportAdapter {
-    client: Arc<McpClient>,
+    /// `None` once closed: the hub's handlers keep the adapter alive after a stop, and must not keep the client.
+    client: arc_swap::ArcSwapOption<McpClient>,
 }
 
 impl McpClientTransportAdapter {
     pub fn new(client: Arc<McpClient>) -> Self {
-        Self { client }
+        Self {
+            client: arc_swap::ArcSwapOption::new(Some(client)),
+        }
+    }
+
+    fn client(&self) -> Result<Arc<McpClient>, xai_computer_hub_mcp_adapter::McpError> {
+        self.client.load_full().ok_or_else(|| {
+            xai_computer_hub_mcp_adapter::McpError::Transport("MCP transport closed".into())
+        })
     }
 }
 
@@ -82,7 +92,7 @@ impl McpClientTransportAdapter {
 impl McpTransport for McpClientTransportAdapter {
     async fn initialize(&self) -> Result<McpServerInfo, xai_computer_hub_mcp_adapter::McpError> {
         let service = self
-            .client
+            .client()?
             .ensure_initialized()
             .await
             .map_err(|e| xai_computer_hub_mcp_adapter::McpError::Transport(e.to_string()))?;
@@ -102,7 +112,7 @@ impl McpTransport for McpClientTransportAdapter {
         &self,
     ) -> Result<Vec<McpToolDefinition>, xai_computer_hub_mcp_adapter::McpError> {
         let service = self
-            .client
+            .client()?
             .ensure_initialized()
             .await
             .map_err(|e| xai_computer_hub_mcp_adapter::McpError::Transport(e.to_string()))?;
@@ -138,7 +148,7 @@ impl McpTransport for McpClientTransportAdapter {
         arguments: Value,
     ) -> Result<McpCallResult, xai_computer_hub_mcp_adapter::McpError> {
         let service = self
-            .client
+            .client()?
             .ensure_initialized()
             .await
             .map_err(|e| xai_computer_hub_mcp_adapter::McpError::Transport(e.to_string()))?;
@@ -161,28 +171,42 @@ impl McpTransport for McpClientTransportAdapter {
             .await
             .map_err(|e| xai_computer_hub_mcp_adapter::McpError::Transport(e.to_string()))?;
 
-        Ok(McpCallResult {
-            content: result
-                .content
-                .into_iter()
-                .map(|c| match c {
-                    rmcp::model::ContentBlock::Text(t) => McpContent::Text { text: t.text },
-                    rmcp::model::ContentBlock::Image(img) => McpContent::Image {
-                        mime_type: img.mime_type,
-                        data: img.data,
-                    },
-                    _ => McpContent::Text {
-                        text: "[unsupported content type]".to_string(),
-                    },
-                })
-                .collect(),
-            is_error: result.is_error.unwrap_or(false),
-        })
+        Ok(mcp_call_result_from_rmcp(result))
     }
 
     async fn close(&self) -> Result<(), xai_computer_hub_mcp_adapter::McpError> {
-        // No-op: cleanup happens when McpClient is dropped.
+        // Letting go of the client is what ends a stdio child, once no in-flight call still holds its
+        // service; a call routed in afterwards fails here.
+        self.client.store(None);
         Ok(())
+    }
+}
+
+/// `McpCallResult` has no structured field, so `structuredContent` rides as a trailing text block.
+fn mcp_call_result_from_rmcp(result: rmcp::model::CallToolResult) -> McpCallResult {
+    let mut content: Vec<McpContent> = result
+        .content
+        .into_iter()
+        .map(|c| match c {
+            rmcp::model::ContentBlock::Text(t) => McpContent::Text { text: t.text },
+            rmcp::model::ContentBlock::Image(img) => McpContent::Image {
+                mime_type: img.mime_type,
+                data: img.data,
+            },
+            _ => McpContent::Text {
+                text: "[unsupported content type]".to_string(),
+            },
+        })
+        .collect();
+    let texts = content.iter().filter_map(|c| match c {
+        McpContent::Text { text } => Some(text.as_str()),
+        _ => None,
+    });
+    let structured = render_structured_content(result.structured_content.as_ref(), texts);
+    content.extend(structured.map(|text| McpContent::Text { text }));
+    McpCallResult {
+        content,
+        is_error: result.is_error.unwrap_or(false),
     }
 }
 
@@ -271,7 +295,6 @@ async fn record_bridge_outcome(
     session: &WorkspaceSession,
     remaining_names: &mut HashSet<String>,
     life: u64,
-    generation: u64,
 ) -> Option<Result<StartedMcpServer, McpStartFailure>> {
     match outcome {
         Ok(BridgedServer {
@@ -292,7 +315,7 @@ async fn record_bridge_outcome(
                     state.owned_clients.remove(&server_name);
                 } else {
                     state.owned_clients.insert(server_name.clone(), client);
-                    state.mark_server_ready(generation, &server_name);
+                    state.mark_server_ready(&server_name);
                 }
                 stale
             };
@@ -319,13 +342,8 @@ async fn record_bridge_outcome(
                 if session.mcp_epoch.load(std::sync::atomic::Ordering::SeqCst) == life {
                     let mut state = session.mcp_state.lock().await;
                     state.owned_clients.remove(&failure.name);
-                    state.record_init_failure(
-                        generation,
-                        &failure.name,
-                        false,
-                        Some(failure.error.clone()),
-                    );
-                    state.mark_server_ready(generation, &failure.name);
+                    state.record_init_failure(&failure.name, false, Some(failure.error.clone()));
+                    state.mark_server_ready(&failure.name);
                 }
             }
             tracing::warn!(
@@ -446,28 +464,27 @@ pub(crate) async fn drive_server_starts(
         .iter()
         .map(|config| xai_grok_mcp::servers::mcp_server_name(config).to_owned())
         .collect();
-    // Dropping the guard mid-drive releases the claim; the normal exits release it through `finish_init_if_life` first.
-    let (_init_claim, generation) = {
+    // Dropping the guard mid-drive releases the claim; the normal exits complete init through it first.
+    let init_claim = {
         let _binding = session.mcp_binding.lock().await;
         let mut state = session.mcp_state.lock().await;
-        let generation = state.generation();
-        let claim = if session.mcp_epoch.load(std::sync::atomic::Ordering::SeqCst) == life {
+        if session.mcp_epoch.load(std::sync::atomic::Ordering::SeqCst) == life {
             let claim = state.try_start_init();
-            state.mark_servers_initializing(generation, remaining_names.iter().cloned());
+            if claim.is_some() {
+                state.mark_servers_initializing(remaining_names.iter().cloned());
+            }
             claim
         } else {
             None
-        };
-        (claim, generation)
+        }
     };
     // Per-server startup watchdog sized so the WHOLE handshake (the server/discover probe phase plus the legacy phase running on this startup budget) fits the shared deadline, keeping the invariant that a hung handshake fails on its own before the deadline has to cancel it.
     // Sizing to the raw deadline would let a swallowed probe burn the legacy phase's window and convert per-server errors into the generic discovery-timeout failure.
     let deadline_secs = discovery_timeout
         .as_secs()
-        .saturating_add(u64::from(discovery_timeout.subsec_nanos() != 0))
-        .max(1);
+        .saturating_add(u64::from(discovery_timeout.subsec_nanos() != 0));
     let startup_timeout_sec =
-        xai_grok_mcp::servers::McpClient::max_startup_within_deadline(deadline_secs).max(1);
+        xai_grok_mcp::servers::McpClient::max_startup_within_deadline(deadline_secs);
     let overrides = McpClientTimeoutOverrides {
         startup_timeout_sec: Some(startup_timeout_sec),
         ..Default::default()
@@ -559,14 +576,8 @@ pub(crate) async fn drive_server_starts(
             }
             outcome = pending.next() => {
                 let Some(outcome) = outcome else { break };
-                if let Some(result) = record_bridge_outcome(
-                    outcome,
-                    session,
-                    &mut remaining_names,
-                    life,
-                    generation,
-                )
-                .await
+                if let Some(result) =
+                    record_bridge_outcome(outcome, session, &mut remaining_names, life).await
                     && outcomes.send(result).await.is_err()
                 {
                     receiver_gone = true;
@@ -579,7 +590,7 @@ pub(crate) async fn drive_server_starts(
         // Teardown or caller abort: drop the pending starts (killing their
         // children) and report nothing further.
         drop(pending);
-        finish_init_if_life(session, life, generation).await;
+        finish_init_if_life(session, life, init_claim).await;
         return if cancelled {
             Err(WorkspaceError::SessionNotFound(session_id.to_owned()))
         } else {
@@ -590,8 +601,7 @@ pub(crate) async fn drive_server_starts(
         // Outcomes that are already complete keep their real result...
         while let Some(Some(outcome)) = futures::FutureExt::now_or_never(pending.next()) {
             if let Some(result) =
-                record_bridge_outcome(outcome, session, &mut remaining_names, life, generation)
-                    .await
+                record_bridge_outcome(outcome, session, &mut remaining_names, life).await
             {
                 let _ = outcomes.send(result).await;
             }
@@ -607,14 +617,13 @@ pub(crate) async fn drive_server_starts(
                 if session.mcp_epoch.load(std::sync::atomic::Ordering::SeqCst) == life {
                     let mut state = session.mcp_state.lock().await;
                     state.record_init_failure(
-                        generation,
                         &name,
                         false,
                         Some(format!(
                             "MCP discovery timed out after {discovery_timeout:?}"
                         )),
                     );
-                    state.mark_server_ready(generation, &name);
+                    state.mark_server_ready(&name);
                 }
             }
             let _ = outcomes
@@ -625,19 +634,27 @@ pub(crate) async fn drive_server_starts(
                 .await;
         }
     }
-    finish_init_if_life(session, life, generation).await;
+    finish_init_if_life(session, life, init_claim).await;
     Ok(())
 }
 
 /// Close out the init-progress bookkeeping, but only if `life` is still the
 /// session's current MCP life — a drive outlived by a teardown+revive must
-/// not stamp the NEW life's init progress.
-async fn finish_init_if_life(session: &WorkspaceSession, life: u64, generation: u64) {
+/// not stamp the NEW life's init progress — and only while the drive still
+/// owns init; a config change's successor completes its own.
+async fn finish_init_if_life(session: &WorkspaceSession, life: u64, claim: Option<InitClaimGuard>) {
+    let Some(claim) = claim else {
+        return;
+    };
     let _binding = session.mcp_binding.lock().await;
     if session.mcp_epoch.load(std::sync::atomic::Ordering::SeqCst) == life {
-        let mut state = session.mcp_state.lock().await;
-        state.finish_init(generation);
-        state.mark_all_servers_ready(generation);
+        let _ = session
+            .mcp_state
+            .write_if_owner(claim, |state, _claim| {
+                state.finish_init();
+                state.complete_init();
+            })
+            .await;
     }
 }
 
@@ -649,7 +666,10 @@ pub(crate) fn dedupe_servers_last_wins(servers: &mut Vec<agent_client_protocol::
     // Iterate from the back so the LAST occurrence of each name is the one
     // kept, preserving its position.
     for index in (0..servers.len()).rev() {
-        let name = xai_grok_mcp::servers::mcp_server_name(&servers[index]).to_owned();
+        let Some(server) = servers.get(index) else {
+            continue;
+        };
+        let name = xai_grok_mcp::servers::mcp_server_name(server).to_owned();
         if !seen.insert(name) {
             servers.remove(index);
             dropped += 1;
@@ -661,6 +681,28 @@ pub(crate) fn dedupe_servers_last_wins(servers: &mut Vec<agent_client_protocol::
             "MCP config has duplicate server names; keeping the last definition of each"
         );
     }
+}
+
+/// Compose a host-owned built-in `entry` into `servers`: same-named entries are dropped so none
+/// can take its first-party posture, and it goes first so [`cap_servers`] keeps it.
+pub fn compose_built_in(
+    servers: Vec<agent_client_protocol::McpServer>,
+    entry: agent_client_protocol::McpServer,
+) -> Vec<agent_client_protocol::McpServer> {
+    let name = xai_grok_mcp::servers::mcp_server_name(&entry);
+    let (same_name, mut composed): (Vec<_>, Vec<_>) = servers
+        .into_iter()
+        .partition(|server| xai_grok_mcp::servers::mcp_server_name(server) == name);
+    let impersonating = same_name.iter().filter(|server| **server != entry).count();
+    if impersonating > 0 {
+        tracing::warn!(
+            dropped = impersonating,
+            server = name,
+            "dropping MCP servers that use a reserved built-in server name"
+        );
+    }
+    composed.insert(0, entry);
+    composed
 }
 
 /// Cap a server-config list at [`crate::config::BindMcpConfig::MAX_SERVERS`], keeping the first entries in config order.
@@ -725,42 +767,79 @@ pub(crate) async fn connect_servers(
     Ok((StartedMcp { servers, failed }, life))
 }
 
-/// Add `started` to the session's server map. The caller drops the bridges, which closes their transports.
+/// Add `started` to the session's server map and return the names added. On error the caller drops the bridges, which closes their transports.
+/// A server stopped [`Restart::OnNextBind`] since its convergence planned it (the host went while it was starting) is ended here instead, the way [`stop_servers`] ends a running one; it never entered the map, so it has no tools to unadvertise.
 pub(crate) async fn install_servers(
     session: &WorkspaceSession,
     started: Vec<StartedMcpServer>,
     expected_life: u64,
-) -> WorkspaceResult<()> {
-    let mut binding = session.mcp_binding.lock().await;
-    // Life-gated, not merely state-gated: a server recorded under an older life can still be IN FLIGHT through
-    // a convergence's publish channel when a teardown+revive opens a new life — a bare `join()` would insert it
-    // into that new life, which would then treat the stale client as already running and never start a fresh one.
-    if session.mcp_epoch.load(std::sync::atomic::Ordering::SeqCst) != expected_life {
-        return Err(WorkspaceError::SessionNotFound(session.session_id.clone()));
-    }
-    let Some(active) = binding.join() else {
-        return Err(WorkspaceError::SessionNotFound(session.session_id.clone()));
+) -> WorkspaceResult<Vec<String>> {
+    let (installed, stopped) = {
+        let mut binding = session.mcp_binding.lock().await;
+        // Life-gated, not merely state-gated: a server recorded under an older life can still be IN FLIGHT through
+        // a convergence's publish channel when a teardown+revive opens a new life — a bare `join()` would insert it
+        // into that new life, which would then treat the stale client as already running and never start a fresh one.
+        if session.mcp_epoch.load(std::sync::atomic::Ordering::SeqCst) != expected_life {
+            return Err(WorkspaceError::SessionNotFound(session.session_id.clone()));
+        }
+        let Some(active) = binding.join() else {
+            return Err(WorkspaceError::SessionNotFound(session.session_id.clone()));
+        };
+        // The stop marks under this lock, and the convergence snapshotted `stopped` before the discovery window opened: only this last commit sees a stop that landed in between.
+        let (stopped, started): (Vec<StartedMcpServer>, Vec<StartedMcpServer>) = started
+            .into_iter()
+            .partition(|server| active.stopped.contains(&server.name));
+        let mut installed = Vec::with_capacity(started.len());
+        for server in started {
+            installed.push(server.name.clone());
+            active.servers.insert(
+                server.name,
+                SessionMcpServer {
+                    bridge: server.bridge,
+                    tool_ids: Vec::new(),
+                    tier: server.tier,
+                },
+            );
+        }
+        // Same binding → mcp_state nesting as `record_bridge_outcome`, which committed these clients.
+        let mut state = session.mcp_state.lock().await;
+        for server in &stopped {
+            state.owned_clients.remove(&server.name);
+        }
+        (installed, stopped)
     };
-    for server in started {
-        active.servers.insert(
-            server.name,
-            SessionMcpServer {
-                bridge: server.bridge,
-                tool_ids: Vec::new(),
-                tier: server.tier,
-            },
+    for server in stopped {
+        tracing::info!(
+            server = %server.name,
+            "ending an MCP server that was stopped while it started"
         );
+        if let Err(error) = server.bridge.bridge.shutdown().await {
+            tracing::warn!(server = %server.name, %error, "MCP bridge shutdown failed");
+        }
     }
-    Ok(())
+    Ok(installed)
 }
 
-/// Stop `names` for this session: unadvertise exactly the ids each owns, then shut its bridge down. A tool call in flight against a stopped server fails when its transport closes.
-/// That is deliberate — the alternative is waiting on an arbitrary third-party server that may never answer, which would hang the convergence.
+/// When a convergence may start a stopped server again.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Restart {
+    /// As soon as a publish wants it again: the stop was the configuration's own.
+    OnReconfigured,
+    /// Not before the session's next bind, however many reloads want it meanwhile: a host that
+    /// has gone must not have it started again, and a start already in flight ends at its
+    /// commit ([`install_servers`]).
+    OnNextBind,
+}
+
+/// Stop `names` for this session: drop each server's client and shut its bridge down, then unadvertise exactly the ids it owns (skipped without a hub, whose registrations went with it).
+/// A call already in flight holds the client's rmcp service, so the child ends when the last such call returns; nothing on this path times a call out — only a hub cancel (a cancel frame, the session's unbind) drops one the server never answers.
+/// A call routed in after the close fails at the adapter instead of waiting on an arbitrary third-party server that may never answer, which would hang the convergence.
 pub(crate) async fn stop_servers(
     session: &WorkspaceSession,
     session_id: &SessionId,
-    tool_server: &impl HubToolRegistry,
+    tool_server: Option<&impl HubToolRegistry>,
     names: &[String],
+    restart: Restart,
 ) -> Vec<String> {
     let (stopped, life) = {
         let mut binding = session.mcp_binding.lock().await;
@@ -771,24 +850,39 @@ pub(crate) async fn stop_servers(
         let Some(active) = binding.active_mut() else {
             return Vec::new();
         };
+        // Held under the same lock a convergence reads `live` under, so it never sees the
+        // server gone without the hold.
+        if restart == Restart::OnNextBind {
+            active.stopped.extend(names.iter().cloned());
+        }
         let stopped: Vec<(String, SessionMcpServer)> = names
             .iter()
             .filter_map(|name| active.servers.remove_entry(name))
             .collect();
+        // Same binding → mcp_state nesting as `record_bridge_outcome`, so a
+        // drive committing this life's client cannot interleave with its removal.
+        let mut state = session.mcp_state.lock().await;
+        for (name, _) in &stopped {
+            state.owned_clients.remove(name);
+        }
         (stopped, life)
     };
     let mut names = Vec::with_capacity(stopped.len());
     for (name, server) in stopped {
-        for tool_id in &server.tool_ids {
-            if let Err(error) = tool_server
-                .unregister_tool_dynamic(tool_id, session_id, life)
-                .await
-            {
-                tracing::warn!(%session_id, tool = %tool_id, %error, "failed to unadvertise MCP tool");
-            }
-        }
+        // Bridge first: its close drops the client's last owner, so a child holding host-side state
+        // (the computer-use helper's remote-control lease) ends before the hub round trips below.
         if let Err(error) = server.bridge.bridge.shutdown().await {
             tracing::warn!(%session_id, server = %name, %error, "MCP bridge shutdown failed");
+        }
+        if let Some(tool_server) = tool_server {
+            for tool_id in &server.tool_ids {
+                if let Err(error) = tool_server
+                    .unregister_tool_dynamic(tool_id, session_id, life)
+                    .await
+                {
+                    tracing::warn!(%session_id, tool = %tool_id, %error, "failed to unadvertise MCP tool");
+                }
+            }
         }
         names.push(name);
     }
@@ -841,8 +935,11 @@ pub(crate) async fn install_and_advertise_qualified(
             "skipping MCP tools past the per-session advertisement cap"
         );
     }
-    install_servers(session, started, life).await?;
-    for (name, handlers) in advertised {
+    let installed = install_servers(session, started, life).await?;
+    for (name, handlers) in advertised
+        .into_iter()
+        .filter(|(name, _)| installed.contains(name))
+    {
         let mut owned = Vec::new();
         for handler in handlers {
             let tool_id = handler.tool_id();
@@ -898,6 +995,7 @@ impl SessionMcpDelta {
 }
 
 /// Whether a convergence with an unchanged server plan still re-claims tool ownership and reconciles the hub. A reload converges every session and skips the untouched ones (`IfChanged`); a bind must reconcile even when no server starts or stops, because its *native* tool set may have changed and a claimed MCP id could newly collide with it (`Always`).
+/// Only a bind (`Always`) starts a server stopped [`Restart::OnNextBind`]; a reload leaves it stopped.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum McpReclaim {
     IfChanged,
@@ -912,24 +1010,25 @@ pub(crate) struct ConvergencePlan {
     pub(crate) start: Vec<String>,
 }
 
-/// Decide the plan from what a session runs (`live`), what the configuration asks for (`wanted`, in config order), and which names the configuration redefined (`redefined`).
-/// Anything wanted that is then not running starts — which covers new servers, redefined ones just stopped, and servers whose previous start failed, since a failed server never entered `live`.
+/// Decide the plan from what a session runs (`live`), what the configuration asks for (`wanted`, in config order), which live names must not be kept as they are (`restart`: the configuration redefined them, or their transport closed), and which are stopped until the session's next bind (`stopped`).
+/// Anything wanted that is then not running starts — which covers new servers, restarted ones just stopped, and servers whose previous start failed, since a failed server never entered `live` — except what is `stopped`.
 pub(crate) fn plan_convergence(
     live: &HashSet<String>,
     wanted: &[String],
-    redefined: &HashSet<String>,
+    restart: &HashSet<String>,
+    stopped: &HashSet<String>,
 ) -> ConvergencePlan {
-    let keeps = |name: &String| wanted.contains(name) && !redefined.contains(name);
+    let keeps = |name: &String| wanted.contains(name) && !restart.contains(name);
     let stop: Vec<String> = live.iter().filter(|name| !keeps(name)).cloned().collect();
     let start = wanted
         .iter()
-        .filter(|name| !live.contains(*name) || !keeps(name))
+        .filter(|name| (!live.contains(*name) || !keeps(name)) && !stopped.contains(*name))
         .cloned()
         .collect();
     ConvergencePlan { stop, start }
 }
 
-/// Make one session's MCP servers match `desired`. Stops servers the config dropped or redefined, starts everything it wants that the session is not already running, and leaves untouched servers alone — their client, process, and in-flight calls all survive.
+/// Make one session's MCP servers match `desired`. Stops servers the config dropped or redefined, restarts servers whose transport closed, starts everything it wants that the session is not already running, and leaves healthy untouched servers alone — their client, process, and in-flight calls all survive.
 /// No-op for sessions that never joined the configured set.
 pub(crate) async fn converge_session(
     session: &WorkspaceSession,
@@ -941,13 +1040,15 @@ pub(crate) async fn converge_session(
 ) -> WorkspaceResult<SessionMcpDelta> {
     let sid = SessionId::new(session_id)
         .map_err(|error| WorkspaceError::HubError(format!("invalid session_id: {error}")))?;
-    let Some(live) = session
-        .mcp_binding
-        .lock()
-        .await
-        .active()
-        .map(|active| active.servers.keys().cloned().collect::<HashSet<_>>())
-    else {
+    let Some((live, stopped)) = session.mcp_binding.lock().await.active_mut().map(|active| {
+        if reclaim == McpReclaim::Always {
+            active.stopped.clear();
+        }
+        (
+            active.servers.keys().cloned().collect::<HashSet<_>>(),
+            active.stopped.clone(),
+        )
+    }) else {
         return Ok(SessionMcpDelta::default());
     };
 
@@ -958,20 +1059,36 @@ pub(crate) async fn converge_session(
         .collect();
     // The diff keeps unchanged servers' clients alive and forgets the rest.
     // Its `added` doubles as "redefined" for names already running.
-    let redefined: HashSet<String> = {
+    let mut restart: HashSet<String> = {
         let mut state = session.mcp_state.lock().await;
         state
             .update_configs_diff(desired.servers().to_vec())
             .map(|diff| diff.added.into_iter().collect())
             .unwrap_or_default()
     };
+    let dead = dead_servers(session, &live).await;
+    if !dead.is_empty() {
+        tracing::warn!(
+            session_id,
+            servers = ?dead,
+            "restarting MCP servers whose transport closed"
+        );
+        restart.extend(dead);
+    }
 
-    let plan = plan_convergence(&live, &wanted, &redefined);
+    let plan = plan_convergence(&live, &wanted, &restart, &stopped);
     if plan == ConvergencePlan::default() && reclaim == McpReclaim::IfChanged {
         return Ok(SessionMcpDelta::default());
     }
     let mut delta = SessionMcpDelta {
-        removed: stop_servers(session, &sid, tool_server, &plan.stop).await,
+        removed: stop_servers(
+            session,
+            &sid,
+            Some(tool_server),
+            &plan.stop,
+            Restart::OnReconfigured,
+        )
+        .await,
         ..Default::default()
     };
     // The bind recorded which ids are native; the hub snapshot cannot be used
@@ -1009,10 +1126,11 @@ pub(crate) async fn converge_session(
                         // Life-gated on the DRIVE's life: the outcome was recorded under it, but this
                         // publish half runs concurrently — a teardown+revive between the record and this
                         // install must refuse the stale server, or the revived life would treat it as already running.
-                        let name = server.name.clone();
-                        install_servers(session, vec![server], drive_life).await?;
-                        delta.added.push(name);
-                        reconcile_session_tools(session, &sid, tool_server, &native).await;
+                        let installed = install_servers(session, vec![server], drive_life).await?;
+                        if !installed.is_empty() {
+                            delta.added.extend(installed);
+                            reconcile_session_tools(session, &sid, tool_server, &native).await;
+                        }
                     }
                     Err(failure) => delta.failed.push(failure.name),
                 }
@@ -1134,6 +1252,29 @@ async fn owned_tool_owners(session: &WorkspaceSession) -> HashMap<ToolId, String
         .unwrap_or_default()
 }
 
+/// The `live` servers whose rmcp service loop has ended — the child was killed, crashed, or closed its pipes — so every call through them fails `Transport closed`.
+/// Nothing else takes such a server out of the session's set: rmcp exposes no closed-future and the workspace arms no liveness poller, so the convergence reads each client's state instead (one cheap lock per client).
+async fn dead_servers(session: &WorkspaceSession, live: &HashSet<String>) -> HashSet<String> {
+    let clients: Vec<(String, Arc<McpClient>)> = {
+        let state = session.mcp_state.lock().await;
+        live.iter()
+            .filter_map(|name| {
+                state
+                    .owned_clients
+                    .get(name)
+                    .map(|client| (name.clone(), Arc::clone(client)))
+            })
+            .collect()
+    };
+    let mut dead = HashSet::new();
+    for (name, client) in clients {
+        if client.liveness_check().await == LivenessCheck::TransportClosed {
+            dead.insert(name);
+        }
+    }
+    dead
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1170,6 +1311,51 @@ mod tests {
         assert_eq!(handler.description().name, "server__lookup");
     }
 
+    fn bridged_texts(result: rmcp::model::CallToolResult) -> Vec<String> {
+        mcp_call_result_from_rmcp(result)
+            .content
+            .into_iter()
+            .map(|c| match c {
+                McpContent::Text { text } => text,
+                other => panic!("expected text block, got {other:?}"),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn bridged_result_appends_structured_content_after_a_summary() {
+        let folders = serde_json::json!({"folders": [{"id": "p1", "name": "Alpha"}]});
+        let mut result =
+            rmcp::model::CallToolResult::success(vec![rmcp::model::ContentBlock::text(
+                "7 product folders, 2 custom folders",
+            )]);
+        result.structured_content = Some(folders.clone());
+        assert_eq!(
+            bridged_texts(result),
+            vec![
+                "7 product folders, 2 custom folders".to_string(),
+                folders.to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn bridged_result_does_not_duplicate_inlined_structured_content() {
+        let folders = serde_json::json!({"folders": [{"id": "p1", "name": "Alpha"}]});
+        let mut result = rmcp::model::CallToolResult::success(vec![
+            rmcp::model::ContentBlock::text("7 product folders, 2 custom folders"),
+            rmcp::model::ContentBlock::text(folders.to_string()),
+        ]);
+        result.structured_content = Some(folders.clone());
+        assert_eq!(
+            bridged_texts(result),
+            vec![
+                "7 product folders, 2 custom folders".to_string(),
+                folders.to_string()
+            ]
+        );
+    }
+
     /// The client-driven configure path honors the SAME server cap as the
     /// machine-owned chokepoint — `cap_servers` is the one helper both run, keeping
     /// the first entries in config order (matching `BindMcpConfig::new`'s documented cap semantics).
@@ -1185,14 +1371,50 @@ mod tests {
         let mut servers: Vec<_> = (0..over).map(|i| http(&format!("server-{i:03}"))).collect();
         cap_servers(&mut servers);
         assert_eq!(crate::config::BindMcpConfig::MAX_SERVERS, servers.len());
+        let Some(last) = servers.last() else {
+            panic!("expected capped servers");
+        };
         assert_eq!(
             format!(
                 "server-{:03}",
                 crate::config::BindMcpConfig::MAX_SERVERS - 1
             ),
-            xai_grok_mcp::servers::mcp_server_name(
-                &servers[crate::config::BindMcpConfig::MAX_SERVERS - 1]
-            ),
+            xai_grok_mcp::servers::mcp_server_name(last),
+        );
+    }
+
+    #[test]
+    fn compose_built_in_reserves_the_name_and_leads_the_list() {
+        let composed = compose_built_in(
+            vec![
+                stdio("other", "/other"),
+                stdio("built_in", "/impersonator"),
+                stdio("built_in", "/impersonator-2"),
+            ],
+            stdio("built_in", "/host"),
+        );
+        assert_eq!(
+            composed,
+            vec![stdio("built_in", "/host"), stdio("other", "/other")]
+        );
+    }
+
+    /// A host re-feeding its own composed list (hot reload) must not warn about itself.
+    #[test]
+    fn compose_built_in_warns_only_for_a_differing_same_named_entry() {
+        let host = stdio("built_in", "/host");
+        let ((), re_fed) = crate::capturing_warn_logs(|| {
+            let composed =
+                compose_built_in(vec![host.clone(), stdio("other", "/other")], host.clone());
+            assert_eq!(2, composed.len());
+        });
+        assert!(!re_fed.contains("reserved"), "own entry re-fed: {re_fed}");
+        let ((), impersonated) = crate::capturing_warn_logs(|| {
+            compose_built_in(vec![stdio("built_in", "/impersonator")], host.clone());
+        });
+        assert!(
+            impersonated.contains("reserved") && impersonated.contains("dropped=1"),
+            "impersonator: {impersonated}"
         );
     }
 
@@ -1234,6 +1456,12 @@ mod tests {
         );
     }
 
+    fn stdio(name: &str, command: &str) -> agent_client_protocol::McpServer {
+        agent_client_protocol::McpServer::Stdio(agent_client_protocol::McpServerStdio::new(
+            name, command,
+        ))
+    }
+
     fn names(values: &[&str]) -> Vec<String> {
         values.iter().map(|v| (*v).to_owned()).collect()
     }
@@ -1247,6 +1475,7 @@ mod tests {
         let plan = plan_convergence(
             &name_set(&["figma"]),
             &names(&["figma", "linear"]),
+            &HashSet::new(),
             &HashSet::new(),
         );
         assert_eq!(
@@ -1263,6 +1492,7 @@ mod tests {
         let plan = plan_convergence(
             &name_set(&["figma", "linear"]),
             &names(&["figma"]),
+            &HashSet::new(),
             &HashSet::new(),
         );
         assert_eq!(
@@ -1281,6 +1511,7 @@ mod tests {
             &name_set(&["figma"]),
             &names(&["figma"]),
             &name_set(&["figma"]),
+            &HashSet::new(),
         );
         assert_eq!(
             plan,
@@ -1300,6 +1531,7 @@ mod tests {
             &name_set(&["figma"]),
             &names(&["figma", "flaky"]),
             &HashSet::new(),
+            &HashSet::new(),
         );
         assert_eq!(plan.stop, Vec::<String>::new());
         assert_eq!(plan.start, names(&["flaky"]));
@@ -1311,6 +1543,21 @@ mod tests {
             &name_set(&["figma", "linear"]),
             &names(&["linear", "figma"]),
             &HashSet::new(),
+            &HashSet::new(),
+        );
+        assert_eq!(plan, ConvergencePlan::default());
+    }
+
+    /// A server stopped until the next bind is configured and not running, like one whose start
+    /// failed, but a reload must not start it: the daemon stops the computer-use helper this way
+    /// when Grok Desktop quits, and the same hang-up's config push converges right after.
+    #[test]
+    fn plan_leaves_a_server_stopped_until_the_next_bind_alone() {
+        let plan = plan_convergence(
+            &name_set(&["figma"]),
+            &names(&["figma", "computer_use"]),
+            &HashSet::new(),
+            &name_set(&["computer_use"]),
         );
         assert_eq!(plan, ConvergencePlan::default());
     }

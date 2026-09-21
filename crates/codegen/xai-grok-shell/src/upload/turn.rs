@@ -84,6 +84,7 @@ pub(crate) struct PromptTraceContext {
     pub(crate) turn_number: u64,
     pub(crate) attempt_id: Option<String>,
     pub(crate) session_handle: crate::session::SessionHandle,
+    pub(crate) memory_mode: Option<crate::config::MemoryMode>,
     pub(crate) session_registry_enabled: bool,
     pub(crate) upload_queue: Option<xai_file_utils::queue::UploadQueue>,
     pub(crate) artifact_tracker: super::manifest::ArtifactTracker,

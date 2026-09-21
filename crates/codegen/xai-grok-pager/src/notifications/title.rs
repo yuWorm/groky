@@ -61,9 +61,7 @@ impl TitleManager {
         self.composed.clear();
         let mut has_parts = false;
 
-        // Iterate by index: TitleItem is Copy, so indexing avoids borrowing self.items while we mutate self.composed
-        for i in 0..self.items.len() {
-            let item = self.items[i];
+        for item in self.items.iter().copied() {
             if write_item(
                 &mut self.composed,
                 &mut has_parts,
@@ -87,7 +85,6 @@ impl TitleManager {
             None
         };
 
-        // Swap into last_title when changed (update the dedup cache).
         if result.is_some() {
             std::mem::swap(&mut self.last_title, &mut self.composed);
         }
@@ -128,8 +125,11 @@ fn write_item(
             if !state.is_busy && state.activity.is_none() {
                 return false;
             }
+            let Some(&ch) = TITLE_SPINNER.get(spinner_frame) else {
+                return false;
+            };
             push_separator(buf, has_parts);
-            buf.push(TITLE_SPINNER[spinner_frame]);
+            buf.push(ch);
         }
         TitleItem::Activity => {
             if let Some(activity) = state.activity {
@@ -294,8 +294,6 @@ mod tests {
         }
     }
 
-    // --- Title composition tests ---
-
     #[test]
     fn grok_only_produces_just_grok() {
         let cfg = config_with_items(vec![TitleItem::Grok]);
@@ -343,11 +341,9 @@ mod tests {
         let cfg = config_with_items(vec![TitleItem::Spinner, TitleItem::Grok]);
         let mut mgr = TitleManager::new(&cfg);
 
-        // Idle: spinner absent
         mgr.update(&idle_state());
         assert_eq!(mgr.last_title, PRODUCT_CLI);
 
-        // Active: spinner present
         let activity = TurnActivity::Thinking;
         let state = TitleState {
             activity: Some(&activity),
@@ -563,8 +559,6 @@ mod tests {
         assert_eq!(mgr.last_title, format!("Thinking - {PRODUCT_CLI}"));
     }
 
-    // --- Action Required blinking ---
-
     #[test]
     fn action_required_visible_on_first_tick() {
         let cfg = config_with_items(vec![TitleItem::ActionRequired, TitleItem::Grok]);
@@ -629,24 +623,19 @@ mod tests {
         assert_eq!(mgr.last_title, PRODUCT_CLI);
     }
 
-    // --- Dedup (no-op when unchanged) ---
-
     #[test]
     fn dedup_skips_emission_when_unchanged() {
         let cfg = config_with_items(vec![TitleItem::Grok]);
         let mut mgr = TitleManager::new(&cfg);
         let state = idle_state();
 
-        mgr.update(&state);
+        let first = mgr.update(&state);
+        assert!(first.is_some());
         assert_eq!(mgr.last_title, PRODUCT_CLI);
 
-        // Second update: title is identical, last_title stays the same (no re-emit).
-        let title_before = mgr.last_title.clone();
-        mgr.update(&state);
-        assert_eq!(mgr.last_title, title_before);
+        assert_eq!(mgr.update(&state), None);
+        assert_eq!(mgr.last_title, PRODUCT_CLI);
     }
-
-    // --- Empty items list ---
 
     #[test]
     fn empty_items_produces_grok_fallback() {
@@ -655,8 +644,6 @@ mod tests {
         mgr.update(&idle_state());
         assert_eq!(mgr.last_title, PRODUCT_CLI);
     }
-
-    // --- Model item ---
 
     #[test]
     fn model_item_shown_when_present() {
@@ -678,8 +665,6 @@ mod tests {
         assert_eq!(mgr.last_title, PRODUCT_CLI);
     }
 
-    // --- Cwd item ---
-
     #[test]
     fn cwd_shows_last_component() {
         let cfg = config_with_items(vec![TitleItem::Cwd, TitleItem::Grok]);
@@ -691,8 +676,6 @@ mod tests {
         mgr.update(&state);
         assert_eq!(mgr.last_title, format!("my-project - {PRODUCT_CLI}"));
     }
-
-    // --- TurnTimer item ---
 
     #[test]
     fn turn_timer_shown_when_above_one_second() {
@@ -717,8 +700,6 @@ mod tests {
         mgr.update(&state);
         assert_eq!(mgr.last_title, PRODUCT_CLI);
     }
-
-    // --- Truncation ---
 
     #[test]
     fn long_session_name_truncated_with_ellipsis() {
@@ -747,8 +728,6 @@ mod tests {
         assert_eq!(mgr.last_title, "short");
     }
 
-    // --- Reset ---
-
     #[test]
     fn reset_clears_state_and_emits_grok() {
         let cfg = config_with_items(vec![TitleItem::SessionName, TitleItem::Grok]);
@@ -767,8 +746,6 @@ mod tests {
         assert_eq!(mgr.spinner_frame, 0);
         assert_eq!(mgr.tick_count, 0);
     }
-
-    // --- Full default config integration ---
 
     #[test]
     fn default_config_active_turn_with_permissions() {
@@ -816,8 +793,6 @@ mod tests {
         mgr.update(&idle_state());
         assert_eq!(mgr.last_title, PRODUCT_CLI);
     }
-
-    // --- Multi-item combinations ---
 
     #[test]
     fn all_items_present_in_order() {

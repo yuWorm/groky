@@ -185,11 +185,11 @@ impl DirNode {
         }
     }
     fn add_item(&mut self, rel_parts: &[&str], is_dir: bool) {
-        if rel_parts.is_empty() {
+        let Some((name, rest)) = rel_parts.split_first() else {
             return;
-        }
-        if rel_parts.len() == 1 {
-            let name = rel_parts[0].to_owned();
+        };
+        if rest.is_empty() {
+            let name = (*name).to_owned();
             if is_dir {
                 let key = format!("{name}/");
                 if !self.children.contains_key(&key) {
@@ -204,17 +204,19 @@ impl DirNode {
             }
             return;
         }
-        let subdir = rel_parts[0];
-        let key = format!("{subdir}/");
+        let key = format!("{name}/");
         if !self.children.contains_key(&key) {
             self.children
                 .insert(key.clone(), DirNode::new(self.depth + 1));
             self.subdirs.push(key.clone());
         }
         let child = self.children.get_mut(&key).expect("just inserted");
-        child.add_item(&rel_parts[1..], is_dir);
+        child.add_item(rest, is_dir);
         if !is_dir {
-            let ext = ext_key_from_path(Path::new(rel_parts.last().unwrap()));
+            let Some(leaf) = rest.last() else {
+                return;
+            };
+            let ext = ext_key_from_path(Path::new(leaf));
             self.subtree.add_ext(&ext);
         }
     }
@@ -542,6 +544,11 @@ impl xai_tool_runtime::Tool for ListDirTool {
         let path = resolve_model_path(&cwd, display_cwd.as_deref(), &input.target_directory);
         let display_base = display_cwd_or_cwd(&cwd, display_cwd.as_deref());
         let display_path = compute_display_path(&display_base, &input.target_directory);
+        if let Err(error) =
+            crate::types::memory_v2::validate_memory_v2_read(&resources, &path).await
+        {
+            return Ok(ListDirOutput::PermissionDenied(error));
+        }
         let meta = tokio::fs::metadata(&path).await;
         let is_dir = meta.as_ref().is_ok_and(|m| m.is_dir());
         if !is_dir {

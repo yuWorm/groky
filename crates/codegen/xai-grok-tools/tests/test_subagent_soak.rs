@@ -311,6 +311,8 @@ struct SoakRunner {
 
 impl ChildRunner for SoakRunner {
     type Control = SoakControl;
+    type RootControl =
+        xai_grok_tools::implementations::grok_build::task::root_control::NoRootControl;
     type CompletionData = ();
     type RunFuture = LocalBoxFuture<ChildRunOutput<()>>;
     type ValidateFuture = LocalBoxFuture<SubagentValidateTypeOutcome>;
@@ -323,9 +325,10 @@ impl ChildRunner for SoakRunner {
                 request,
                 cancellation,
                 reporter,
-                wake_agent_id: _,
-                wake_message_source: _,
-                wake_message_id: _,
+                attempt_id: _,
+                generation: _,
+                agent_message_sender: _,
+                wake_origin: _,
                 queued_for: _,
                 session_running: _,
                 agent_address: _,

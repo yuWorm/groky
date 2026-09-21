@@ -18,7 +18,7 @@ use crate::scrollback::render::ScratchBuffer;
 use crate::views::prompt_widget::PromptWidget;
 use crate::views::welcome::WelcomePromptFocus;
 use agent_client_protocol as acp;
-use crossterm::event::{Event, KeyCode, KeyEventKind, KeyModifiers, MouseButton, MouseEventKind};
+use crossterm::event::{Event, KeyCode, KeyEventKind, MouseButton, MouseEventKind};
 use indexmap::IndexMap;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -197,7 +197,7 @@ impl WorktreeMode {
 use super::PagerTerminal;
 use super::actions::Action;
 use super::agent::AgentId;
-use super::agent_view::{AgentView, AppRenderParams, McpInitProgress};
+use super::agent_view::{AgentView, AppRenderParams};
 use super::bundle::BundleState;
 /// Which view is currently displayed.
 /// `AgentDashboard` does not carry state directly because `DashboardState` is not `Copy`.
@@ -539,6 +539,17 @@ pub struct ScreenModeRelaunch {
     /// Active session to reopen via `--resume`.
     pub session_id: String,
 }
+/// The coding-data write in flight. Its reply owns the banner ack; it holds the rollback a failure reverts to.
+/// `opted_in` is independent of `coding_data_retention_opt_out`, which is optimistic and which auth-meta refreshes rewrite mid-flight.
+/// `rollback_to_opted_in` starts from that mirror when idle and is inherited when this write replaces a pending one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PendingCodingDataWrite {
+    /// The choice the write carries.
+    pub opted_in: bool,
+    /// What a failure reverts to: the click-time mirror (possibly the unconfirmed fail-safe default), overwritten by an auth-meta refresh or a superseded write's success.
+    /// Replies are not ordered by server commit, so a late older success can still overwrite a newer value here.
+    pub rollback_to_opted_in: bool,
+}
 /// Root view component: owns all application state.
 pub struct AppView {
     /// Taken by whichever path reaches a usable session (or interactive idle) first.
@@ -643,6 +654,8 @@ pub struct AppView {
     /// External `auth_provider_command` deployment.
     /// No grok.com billing session exists; `/usage` and credit UI stay off.
     pub has_external_auth_provider: bool,
+    /// `AuthMeta::backend_billed`: the agent's backend handles billing itself.
+    pub backend_billed: bool,
     /// Slash commands denied for the current subscription tier ([`TIER_RESTRICTED_COMMANDS`] on the free / X Basic tier, empty otherwise).
     /// Recomputed by [`Self::apply_tier_restrictions`] and fanned out to every slash registry (welcome prompt, agents, dashboard).
     /// Deny wins over all other visibility gates.
@@ -715,6 +728,9 @@ pub struct AppView {
     /// Session created for the current home screen. Home stays visible until
     /// the first interaction reveals it; `None` from then on.
     pub home_session_agent: Option<AgentId>,
+    /// Welcome husk. Survives reveal, which clears `home_session_agent`.
+    /// Not set for `/new`.
+    pub optimistic_home_husk: Option<AgentId>,
     /// Sticky flag: set once the user types in the welcome prompt, hides the tip for the rest of the session (even if the input is cleared).
     pub welcome_tip_typing_dismissed: bool,
     /// Effects queued by notification handlers (drained by the event loop).
@@ -789,6 +805,13 @@ pub struct AppView {
     pub welcome_on_workspace_mode: bool,
     /// Transient welcome toast: (message, wall-clock expiry).
     pub welcome_toast: Option<(String, std::time::Instant)>,
+    /// Nesting depth of `dispatch::dispatch`; image notices surface only when it returns to 0.
+    pub dispatch_depth: u32,
+    /// Image notices raised while one dispatch or ACP message runs (unbound placeholder, unreadable
+    /// attachment, dropped by a command). App-owned so a command that removes its own session
+    /// (`/new`, `/home` in minimal) cannot take the notice down with it; the `unified_log` event is
+    /// written against the originating session when the notice is raised.
+    pub pending_image_notices: Vec<String>,
     /// Sticky hover flag for the privacy banner buttons (redraw on enter/leave).
     pub welcome_on_privacy_banner: bool,
     /// Sticky hover flag for the welcome upgrade CTA (redraw on enter/leave).
@@ -889,6 +912,8 @@ pub struct AppView {
     /// Stamps `_meta["x.ai/session"].kind = "chat"` and omits Build agent profiles on create/load while set.
     /// `/chat` does **not** set this (uses [`Self::deferred_startup`] one-shot state instead).
     pub chat_mode: bool,
+    /// Post-turn CreatePlan review. ACP connect seed for backends that implement ExecutePlan.
+    pub(crate) post_turn_plan_review: bool,
     /// Welcome picker mode; ignored when `local_workspace_startup_locked`.
     #[cfg(feature = "local-workspace")]
     pub welcome_workspace_mode: crate::views::welcome::WelcomeWorkspaceMode,
@@ -1004,10 +1029,9 @@ pub struct AppView {
     pub privacy_banner_reshow_days: Option<u64>,
     /// Local `[privacy].privacy_banner_acked` (RFC 3339 UTC).
     pub privacy_banner_acked: Option<String>,
-    /// In-flight opt-in write whose ack waits on ACP success.
-    pub privacy_banner_opt_in_inflight: bool,
+    pub coding_data_pending_write: Option<PendingCodingDataWrite>,
     /// Newest `SetCodingDataSharing` write. Bumped per dispatch and echoed on the `TaskResult`.
-    /// An older write's late reply (whose `rollback_to_opted_in` was captured before the newer one) thus cannot clobber the current value.
+    /// Only the newest result directly sets the mirror; an older success may update the pending rollback, which does not establish commit order.
     pub coding_data_write_seq: u64,
     /// Persisted `[cli].show_tips` mirror. `None` means no override (default `true`).
     pub show_tips: Option<bool>,
@@ -1134,98 +1158,6 @@ enum UnconsumedInputScope {
     QuitAndResize,
 }
 impl AppView {
-    fn handle_dashboard_session_picker_input(&mut self, ev: &Event) -> Option<InputOutcome> {
-        use crate::views::picker::{PickerConfig, PickerOutcome, handle_picker_input};
-        use crate::views::session_picker::{
-            PickerItem, build_entry_map, effective_filter_query, repo_name_from_cwd,
-        };
-        if self.dashboard_session_picker.is_some()
-            && matches!(
-                ev,
-                Event::Key(key)
-                    if key.kind != KeyEventKind::Release && key.code == KeyCode::Esc
-            )
-        {
-            return Some(InputOutcome::Action(Action::DashboardCloseSessionPicker));
-        }
-        let picker_cwd = self
-            .dashboard
-            .as_ref()
-            .map_or(self.cwd.as_path(), |dashboard| dashboard.cwd.as_path());
-        let current_repo = repo_name_from_cwd(&picker_cwd.to_string_lossy());
-        let surface = self.dashboard_session_picker.as_mut()?;
-        if let Event::Mouse(mouse) = ev {
-            use crate::views::modal_window::ModalWindowOutcome;
-            match crate::views::modal_window::handle_modal_mouse(
-                &mut surface.window,
-                mouse.kind,
-                mouse.column,
-                mouse.row,
-            ) {
-                ModalWindowOutcome::CloseRequested => {
-                    return Some(InputOutcome::Action(Action::DashboardCloseSessionPicker));
-                }
-                ModalWindowOutcome::Unhandled => {}
-                _ => return Some(InputOutcome::Changed),
-            }
-        }
-        if matches!(
-            ev,
-            Event::Key(key)
-                if key.kind != KeyEventKind::Release
-                    && key.code == KeyCode::Char('f')
-                    && key.modifiers.contains(KeyModifiers::CONTROL)
-        ) {
-            return Some(InputOutcome::Unchanged);
-        }
-        let entry_map = build_entry_map(
-            surface.entries.as_deref(),
-            None,
-            effective_filter_query(surface.state.query(), surface.entries_query.as_deref()),
-            true,
-            false,
-            surface.source_filter,
-            Some(current_repo.as_str()),
-        );
-        let non_selectable: Vec<bool> = entry_map.iter().map(Option::is_none).collect();
-        let config = PickerConfig {
-            title: Some(crate::views::session_picker_surface::DASHBOARD_PICKER_TITLE),
-            show_search_hint: true,
-            expandable: false,
-            esc_clears_query: false,
-            shortcuts: Some(crate::views::picker::picker_shortcuts()),
-            pending_hint: None,
-            non_selectable: &non_selectable,
-            non_selectable_clickable: &[],
-            shortcuts_area: None,
-            tabs: None,
-            active_tab: 0,
-            filter_label: None,
-            filter_key_hint: None,
-            filter_active: false,
-            header_note: None,
-            action_keys: &[],
-            disable_search: false,
-            compact_bottom_bar: false,
-            search_only_on_slash: false,
-            vim_normal_first: crate::appearance::cache::load_vim_mode(),
-        };
-        let outcome = handle_picker_input(ev, &mut surface.state, entry_map.len(), &config);
-        Some(match outcome {
-            PickerOutcome::Selected(index) => {
-                match entry_map.get(index).and_then(|item| item.as_ref()) {
-                    Some(PickerItem::Fuzzy { original_index }) => {
-                        InputOutcome::Action(Action::DashboardPickSession(*original_index))
-                    }
-                    _ => InputOutcome::Changed,
-                }
-            }
-            PickerOutcome::Closed => InputOutcome::Action(Action::DashboardCloseSessionPicker),
-            PickerOutcome::Unchanged => InputOutcome::Unchanged,
-            PickerOutcome::Changed | PickerOutcome::QueryChanged => InputOutcome::Changed,
-            _ => InputOutcome::Changed,
-        })
-    }
     /// Finishes startup if this view still holds the obligation; does nothing after.
     pub(crate) fn finish_startup(&mut self, outcome: xai_grok_telemetry::startup::StartupOutcome) {
         xai_grok_telemetry::startup::PendingStartup::finish_held(
@@ -1281,6 +1213,10 @@ impl AppView {
             None
         }
     }
+    /// Choice carried by the coding-data write in flight, if any.
+    pub fn coding_data_pending_opted_in(&self) -> Option<bool> {
+        self.coding_data_pending_write.map(|w| w.opted_in)
+    }
     /// Welcome privacy banner visibility gates.
     pub fn privacy_banner_should_show(&self) -> bool {
         if self.screen_mode.is_minimal() {
@@ -1290,6 +1226,9 @@ impl AppView {
             return false;
         }
         if self.is_zdr || self.is_team_non_admin() {
+            return false;
+        }
+        if self.coding_data_pending_write.is_some() {
             return false;
         }
         if !self.coding_data_retention_opt_out {
@@ -1350,6 +1289,9 @@ impl AppView {
         self.team_name = meta.team_name.clone();
         self.is_zdr = meta.is_zdr;
         self.team_role = meta.team_role.clone();
+        if let Some(pending) = self.coding_data_pending_write.as_mut() {
+            pending.rollback_to_opted_in = !meta.coding_data_retention_opt_out;
+        }
         self.coding_data_retention_opt_out = meta.coding_data_retention_opt_out;
         self.shell_feedback_trace_offer = meta.feedback_trace_offer;
         self.gate = meta.gate.clone();
@@ -1363,14 +1305,14 @@ impl AppView {
             );
         }
         self.subscription_tier = meta.subscription_tier.clone();
+        self.backend_billed = meta.backend_billed;
         let was_api_key = self.is_api_key_auth;
         self.is_api_key_auth = meta.auth_mode.as_deref().is_some_and(is_api_key_label)
             || meta
                 .subscription_tier
                 .as_deref()
                 .is_some_and(is_api_key_label);
-        self.usage_visible =
-            meta.team_name.is_none() && !self.is_api_key_auth && !self.has_external_auth_provider;
+        self.usage_visible = self.team_name.is_none() && self.consumer_account();
         self.sync_billing_surface_to_agents();
         self.apply_tier_restrictions();
         if self.is_api_key_auth {
@@ -1484,6 +1426,7 @@ impl AppView {
             command_tags,
             welcome_prompt_focused: true,
             home_session_agent: None,
+            optimistic_home_husk: None,
             welcome_tip_typing_dismissed: false,
             pending_effects: Vec::new(),
             pending_editor: None,
@@ -1518,6 +1461,8 @@ impl AppView {
             #[cfg(feature = "local-workspace")]
             welcome_on_workspace_mode: false,
             welcome_toast: None,
+            dispatch_depth: 0,
+            pending_image_notices: Vec::new(),
             welcome_on_privacy_banner: false,
             welcome_on_upgrade_cta: false,
             welcome_changelog_cta_rect: None,
@@ -1559,6 +1504,7 @@ impl AppView {
             subagents: false,
             ask_user: false,
             chat_mode: false,
+            post_turn_plan_review: false,
             #[cfg(feature = "local-workspace")]
             welcome_workspace_mode: crate::views::welcome::WelcomeWorkspaceMode::Sandbox,
             #[cfg(feature = "local-workspace")]
@@ -1609,7 +1555,7 @@ impl AppView {
             privacy_notice_rollout: false,
             privacy_banner_reshow_days: None,
             privacy_banner_acked: None,
-            privacy_banner_opt_in_inflight: false,
+            coding_data_pending_write: None,
             coding_data_write_seq: 0,
             show_tips: None,
             auto_update: None,
@@ -1647,6 +1593,7 @@ impl AppView {
             workspace_dashboard_enabled: false,
             usage_visible: true,
             has_external_auth_provider: false,
+            backend_billed: false,
             tier_restricted_commands: Vec::new(),
             leader_mode: false,
             credit_balance: None,
@@ -1742,8 +1689,7 @@ impl AppView {
     /// A mid-session upgrade thus lifts the restrictions without a restart.
     pub fn apply_tier_restrictions(&mut self) {
         let restricted = self.team_name.is_none()
-            && !self.is_api_key_auth
-            && !self.has_external_auth_provider
+            && self.consumer_account()
             && is_restricted_tier(self.subscription_tier.as_deref());
         let names: Vec<String> = if restricted {
             TIER_RESTRICTED_COMMANDS
@@ -1761,6 +1707,10 @@ impl AppView {
             dashboard.set_restricted_commands(&names);
         }
         self.tier_restricted_commands = names;
+    }
+    /// A personal subscription login. API keys, external auth providers, and backend-billed accounts carry no subscription tier
+    pub(super) fn consumer_account(&self) -> bool {
+        !self.backend_billed && !self.is_api_key_auth && !self.has_external_auth_provider
     }
     /// Whether voice mode is withheld for the current subscription tier (free / X Basic personal accounts).
     /// Derived from the computed [`Self::tier_restricted_commands`] deny list so it stays in lockstep with the slash-command gate.
@@ -1990,6 +1940,11 @@ impl AppView {
         self.active_agent()
             .and_then(|a| a.session.session_id.as_ref())
             .map(|sid| sid.0.as_ref())
+    }
+    /// Show the queued image notices when no dispatch is in flight (a nested dispatch leaves them to
+    /// the outermost one); true when a visible surface changed.
+    pub fn flush_image_notices_if_root(&mut self) -> bool {
+        self.dispatch_depth == 0 && crate::app::dispatch::flush_image_notices(self)
     }
     /// Show a toast on the currently active view.
     /// Registration (and thus the mismatch notif) finishes during reconnect.
@@ -2581,149 +2536,116 @@ impl AppView {
                         _ => {}
                     }
                 }
-                if overlay_active {
-                    if let Event::Key(key) = ev
-                        && key.kind != KeyEventKind::Release
-                    {
-                        let lookup = self
-                            .registry
-                            .lookup(key, crate::actions::When::DashboardOverlay)
-                            .or_else(|| self.registry.lookup(key, crate::actions::When::Always));
-                        match lookup {
-                            Some(crate::actions::ActionId::OpenDashboard)
-                            | Some(crate::actions::ActionId::DashboardOverlayExit) => {
-                                return InputOutcome::Action(Action::DashboardOverlayExit);
-                            }
-                            Some(crate::actions::ActionId::DashboardOverlayPrev) => {
-                                return InputOutcome::Action(Action::DashboardOverlayPrev);
-                            }
-                            Some(crate::actions::ActionId::DashboardOverlayNext) => {
-                                return InputOutcome::Action(Action::DashboardOverlayNext);
-                            }
-                            Some(crate::actions::ActionId::DashboardOverlayStop) => {
-                                let confirmation_label = if self.workspace_dashboard_enabled {
-                                    let Some(readiness) = self
-                                        .agents
-                                        .get(&id)
-                                        .map(super::dispatch::dashboard_stop_readiness)
-                                    else {
-                                        return InputOutcome::Unchanged;
-                                    };
-                                    match readiness {
-                                        super::dispatch::DashboardStopReadiness::Stoppable => {
-                                            if self
-                                                .agents
-                                                .get_mut(&id)
-                                                .is_some_and(|agent| agent.arm_dashboard_stop())
-                                            {
-                                                return InputOutcome::Action(Action::CancelTurn);
-                                            }
-                                            return InputOutcome::Action(Action::DashboardOverlayStop);
-                                        }
-                                        super::dispatch::DashboardStopReadiness::Busy => {
-                                            return InputOutcome::Changed;
-                                        }
-                                        super::dispatch::DashboardStopReadiness::Archiveable
-                                        | super::dispatch::DashboardStopReadiness::LocallyClosable => {}
-                                    }
-                                    readiness.action().confirmation_label()
-                                } else if self
+                if overlay_active
+                    && let Event::Key(key) = ev
+                    && key.kind != KeyEventKind::Release
+                {
+                    let lookup = self
+                        .registry
+                        .lookup(key, crate::actions::When::DashboardOverlay)
+                        .or_else(|| self.registry.lookup(key, crate::actions::When::Always));
+                    match lookup {
+                        Some(crate::actions::ActionId::OpenDashboard)
+                        | Some(crate::actions::ActionId::DashboardOverlayExit) => {
+                            return InputOutcome::Action(Action::DashboardOverlayExit);
+                        }
+                        Some(crate::actions::ActionId::DashboardOverlayPrev) => {
+                            return InputOutcome::Action(Action::DashboardOverlayPrev);
+                        }
+                        Some(crate::actions::ActionId::DashboardOverlayNext) => {
+                            return InputOutcome::Action(Action::DashboardOverlayNext);
+                        }
+                        Some(crate::actions::ActionId::DashboardOverlayStop) => {
+                            let confirmation_label = if self.workspace_dashboard_enabled {
+                                let Some(readiness) = self
                                     .agents
-                                    .get_mut(&id)
-                                    .is_some_and(|agent| agent.arm_dashboard_stop())
-                                {
-                                    return InputOutcome::Action(Action::CancelTurn);
-                                } else {
-                                    Some("close this session")
+                                    .get(&id)
+                                    .map(super::dispatch::dashboard_stop_readiness)
+                                else {
+                                    return InputOutcome::Unchanged;
                                 };
-                                self.pending_action = Some(PendingAction::with_ttl(
-                                    Action::DashboardOverlayStop,
-                                    KeyShortcut::from(*key),
-                                    confirmation_label,
-                                    crate::views::dashboard::state::CONFIRM_WINDOW,
-                                ));
-                                return InputOutcome::Changed;
-                            }
-                            _ => {}
-                        }
-                        if key.code == KeyCode::Left
-                            && key.modifiers.is_empty()
-                            && self
+                                match readiness {
+                                    super::dispatch::DashboardStopReadiness::Stoppable => {
+                                        if self
+                                            .agents
+                                            .get_mut(&id)
+                                            .is_some_and(|agent| agent.arm_dashboard_stop())
+                                        {
+                                            return InputOutcome::Action(Action::CancelTurn);
+                                        }
+                                        return InputOutcome::Action(Action::DashboardOverlayStop);
+                                    }
+                                    super::dispatch::DashboardStopReadiness::Busy => {
+                                        return InputOutcome::Changed;
+                                    }
+                                    super::dispatch::DashboardStopReadiness::Archiveable
+                                    | super::dispatch::DashboardStopReadiness::LocallyClosable => {}
+                                }
+                                readiness.action().confirmation_label()
+                            } else if self
                                 .agents
-                                .get(&id)
-                                .is_some_and(|a| a.is_empty_focused_prompt())
-                        {
-                            return InputOutcome::Action(Action::DashboardOverlayExit);
+                                .get_mut(&id)
+                                .is_some_and(|agent| agent.arm_dashboard_stop())
+                            {
+                                return InputOutcome::Action(Action::CancelTurn);
+                            } else {
+                                Some("close this session")
+                            };
+                            self.pending_action = Some(PendingAction::with_ttl(
+                                Action::DashboardOverlayStop,
+                                KeyShortcut::from(*key),
+                                confirmation_label,
+                                crate::views::dashboard::state::CONFIRM_WINDOW,
+                            ));
+                            return InputOutcome::Changed;
                         }
-                        if key.code == KeyCode::Esc
-                            && key.modifiers.is_empty()
-                            && self
-                                .agents
-                                .get(&id)
-                                .is_some_and(|a| a.overlay_esc_backs_out_from_prompt())
-                        {
-                            return InputOutcome::Action(Action::DashboardOverlayExit);
-                        }
-                        if key.modifiers.is_empty()
-                            && self.agents.get(&id).is_some_and(|a| match key.code {
-                                KeyCode::Esc => a.overlay_esc_backs_out(),
-                                KeyCode::Left => a.overlay_left_backs_out(),
-                                _ => false,
-                            })
-                        {
-                            return InputOutcome::Action(Action::DashboardOverlayExit);
-                        }
-                        let neutral = self.agents.get(&id).is_some_and(|a| {
-                            a.is_bare_scrollback() && a.no_input_overlay_pending()
-                        });
-                        if key.code == KeyCode::Char('q') && key.modifiers.is_empty() && neutral {
-                            return InputOutcome::Action(Action::DashboardOverlayExit);
-                        }
-                        if key.code == KeyCode::Esc
-                            && key.modifiers.is_empty()
-                            && neutral
-                            && self.agents.get(&id).is_some_and(|a| {
-                                a.no_esc_consumer_pending()
-                                    && !a.session.state.is_turn_running()
-                                    && !a.session.state.is_cancelling()
-                                    && !a.wake_turn_active()
-                            })
-                        {
-                            return InputOutcome::Action(Action::DashboardOverlayExit);
-                        }
+                        _ => {}
                     }
-                    if let Event::Mouse(mouse) = ev {
-                        use crossterm::event::{MouseButton, MouseEventKind};
-                        match mouse.kind {
-                            MouseEventKind::Moved => {
-                                let mut changed = false;
-                                if let Some(d) = self.dashboard.as_mut() {
-                                    changed |=
-                                        d.overlay_close_hit.update_hover(mouse.column, mouse.row);
-                                    changed |=
-                                        d.overlay_prev_hit.update_hover(mouse.column, mouse.row);
-                                    changed |=
-                                        d.overlay_next_hit.update_hover(mouse.column, mouse.row);
-                                }
-                                if changed {
-                                    return InputOutcome::Changed;
-                                }
-                            }
-                            MouseEventKind::Down(MouseButton::Left) => {
-                                if let Some(d) = self.dashboard.as_ref() {
-                                    if d.overlay_close_hit.contains(mouse.column, mouse.row) {
-                                        return InputOutcome::Action(Action::DashboardOverlayExit);
-                                    }
-                                    if d.overlay_prev_hit.contains(mouse.column, mouse.row) {
-                                        return InputOutcome::Action(Action::DashboardOverlayPrev);
-                                    }
-                                    if d.overlay_next_hit.contains(mouse.column, mouse.row) {
-                                        return InputOutcome::Action(Action::DashboardOverlayNext);
-                                    }
-                                }
-                            }
-                            _ => {}
-                        }
+                    if key.code == KeyCode::Left
+                        && key.modifiers.is_empty()
+                        && self
+                            .agents
+                            .get(&id)
+                            .is_some_and(|a| a.is_empty_focused_prompt())
+                    {
+                        return InputOutcome::Action(Action::DashboardOverlayExit);
+                    }
+                    if key.code == KeyCode::Esc
+                        && key.modifiers.is_empty()
+                        && self
+                            .agents
+                            .get(&id)
+                            .is_some_and(|a| a.overlay_esc_backs_out_from_prompt())
+                    {
+                        return InputOutcome::Action(Action::DashboardOverlayExit);
+                    }
+                    if key.modifiers.is_empty()
+                        && self.agents.get(&id).is_some_and(|a| match key.code {
+                            KeyCode::Esc => a.overlay_esc_backs_out(),
+                            KeyCode::Left => a.overlay_left_backs_out(),
+                            _ => false,
+                        })
+                    {
+                        return InputOutcome::Action(Action::DashboardOverlayExit);
+                    }
+                    let neutral = self
+                        .agents
+                        .get(&id)
+                        .is_some_and(|a| a.is_bare_scrollback() && a.no_input_overlay_pending());
+                    if key.code == KeyCode::Char('q') && key.modifiers.is_empty() && neutral {
+                        return InputOutcome::Action(Action::DashboardOverlayExit);
+                    }
+                    if key.code == KeyCode::Esc
+                        && key.modifiers.is_empty()
+                        && neutral
+                        && self.agents.get(&id).is_some_and(|a| {
+                            a.no_esc_consumer_pending()
+                                && !a.session.state.is_turn_running()
+                                && !a.session.state.is_cancelling()
+                                && !a.wake_turn_active()
+                        })
+                    {
+                        return InputOutcome::Action(Action::DashboardOverlayExit);
                     }
                 }
                 if let Some(modal) = self.import_claude_modal.as_mut() {
@@ -2804,6 +2726,7 @@ impl AppView {
                 }
             }
             ActiveView::AgentDashboard => {
+                self.close_dashboard_send_echo_window(key_event);
                 if let Some(outcome) = self.voice_esc_outcome(key_event) {
                     return outcome;
                 }
@@ -2924,7 +2847,10 @@ impl AppView {
                                 self.scroll_state.cancel_stream();
                                 self.last_scroll_pos = None;
                             }
-                            if matches!(outcome, InputOutcome::Action(Action::ExitSession)) {
+                            if matches!(
+                                outcome,
+                                InputOutcome::Action(Action::ExitSession | Action::OpenDashboard)
+                            ) {
                                 if let Some(d) = self.dashboard.as_mut() {
                                     d.close_popup();
                                 }
@@ -3019,6 +2945,15 @@ impl AppView {
             return outcome;
         }
         self.handle_unconsumed_input(ev, key_event, UnconsumedInputScope::All)
+    }
+    /// Any key other than Enter closes the dashboard's send echo window.
+    fn close_dashboard_send_echo_window(&mut self, key_event: Option<&crossterm::event::KeyEvent>) {
+        if let Some(key) = key_event
+            && key.code != KeyCode::Enter
+            && let Some(d) = self.dashboard.as_mut()
+        {
+            d.last_send_at = None;
+        }
     }
     fn handle_unconsumed_input(
         &mut self,
@@ -4391,7 +4326,7 @@ impl AppView {
     /// Render the current view to the terminal.
     pub fn draw(&mut self, terminal: &mut PagerTerminal) {
         self.draw_inner(terminal);
-        xai_grok_telemetry::startup::record_first_frame();
+        xai_grok_telemetry::startup::record_first_draw();
         crate::memory_release::run_deferred_release();
     }
     fn draw_inner(&mut self, terminal: &mut PagerTerminal) {
@@ -4427,14 +4362,6 @@ impl AppView {
         self.maybe_trigger_small_screen_tip();
         self.maybe_trigger_ssh_wrap_tip();
         let compact = self.appearance.prompt.compact;
-        let (header_pad_left, header_pad_right, header_pad_top) = {
-            let layout_cfg = &self.appearance.scrollback.layout;
-            (
-                layout_cfg.eff_hpad_left(compact),
-                layout_cfg.eff_hpad_right(compact),
-                layout_cfg.eff_outer_vpad(compact),
-            )
-        };
         let zdr_blocked_for_draw = self.is_zdr_blocked();
         let has_access = self.has_access();
         let privacy_banner = self.privacy_banner_should_show();
@@ -4486,436 +4413,219 @@ impl AppView {
                     })
             });
         let fps_frame_started = fps_overlay.as_ref().map(|_| std::time::Instant::now());
-        crate::render::draw::draw_frame(terminal, cursor, |f, link_spans| {
-            let full_area = f.area();
-            let tracing_height = 0u16;
-            #[allow(unused_variables)]
-            let (tracing_area, view_area) =
-                if tracing_height > 0 && tracing_height < full_area.height {
-                    let tracing = ratatui::layout::Rect {
-                        x: full_area.x,
-                        y: full_area.y,
-                        width: full_area.width,
-                        height: tracing_height,
+        crate::render::draw::draw_frame(
+            terminal,
+            cursor,
+            crate::terminal::terminal_context(),
+            |f, link_spans| {
+                let full_area = f.area();
+                let tracing_height = 0u16;
+                #[allow(unused_variables)]
+                let (tracing_area, view_area) =
+                    if tracing_height > 0 && tracing_height < full_area.height {
+                        let tracing = ratatui::layout::Rect {
+                            x: full_area.x,
+                            y: full_area.y,
+                            width: full_area.width,
+                            height: tracing_height,
+                        };
+                        let view = ratatui::layout::Rect {
+                            x: full_area.x,
+                            y: full_area.y + tracing_height,
+                            width: full_area.width,
+                            height: full_area.height.saturating_sub(tracing_height),
+                        };
+                        (Some(tracing), view)
+                    } else if tracing_height >= full_area.height {
+                        let tracing = full_area;
+                        (Some(tracing), ratatui::layout::Rect::default())
+                    } else {
+                        (None, full_area)
                     };
-                    let view = ratatui::layout::Rect {
-                        x: full_area.x,
-                        y: full_area.y + tracing_height,
-                        width: full_area.width,
-                        height: full_area.height.saturating_sub(tracing_height),
-                    };
-                    (Some(tracing), view)
-                } else if tracing_height >= full_area.height {
-                    let tracing = full_area;
-                    (Some(tracing), ratatui::layout::Rect::default())
-                } else {
-                    (None, full_area)
-                };
-            if view_area.height > 0 {
-                match *active_view {
-                    ActiveView::Welcome => {
-                        let mut flags_vec: Vec<crate::views::prompt_widget::PromptFlag<'_>> =
-                            Vec::new();
-                        let theme = crate::theme::Theme::current();
-                        match welcome_mode {
-                            Some((true, _, _)) => {
-                                flags_vec.push(crate::views::prompt_widget::PromptFlag {
-                                    text: "plan",
-                                    color: Some(theme.accent_plan),
-                                    bold: false,
-                                });
-                            }
-                            Some((false, true, _)) => {
-                                flags_vec.push(crate::views::prompt_widget::PromptFlag {
-                                    text: "always-approve",
-                                    color: None,
-                                    bold: false,
-                                });
-                            }
-                            Some((false, false, true)) if welcome_auto_gate => {
-                                flags_vec.push(crate::views::prompt_widget::PromptFlag {
-                                    text: "auto",
-                                    color: Some(theme.accent_system),
-                                    bold: false,
-                                });
-                            }
-                            None if welcome_default_yolo => {
-                                flags_vec.push(crate::views::prompt_widget::PromptFlag {
-                                    text: "always-approve",
-                                    color: None,
-                                    bold: false,
-                                });
-                            }
-                            _ => {}
-                        }
-                        if !self.welcome_prompt.text().is_empty() {
-                            self.welcome_tip_typing_dismissed = true;
-                        }
-                        let tip = if self.welcome_tip_typing_dismissed {
-                            None
-                        } else {
-                            self.tip.as_deref()
-                        };
-                        let model_name_base = self.models.current_model_name().unwrap_or_default();
-                        let model_name = match self.models.reasoning_effort {
-                            Some(eff) => format!("{model_name_base} ({eff})"),
-                            None => model_name_base,
-                        };
-                        let hero_cta = crate::views::announcements::promo_cta(
-                            &self.active_announcements,
-                            &self.hidden_announcement_ids,
-                        );
-                        let hero_announcement = hero_cta
-                            .map(|(owner, _, _)| owner)
-                            .or_else(|| {
-                                crate::views::announcements::first_session_announcement(
-                                    &self.active_announcements,
-                                    &self.hidden_announcement_ids,
-                                )
-                            })
-                            .or(self.announcement.as_ref());
-                        let welcome_params = crate::views::welcome::WelcomeRenderParams {
-                            prompt_focus: if self.welcome_prompt_focused {
-                                WelcomePromptFocus::Focused
-                            } else {
-                                WelcomePromptFocus::Unfocused
-                            },
-                            cwd: &self.cwd,
-                            auth_state: &self.auth_state,
-                            trust_state: &self.trust_state,
-                            consent_state: &self.consent_state,
-                            consent_hover_link: self.welcome_consent_hover_link,
-                            login_label: self.login_label.as_deref(),
-                            auth_code_input: self.auth_code_input.text(),
-                            auth_code_cursor_byte: self.auth_code_input.cursor_byte(),
-                            clipboard_delivery: self.auth_clipboard_delivery,
-                            show_raw_url: self.auth_show_raw_url,
-                            announcement: hero_announcement,
-                            tip,
-                            model_name: &model_name,
-                            flags: &flags_vec,
-                            selected: self.welcome_menu_index,
-                            team_name: self.team_name.as_deref(),
-                            has_access,
-                            has_claude_import: self.has_claude_import,
-                            mouse_pos: self.last_mouse_pos,
-                            is_zdr_blocked: zdr_blocked_for_draw,
-                            session_picker: self.session_picker_entries.as_deref(),
-                            session_picker_loading:
-                                crate::views::session_picker::loading_spinner_active(
-                                    self.session_picker_entries.as_deref(),
-                                    self.session_picker_source_filter,
-                                    self.session_picker_loading,
-                                    &self.session_picker_lanes,
-                                ),
-                            compact,
-                            pending_hint,
-                            startup_warnings: &self.startup_warnings,
-                            pending_update_version: self.pending_update_version.as_deref(),
-                            foreign_resume_hint: foreign_resume_hint.as_ref(),
-                            session_picker_content_results: self
-                                .session_picker_content_results
-                                .as_deref(),
-                            session_picker_content_loading: self.session_picker_content_loading,
-                            session_picker_entries_query: self
-                                .session_picker_entries_query
-                                .as_deref(),
-                            welcome_tick: self.welcome_tick,
-                            gate: self.gate.as_ref(),
-                            subscription_tier: self.subscription_tier.as_deref(),
-                            session_picker_grouped: self.session_picker_grouped,
-                            session_picker_source_filter: self.session_picker_source_filter,
-                            session_picker_pending_delete: self
-                                .session_picker_pending_delete
-                                .is_some(),
-                            chat_mode: self.chat_mode,
-                            credit_balance: self.credit_balance.as_ref(),
-                            auto_topup: self.auto_topup.as_ref(),
-                            usage_visible: self.usage_visible,
-                            is_api_key_auth: self.is_api_key_auth,
-                            changelog_bullets: &self.changelog_bullets,
-                            changelog_has_full_notes: self.changelog_markdown.is_some(),
-                            welcome_announcement_expanded: self.welcome_announcement.expanded,
-                            upgrade_cta: hero_cta.map(|(_owner, label, _)| label),
-                            privacy_banner,
-                            #[cfg(feature = "local-workspace")]
-                            workspace_mode: self.welcome_workspace_mode,
-                            #[cfg(feature = "local-workspace")]
-                            workspace_mode_startup_locked: self.local_workspace_startup_locked,
-                            #[cfg(feature = "local-workspace")]
-                            workspace_mode_ack_pending: self.welcome_local_workspace_ack_pending,
-                        };
-                        let result = crate::views::welcome::render_welcome(
-                            view_area,
-                            f.buffer_mut(),
-                            &welcome_params,
-                            &mut self.welcome_prompt,
-                            &mut self.session_picker_state,
-                        );
-                        self.welcome_menu_rects = result.menu_rects;
-                        self.welcome_show_changelog_action = result.changelog_action_present;
-                        self.welcome_prompt_rect = result.prompt_rect;
-                        self.welcome_import_banner_rect = result.import_banner_rect;
-                        self.welcome_auth_url_rect = result.auth_url_rect;
-                        self.welcome_auth_fallback_rect = result.auth_fallback_rect;
-                        self.welcome_refresh_rect = result.refresh_rect;
-                        self.welcome_gate_url_rect = result.gate_url_rect;
-                        self.welcome_consent_link_rects = result.consent_link_rects;
-                        if self.welcome_consent_link_rects.is_empty() {
-                            self.welcome_consent_hover_link = None;
-                        }
-                        record_consent_paint(&mut self.consent_state, result.consent_legibility);
-                        self.welcome_upgrade_cta_rect = result.upgrade_cta_rect;
-                        self.welcome_privacy_banner_opt_in_rect = result.privacy_banner_opt_in_rect;
-                        self.welcome_privacy_banner_opt_out_rect =
-                            result.privacy_banner_opt_out_rect;
-                        self.welcome_privacy_banner_terms_rect = result.privacy_banner_terms_rect;
-                        self.welcome_privacy_banner_policy_rect = result.privacy_banner_policy_rect;
-                        #[cfg(feature = "local-workspace")]
-                        {
-                            self.welcome_workspace_mode_rects = result.workspace_mode_rects;
-                        }
-                        self.welcome_changelog_cta_rect = result.changelog_cta_rect;
-                        if let Some((ref msg, _)) = self.welcome_toast {
-                            crate::views::welcome::paint_welcome_toast(
-                                f.buffer_mut(),
-                                view_area,
-                                msg,
-                                self.welcome_prompt_rect,
-                            );
-                        }
-                        self.welcome_announcement.truncated = result.announcement_truncated;
-                        self.welcome_announcement.rect = result.announcement_rect;
-                        self.session_picker_state.hit_areas = result.session_picker_hit_areas;
-                        if let Some(modal) = self.import_claude_modal.as_mut() {
+                if view_area.height > 0 {
+                    match *active_view {
+                        ActiveView::Welcome => {
+                            let mut flags_vec: Vec<crate::views::prompt_widget::PromptFlag<'_>> =
+                                Vec::new();
                             let theme = crate::theme::Theme::current();
-                            crate::views::import_claude_modal::render_import_claude_modal(
-                                f.buffer_mut(),
-                                view_area,
-                                modal,
-                                &theme,
-                                compact,
-                            );
-                        }
-                        if let Some(ref mut modal_state) = self.welcome_vendor_login {
-                            crate::views::vendor_login_modal::render_vendor_login_modal(
-                                f.buffer_mut(),
-                                view_area,
-                                modal_state,
-                                compact,
-                            );
-                        }
-                        if let Some(dialog) = self.new_worktree_dialog.as_ref() {
-                            crate::views::new_worktree_dialog::render_new_worktree_dialog(
-                                view_area,
-                                f.buffer_mut(),
-                                dialog,
-                            );
-                        }
-                        if let Some(crate::views::modal::ActiveModal::DocViewer {
-                            ref title,
-                            ref content,
-                            ref mut scroll,
-                            ref mut window,
-                            ref mut cached_lines,
-                            ..
-                        }) = self.welcome_doc_viewer
-                        {
-                            let theme = crate::theme::Theme::current();
-                            crate::views::modal::render_doc_viewer_overlay(
-                                f.buffer_mut(),
-                                view_area,
-                                window,
-                                title,
-                                content,
-                                scroll,
-                                cached_lines,
-                                compact,
-                                &theme,
-                            );
-                        }
-                        if !has_access && !self.access_gate_shown_logged {
-                            self.access_gate_shown_logged = true;
-                            xai_grok_telemetry::session_ctx::log_event(
-                                xai_grok_telemetry::events::SuperGrokUpsellShown {
-                                    source:
-                                        xai_grok_telemetry::events::SuperGrokUpsell::WelcomeScreen,
-                                    auth_method: self
-                                        .login_method_id
-                                        .as_ref()
-                                        .map(|id| id.0.to_string()),
-                                },
-                            );
-                        }
-                        if let Some(tutorial) = self.tutorial.as_mut() {
-                            crate::views::tutorial::render_tutorial(
-                                f.buffer_mut(),
-                                view_area,
-                                tutorial,
-                                compact,
-                            );
-                        }
-                        if let Some(fps) = &fps_overlay {
-                            fps.render(full_area, f.buffer_mut());
-                        }
-                        if let Some(panel) = &scroll_debug_panel {
-                            panel.render(full_area, f.buffer_mut());
-                        }
-                        let has_cloud_modal = false;
-                        let cursor = if has_cloud_modal || self.tutorial.is_some() {
-                            None
-                        } else {
-                            result.cursor_pos
-                        };
-                        let on_url = self.welcome_auth_url_rect.as_ref().is_some_and(|r| {
-                            matches!(self.auth_state, AuthState::Authenticating { .. })
-                                && self.last_mouse_pos.is_some_and(|(mx, my)| {
-                                    mx >= r.x
-                                        && mx < r.x + r.width
-                                        && my >= r.y
-                                        && my < r.y + r.height
-                                })
-                        });
-                        let mut post_flush = result.post_flush_escapes;
-                        if crate::terminal::terminal_context()
-                            .hyperlink_capabilities()
-                            .osc22_cursor
-                            && on_url != self.welcome_on_auth_url
-                        {
-                            use crossterm::Command;
-                            let mut buf = String::new();
-                            if on_url {
-                                let _ = crate::terminal::SetPointerCursor.write_ansi(&mut buf);
-                            } else {
-                                let _ = crate::terminal::SetDefaultCursor.write_ansi(&mut buf);
-                            }
-                            match post_flush.as_mut() {
-                                Some(existing) => existing.append_plain(&buf),
-                                None => {
-                                    post_flush =
-                                        Some(crate::terminal::overlay::PostFlush::plain(buf));
+                            match welcome_mode {
+                                Some((true, _, _)) => {
+                                    flags_vec.push(crate::views::prompt_widget::PromptFlag {
+                                        text: "plan",
+                                        color: Some(theme.accent_plan),
+                                        bold: false,
+                                    });
                                 }
+                                Some((false, true, _)) => {
+                                    flags_vec.push(crate::views::prompt_widget::PromptFlag {
+                                        text: "always-approve",
+                                        color: None,
+                                        bold: false,
+                                    });
+                                }
+                                Some((false, false, true)) if welcome_auto_gate => {
+                                    flags_vec.push(crate::views::prompt_widget::PromptFlag {
+                                        text: "auto",
+                                        color: Some(theme.accent_system),
+                                        bold: false,
+                                    });
+                                }
+                                None if welcome_default_yolo => {
+                                    flags_vec.push(crate::views::prompt_widget::PromptFlag {
+                                        text: "always-approve",
+                                        color: None,
+                                        bold: false,
+                                    });
+                                }
+                                _ => {}
                             }
-                        }
-                        self.welcome_on_auth_url = on_url;
-                        return (cursor, post_flush);
-                    }
-                    ActiveView::Agent(id) => {
-                        let overlay_focused = false;
-                        let overlay_active = self
-                            .dashboard
-                            .as_ref()
-                            .is_some_and(|d| d.attached_agent == Some(id));
-                        let position: Option<(usize, usize)> =
-                            if overlay_active && let Some(d) = self.dashboard.as_ref() {
-                                let order = crate::views::dashboard::overlay_cycle_order(d, agents);
-                                order
-                                    .iter()
-                                    .position(|i| *i == id)
-                                    .map(|idx| (idx + 1, order.len()))
-                            } else {
+                            if !self.welcome_prompt.text().is_empty() {
+                                self.welcome_tip_typing_dismissed = true;
+                            }
+                            let tip = if self.welcome_tip_typing_dismissed {
                                 None
+                            } else {
+                                self.tip.as_deref()
                             };
-                        let overlay_can_cycle = position.is_some_and(|(_, n)| n > 1);
-                        let (agent_area, header) = if overlay_active {
-                            let theme = crate::theme::Theme::current();
-                            let title = agents
-                                .get(&id)
-                                .map(crate::views::session_title::entry_title)
-                                .unwrap_or_else(|| "(session)".to_string());
-                            let (hover_prev, hover_next, hover_close) = self
-                                .dashboard
-                                .as_ref()
-                                .map(|d| {
-                                    (
-                                        d.overlay_prev_hit.hovered,
-                                        d.overlay_next_hit.hovered,
-                                        d.overlay_close_hit.hovered,
+                            let model_name_base =
+                                self.models.current_model_name().unwrap_or_default();
+                            let model_name = match self.models.reasoning_effort {
+                                Some(eff) => format!("{model_name_base} ({eff})"),
+                                None => model_name_base,
+                            };
+                            let hero_cta = crate::views::announcements::promo_cta(
+                                &self.active_announcements,
+                                &self.hidden_announcement_ids,
+                            );
+                            let hero_announcement = hero_cta
+                                .map(|(owner, _, _)| owner)
+                                .or_else(|| {
+                                    crate::views::announcements::first_session_announcement(
+                                        &self.active_announcements,
+                                        &self.hidden_announcement_ids,
                                     )
                                 })
-                                .unwrap_or((false, false, false));
-                            let header = crate::views::dashboard::render_dashboard_session_header(
-                                f.buffer_mut(),
-                                view_area,
-                                &theme,
-                                &title,
-                                position,
-                                hover_prev,
-                                hover_next,
-                                hover_close,
-                                header_pad_left,
-                                header_pad_right,
-                                header_pad_top,
-                            );
-                            match header {
-                                Some(chrome) => (chrome.content, Some(chrome)),
-                                None => (view_area, None),
-                            }
-                        } else {
-                            (view_area, None)
-                        };
-                        if let Some(d) = self.dashboard.as_mut() {
-                            d.overlay_close_hit.set(header.and_then(|c| c.close_rect));
-                            d.overlay_prev_hit.set(header.and_then(|c| c.prev_rect));
-                            d.overlay_next_hit.set(header.and_then(|c| c.next_rect));
-                        }
-                        if let Some(d) = self.dashboard.as_mut()
-                            && d.peek_viewport.is_some()
-                        {
-                            d.restore_peek_viewport(agents);
-                        }
-                        if let Some(agent) = agents.get_mut(&id) {
-                            let announcement_banner_h =
-                                crate::views::announcements::session_banner_height(
-                                    &self.active_announcements,
-                                    &self.hidden_announcement_ids,
-                                );
-                            let privacy_banner = privacy_banner_agent;
-                            let show_session_tip =
-                                !privacy_banner && self.tip.is_some() && agent.should_show_tip();
-                            let has_mode_banner = agent.mode_switch_banner.is_some();
-                            let banner_height = if privacy_banner {
-                                crate::views::privacy_banner::MIN_HEIGHT
-                            } else if has_mode_banner {
-                                1
-                            } else if announcement_banner_h > 0 {
-                                announcement_banner_h
-                            } else if show_session_tip {
-                                1
-                            } else {
-                                0
-                            };
-                            let result = agent.draw(
-                                agent_area,
-                                f.buffer_mut(),
-                                registry,
-                                scratch,
+                                .or(self.announcement.as_ref());
+                            let welcome_params = crate::views::welcome::WelcomeRenderParams {
+                                prompt_focus: if self.welcome_prompt_focused {
+                                    WelcomePromptFocus::Focused
+                                } else {
+                                    WelcomePromptFocus::Unfocused
+                                },
+                                cwd: &self.cwd,
+                                auth_state: &self.auth_state,
+                                trust_state: &self.trust_state,
+                                consent_state: &self.consent_state,
+                                consent_hover_link: self.welcome_consent_hover_link,
+                                login_label: self.login_label.as_deref(),
+                                auth_code_input: self.auth_code_input.text(),
+                                auth_code_cursor_byte: self.auth_code_input.cursor_byte(),
+                                clipboard_delivery: self.auth_clipboard_delivery,
+                                show_raw_url: self.auth_show_raw_url,
+                                announcement: hero_announcement,
+                                tip,
+                                model_name: &model_name,
+                                flags: &flags_vec,
+                                selected: self.welcome_menu_index,
+                                team_name: self.team_name.as_deref(),
+                                has_access,
+                                has_claude_import: self.has_claude_import,
+                                mouse_pos: self.last_mouse_pos,
+                                is_zdr_blocked: zdr_blocked_for_draw,
+                                session_picker: self.session_picker_entries.as_deref(),
+                                session_picker_loading:
+                                    crate::views::session_picker::loading_spinner_active(
+                                        self.session_picker_entries.as_deref(),
+                                        self.session_picker_source_filter,
+                                        self.session_picker_loading,
+                                        &self.session_picker_lanes,
+                                    ),
+                                compact,
                                 pending_hint,
-                                overlay_focused,
-                                crate::app::agent_view::BannerSlotParams {
-                                    height: banner_height,
-                                    announcements: &self.active_announcements,
-                                    hidden_ids: &self.hidden_announcement_ids,
-                                    privacy_banner,
-                                    mouse_pos: agent_mouse_pos,
-                                    tip: if show_session_tip {
-                                        self.tip.as_deref()
-                                    } else {
-                                        None
-                                    },
-                                },
-                                &self.bundle_state,
-                                overlay_active,
-                                overlay_can_cycle,
-                                link_spans,
-                                AppRenderParams {
-                                    voice_available,
-                                    voice_listening,
-                                    voice_interim: voice_interim.as_deref(),
-                                    status_line: status_line_frame.clone(),
-                                    workspace_dashboard_enabled: self.workspace_dashboard_enabled,
-                                },
+                                startup_warnings: &self.startup_warnings,
+                                pending_update_version: self.pending_update_version.as_deref(),
+                                foreign_resume_hint: foreign_resume_hint.as_ref(),
+                                session_picker_content_results: self
+                                    .session_picker_content_results
+                                    .as_deref(),
+                                session_picker_content_loading: self.session_picker_content_loading,
+                                session_picker_entries_query: self
+                                    .session_picker_entries_query
+                                    .as_deref(),
+                                welcome_tick: self.welcome_tick,
+                                gate: self.gate.as_ref(),
+                                subscription_tier: self.subscription_tier.as_deref(),
+                                session_picker_grouped: self.session_picker_grouped,
+                                session_picker_source_filter: self.session_picker_source_filter,
+                                session_picker_pending_delete: self
+                                    .session_picker_pending_delete
+                                    .is_some(),
+                                chat_mode: self.chat_mode,
+                                credit_balance: self.credit_balance.as_ref(),
+                                auto_topup: self.auto_topup.as_ref(),
+                                usage_visible: self.usage_visible,
+                                is_api_key_auth: self.is_api_key_auth,
+                                changelog_bullets: &self.changelog_bullets,
+                                changelog_has_full_notes: self.changelog_markdown.is_some(),
+                                welcome_announcement_expanded: self.welcome_announcement.expanded,
+                                upgrade_cta: hero_cta.map(|(_owner, label, _)| label),
+                                privacy_banner,
+                                #[cfg(feature = "local-workspace")]
+                                workspace_mode: self.welcome_workspace_mode,
+                                #[cfg(feature = "local-workspace")]
+                                workspace_mode_startup_locked: self.local_workspace_startup_locked,
+                                #[cfg(feature = "local-workspace")]
+                                workspace_mode_ack_pending: self
+                                    .welcome_local_workspace_ack_pending,
+                            };
+                            let result = crate::views::welcome::render_welcome(
+                                view_area,
+                                f.buffer_mut(),
+                                &welcome_params,
+                                &mut self.welcome_prompt,
+                                &mut self.session_picker_state,
                             );
+                            self.welcome_menu_rects = result.menu_rects;
+                            self.welcome_show_changelog_action = result.changelog_action_present;
+                            self.welcome_prompt_rect = result.prompt_rect;
+                            self.welcome_import_banner_rect = result.import_banner_rect;
+                            self.welcome_auth_url_rect = result.auth_url_rect;
+                            self.welcome_auth_fallback_rect = result.auth_fallback_rect;
+                            self.welcome_refresh_rect = result.refresh_rect;
+                            self.welcome_gate_url_rect = result.gate_url_rect;
+                            self.welcome_consent_link_rects = result.consent_link_rects;
+                            if self.welcome_consent_link_rects.is_empty() {
+                                self.welcome_consent_hover_link = None;
+                            }
+                            record_consent_paint(
+                                &mut self.consent_state,
+                                result.consent_legibility,
+                            );
+                            self.welcome_upgrade_cta_rect = result.upgrade_cta_rect;
+                            self.welcome_privacy_banner_opt_in_rect =
+                                result.privacy_banner_opt_in_rect;
+                            self.welcome_privacy_banner_opt_out_rect =
+                                result.privacy_banner_opt_out_rect;
+                            self.welcome_privacy_banner_terms_rect =
+                                result.privacy_banner_terms_rect;
+                            self.welcome_privacy_banner_policy_rect =
+                                result.privacy_banner_policy_rect;
+                            #[cfg(feature = "local-workspace")]
+                            {
+                                self.welcome_workspace_mode_rects = result.workspace_mode_rects;
+                            }
+                            self.welcome_changelog_cta_rect = result.changelog_cta_rect;
+                            if let Some((ref msg, _)) = self.welcome_toast {
+                                crate::views::welcome::paint_welcome_toast(
+                                    f.buffer_mut(),
+                                    view_area,
+                                    msg,
+                                    self.welcome_prompt_rect,
+                                );
+                            }
+                            self.welcome_announcement.truncated = result.announcement_truncated;
+                            self.welcome_announcement.rect = result.announcement_rect;
+                            self.session_picker_state.hit_areas = result.session_picker_hit_areas;
                             if let Some(modal) = self.import_claude_modal.as_mut() {
                                 let theme = crate::theme::Theme::current();
                                 crate::views::import_claude_modal::render_import_claude_modal(
@@ -4926,6 +4636,53 @@ impl AppView {
                                     compact,
                                 );
                             }
+                            if let Some(ref mut modal_state) = self.welcome_vendor_login {
+                                crate::views::vendor_login_modal::render_vendor_login_modal(
+                                    f.buffer_mut(),
+                                    view_area,
+                                    modal_state,
+                                    compact,
+                                );
+                            }
+                            if let Some(dialog) = self.new_worktree_dialog.as_ref() {
+                                crate::views::new_worktree_dialog::render_new_worktree_dialog(
+                                    view_area,
+                                    f.buffer_mut(),
+                                    dialog,
+                                );
+                            }
+                            if let Some(crate::views::modal::ActiveModal::DocViewer {
+                                ref title,
+                                ref content,
+                                ref mut scroll,
+                                ref mut window,
+                                ref mut cached_lines,
+                                ..
+                            }) = self.welcome_doc_viewer
+                            {
+                                let theme = crate::theme::Theme::current();
+                                crate::views::modal::render_doc_viewer_overlay(
+                                    f.buffer_mut(),
+                                    view_area,
+                                    window,
+                                    title,
+                                    content,
+                                    scroll,
+                                    cached_lines,
+                                    compact,
+                                    &theme,
+                                );
+                            }
+                            if !has_access && !self.access_gate_shown_logged {
+                                self.access_gate_shown_logged = true;
+                                xai_grok_telemetry::session_ctx::log_event(xai_grok_telemetry::events::SuperGrokUpsellShown {
+                                    source: xai_grok_telemetry::events::SuperGrokUpsell::WelcomeScreen,
+                                    auth_method: self
+                                        .login_method_id
+                                        .as_ref()
+                                        .map(|id| id.0.to_string()),
+                                });
+                            }
                             if let Some(tutorial) = self.tutorial.as_mut() {
                                 crate::views::tutorial::render_tutorial(
                                     f.buffer_mut(),
@@ -4940,161 +4697,318 @@ impl AppView {
                             if let Some(panel) = &scroll_debug_panel {
                                 panel.render(full_area, f.buffer_mut());
                             }
-                            let (cursor_pos, post_flush) = result;
-                            let has_cloud = false;
-                            if has_cloud
-                                || self.import_claude_modal.is_some()
-                                || self.tutorial.is_some()
-                            {
-                                link_spans.clear();
-                            }
-                            let cursor = if has_cloud || self.tutorial.is_some() {
+                            let has_cloud_modal = false;
+                            let cursor = if has_cloud_modal || self.tutorial.is_some() {
                                 None
                             } else {
-                                cursor_pos
+                                result.cursor_pos
                             };
-                            return (cursor, Self::merge_escapes(notif_escapes, post_flush));
-                        }
-                    }
-                    ActiveView::AgentDashboard => {
-                        if let Some(dashboard) = self.dashboard.as_mut() {
-                            dashboard.voice_listening = voice_listening;
-                            dashboard.voice_interim = voice_interim.clone();
-                            if let Some(id) = dashboard.attached_agent
-                                && !agents.contains_key(&id)
+                            let on_url = self.welcome_auth_url_rect.as_ref().is_some_and(|r| {
+                                matches!(self.auth_state, AuthState::Authenticating { .. })
+                                    && self.last_mouse_pos.is_some_and(|(mx, my)| {
+                                        mx >= r.x
+                                            && mx < r.x + r.width
+                                            && my >= r.y
+                                            && my < r.y + r.height
+                                    })
+                            });
+                            let mut post_flush = result.post_flush_escapes;
+                            if crate::terminal::terminal_context()
+                                .hyperlink_capabilities()
+                                .osc22_cursor
+                                && on_url != self.welcome_on_auth_url
                             {
-                                dashboard.close_popup();
-                                if dashboard.error_toast.is_none() {
-                                    dashboard.error_toast = Some(format!(
-                                        "{} Session closed",
-                                        crate::glyphs::check_mark()
-                                    ));
+                                use crossterm::Command;
+                                let mut buf = String::new();
+                                if on_url {
+                                    let _ = crate::terminal::SetPointerCursor.write_ansi(&mut buf);
+                                } else {
+                                    let _ = crate::terminal::SetDefaultCursor.write_ansi(&mut buf);
+                                }
+                                match post_flush.as_mut() {
+                                    Some(existing) => existing.append_plain(&buf),
+                                    None => {
+                                        post_flush =
+                                            Some(crate::terminal::overlay::PostFlush::plain(buf));
+                                    }
                                 }
                             }
-                            let dashboard_roster: &[crate::app::roster::RosterEntry] =
-                                if self.leader_mode {
-                                    &self.leader_roster
+                            self.welcome_on_auth_url = on_url;
+                            return (cursor, post_flush);
+                        }
+                        ActiveView::Agent(id) => {
+                            let overlay_focused = false;
+                            let overlay_active = self
+                                .dashboard
+                                .as_ref()
+                                .is_some_and(|d| d.attached_agent == Some(id));
+                            let position: Option<(usize, usize)> = if overlay_active
+                                && let Some(d) = self.dashboard.as_ref()
+                            {
+                                let order = crate::views::dashboard::overlay_cycle_order(d, agents);
+                                order
+                                    .iter()
+                                    .position(|i| *i == id)
+                                    .map(|idx| (idx + 1, order.len()))
+                            } else {
+                                None
+                            };
+                            let overlay_title = overlay_active
+                                .then(|| {
+                                    agents
+                                        .get(&id)
+                                        .and_then(crate::views::session_title::named_title)
+                                })
+                                .flatten();
+                            let overlay_header = crate::app::agent_view::OverlayHeader {
+                                title: overlay_title.as_deref(),
+                                position,
+                            };
+                            if let Some(d) = self.dashboard.as_mut()
+                                && d.peek_viewport.is_some()
+                            {
+                                d.restore_peek_viewport(agents);
+                            }
+                            if let Some(agent) = agents.get_mut(&id) {
+                                let announcement_banner_h =
+                                    crate::views::announcements::session_banner_height(
+                                        &self.active_announcements,
+                                        &self.hidden_announcement_ids,
+                                    );
+                                let privacy_banner = privacy_banner_agent;
+                                let show_session_tip = !privacy_banner
+                                    && self.tip.is_some()
+                                    && agent.should_show_tip();
+                                let has_mode_banner = agent.mode_switch_banner.is_some();
+                                let banner_height = if privacy_banner {
+                                    crate::views::privacy_banner::MIN_HEIGHT
+                                } else if has_mode_banner {
+                                    1
+                                } else if announcement_banner_h > 0 {
+                                    announcement_banner_h
+                                } else if show_session_tip {
+                                    1
                                 } else {
-                                    &self.dashboard_local_sessions
+                                    0
                                 };
-                            let dash_upgrade_cta = crate::views::announcements::promo_cta(
-                                &self.active_announcements,
-                                &self.hidden_announcement_ids,
-                            )
-                            .map(
-                                |(owner, label, _)| crate::views::dashboard::HeaderUpgradeCta {
-                                    label,
-                                    pinned: !crate::views::announcements::is_dismissible(owner),
-                                    caption: crate::views::announcements::usable_cta_caption(owner),
-                                },
-                            );
-                            let workspace_rows =
-                                crate::app::workspace_sync::WorkspaceRowSource::capture(
-                                    agents,
-                                    &self.workspace_membership,
-                                    self.home_session_agent,
-                                    self.workspace_dashboard_enabled,
+                                let result = agent.draw(
+                                    view_area,
+                                    f.buffer_mut(),
+                                    registry,
+                                    scratch,
+                                    pending_hint,
+                                    overlay_focused,
+                                    crate::app::agent_view::BannerSlotParams {
+                                        height: banner_height,
+                                        announcements: &self.active_announcements,
+                                        hidden_ids: &self.hidden_announcement_ids,
+                                        privacy_banner,
+                                        mouse_pos: agent_mouse_pos,
+                                        tip: if show_session_tip {
+                                            self.tip.as_deref()
+                                        } else {
+                                            None
+                                        },
+                                    },
+                                    &self.bundle_state,
+                                    overlay_active,
+                                    link_spans,
+                                    AppRenderParams {
+                                        voice_available,
+                                        voice_listening,
+                                        voice_interim: voice_interim.as_deref(),
+                                        status_line: status_line_frame.clone(),
+                                        workspace_dashboard_enabled: self
+                                            .workspace_dashboard_enabled,
+                                        overlay_header,
+                                        overlay_stop_label: None,
+                                    },
                                 );
-                            let dash_cursor = crate::views::dashboard::render_dashboard(
-                                f.buffer_mut(),
-                                view_area,
-                                dashboard,
-                                agents,
-                                registry,
-                                pending_hint,
-                                dashboard_roster,
-                                self.workspace_dashboard_enabled,
-                                workspace_rows.inputs(),
-                                self.dashboard_session_picker.as_mut(),
-                                self.dashboard_sessions_loading,
-                                dash_upgrade_cta,
-                                self.credit_balance.as_ref(),
-                            );
-                            let (popup_cursor, popup_post_flush, drawn_popup_agent) =
-                                if let Some(agent_id) = dashboard.attached_agent {
+                                if let Some(modal) = self.import_claude_modal.as_mut() {
                                     let theme = crate::theme::Theme::current();
-                                    let popup_area = crate::views::dashboard::popup_rect(view_area);
-                                    let title = agents
-                                        .get(&agent_id)
-                                        .map(crate::views::session_title::entry_title)
-                                        .unwrap_or_else(|| "(session)".to_string());
-                                    let bundle_state = &self.bundle_state;
-                                    let (cursor, post_flush, drawn) =
-                                        crate::views::dashboard::render_popup_overlay(
-                                            f.buffer_mut(),
-                                            popup_area,
-                                            &theme,
-                                            &title,
-                                            dashboard,
-                                            |inner, buf| {
-                                                if let Some(agent) = agents.get_mut(&agent_id) {
-                                                    agent.draw(
-                                                    inner,
-                                                    buf,
-                                                    registry,
-                                                    scratch,
-                                                    None,
-                                                    false,
-                                                    crate::app::agent_view::BannerSlotParams::none(
-                                                    ),
-                                                    bundle_state,
-                                                    false,
-                                                    false,
-                                                    link_spans,
-                                                    AppRenderParams {
-                                                        workspace_dashboard_enabled: self
-                                                            .workspace_dashboard_enabled,
-                                                        ..Default::default()
-                                                    },
-                                                )
-                                                } else {
-                                                    (None, None)
-                                                }
-                                            },
-                                        );
-                                    (cursor, post_flush, drawn.then_some(agent_id))
+                                    crate::views::import_claude_modal::render_import_claude_modal(
+                                        f.buffer_mut(),
+                                        view_area,
+                                        modal,
+                                        &theme,
+                                        compact,
+                                    );
+                                }
+                                if let Some(tutorial) = self.tutorial.as_mut() {
+                                    crate::views::tutorial::render_tutorial(
+                                        f.buffer_mut(),
+                                        view_area,
+                                        tutorial,
+                                        compact,
+                                    );
+                                }
+                                if let Some(fps) = &fps_overlay {
+                                    fps.render(full_area, f.buffer_mut());
+                                }
+                                if let Some(panel) = &scroll_debug_panel {
+                                    panel.render(full_area, f.buffer_mut());
+                                }
+                                let (cursor_pos, post_flush) = result;
+                                let has_cloud = false;
+                                if has_cloud
+                                    || self.import_claude_modal.is_some()
+                                    || self.tutorial.is_some()
+                                {
+                                    link_spans.clear();
+                                }
+                                let cursor = if has_cloud || self.tutorial.is_some() {
+                                    None
                                 } else {
-                                    (None, None, None)
+                                    cursor_pos
                                 };
-                            let stale_clears =
-                                Self::dashboard_stale_image_clears(agents, drawn_popup_agent);
-                            let popup_post_flush =
-                                Self::merge_post_flush(stale_clears, popup_post_flush);
-                            let tutorial_open = self.tutorial.is_some();
-                            if let Some(tutorial) = self.tutorial.as_mut() {
-                                crate::views::tutorial::render_tutorial(
+                                return (cursor, Self::merge_escapes(notif_escapes, post_flush));
+                            }
+                        }
+                        ActiveView::AgentDashboard => {
+                            if let Some(dashboard) = self.dashboard.as_mut() {
+                                dashboard.voice_listening = voice_listening;
+                                dashboard.voice_interim = voice_interim.clone();
+                                if let Some(id) = dashboard.attached_agent
+                                    && !agents.contains_key(&id)
+                                {
+                                    dashboard.close_popup();
+                                    if dashboard.error_toast.is_none() {
+                                        dashboard.error_toast = Some(format!(
+                                            "{} Session closed",
+                                            crate::glyphs::check_mark()
+                                        ));
+                                    }
+                                }
+                                let dashboard_roster: &[crate::app::roster::RosterEntry] =
+                                    if self.leader_mode {
+                                        &self.leader_roster
+                                    } else {
+                                        &self.dashboard_local_sessions
+                                    };
+                                let dash_upgrade_cta = crate::views::announcements::promo_cta(
+                                    &self.active_announcements,
+                                    &self.hidden_announcement_ids,
+                                )
+                                .map(|(owner, label, _)| {
+                                    crate::views::dashboard::HeaderUpgradeCta {
+                                        label,
+                                        pinned: !crate::views::announcements::is_dismissible(owner),
+                                        caption: crate::views::announcements::usable_cta_caption(
+                                            owner,
+                                        ),
+                                    }
+                                });
+                                let workspace_rows =
+                                    crate::app::workspace_sync::WorkspaceRowSource::capture(
+                                        agents,
+                                        &self.workspace_membership,
+                                        self.home_session_agent,
+                                        self.workspace_dashboard_enabled,
+                                    );
+                                let dash_cursor = crate::views::dashboard::render_dashboard(
                                     f.buffer_mut(),
                                     view_area,
-                                    tutorial,
-                                    compact,
+                                    dashboard,
+                                    agents,
+                                    registry,
+                                    pending_hint,
+                                    dashboard_roster,
+                                    self.workspace_dashboard_enabled,
+                                    workspace_rows.inputs(),
+                                    self.dashboard_session_picker.as_mut(),
+                                    self.dashboard_sessions_loading,
+                                    dash_upgrade_cta,
+                                    self.credit_balance.as_ref(),
+                                );
+                                let (popup_cursor, popup_post_flush, drawn_popup_agent) =
+                                    if let Some(agent_id) = dashboard.attached_agent {
+                                        let theme = crate::theme::Theme::current();
+                                        let popup_area =
+                                            crate::views::dashboard::popup_rect(view_area);
+                                        let title = agents
+                                            .get(&agent_id)
+                                            .map(crate::views::session_title::entry_title)
+                                            .unwrap_or_else(|| "(session)".to_string());
+                                        let bundle_state = &self.bundle_state;
+                                        let (cursor, post_flush, drawn) =
+                                            crate::views::dashboard::render_popup_overlay(
+                                                f.buffer_mut(),
+                                                popup_area,
+                                                &theme,
+                                                &title,
+                                                dashboard,
+                                                |inner, buf| {
+                                                    if let Some(agent) = agents.get_mut(&agent_id) {
+                                                        agent
+                                                    .draw(
+                                                        inner,
+                                                        buf,
+                                                        registry,
+                                                        scratch,
+                                                        None,
+                                                        false,
+                                                        crate::app::agent_view::BannerSlotParams::none(),
+                                                        bundle_state,
+                                                        false,
+                                                        link_spans,
+                                                        AppRenderParams {
+                                                            workspace_dashboard_enabled: self
+                                                                .workspace_dashboard_enabled,
+                                                            ..Default::default()
+                                                        },
+                                                    )
+                                                    } else {
+                                                        (None, None)
+                                                    }
+                                                },
+                                            );
+                                        (cursor, post_flush, drawn.then_some(agent_id))
+                                    } else {
+                                        (None, None, None)
+                                    };
+                                let stale_clears =
+                                    Self::dashboard_stale_image_clears(agents, drawn_popup_agent);
+                                let popup_post_flush =
+                                    Self::merge_post_flush(stale_clears, popup_post_flush);
+                                let tutorial_open = self.tutorial.is_some();
+                                if let Some(tutorial) = self.tutorial.as_mut() {
+                                    crate::views::tutorial::render_tutorial(
+                                        f.buffer_mut(),
+                                        view_area,
+                                        tutorial,
+                                        compact,
+                                    );
+                                }
+                                if let Some(fps) = &fps_overlay {
+                                    fps.render(full_area, f.buffer_mut());
+                                }
+                                if let Some(panel) = &scroll_debug_panel {
+                                    panel.render(full_area, f.buffer_mut());
+                                }
+                                let cursor = if tutorial_open {
+                                    None
+                                } else if dashboard.attached_agent.is_some() {
+                                    popup_cursor
+                                } else {
+                                    dash_cursor
+                                };
+                                return (
+                                    cursor,
+                                    Self::merge_escapes(notif_escapes, popup_post_flush),
                                 );
                             }
-                            if let Some(fps) = &fps_overlay {
-                                fps.render(full_area, f.buffer_mut());
-                            }
-                            if let Some(panel) = &scroll_debug_panel {
-                                panel.render(full_area, f.buffer_mut());
-                            }
-                            let cursor = if tutorial_open {
-                                None
-                            } else if dashboard.attached_agent.is_some() {
-                                popup_cursor
-                            } else {
-                                dash_cursor
-                            };
-                            return (cursor, Self::merge_escapes(notif_escapes, popup_post_flush));
                         }
                     }
                 }
-            }
-            if let Some(fps) = &fps_overlay {
-                fps.render(full_area, f.buffer_mut());
-            }
-            if let Some(panel) = &scroll_debug_panel {
-                panel.render(full_area, f.buffer_mut());
-            }
-            (None, Self::merge_escapes(notif_escapes, None))
-        });
+                if let Some(fps) = &fps_overlay {
+                    fps.render(full_area, f.buffer_mut());
+                }
+                if let Some(panel) = &scroll_debug_panel {
+                    panel.render(full_area, f.buffer_mut());
+                }
+                (None, Self::merge_escapes(notif_escapes, None))
+            },
+        );
         if let Some(started) = fps_frame_started {
             self.fps_hud.record(started.elapsed());
         }
@@ -5415,10 +5329,11 @@ impl AppView {
         if matches!(self.active_view, ActiveView::AgentDashboard)
             && let Some(d) = self.dashboard.as_mut()
         {
-            d.spinner_tick = d.spinner_tick.wrapping_add(1);
-            needs_redraw = true;
-            d.dispatch.poll_file_search();
-            d.peek_reply.poll_file_search();
+            needs_redraw |= d.tick();
+            needs_redraw |= d.dispatch.poll_file_search();
+            if d.peek_owns_input() {
+                needs_redraw |= d.peek_reply.poll_file_search();
+            }
         }
         if let Some(pending) = &self.pending_action
             && pending.expired()
@@ -5460,10 +5375,7 @@ impl AppView {
             let spinner_frame_tick =
                 agent.scrollback.animation_tick() % crate::views::turn_status::SPINNER_DIVISOR == 0;
             needs_redraw |= !agent.session.state.is_idle() && spinner_frame_tick;
-            needs_redraw |= agent
-                .mcp_init_progress
-                .as_ref()
-                .is_some_and(McpInitProgress::is_visible)
+            needs_redraw |= (agent.session_starting_since.is_some() || agent.mcp_chip_visible())
                 && spinner_frame_tick;
             needs_redraw |= matches!(
                 agent.btw_state,
@@ -5542,6 +5454,7 @@ impl AppView {
                 );
             }
             needs_redraw |= agent.tick_extensions_result_notice();
+            needs_redraw |= agent.tick_memory_modal_status();
             needs_redraw |= agent.tick_ephemeral_tip();
             needs_redraw |= agent.tick_mode_banner();
             needs_redraw |= agent.tick_selection_highlight();
@@ -5755,9 +5668,10 @@ impl AppView {
         }
         if self.agents.values().any(|a| {
             a.pending_cancel_resend.is_some()
+                || a.prompt_ack.is_some()
                 || a.subagent_views
                     .values()
-                    .any(|c| c.pending_cancel_resend.is_some())
+                    .any(|c| c.pending_cancel_resend.is_some() || c.prompt_ack.is_some())
         }) {
             return TickDemand::Fast;
         }
@@ -5792,10 +5706,8 @@ impl AppView {
                     || !agent.session.state.is_idle()
                     || agent.wake_turn_active()
                     || agent.session.loading_replay
-                    || agent
-                        .mcp_init_progress
-                        .as_ref()
-                        .is_some_and(McpInitProgress::is_visible)
+                    || agent.session_starting_since.is_some()
+                    || agent.mcp_chip_visible()
                     || agent.plugin_cta.phase.is_spinner()
                     || matches!(
                         agent.btw_state,
@@ -5811,6 +5723,7 @@ impl AppView {
                         .extensions_modal
                         .as_ref()
                         .is_some_and(|m| m.result_notice.is_some() || m.needs_spinner_tick())
+                    || agent.memory_modal_status_needs_tick()
                     || agent.ephemeral_tip_needs_tick()
                     || agent.mode_switch_banner.is_some()
                     || agent.has_drag_autoscroll()
@@ -5869,25 +5782,19 @@ impl AppView {
                 TickDemand::None
             }
             ActiveView::AgentDashboard => {
-                let agents_need = self.agents.values().any(|agent| {
-                    !agent.session.state.is_idle()
-                        || !agent.permission_queue.is_empty()
-                        || agent.session.loading_replay
-                        || agent
-                            .subagent_sessions
-                            .values()
-                            .any(|info| info.is_running() && info.attempt.workflow_run_id.is_none())
-                        || agent.workflow_runs.iter().any(|run| run.is_active())
-                });
+                let rows_animate = self
+                    .dashboard
+                    .as_ref()
+                    .is_some_and(|d| d.painted_animations.any());
                 let dash_search = self.dashboard.as_ref().is_some_and(|d| {
                     d.dispatch.file_search.context().is_some()
-                        || d.peek_reply.file_search.context().is_some()
+                        || (d.peek_owns_input() && d.peek_reply.file_search.context().is_some())
                 });
                 let picker_loading = self
                     .dashboard_session_picker
                     .as_ref()
                     .is_some_and(|surface| surface.loading);
-                if agents_need || dash_search || picker_loading {
+                if rows_animate || dash_search || picker_loading {
                     TickDemand::Fast
                 } else {
                     TickDemand::None

@@ -23,15 +23,13 @@ impl HookRegistry {
         self.hooks.get(&event).map(|v| v.as_slice()).unwrap_or(&[])
     }
 
-    /// Returns true when any enabled hook is registered for `event` or its alias spelling (reads the disabled-hooks file for non-managed specs).
-    /// Managed-policy hooks always count as enabled (not user-disableable), matching `dispatcher::eligible_or_record_skip`.
-    pub fn has_enabled_hooks_for_canonical(&self, event: HookEventName) -> bool {
-        let disabled = crate::trust::DisabledHooks::load();
-        let enabled = |specs: &[HookSpec]| {
-            specs
-                .iter()
-                .any(|s| s.is_managed_policy() || (s.enabled && !disabled.contains(&s.name)))
-        };
+    /// True when any hook for `event` (or its alias spelling) passes the skip rule against `disabled`.
+    pub fn has_enabled_hooks_for_canonical(
+        &self,
+        event: HookEventName,
+        disabled: &crate::trust::DisabledHooks,
+    ) -> bool {
+        let enabled = |specs: &[HookSpec]| specs.iter().any(|s| !disabled.blocks(s));
         let canonical = event.canonical();
         enabled(self.hooks_for(canonical))
             || (canonical == HookEventName::SubagentStop
@@ -544,7 +542,12 @@ mod tests {
 
         let (registry, errors) = load_hooks(Some(dir.path()), None);
         assert_eq!(errors.len(), 1);
-        assert!(matches!(&errors[0], HookError::ParseFile { .. }));
+        assert!(matches!(
+            errors
+                .first()
+                .unwrap_or_else(|| panic!("expected errors item 0: {errors:?}")),
+            HookError::ParseFile { .. }
+        ));
         assert_eq!(registry.len(), 2);
     }
 
@@ -698,8 +701,20 @@ mod tests {
         assert!(errors.is_empty());
         let hooks = registry.hooks_for(HookEventName::PreToolUse);
         assert_eq!(hooks.len(), 2);
-        assert!(hooks[0].name.starts_with("global/"));
-        assert!(hooks[1].name.starts_with("project/"));
+        assert!(
+            hooks
+                .first()
+                .unwrap_or_else(|| panic!("expected hooks item 0: {hooks:?}"))
+                .name
+                .starts_with("global/")
+        );
+        assert!(
+            hooks
+                .get(1)
+                .unwrap_or_else(|| panic!("expected hooks item 1: {hooks:?}"))
+                .name
+                .starts_with("project/")
+        );
     }
 
     /// A byte-identical duplicate must not shadow a managed hook's provenance.
@@ -736,9 +751,27 @@ mod tests {
         ]);
         let hooks = registry.hooks_for(HookEventName::PreToolUse);
         assert_eq!(hooks.len(), 1);
-        assert_eq!(hooks[0].layer, HookProvenance::Requirements);
-        assert_eq!(hooks[0].timeout_ms, 5000, "pinned copy's fields survive");
-        assert!(hooks[0].is_managed_policy());
+        assert_eq!(
+            hooks
+                .first()
+                .unwrap_or_else(|| panic!("expected hooks item 0: {hooks:?}"))
+                .layer,
+            HookProvenance::Requirements
+        );
+        assert_eq!(
+            hooks
+                .first()
+                .unwrap_or_else(|| panic!("expected hooks item 0: {hooks:?}"))
+                .timeout_ms,
+            5000,
+            "pinned copy's fields survive"
+        );
+        assert!(
+            hooks
+                .first()
+                .unwrap_or_else(|| panic!("expected hooks item 0: {hooks:?}"))
+                .is_managed_policy()
+        );
 
         // Root-owned copy first: unchanged (first-wins already keeps it).
         let registry = registry_from_specs_deduped(vec![
@@ -751,7 +784,13 @@ mod tests {
         ]);
         let hooks = registry.hooks_for(HookEventName::PreToolUse);
         assert_eq!(hooks.len(), 1);
-        assert_eq!(hooks[0].layer, HookProvenance::Requirements);
+        assert_eq!(
+            hooks
+                .first()
+                .unwrap_or_else(|| panic!("expected hooks item 0: {hooks:?}"))
+                .layer,
+            HookProvenance::Requirements
+        );
 
         // Managed-vs-managed pair: `$GROK_HOME/requirements.toml` arrives before `/etc/grok`, but the root-owned tier outranks it
         // The no-disable rule and pinned fields must not resolve under the user-writable copy
@@ -765,9 +804,62 @@ mod tests {
         ]);
         let hooks = registry.hooks_for(HookEventName::PreToolUse);
         assert_eq!(hooks.len(), 1);
-        assert_eq!(hooks[0].layer, HookProvenance::SystemManaged);
-        assert_eq!(hooks[0].timeout_ms, 5000);
-        assert!(hooks[0].is_managed_policy());
+        assert_eq!(
+            hooks
+                .first()
+                .unwrap_or_else(|| panic!("expected hooks item 0: {hooks:?}"))
+                .layer,
+            HookProvenance::SystemManaged
+        );
+        assert_eq!(
+            hooks
+                .first()
+                .unwrap_or_else(|| panic!("expected hooks item 0: {hooks:?}"))
+                .timeout_ms,
+            5000
+        );
+        assert!(
+            hooks
+                .first()
+                .unwrap_or_else(|| panic!("expected hooks item 0: {hooks:?}"))
+                .is_managed_policy()
+        );
+
+        // The signed cloud cache outranks the user-writable `$GROK_HOME` tiers it shares a directory with, and yields to root-owned policy
+        let registry = registry_from_specs_deduped(vec![
+            spec("managed:pre[0]", HookProvenance::Managed, 1),
+            spec(
+                "requirements/signed:pre[0]",
+                HookProvenance::SignedRequirements,
+                5000,
+            ),
+            spec(
+                "requirements/system:pre[0]",
+                HookProvenance::Requirements,
+                7,
+            ),
+        ]);
+        let hooks = registry.hooks_for(HookEventName::PreToolUse);
+        assert_eq!(hooks.len(), 1);
+        let kept = hooks
+            .first()
+            .unwrap_or_else(|| panic!("expected hooks item 0: {hooks:?}"));
+        assert_eq!(kept.layer, HookProvenance::Requirements);
+        assert_eq!(kept.timeout_ms, 7);
+        let registry = registry_from_specs_deduped(vec![
+            spec("managed:pre[0]", HookProvenance::Managed, 1),
+            spec(
+                "requirements/signed:pre[0]",
+                HookProvenance::SignedRequirements,
+                5000,
+            ),
+        ]);
+        let hooks = registry.hooks_for(HookEventName::PreToolUse);
+        let kept = hooks
+            .first()
+            .unwrap_or_else(|| panic!("expected hooks item 0: {hooks:?}"));
+        assert_eq!(kept.layer, HookProvenance::SignedRequirements);
+        assert!(kept.is_managed_policy());
     }
 
     /// Managed-policy hooks count as enabled for the stop-gate hot-path guard even when their name is in the disabled-hooks state.
@@ -792,17 +884,26 @@ mod tests {
         };
         let mut registry = HookRegistry::default();
         registry.append_specs(vec![spec.clone()]);
+        let disabled = crate::trust::DisabledHooks::new([spec.name.clone()], false);
         assert!(
-            registry.has_enabled_hooks_for_canonical(HookEventName::Stop),
+            registry.has_enabled_hooks_for_canonical(HookEventName::Stop, &disabled),
             "managed-policy hook must count as enabled"
         );
 
         spec.layer = crate::config::HookProvenance::File;
+        spec.enabled = true;
         let mut registry = HookRegistry::default();
         registry.append_specs(vec![spec]);
         assert!(
-            !registry.has_enabled_hooks_for_canonical(HookEventName::Stop),
+            !registry.has_enabled_hooks_for_canonical(HookEventName::Stop, &disabled),
             "a disabled file hook must not count"
+        );
+        assert!(
+            !registry.has_enabled_hooks_for_canonical(
+                HookEventName::Stop,
+                &crate::trust::DisabledHooks::new([], true)
+            ),
+            "under allow_managed_hooks_only an enabled file hook must not count either"
         );
     }
 
@@ -848,9 +949,16 @@ mod tests {
             hooks.len()
         );
         assert!(
-            hooks[0].name.starts_with("global/"),
+            hooks
+                .first()
+                .unwrap_or_else(|| panic!("expected hooks item 0: {hooks:?}"))
+                .name
+                .starts_with("global/"),
             "first source (global) should win, got: {}",
-            hooks[0].name
+            hooks
+                .first()
+                .unwrap_or_else(|| panic!("expected hooks item 0: {hooks:?}"))
+                .name
         );
     }
 
@@ -1022,9 +1130,10 @@ mod tests {
         registry.recompile_matchers();
 
         assert!(
-            registry.hooks_for(HookEventName::PreToolUse)[0]
-                .matcher
-                .is_none(),
+            registry
+                .hooks_for(HookEventName::PreToolUse)
+                .first()
+                .is_some_and(|h| h.matcher.is_none()),
             "no configured pattern must stay match-all (matcher None)"
         );
     }
@@ -1043,14 +1152,18 @@ mod tests {
         let by_name: std::collections::HashMap<_, _> =
             hooks.iter().map(|h| (h.name.as_str(), h)).collect();
 
-        let ok = by_name["ok"]
+        let ok = by_name
+            .get("ok")
+            .unwrap_or_else(|| panic!("missing ok spec: {by_name:?}"))
             .matcher
             .as_ref()
             .expect("valid sibling must recompile");
         assert!(ok.is_match("run_terminal_command"));
         assert!(!ok.is_match("read_file"));
 
-        let broken = by_name["broken"]
+        let broken = by_name
+            .get("broken")
+            .unwrap_or_else(|| panic!("missing broken spec: {by_name:?}"))
             .matcher
             .as_ref()
             .expect("invalid sibling must become never-match");

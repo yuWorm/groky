@@ -2771,17 +2771,26 @@ async fn update_writes_disk_before_user_enrichment() {
 /// Without it an interleaved enrichment write can resurrect the older `refresh_token`, re-opening the `invalid_grant` race.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn enrichment_task_preserves_interleaved_token_rotation() {
+    let release = Arc::new(tokio::sync::Notify::new());
+    let hits = Arc::new(AtomicU32::new(0));
+    let release_for_handler = Arc::clone(&release);
+    let hits_for_handler = Arc::clone(&hits);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
     let app = axum::Router::new().route(
         "/user",
-        axum::routing::get(|| async {
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-            axum::Json(serde_json::json!({
-                "userId": "stable-user",
-                "email": "user@corp.com",
-                "teamId": "team-alpha",
-            }))
+        axum::routing::get(move || {
+            let r = Arc::clone(&release_for_handler);
+            let h = Arc::clone(&hits_for_handler);
+            async move {
+                h.fetch_add(1, Ordering::SeqCst);
+                r.notified().await;
+                axum::Json(serde_json::json!({
+                    "userId": "stable-user",
+                    "email": "user@corp.com",
+                    "teamId": "team-alpha",
+                }))
+            }
         }),
     );
     let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
@@ -2804,9 +2813,22 @@ async fn enrichment_task_preserves_interleaved_token_rotation() {
     };
     mgr.update(auth_v1).await.unwrap();
     mgr.update(auth_v2).await.unwrap();
+    let mut seen = 0;
+    for _ in 0..50 {
+        seen = hits.load(Ordering::SeqCst);
+        if seen >= 2 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    assert_eq!(
+        seen, 2,
+        "both enrichment /user calls must be in flight before release, got {seen}"
+    );
+    release.notify_waiters();
     let auth_path = dir.path().join("auth.json");
     let mut final_state = None;
-    for _ in 0..30 {
+    for _ in 0..50 {
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         let store = read_auth_json(&auth_path).unwrap();
         let entry = store.values().next().unwrap().clone();
@@ -2815,7 +2837,17 @@ async fn enrichment_task_preserves_interleaved_token_rotation() {
             break;
         }
     }
-    let final_state = final_state.expect("v2 + enrichment must land within 3s");
+    let Some(final_state) = final_state else {
+        let store = read_auth_json(&auth_path).unwrap();
+        let entry = store.values().next().cloned();
+        panic!(
+            "v2 + enrichment must land within 5s; disk key={:?} refresh={:?} team={:?} hits={}",
+            entry.as_ref().map(|e| e.key.as_str()),
+            entry.as_ref().and_then(|e| e.refresh_token.as_deref()),
+            entry.as_ref().and_then(|e| e.team_id.as_deref()),
+            hits.load(Ordering::SeqCst),
+        );
+    };
     assert_eq!(
         final_state.refresh_token.as_deref(),
         Some("rt-v2"),
@@ -3060,7 +3092,7 @@ async fn current_api_key_async_drives_refresh_chain() {
         call_count: call_count.clone(),
         delay: StdDuration::from_millis(0),
     }));
-    let provider = super::SharedAuthKeyProvider(mgr.clone());
+    let provider = crate::side_call_bearer::SharedAuthKeyProvider(mgr.clone());
     assert_eq!(provider.current_api_key().as_deref(), Some("expired-oidc"));
     let key = provider.current_api_key_async().await;
     assert_eq!(key.as_deref(), Some("fresh-token"));
@@ -3746,7 +3778,7 @@ async fn shared_api_key_provider_resolves_live_bearer() {
         ..GrokAuth::test_default()
     };
     mgr.hot_swap(auth);
-    let provider = shared_api_key_provider(mgr.clone());
+    let provider = crate::shared_api_key_provider(mgr.clone());
     assert_eq!(
         provider.current_api_key(),
         Some("shared-provider-token".to_string()),
@@ -3777,7 +3809,7 @@ async fn shared_api_key_provider_static_fallthrough() {
     use xai_grok_test_support::EnvGuard;
     let dir = tempfile::tempdir().unwrap();
     let mgr = Arc::new(AuthManager::new(dir.path(), GrokComConfig::default()));
-    let provider = shared_api_key_provider(mgr.clone());
+    let provider = crate::shared_api_key_provider(mgr.clone());
     {
         let _legacy = EnvGuard::unset("GROK_CODE_XAI_API_KEY");
         let _key = EnvGuard::set("XAI_API_KEY", "env-only-key");
@@ -3824,7 +3856,9 @@ async fn shared_api_key_provider_kill_switch_blocks_static() {
         },
     ));
     assert_eq!(
-        shared_api_key_provider(mgr).current_api_key_async().await,
+        crate::shared_api_key_provider(mgr)
+            .current_api_key_async()
+            .await,
         None
     );
 }
@@ -3842,7 +3876,9 @@ async fn shared_api_key_provider_oidc_preferred_blocks_static() {
         },
     ));
     assert_eq!(
-        shared_api_key_provider(mgr).current_api_key_async().await,
+        crate::shared_api_key_provider(mgr)
+            .current_api_key_async()
+            .await,
         None
     );
 }
@@ -3868,7 +3904,7 @@ async fn shared_api_key_provider_api_key_preferred_skips_session() {
         ..GrokAuth::test_default()
     });
     assert_eq!(
-        shared_api_key_provider(mgr)
+        crate::shared_api_key_provider(mgr)
             .current_api_key_async()
             .await
             .as_deref(),
@@ -3891,7 +3927,7 @@ async fn shared_api_key_provider_sync_falls_through_when_session_expired() {
         expires_at: Some(Utc::now() - Duration::hours(1)),
         ..GrokAuth::test_default()
     });
-    let provider = shared_api_key_provider(mgr);
+    let provider = crate::shared_api_key_provider(mgr);
     assert_eq!(
         provider.current_api_key().as_deref(),
         Some("static-after-expiry"),
@@ -3919,7 +3955,7 @@ async fn shared_api_key_provider_sync_buffered_session_beats_static() {
         expires_at: Some(Utc::now() + Duration::minutes(2)),
         ..GrokAuth::test_default()
     });
-    let provider = super::SharedAuthKeyProvider(mgr);
+    let provider = crate::side_call_bearer::SharedAuthKeyProvider(mgr);
     assert_eq!(provider.current_api_key().as_deref(), Some("buffered-oidc"));
 }
 /// Auth.json create, rewrite (including same-length, caught by the inode in the memo stamp), and logout must all invalidate the disk static-key memo.
@@ -3932,7 +3968,7 @@ async fn shared_api_key_provider_disk_memo_follows_rewrites() {
     let _auth_path = EnvGuard::unset("GROK_AUTH_PATH");
     let dir = tempfile::tempdir().unwrap();
     let mgr = Arc::new(AuthManager::new(dir.path(), GrokComConfig::default()));
-    let provider = shared_api_key_provider(mgr);
+    let provider = crate::shared_api_key_provider(mgr);
     assert_eq!(provider.current_api_key_async().await, None);
     for key in ["first-key", "fresh-key", "second-key-rotated"] {
         crate::store_api_key(dir.path(), key).unwrap();
@@ -3950,7 +3986,7 @@ async fn process_key_precedence() {
     let _auth_path = EnvGuard::unset("GROK_AUTH_PATH");
     let dir = tempfile::tempdir().unwrap();
     let mgr = Arc::new(AuthManager::new(dir.path(), GrokComConfig::default()));
-    let provider = shared_api_key_provider(mgr.clone());
+    let provider = crate::shared_api_key_provider(mgr.clone());
     assert_eq!(provider.current_api_key_async().await, None);
     crate::store_api_key(dir.path(), "disk").unwrap();
     assert_eq!(
@@ -3984,7 +4020,7 @@ async fn process_key_precedence() {
     ));
     blocked.set_process_static_api_key(Some("ignored".into()));
     assert_eq!(
-        shared_api_key_provider(blocked)
+        crate::shared_api_key_provider(blocked)
             .current_api_key_async()
             .await,
         None
