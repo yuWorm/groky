@@ -32,6 +32,8 @@ Never `git push upstream`.
 Then:
 
 1. Resolve conflicts **only** at `GROK_COMPAT_HOOK` (keep both: their code + the hook call).
+   Vendor catalog overlay lives in `agent/remote_config/manager/mod.rs`
+   (upstream moved it off `agent/models.rs`).
 2. Exhaustive `Action` / `Effect` / `TaskResult` matches: keep **both** sides' variants.
 3. Do not take upstream if it reintroduces xAI `/login` on a vendor 401.
 4. Smoke:

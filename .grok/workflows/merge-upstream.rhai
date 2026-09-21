@@ -48,7 +48,7 @@ let p1 = "Compare HEAD to git ref ";
 p1 += encoded_ref;
 p1 += " for GROK_COMPAT hook files in the sampler. Use grep for GROK_COMPAT_HOOK and git diff HEAD...";
 p1 += from_ref;
-p1 += " -- crates/codegen/xai-grok-sampler/src/client.rs crates/codegen/xai-grok-sampler/src/stream/responses.rs crates/codegen/xai-grok-sampler/src/actor/request_task.rs. Read the current files. Report at most 16 {path, risk, note} where risk is low/medium/high. Empty files is valid only after you ran git diff. Stay under crates/codegen/xai-grok-sampler/.";
+p1 += " -- crates/codegen/xai-grok-sampler/src/client.rs crates/codegen/xai-grok-sampler/src/compat.rs crates/codegen/xai-grok-sampler/src/stream/responses.rs crates/codegen/xai-grok-sampler/src/actor/request_task.rs. Read the current files. Report at most 16 {path, risk, note} where risk is low/medium/high. Empty files is valid only after you ran git diff. Stay under crates/codegen/xai-grok-sampler/.";
 jobs.push(#{
     prompt: p1,
     label: "scan-sampler",
@@ -60,7 +60,7 @@ let p2 = "Compare HEAD to git ref ";
 p2 += encoded_ref;
 p2 += " for GROK_COMPAT hook files in the shell. Use grep for GROK_COMPAT_HOOK and git diff HEAD...";
 p2 += from_ref;
-p2 += " -- crates/codegen/xai-grok-shell/src/agent/config.rs crates/codegen/xai-grok-shell/src/agent/models.rs crates/codegen/xai-grok-shell/src/session/acp_session_impl/sampler_turn.rs crates/codegen/xai-grok-shell/src/extensions/notification.rs. Read crates/codegen/xai-grok-shell/src/compat/UPSTREAM.md. Report at most 16 {path, risk, note}. Stay under crates/codegen/xai-grok-shell/.";
+p2 += " -- crates/codegen/xai-grok-shell/src/agent/config.rs crates/codegen/xai-grok-shell/src/agent/remote_config/manager/mod.rs crates/codegen/xai-grok-shell/src/agent/mvp_agent/acp_agent.rs crates/codegen/xai-grok-shell/src/session/acp_session_impl/sampler_turn.rs crates/codegen/xai-grok-shell/src/extensions/notification.rs. Read crates/codegen/xai-grok-shell/src/compat/UPSTREAM.md. Catalog overlay is remote_config/manager, not agent/models.rs. Report at most 16 {path, risk, note}. Stay under crates/codegen/xai-grok-shell/.";
 jobs.push(#{
     prompt: p2,
     label: "scan-shell",
@@ -72,7 +72,7 @@ let p3 = "Compare HEAD to git ref ";
 p3 += encoded_ref;
 p3 += " for vendor Action/Effect/TaskResult and slash-command registration in the pager. git diff HEAD...";
 p3 += from_ref;
-p3 += " -- crates/codegen/xai-grok-pager/src/app/actions.rs crates/codegen/xai-grok-pager/src/app/dispatch crates/codegen/xai-grok-pager/src/slash/commands/mod.rs. Report at most 16 {path, risk, note} about merge conflicts (enum variants, match arms). Stay under crates/codegen/xai-grok-pager/. Empty files is valid only after you ran git diff.";
+p3 += " -- crates/codegen/xai-grok-pager/src/app/actions.rs crates/codegen/xai-grok-pager/src/app/dispatch crates/codegen/xai-grok-pager/src/app/dispatch/modes.rs crates/codegen/xai-grok-pager/src/slash/commands/mod.rs. Report at most 16 {path, risk, note} about merge conflicts (enum variants, match arms, set_fast_mode). Stay under crates/codegen/xai-grok-pager/. Empty files is valid only after you ran git diff.";
 jobs.push(#{
     prompt: p3,
     label: "scan-pager",

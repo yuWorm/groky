@@ -39,16 +39,19 @@ echo
 
 HOOK_FILES=(
   crates/codegen/xai-grok-sampler/src/client.rs
+  crates/codegen/xai-grok-sampler/src/compat.rs
   crates/codegen/xai-grok-sampler/src/stream/responses.rs
   crates/codegen/xai-grok-sampler/src/actor/request_task.rs
   crates/codegen/xai-grok-sampler/src/lib.rs
   crates/codegen/xai-grok-shell/src/agent/config.rs
-  crates/codegen/xai-grok-shell/src/agent/models.rs
+  crates/codegen/xai-grok-shell/src/agent/remote_config/manager/mod.rs
+  crates/codegen/xai-grok-shell/src/agent/mvp_agent/acp_agent.rs
   crates/codegen/xai-grok-shell/src/session/acp_session_impl/sampler_turn.rs
   crates/codegen/xai-grok-shell/src/extensions/notification.rs
   crates/codegen/xai-grok-shell/src/lib.rs
   crates/codegen/xai-grok-pager/src/app/actions.rs
   crates/codegen/xai-grok-pager/src/app/dispatch/mod.rs
+  crates/codegen/xai-grok-pager/src/app/dispatch/modes.rs
   crates/codegen/xai-grok-pager/src/app/dispatch/router.rs
   crates/codegen/xai-grok-pager/src/app/dispatch/task_result.rs
   crates/codegen/xai-grok-pager/src/app/effects/mod.rs
