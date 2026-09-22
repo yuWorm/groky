@@ -1,4 +1,4 @@
-//! Live vendor model lists, cached under `~/.grok/vendor-catalog.json`.
+//! Live vendor model lists, cached under `$GROK_HOME/vendor-catalog.json`.
 //!
 //! Builtin picker rows prefer:
 //! 1. Last successful `/v1/models` fetch for that provider

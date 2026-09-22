@@ -1,11 +1,14 @@
 //! Home-directory resolution generally: USERPROFILE-first `home_dir`, plus
-//! grok-home (`$GROK_HOME` or `<home>/.grok`). Shared by `xai-grok-config`
+//! grok-home (`$GROK_HOME` or `<home>/.groky`). Shared by `xai-grok-config`
 //! and `xai-fast-worktree`.
+//!
+//! GROK_COMPAT: the product CLI (`groky`) defaults to `~/.groky`. Official
+//! `grok` still uses `~/.grok`. See [`groky_layout`].
 //!
 //! Which function to call:
 //! - [`grok_home`]: the usual choice, a cached, created path to build on.
 //! - [`user_grok_home`]: `None` instead of a cwd fallback when no home resolves.
-//! - [`default_grok_home`]: the `<home>/.grok` default, ignoring `$GROK_HOME`, so callers can detect an override.
+//! - [`default_grok_home`]: the `<home>/.groky` default, ignoring `$GROK_HOME`, so callers can detect an override.
 //! - [`resolve_grok_home`]: a fresh, uncached resolve.
 //! - [`resolve_grok_home_with_source`]: [`resolve_grok_home`] plus where the path came from.
 //! - [`home_dir`]: the home directory itself, for sibling dot dirs (`~/.claude`, `~/.agents`, ...).
@@ -19,6 +22,13 @@ use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
+mod groky_layout;
+
+/// GROK_COMPAT_HOOK: product home directory name (`groky`).
+const PRODUCT_HOME_DIR: &str = ".groky";
+/// Official Grok Build still lives here; groky links sessions/auth onto it.
+const OFFICIAL_HOME_DIR: &str = ".grok";
+
 /// Where a resolved grok home came from, so "why did grok pick this
 /// directory?" is answerable in diagnostics without re-reading the
 /// environment at the asking site.
@@ -26,7 +36,7 @@ use std::sync::OnceLock;
 pub enum GrokHomeSource {
     /// A non-empty `$GROK_HOME` override.
     EnvOverride,
-    /// `<home>/.grok` derived from the home directory.
+    /// `<home>/.groky` derived from the home directory.
     HomeDefault,
 }
 
@@ -38,15 +48,19 @@ pub fn home_dir() -> Option<PathBuf> {
     std::env::home_dir()
 }
 
-/// `<home>/.grok`, canonicalized via `dunce` (not `std::fs::canonicalize`,
+/// `<home>/.groky`, canonicalized via `dunce` (not `std::fs::canonicalize`,
 /// which yields Windows `\\?\` verbatim paths).
 fn grok_home_in(home: &Path) -> PathBuf {
-    dunce::canonicalize(home)
-        .unwrap_or_else(|_| home.to_path_buf())
-        .join(".grok")
+    home_join(home, PRODUCT_HOME_DIR)
 }
 
-/// `$GROK_HOME` verbatim when non-empty, else `<home>/.grok`.
+fn home_join(home: &Path, dir: &str) -> PathBuf {
+    dunce::canonicalize(home)
+        .unwrap_or_else(|_| home.to_path_buf())
+        .join(dir)
+}
+
+/// `$GROK_HOME` verbatim when non-empty, else `<home>/.groky`.
 /// Used as-is (not canonicalized) so literal prefix checks and symlink guards still see original components.
 fn resolve_grok_home_from(
     grok_home_env: Option<&OsStr>,
@@ -65,13 +79,17 @@ pub fn resolve_grok_home() -> Option<PathBuf> {
 
 /// [`resolve_grok_home`] plus the [`GrokHomeSource`] the path came from.
 pub fn resolve_grok_home_with_source() -> Option<(PathBuf, GrokHomeSource)> {
-    resolve_grok_home_from(
+    let resolved = resolve_grok_home_from(
         std::env::var_os("GROK_HOME").as_deref(),
         home_dir().as_deref(),
-    )
+    );
+    if let Some((ref home, _)) = resolved {
+        groky_layout::ensure_if_product_home(home);
+    }
+    resolved
 }
 
-/// The default `<home>/.grok`, used when `$GROK_HOME` is unset.
+/// The default `<home>/.groky`, used when `$GROK_HOME` is unset.
 pub fn default_grok_home() -> PathBuf {
     grok_home_in(&home_dir().unwrap_or_else(|| PathBuf::from(".")))
 }
@@ -83,6 +101,7 @@ pub fn grok_home() -> PathBuf {
     GROK_HOME
         .get_or_init(|| {
             let home = resolve_grok_home().unwrap_or_else(default_grok_home);
+            groky_layout::ensure_if_product_home(&home);
             if let Err(err) = std::fs::create_dir_all(&home) {
                 tracing::warn!(path = %home.display(), %err, "failed to create grok home");
             }
@@ -131,7 +150,7 @@ mod tests {
         assert_eq!(
             resolved,
             Some((
-                dunce::canonicalize(tmp.path()).unwrap().join(".grok"),
+                dunce::canonicalize(tmp.path()).unwrap().join(".groky"),
                 GrokHomeSource::HomeDefault
             ))
         );
@@ -144,7 +163,7 @@ mod tests {
         // comparisons. No-op assertion on Unix.
         let home = default_grok_home();
         assert!(!home.to_string_lossy().starts_with(r"\\?\"));
-        assert!(home.ends_with(".grok"));
+        assert!(home.ends_with(".groky"));
     }
 
     #[test]

@@ -2,7 +2,7 @@
 //!
 //! Lookup is by normalized API model id. Unknown ids stay off.
 //!
-//! 1. Runtime overlay `~/.grok/models-dev-reasoning.json` (`/sync-models-dev`).
+//! 1. Runtime overlay `$GROK_HOME/models-dev-reasoning.json` (`/sync-models-dev`).
 //! 2. Committed snapshot baked at release (`scripts/sync_models_dev.py`).
 
 use std::collections::{BTreeMap, HashMap, HashSet};

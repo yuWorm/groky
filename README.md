@@ -9,7 +9,7 @@ plus ChatGPT Codex OAuth.
 
 The CLI binary is **`groky`**. It can sit next to official `grok`.
 
-Latest release: [v0.1.16](https://github.com/yuWorm/groky/releases/tag/v0.1.16)
+Latest release: [v0.1.17](https://github.com/yuWorm/groky/releases/tag/v0.1.17)
 
 ## Install
 
@@ -20,8 +20,13 @@ curl -fsSL https://raw.githubusercontent.com/yuWorm/groky/main/scripts/install-g
 groky --version
 ```
 
-The binary lands in `~/.groky/bin/groky`. Config, sessions, and vendor
-credentials stay under `~/.grok/` (`config.toml`, `auth.json`, `vendor-auth.json`).
+The binary lands in `~/.groky/bin/groky`. groky's own config lives under
+`~/.groky/` (`config.toml`, `vendor-auth.json`). On first launch (and any
+later upgrade that is still missing a file) groky copies those from
+`~/.grok/` if present, then **shares** sessions, xAI login, memory, skills,
+and plugins with official `grok` via `~/.grok/` (directory links +
+`GROK_AUTH_PATH`). Set `GROK_HOME` to isolate everything; set
+`GROKY_SKIP_HOME_MIGRATE=1` to skip the copy/link step.
 
 - Pin a version: `bash -s 0.1.0`
 - Upgrade: run the same `curl | bash` again
@@ -49,11 +54,12 @@ groky
 | Fast mode (GPT, including custom OpenAI-compatible relays) | `/fast` |
 | Drop a vendor key | `/provider-logout` |
 | Refresh vendor model lists | `/sync-models-dev` (alias `/refresh-models`); provider picker `r`; custom model list `Ctrl+R` |
-| Update groky | `groky update` or `groky update --version 0.1.15` (Welcome: ctrl+u) |
+| Update groky | `groky update` or `groky update --version 0.1.17` (Welcome: ctrl+u) |
 
-xAI login is unchanged (`AuthManager`, `~/.grok/auth.json`). Third-party
-keys never go in `config.toml`; they live in `~/.grok/vendor-auth.json`.
-A vendor 401 asks for `/provider-login`, not `/login`.
+xAI login is unchanged (`AuthManager`, `~/.grok/auth.json`, shared with
+official `grok`). Third-party keys never go in `config.toml`; they live in
+`~/.groky/vendor-auth.json`. A vendor 401 asks for `/provider-login`, not
+`/login`.
 
 ## What this fork changes
 
@@ -64,7 +70,7 @@ A vendor 401 asks for `/provider-login`, not `/login`.
 | ChatGPT Codex OAuth (`openai-codex`) | Official `grok` CDN install and auto-update |
 | Claude Pro/Max OAuth (`anthropic-claude`) | Anthropic console API keys (`anthropic`) |
 | models.dev reasoning / context overlay | Default auto-compact threshold (85%) |
-| Binary name `groky` (`~/.groky/bin`) | Rewriting the TUI as a different product |
+| Binary name `groky` (`~/.groky/bin`) and config home `~/.groky` | Rewriting the TUI as a different product |
 
 ## Official documentation
 

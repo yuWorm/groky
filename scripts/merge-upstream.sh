@@ -38,6 +38,8 @@ git log --oneline --no-decorate "HEAD..$REMOTE/$REF" | head -30
 echo
 
 HOOK_FILES=(
+  crates/codegen/xai-dirs/src/lib.rs
+  crates/codegen/xai-grok-pager-render/src/util.rs
   crates/codegen/xai-grok-sampler/src/client.rs
   crates/codegen/xai-grok-sampler/src/compat.rs
   crates/codegen/xai-grok-sampler/src/stream/responses.rs

@@ -1,7 +1,8 @@
 //! Multi-provider catalog, API-key store, and credential merge.
 //!
 //! GROK_COMPAT: first-party xAI auth (`AuthManager` / `auth.json`) is
-//! untouched. Vendor keys live in `~/.grok/vendor-auth.json`.
+//! untouched. Vendor keys live in `$GROK_HOME/vendor-auth.json`
+//! (default `~/.groky/vendor-auth.json`).
 
 mod auth_store;
 mod catalog;
@@ -203,7 +204,7 @@ fn vendor_auth_method() -> agent_client_protocol::AuthMethod {
             "Configured provider".to_string(),
         )
         .description(Some(
-            "Use a credential from ~/.grok/vendor-auth.json".into(),
+            "Use a credential from ~/.groky/vendor-auth.json".into(),
         )),
     )
 }

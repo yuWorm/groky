@@ -1,4 +1,5 @@
-//! `~/.grok/vendor-auth.json` — credentials keyed by provider id.
+//! `$GROK_HOME/vendor-auth.json` (default `~/.groky/vendor-auth.json`) —
+//! credentials keyed by provider id.
 //!
 //! Shape matches Pi's `auth.json` enough to store API keys and OAuth
 //! tokens. First-party xAI `auth.json` is never read or written here.

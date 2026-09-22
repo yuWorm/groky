@@ -7,9 +7,11 @@ This page is the release appendix (asset names, Windows).
 It is the same TUI as Grok Build (`xai-grok-pager-bin`), shipped under a
 different binary name so it can sit next to official `grok`.
 
-Config, sessions, and vendor credentials still live under `~/.grok/`
-(`vendor-auth.json`, `config.toml`). Only the **executable path** is separate
-(`~/.groky/bin/groky`).
+The **executable** is `~/.groky/bin/groky`. groky **config** is `~/.groky/`
+(`config.toml`, `vendor-auth.json`). First launch copies those from `~/.grok/`
+when groky does not have them yet, and shares sessions / xAI login / memory /
+skills / plugins with official `grok` via `~/.grok/`. `GROK_HOME` isolates
+everything; `GROKY_SKIP_HOME_MIGRATE=1` skips the copy/link step.
 
 ## One-click
 
@@ -28,11 +30,11 @@ Pin a version (downloads `github.com/.../releases/download/...` and does
 **not** call `api.github.com` — useful behind a shared VPN IP):
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/yuWorm/groky/main/scripts/install-groky.sh | bash -s 0.1.15
-groky update --version 0.1.15
+curl -fsSL https://raw.githubusercontent.com/yuWorm/groky/main/scripts/install-groky.sh | bash -s 0.1.17
+groky update --version 0.1.17
 ```
 
-PowerShell: `$env:GROKY_VERSION="0.1.15"; irm ... | iex`
+PowerShell: `$env:GROKY_VERSION="0.1.17"; irm ... | iex`
 
 Unpinned `groky update` / the installer without a version still query
 `/releases/latest`. A `GROKY_GITHUB_TOKEN` (or `GITHUB_TOKEN`) raises that

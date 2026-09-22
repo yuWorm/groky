@@ -35,7 +35,9 @@ if args != () && args.from != () {
 
 fn allowed_path(path) {
     if type_of(path) != "string" { return false; }
-    path.starts_with("crates/codegen/xai-grok-sampler/")
+    path.starts_with("crates/codegen/xai-dirs/")
+        || path.starts_with("crates/codegen/xai-grok-pager-render/")
+        || path.starts_with("crates/codegen/xai-grok-sampler/")
         || path.starts_with("crates/codegen/xai-grok-shell/")
         || path.starts_with("crates/codegen/xai-grok-pager/")
 }

@@ -8,7 +8,7 @@ agent、tools、MCP、ACP、TUI 与官方同一套，额外支持第三方模型
 
 命令行二进制是 **`groky`**，可以和官方 `grok` 并存。
 
-最新版本：[v0.1.16](https://github.com/yuWorm/groky/releases/tag/v0.1.16)
+最新版本：[v0.1.17](https://github.com/yuWorm/groky/releases/tag/v0.1.17)
 
 ## 安装
 
@@ -19,8 +19,11 @@ curl -fsSL https://raw.githubusercontent.com/yuWorm/groky/main/scripts/install-g
 groky --version
 ```
 
-二进制在 `~/.groky/bin/groky`。配置、会话、供应商凭证仍在 `~/.grok/`
-（`config.toml`、`auth.json`、`vendor-auth.json`）。
+二进制在 `~/.groky/bin/groky`。groky 自己的配置在 `~/.groky/`
+（`config.toml`、`vendor-auth.json`）。第一次启动（以及之后缺文件的升级）
+会从 `~/.grok/` 拷过来；会话、xAI 登录、记忆、技能、插件仍和官方 `grok`
+共用 `~/.grok/`（目录软链 + `GROK_AUTH_PATH`）。`GROK_HOME` 可整棵隔离；
+`GROKY_SKIP_HOME_MIGRATE=1` 跳过拷贝/链接。
 
 - 指定版本：`bash -s 0.1.0`
 - 升级：再跑一遍上面的 `curl | bash`
@@ -47,11 +50,11 @@ groky
 | Fast 模式（GPT，含自定义 OpenAI 兼容中转站） | `/fast` |
 | 去掉供应商密钥 | `/provider-logout` |
 | 刷新供应商模型列表 | `/sync-models-dev`（别名 `/refresh-models`）；供应商列表 `r`；自定义模型列表 `Ctrl+R` |
-| 更新 groky | `groky update` 或 `groky update --version 0.1.15`（Welcome：ctrl+u） |
+| 更新 groky | `groky update` 或 `groky update --version 0.1.17`（Welcome：ctrl+u） |
 
-xAI 登录未改（`AuthManager`、`~/.grok/auth.json`）。第三方密钥不进
-`config.toml`，而在 `~/.grok/vendor-auth.json`。供应商 401 会提示
-`/provider-login`，不会跳 `/login`。
+xAI 登录未改（`AuthManager`、`~/.grok/auth.json`，与官方 `grok` 共用）。
+第三方密钥不进 `config.toml`，而在 `~/.groky/vendor-auth.json`。供应商
+401 会提示 `/provider-login`，不会跳 `/login`。
 
 ## 相对官方改了什么
 
@@ -62,7 +65,7 @@ xAI 登录未改（`AuthManager`、`~/.grok/auth.json`）。第三方密钥不�
 | ChatGPT Codex OAuth（`openai-codex`） | 官方 `grok` 的 CDN 安装和自更新 |
 | Claude Pro/Max OAuth（`anthropic-claude`） | Anthropic 控制台 API key（`anthropic`） |
 | models.dev 推理档 / 上下文窗口 overlay | 默认压缩阈值（85%） |
-| 二进制名 `groky`（`~/.groky/bin`） | 把 TUI 重写成另一套产品 |
+| 二进制名 `groky`（`~/.groky/bin`）和配置家目录 `~/.groky` | 把 TUI 重写成另一套产品 |
 
 ## 官方文档
 

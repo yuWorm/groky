@@ -58,5 +58,11 @@ hook-file checklist. It does **not** merge.
 | OAuth, vendor-auth.json, catalog | Compact default (stay 85) |
 | Codex allowlist / SSE skip | Deleting upstream scripts |
 | Provider login TUI | Rewriting `/login` / AuthManager |
+| `xai-dirs` `~/.groky` home + `groky_layout.rs` | Project-local `.grok/` dirs |
+
+Product `$GROK_HOME` is `~/.groky` (GROK_COMPAT_HOOK in `xai-dirs`). Official
+`grok` stays on `~/.grok`. Layout migration copies config / vendor files and
+symlinks sessions (see `xai-dirs/src/groky_layout.rs`). Do not take upstream
+if it reverts the default dir name to `.grok`.
 
 Pi and Oh My Pi stay in gitignored `./sources/` as read-only references.

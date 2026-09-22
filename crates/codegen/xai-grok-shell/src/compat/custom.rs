@@ -1,4 +1,4 @@
-//! User-defined providers (`~/.grok/vendor-providers.json`).
+//! User-defined providers (`$GROK_HOME/vendor-providers.json`, default `~/.groky`).
 //!
 //! Specs (name, base URL, protocol, enabled models) live here. Secrets
 //! stay in `vendor-auth.json`. Nothing is written to `config.toml`.

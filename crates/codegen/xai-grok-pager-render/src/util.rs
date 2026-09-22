@@ -20,7 +20,7 @@ pub fn pager_toml_path() -> PathBuf {
     grok_home().join("pager.toml")
 }
 
-/// `~/.grok` or `$GROK_HOME`, decided by the resolved home rather than by
+/// `~/.groky` or `$GROK_HOME`, decided by the resolved home rather than by
 /// whether `GROK_HOME` is set in the environment.
 pub fn display_grok_home_prefix() -> String {
     display_grok_home_prefix_for(&grok_home())
@@ -29,13 +29,14 @@ pub fn display_grok_home_prefix() -> String {
 pub fn display_grok_home_prefix_for(home: &Path) -> String {
     let default = xai_grok_config::default_grok_home();
     if home == default || home == dunce::canonicalize(&default).unwrap_or(default) {
-        "~/.grok".to_string()
+        // GROK_COMPAT_HOOK: product home is ~/.groky, not official ~/.grok.
+        "~/.groky".to_string()
     } else {
         "$GROK_HOME".to_string()
     }
 }
 
-/// User-facing path under [`grok_home()`], e.g. ``~/.grok/config.toml``.
+/// User-facing path under [`grok_home()`], e.g. ``~/.groky/config.toml``.
 pub fn display_user_grok_path(relative: impl AsRef<Path>) -> String {
     display_user_grok_path_for(&grok_home(), relative)
 }
@@ -397,17 +398,18 @@ mod tests {
 
     #[test]
     fn display_grok_home_prefix_default_install() {
-        if std::env::var("GROK_HOME").is_ok() {
-            return;
-        }
-        assert_eq!(display_grok_home_prefix(), "~/.grok");
+        // Avoid grok_home() so this test does not init the process-wide OnceLock
+        // or run product-home migration.
+        let default = xai_grok_config::default_grok_home();
+        assert_eq!(display_grok_home_prefix_for(&default), "~/.groky");
     }
 
     #[test]
     fn display_user_grok_path_joins_relative() {
-        let path = display_user_grok_path(xai_grok_config::USER_CONFIG_FILENAME);
+        let default = xai_grok_config::default_grok_home();
+        let path = display_user_grok_path_for(&default, xai_grok_config::USER_CONFIG_FILENAME);
         assert!(path.ends_with("/config.toml") || path.ends_with("\\config.toml"));
-        assert!(path.contains(".grok") || path.contains("$GROK_HOME"));
+        assert!(path.contains(".groky") || path.contains("$GROK_HOME"));
     }
 
     #[test]
