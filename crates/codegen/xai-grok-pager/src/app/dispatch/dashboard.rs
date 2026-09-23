@@ -1255,6 +1255,7 @@ pub(super) fn dispatch_dashboard_dispatch_slash(app: &mut AppView, text: String)
                     && !app.default_yolo,
                 fast_mode: false,
                 current_model_name: app.models.current_model_name(),
+                persisted_default_model_id: app.persisted_default_model.clone(),
                 available_models: app
                     .models
                     .available

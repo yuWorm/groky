@@ -880,6 +880,9 @@ pub struct AppView {
     pub cli_model_override: Option<acp::ModelId>,
     /// CLI effort token (`--reasoning-effort` / `--effort`). Applied on session create.
     pub cli_effort_token: Option<String>,
+    /// User-layer `[models].default` catalog key (`None` = no override).
+    /// Settings and `/default` read this, not the live session model.
+    pub persisted_default_model: Option<String>,
     /// Default YOLO for new sessions, seeded at startup from `effective_yolo_for_launch`.
     pub default_yolo: bool,
     /// Soft-default still owns the mode: settings/update may rewrite the UI and `default_yolo`.
@@ -1493,6 +1496,7 @@ impl AppView {
             welcome_shimmer_frame: 0,
             cli_model_override: None,
             cli_effort_token: None,
+            persisted_default_model: None,
             default_yolo: false,
             permission_mode_from_soft_default: true,
             auto_mode_gate: xai_grok_shell::util::config::auto_permission_mode_enabled_from_disk(),

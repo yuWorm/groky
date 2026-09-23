@@ -1595,9 +1595,72 @@ fn save_default_model_toast(value: &str) -> String {
     format!("\u{2713} Default model: {value}")
 }
 
+fn persist_default_model_setting(app: &mut AppView, new_id: &acp::ModelId) -> Option<Effect> {
+    if xai_grok_shell::agent::chat_modes::process_chat_mode_enabled() {
+        return None;
+    }
+    let new_id_str = new_id.0.to_string();
+    let prev_id_str = app.persisted_default_model.clone().unwrap_or_default();
+    if prev_id_str == new_id_str {
+        return None;
+    }
+    app.persisted_default_model = Some(new_id_str.clone());
+    Some(Effect::PersistSetting {
+        key: "default_model",
+        value: crate::settings::SettingValue::String(new_id_str),
+        rollback_value: crate::settings::SettingValue::String(prev_id_str),
+    })
+}
+
+/// Persist `[models].default` without switching the live session. Used by `/default`.
+pub(in crate::app::dispatch) fn persist_default_model(
+    app: &mut AppView,
+    new_id: acp::ModelId,
+) -> Vec<Effect> {
+    let in_catalog = app.models.available.contains_key(&new_id)
+        || app
+            .agents
+            .values()
+            .any(|agent| agent.session.models.available.contains_key(&new_id));
+    if !in_catalog {
+        tracing::error!(
+            target: "settings",
+            key = "default_model",
+            id = ?new_id,
+            "Action::PersistDefaultModel dispatched with model id not in catalog — no-op",
+        );
+        return vec![];
+    }
+    let new_display = app
+        .agents
+        .values()
+        .find_map(|agent| {
+            agent
+                .session
+                .models
+                .available
+                .contains_key(&new_id)
+                .then(|| agent.session.models.display_name_for(&new_id))
+        })
+        .unwrap_or_else(|| app.models.display_name_for(&new_id));
+    let Some(persist) = persist_default_model_setting(app, &new_id) else {
+        return vec![];
+    };
+    refresh_open_settings_modals(app);
+    tracing::info!(
+        target: "settings",
+        key = "default_model",
+        new = ?new_display,
+        new_id = %new_id.0,
+        "persisted default model (session unchanged)",
+    );
+    app.show_toast(&save_default_model_toast(&new_display));
+    vec![persist]
+}
+
 /// Outer dispatcher for `Action::SetDefaultModel`. Switches and persists and toasts.
 /// `PersistSetting` is emitted first for consistent rollback; `SwitchModel` second.
-/// Idempotent: when the same model is already active, this is a no-op.
+/// Idempotent only when the session is already on `new_id` **and** it is already the persisted default.
 pub(in crate::app::dispatch) fn set_default_model(
     app: &mut AppView,
     new_id: acp::ModelId,
@@ -1639,13 +1702,16 @@ pub(in crate::app::dispatch) fn set_default_model(
         return vec![];
     }
 
-    // Idempotent: the same model already active is a no-op
-    if prev_id.as_ref() == Some(&new_id) {
+    let already_session = prev_id.as_ref() == Some(&new_id);
+    let already_persisted = app.persisted_default_model.as_deref() == Some(new_id.0.as_ref());
+    if already_session && already_persisted {
         return vec![];
     }
 
-    let did_mutate = set_default_model_inner(app, &new_id);
-    debug_assert!(did_mutate, "available_has_new gate guarantees mutation");
+    if !already_session {
+        let did_mutate = set_default_model_inner(app, &new_id);
+        debug_assert!(did_mutate, "available_has_new gate guarantees mutation");
+    }
     refresh_open_settings_modals(app);
     tracing::info!(
         target: "settings",
@@ -1658,20 +1724,13 @@ pub(in crate::app::dispatch) fn set_default_model(
     app.show_toast(&save_default_model_toast(&new_display));
 
     // Persist the **model ID** (catalog key), not the display name.
-    // would silently fail to resolve on the next startup.
-    // slugs that must not become the global Build `default_model`.
     let mut effects: Vec<Effect> = Vec::new();
-    if !xai_grok_shell::agent::chat_modes::process_chat_mode_enabled() {
-        let new_id_str = new_id.0.to_string();
-        let prev_id_str = prev_id
-            .as_ref()
-            .map(|id| id.0.to_string())
-            .unwrap_or_default();
-        effects.push(Effect::PersistSetting {
-            key: "default_model",
-            value: crate::settings::SettingValue::String(new_id_str),
-            rollback_value: crate::settings::SettingValue::String(prev_id_str),
-        });
+    if let Some(persist) = persist_default_model_setting(app, &new_id) {
+        effects.push(persist);
+    }
+
+    if already_session {
+        return effects;
     }
 
     // Best-effort session-level switch
@@ -1703,21 +1762,8 @@ pub(in crate::app::dispatch) fn set_default_model(
 /// Clear the default model override.
 /// Persists `[models].default = None`; does NOT mutate the active session's current model.
 pub(in crate::app::dispatch) fn clear_default_model(app: &mut AppView) -> Vec<Effect> {
-    // Active-agent snapshot: the previous model ID for the rollback payload
-    // Use the model ID (catalog key), not the display name, so that rollback persists a value `resolve_default_model` can match
-    let prev_id_str = if let ActiveView::Agent(aid) = app.active_view
-        && let Some(agent) = app.agents.get(&aid)
-    {
-        agent
-            .session
-            .models
-            .current
-            .as_ref()
-            .map(|id| id.0.to_string())
-            .unwrap_or_default()
-    } else {
-        String::new()
-    };
+    // Rollback to the persisted catalog key, not the live session model.
+    let prev_id_str = app.persisted_default_model.take().unwrap_or_default();
 
     // During the startup window `current` is None even if a default is on disk
     // Emit persist unconditionally; the shell de-dupes

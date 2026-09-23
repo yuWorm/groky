@@ -2,9 +2,10 @@ use chrono::{Duration as ChronoDuration, Utc};
 
 use super::super::{
     CACHE_TTL, CacheAuthMethod, Commit, MODELS_CACHE_FILE, ModelsCache, ModelsCacheScope,
-    ModelsFetchFuture, SettingsCacheManager, allowlist_denied_message, build_prefetched_map,
-    degraded_log_level, evaluate_models_commit, resolve_prefetch_inputs_from_parts,
-    resolve_startup_endpoints, selectable_catalog_key_for_persisted,
+    ModelsFetchFuture, RestoreModelDecision, SettingsCacheManager, allowlist_denied_message,
+    build_prefetched_map, degraded_log_level, evaluate_models_commit,
+    resolve_prefetch_inputs_from_parts, resolve_restore_model, resolve_startup_endpoints,
+    selectable_catalog_key_for_persisted,
 };
 use super::*;
 
@@ -2435,6 +2436,96 @@ fn test_available_keys(keys: &[&str]) -> IndexMap<acp::ModelId, acp::ModelInfo> 
             (id.clone(), acp::ModelInfo::new(id, (*k).to_string()))
         })
         .collect()
+}
+
+#[test]
+fn resolve_default_model_prefers_bundled_over_first_visible() {
+    let bundled = crate::models::default_model();
+    let catalog = make_prefetched(&["grok-4.7", bundled, "grok-4.5"]);
+    let cfg = config::Config::default();
+    let (key, _, source) = resolve_default_model(&cfg, &catalog, true);
+    assert_eq!(
+        key, bundled,
+        "with no preference, bundled default must win over newest-first catalog order"
+    );
+    assert_eq!(source, config::ConfigSource::Default);
+}
+
+#[test]
+fn resolve_default_model_missing_pref_falls_back_to_bundled_not_first() {
+    let bundled = crate::models::default_model();
+    let catalog = make_prefetched(&["grok-4.7", bundled]);
+    let mut cfg = config::Config::default();
+    cfg.models.default = Some("claudeuyplan/gpt-6-astra".to_string());
+    let (key, _, source) = resolve_default_model(&cfg, &catalog, true);
+    assert_eq!(
+        key, bundled,
+        "a missing user/vendor default must not fall through to the newest catalog row"
+    );
+    assert_eq!(source, config::ConfigSource::Default);
+}
+
+#[test]
+fn resolve_default_model_picks_vendor_key_when_present_in_catalog() {
+    let catalog = make_prefetched(&[
+        "grok-4.7",
+        crate::models::default_model(),
+        "claudeuyplan/gpt-6-astra",
+    ]);
+    let mut cfg = config::Config::default();
+    cfg.models.default = Some("claudeuyplan/gpt-6-astra".to_string());
+    let (key, _, source) = resolve_default_model(&cfg, &catalog, true);
+    assert_eq!(key, "claudeuyplan/gpt-6-astra");
+    assert_eq!(source, config::ConfigSource::Config);
+}
+
+#[test]
+fn restore_keeps_persisted_xai_model_when_still_available() {
+    let bundled = crate::models::default_model();
+    let models = make_prefetched(&["grok-4.7", bundled]);
+    let available = test_available_keys(&["grok-4.7", bundled]);
+    let persisted = acp::ModelId::new(bundled);
+    assert_eq!(
+        resolve_restore_model(&persisted, &models, &available),
+        RestoreModelDecision::Use(persisted)
+    );
+}
+
+#[test]
+fn restore_does_not_auto_switch_vanished_model_to_newest() {
+    let models = make_prefetched(&["grok-4.7", "grok-4.6"]);
+    let available = test_available_keys(&["grok-4.7", "grok-4.6"]);
+    let persisted = acp::ModelId::new("claudeuyplan/gpt-6-astra");
+    assert_eq!(
+        resolve_restore_model(&persisted, &models, &available),
+        RestoreModelDecision::Unavailable(persisted),
+        "must not silently upgrade a vanished session model to grok-4.7"
+    );
+}
+
+#[test]
+fn restore_keeps_unverified_when_catalog_empty() {
+    let models = IndexMap::new();
+    let available = IndexMap::new();
+    let persisted = acp::ModelId::new("grok-4.6");
+    assert_eq!(
+        resolve_restore_model(&persisted, &models, &available),
+        RestoreModelDecision::KeepUnverified(persisted)
+    );
+}
+
+#[test]
+fn restore_auto_switches_within_grok_build_family() {
+    let models = make_prefetched(&["grok-build-new", "grok-4.7"]);
+    let available = test_available_keys(&["grok-build-new", "grok-4.7"]);
+    let persisted = acp::ModelId::new("grok-build-old");
+    match resolve_restore_model(&persisted, &models, &available) {
+        RestoreModelDecision::AutoSwitch { from, to } => {
+            assert_eq!(from.0.as_ref(), "grok-build-old");
+            assert_eq!(to.0.as_ref(), "grok-build-new");
+        }
+        other => panic!("expected grok-build family auto-switch, got {other:?}"),
+    }
 }
 
 #[tokio::test(start_paused = true)]

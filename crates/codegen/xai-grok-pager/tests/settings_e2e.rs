@@ -4127,8 +4127,8 @@ fn pr14_default_model_picker_row_zero_commits_clear_action() {
     );
     navigate_to(&mut s, "default_model");
     let _ = handle_settings_key(&mut s, &press(KeyCode::Enter));
-    // Picker opens with choices_idx at the snapshot's current model, OR at 0 when current_model_name is None
-    // The fixture above leaves current_model_name as None, so the picker opens on row 0
+    // Picker opens with choices_idx at the persisted default, OR at 0 when persisted_default_model_id is None
+    // The fixture above leaves that unset, so the picker opens on row 0
     match &s.mode() {
         SettingsModalMode::PickingEnum { choices_idx, .. } => {
             assert_eq!(
@@ -4387,8 +4387,8 @@ fn pr8_default_model_and_max_thoughts_width_defaults_roundtrip() {
     let ui = UiConfig::default();
     let pager = PagerLocalSnapshot::default();
 
-    // default_model: registered default is the empty-string sentinel (no UiConfig mirror; cfg.models.default is resolved dynamically)
-    // `current_value_for` reads from `pager.current_model_name`, which is None by default, so `unwrap_or_default()` produces the empty string
+    // default_model: registered default is the empty-string sentinel (no UiConfig mirror)
+    // `current_value_for` reads persisted `[models].default`, which is None by default, so the empty string
     // Both paths converge on `SettingValue::String("")`
     let dm_meta = reg.find("default_model").unwrap();
     assert_eq!(

@@ -10,9 +10,9 @@ use agent_client_protocol as acp;
 
 use super::{
     HttpModelsEndpoint, ModelFetchAuth, ModelsCacheManager, ModelsCacheScope, ModelsEndpoint,
-    allowlist_matches_nothing, available_models, is_campaign_only_flip, resolve_catalog_key,
-    resolve_default_model, resolve_model_catalog, task_model_error_for_catalog,
-    validate_selectable,
+    allowlist_matches_nothing, available_models, catalog_with_vendor_overlay,
+    is_campaign_only_flip, resolve_catalog_key, resolve_default_model, resolve_model_catalog,
+    task_model_error_for_catalog, validate_selectable,
 };
 use crate::agent::config::{self, ModelEntry, resolve_credentials, sampling_config_for_model};
 use crate::agent::remote_config::task_model_policy::{
@@ -277,7 +277,7 @@ impl ModelsManager {
         }
 
         let (current_model_key, current_model, model_source) =
-            resolve_default_model(cfg, &catalog, is_session_auth);
+            resolve_default_model(cfg, &catalog_with_vendor_overlay(&catalog), is_session_auth);
 
         tracing::info!(
             model_id = %current_model.model,
@@ -357,8 +357,7 @@ impl ModelsManager {
         let campaign_only_flip =
             is_campaign_only_flip(&old_preferred, &new_preferred, &campaign_defaults);
         let current_still_ok = {
-            let cat = self.inner.catalog.read();
-            let models = &cat.models;
+            let models = self.merged_catalog_models();
             let cur = self.inner.current_model_id.read();
             models
                 .get(cur.0.as_ref())
@@ -385,12 +384,7 @@ impl ModelsManager {
     }
 
     fn merged_catalog_models(&self) -> IndexMap<String, ModelEntry> {
-        let mut models = self.inner.catalog.read().models.clone();
-        // GROK_COMPAT_HOOK begin
-        crate::compat::merge_vendor_catalog(&mut models);
-        crate::compat::reasoning::apply_overlay_to_vendor_entries(&mut models);
-        // GROK_COMPAT_HOOK end
-        models
+        catalog_with_vendor_overlay(&self.inner.catalog.read().models)
     }
 
     /// One name without cloning the catalog, for callers on a hot path.
@@ -430,18 +424,15 @@ impl ModelsManager {
         remote_fetch_enabled: bool,
     ) -> TaskModelCatalogSnapshot {
         let is_session_auth = self.is_session_auth();
-        let (mut models, authority) = {
+        let (models, authority) = {
             let cat = self.inner.catalog.read();
             let authority = if cat.has_fetched_real_catalog || !remote_fetch_enabled {
                 CatalogAuthority::Complete
             } else {
                 CatalogAuthority::Provisional
             };
-            (cat.models.clone(), authority)
+            (catalog_with_vendor_overlay(&cat.models), authority)
         };
-        // GROK_COMPAT_HOOK: vendor rows are overlaid on read, not stored.
-        crate::compat::merge_vendor_catalog(&mut models);
-        crate::compat::reasoning::apply_overlay_to_vendor_entries(&mut models);
         TaskModelCatalogSnapshot {
             eligible: models
                 .iter()
@@ -1284,9 +1275,8 @@ impl ModelsManager {
             return;
         }
         let (key, _, source) = {
-            let cat = self.inner.catalog.read();
-            let models = &cat.models;
-            resolve_default_model(config, models, self.is_session_auth())
+            let models = catalog_with_vendor_overlay(&self.inner.catalog.read().models);
+            resolve_default_model(config, &models, self.is_session_auth())
         };
         let new_id = acp::ModelId::new(Arc::from(key));
         tracing::info!(
@@ -1298,9 +1288,8 @@ impl ModelsManager {
 
     fn reselect_default_model(&self, config: &config::Config) {
         let (key, _, source) = {
-            let cat = self.inner.catalog.read();
-            let models = &cat.models;
-            resolve_default_model(config, models, self.is_session_auth())
+            let models = catalog_with_vendor_overlay(&self.inner.catalog.read().models);
+            resolve_default_model(config, &models, self.is_session_auth())
         };
         let new_id = acp::ModelId::new(Arc::from(key));
         let current = self.inner.current_model_id.read().clone();

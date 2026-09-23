@@ -12,7 +12,8 @@ impl SlashCommand for ReleaseNotesCommand {
     }
 
     fn run(&self, _ctx: &mut CommandExecCtx, _args: &str) -> CommandResult {
-        let changelog = xai_grok_shell::util::changelog::ChangelogManager::new().fetch();
+        // GROK_COMPAT_HOOK: groky notes are bundled; skip x.ai/cli/changelogs.
+        let changelog = xai_grok_shell::compat::changelog::fetch();
         match changelog.markdown {
             Some(content) => CommandResult::Action(Action::ShowReleaseNotes {
                 title: "Release Notes".to_string(),

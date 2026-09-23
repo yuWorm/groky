@@ -54,6 +54,7 @@ pub(crate) fn refresh_open_settings_modals(app: &mut AppView) {
     let auto_mode_gate_from_app = app.auto_mode_gate;
     let ask_user_question_timeout_enabled_from_app = app.ask_user_question_timeout_enabled;
     let voice_stt_language_from_app = app.voice_config.language.clone();
+    let persisted_default_from_app = app.persisted_default_model.clone();
     for agent in app.agents.values_mut() {
         // Walk both `Settings` and `ResetSettingsConfirm`
         // The confirm dialog embeds settings state that must stay fresh through async persist failures
@@ -73,6 +74,7 @@ pub(crate) fn refresh_open_settings_modals(app: &mut AppView) {
                 auto_mode: agent.session.is_auto(),
                 fast_mode: agent.session.is_fast(),
                 current_model_name: agent.session.models.current_model_name(),
+                persisted_default_model_id: persisted_default_from_app.clone(),
                 available_models: agent
                     .session
                     .models
@@ -187,6 +189,7 @@ pub(in crate::app::dispatch) fn dispatch_open_settings(
     let auto_mode_gate_from_app = app.auto_mode_gate;
     let ask_user_question_timeout_enabled_from_app = app.ask_user_question_timeout_enabled;
     let voice_stt_language_from_app = app.voice_config.language.clone();
+    let persisted_default_from_app = app.persisted_default_model.clone();
     // Theme rows are `hidden_in_minimal`. Snapshot this AppView's mode, not `MINIMAL_MODE_ACTIVE`
     // (other tests flip that process flag in parallel and would drop `theme` from the list).
     let visibility = RowVisibility {
@@ -219,6 +222,7 @@ pub(in crate::app::dispatch) fn dispatch_open_settings(
         auto_mode: agent.session.is_auto(),
         fast_mode: agent.session.is_fast(),
         current_model_name: agent.session.models.current_model_name(),
+        persisted_default_model_id: persisted_default_from_app,
         available_models: agent
             .session
             .models
@@ -583,7 +587,7 @@ fn agent_plan_mode(app: &AppView) -> bool {
     false
 }
 
-/// Read the active agent's currently-selected model display name; the `default_model` row's `current_value_for` uses it.
+/// Read the active agent's currently-selected model display name.
 /// Returns `None` when no agent is active or the catalog hasn't loaded yet (e.g. early startup).
 /// See [`agent_multiline_mode`] for the no-agent fallback rationale.
 fn agent_current_model_name(app: &AppView) -> Option<String> {
@@ -620,6 +624,7 @@ pub(crate) fn build_pager_snapshot(app: &AppView) -> crate::settings::PagerLocal
         auto_mode: agent_auto_mode(app),
         fast_mode: agent_fast_mode(app),
         current_model_name: agent_current_model_name(app),
+        persisted_default_model_id: app.persisted_default_model.clone(),
         available_models: agent_available_models(app),
         coding_data_sharing_opt_out: app.coding_data_retention_opt_out,
         coding_data_sharing_lock: app.coding_data_sharing_lock(),
@@ -930,6 +935,7 @@ pub(in crate::app::dispatch) fn apply_setting_rollback(
         }
         // default_model: best-effort rollback. If the prior model no longer resolves, leave the optimistic value and log.
         ("default_model", SettingValue::String(s)) => {
+            app.persisted_default_model = if s.is_empty() { None } else { Some(s.clone()) };
             if s.is_empty() {
                 tracing::warn!(
                     target: "settings",

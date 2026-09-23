@@ -23,6 +23,50 @@ pub(crate) fn resolve_catalog_key(
         .map(|(key, _)| acp::ModelId::new(key.clone()))
 }
 
+/// How restore should point a loaded session at a model.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum RestoreModelDecision {
+    /// Catalog key (exact or mapped routing slug).
+    Use(acp::ModelId),
+    /// Catalog empty (fetch may still be in flight); keep the persisted id unverified.
+    KeepUnverified(acp::ModelId),
+    /// grok-build routing family still has a selectable member.
+    AutoSwitch {
+        from: acp::ModelId,
+        to: acp::ModelId,
+    },
+    /// Persisted model is gone; keep it and block prompts. Do not pick the newest catalog row.
+    Unavailable(acp::ModelId),
+}
+
+/// Decide which model a resumed session should use.
+/// A vanished non-`grok-build` model is **not** auto-upgraded to the first visible catalog row
+/// (remote catalogs list newest-first, currently grok-4.7).
+pub(crate) fn resolve_restore_model(
+    persisted: &acp::ModelId,
+    models: &IndexMap<String, ModelEntry>,
+    available: &IndexMap<acp::ModelId, acp::ModelInfo>,
+) -> RestoreModelDecision {
+    if let Some(catalog_key) = selectable_catalog_key_for_persisted(models, available, persisted) {
+        return RestoreModelDecision::Use(catalog_key);
+    }
+    if available.is_empty() {
+        return RestoreModelDecision::KeepUnverified(persisted.clone());
+    }
+    if persisted.0.starts_with("grok-build")
+        && let Some(fallback) = available
+            .keys()
+            .find(|id| id.0.starts_with("grok-build") && *id != persisted)
+            .cloned()
+    {
+        return RestoreModelDecision::AutoSwitch {
+            from: persisted.clone(),
+            to: fallback,
+        };
+    }
+    RestoreModelDecision::Unavailable(persisted.clone())
+}
+
 /// Catalog key for a persisted session model id, restricted to **selectable** entries.
 pub(crate) fn selectable_catalog_key_for_persisted(
     models: &IndexMap<String, ModelEntry>,
@@ -59,7 +103,54 @@ pub(crate) fn is_campaign_only_flip(
             .is_some_and(|p| campaign_defaults.contains(p))
 }
 
-/// Pick the default model: CLI > env > config > remote-settings hint, falling back to the first visible model, then the bundled default.
+/// Overlay vendor catalog rows onto a stored catalog clone.
+/// Vendor rows are not stored (logout would leave stale entries); merge them at resolve/read time.
+pub(crate) fn catalog_with_vendor_overlay(
+    catalog: &IndexMap<String, ModelEntry>,
+) -> IndexMap<String, ModelEntry> {
+    let mut models = catalog.clone();
+    crate::compat::merge_vendor_catalog(&mut models);
+    crate::compat::reasoning::apply_overlay_to_vendor_entries(&mut models);
+    models
+}
+
+/// Look up `id` as a catalog key or routing slug in `visible`.
+fn visible_entry<'a>(
+    visible: &'a IndexMap<String, ModelEntry>,
+    id: &str,
+) -> Option<(&'a String, &'a ModelEntry)> {
+    visible
+        .get_key_value(id)
+        .or_else(|| visible.iter().find(|(_, m)| m.has_model_id(id)))
+}
+
+/// Stable fallback when there is no preference, or the preference is missing from the catalog.
+/// Prefers the bundled default over "first visible", because remote catalogs list newest-first
+/// (currently grok-4.7) and that must not silently replace a missing user/vendor pick.
+fn stable_fallback(
+    cfg: &config::Config,
+    catalog: &IndexMap<String, ModelEntry>,
+    visible: &IndexMap<String, ModelEntry>,
+) -> (String, ModelEntry) {
+    let bundled = crate::models::default_model();
+    if let Some((key, entry)) = visible_entry(visible, bundled) {
+        return (key.clone(), entry.clone());
+    }
+    if let Some((key, first)) = visible.first() {
+        return (key.clone(), first.clone());
+    }
+    if let Some((key, entry)) = catalog.iter().find(|(_, e)| e.info.user_selectable) {
+        tracing::warn!("no auth-visible selectable model; using first selectable entry");
+        return (key.clone(), entry.clone());
+    }
+    tracing::warn!("no selectable models; falling back to bundled default (pre-catalog)");
+    let default_id = bundled.to_string();
+    let mut entry = ModelEntry::fallback(&default_id, &cfg.endpoints);
+    entry.info.user_selectable = model_is_allowlisted(cfg, &default_id, &default_id);
+    (default_id, entry)
+}
+
+/// Pick the default model: CLI > env > config > remote-settings hint, falling back to the bundled default, then the first visible model.
 pub(crate) fn resolve_default_model(
     cfg: &config::Config,
     catalog: &IndexMap<String, ModelEntry>,
@@ -80,20 +171,7 @@ pub(crate) fn resolve_default_model(
             .and_then(|rs| rs.default_model.as_deref()),
     );
 
-    let first_or_fallback = || -> (String, ModelEntry) {
-        if let Some((key, first)) = visible.first() {
-            return (key.clone(), first.clone());
-        }
-        if let Some((key, entry)) = catalog.iter().find(|(_, e)| e.info.user_selectable) {
-            tracing::warn!("no auth-visible selectable model; using first selectable entry");
-            return (key.clone(), entry.clone());
-        }
-        tracing::warn!("no selectable models; falling back to bundled default (pre-catalog)");
-        let default_id = crate::models::default_model().to_string();
-        let mut entry = ModelEntry::fallback(&default_id, &cfg.endpoints);
-        entry.info.user_selectable = model_is_allowlisted(cfg, &default_id, &default_id);
-        (default_id, entry)
-    };
+    let first_or_fallback = || stable_fallback(cfg, catalog, &visible);
 
     match &model_pref {
         None => {
@@ -101,9 +179,7 @@ pub(crate) fn resolve_default_model(
             (key, first, config::ConfigSource::Default)
         }
         Some(pref) => {
-            let found = visible
-                .get_key_value(&pref.value)
-                .or_else(|| visible.iter().find(|(_, m)| m.has_model_id(&pref.value)));
+            let found = visible_entry(&visible, &pref.value);
 
             if let Some((key, entry)) = found {
                 (key.clone(), entry.clone(), pref.source)
@@ -133,9 +209,7 @@ pub(crate) fn resolve_default_model(
                         .pre_campaign_default
                         .as_deref()
                         .filter(|s| !s.is_empty())
-                    && let Some((key, entry)) = visible
-                        .get_key_value(prev)
-                        .or_else(|| visible.iter().find(|(_, m)| m.has_model_id(prev)))
+                    && let Some((key, entry)) = visible_entry(&visible, prev)
                 {
                     tracing::info!(
                         unavailable = %pref.value, fallback = %prev,

@@ -551,6 +551,8 @@ pub enum Action {
     /// The dispatcher switches the active session and persists via `Effect::PersistSetting`.
     /// Does not carry effort; use `Action::SwitchModel` for that.
     SetDefaultModel(acp::ModelId),
+    /// Persist `[models].default` without switching the live session. Used by `/default`.
+    PersistDefaultModel(acp::ModelId),
     /// Clear the persisted default model (`cfg.models.default = None`).
     /// Active session's model is unchanged; next session resolves via the shell's default-resolution chain.
     ClearDefaultModel,
@@ -1669,6 +1671,8 @@ pub enum Effect {
     /// Runs off the render path via `spawn_blocking`.
     /// Result is cached on `AppView` so `/release-notes` and the welcome screen share it.
     FetchChangelog,
+    /// Remember that this groky version's Release Notes prompt was shown.
+    PersistChangelogSeen { version: String },
     /// Persist the hidden announcement ids to disk.
     PersistAnnouncementsHidden {
         hidden_ids: std::collections::BTreeSet<String>,
@@ -2772,7 +2776,11 @@ pub enum TaskResult {
     ChangelogFetched {
         markdown: Option<String>,
         entries: Vec<xai_grok_shell::util::changelog::ChangelogEntry>,
+        /// True when this install has not yet prompted for this version.
+        unseen: bool,
     },
+    /// `$GROK_HOME/.changelog_seen_version` write finished.
+    ChangelogSeenPersisted,
     /// Announcements hidden state persisted.
     AnnouncementsHiddenPersisted {
         result: Result<(), String>,

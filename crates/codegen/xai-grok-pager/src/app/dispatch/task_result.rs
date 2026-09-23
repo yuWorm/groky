@@ -62,6 +62,7 @@ use crate::app::agent::AgentId;
 use crate::app::agent_view::AgentDeferredSend;
 use crate::app::app_view::{ActiveView, AppView, AuthState};
 use crate::app::command_catalog::CommandCatalogSource;
+use crate::app::consent::ConsentState;
 use crate::app::dispatch::settings;
 use crate::scrollback::block::RenderBlock;
 use crate::scrollback::blocks::MemoryCommandKind;
@@ -454,6 +455,45 @@ pub(crate) fn deliver_doctor_message(app: &mut AppView, preferred: AgentId, mess
         action: None,
     });
 }
+/// Welcome is idle enough to show the once-per-version Release Notes modal.
+fn welcome_can_prompt_release_notes(app: &AppView) -> bool {
+    matches!(app.active_view, ActiveView::Welcome)
+        && matches!(app.auth_state, AuthState::Done)
+        && matches!(app.consent_state, ConsentState::Done)
+        && app.has_access()
+        && !app.screen_mode.is_minimal()
+        && app.welcome_doc_viewer.is_none()
+        && app.tutorial.is_none()
+        && app.import_claude_modal.is_none()
+        && app.welcome_vendor_login.is_none()
+        && app.new_worktree_dialog.is_none()
+        && app.session_picker_entries.is_none()
+        && !app.privacy_banner_should_show()
+}
+
+/// Open Release Notes on Welcome after an upgrade. Persist is an Effect so
+/// dispatch stays off the filesystem.
+fn maybe_auto_open_release_notes(app: &mut AppView) -> Vec<Effect> {
+    let Some(content) = app
+        .changelog_markdown
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned)
+    else {
+        return vec![];
+    };
+    if !welcome_can_prompt_release_notes(app) {
+        return vec![];
+    }
+    let mut effects =
+        super::status::dispatch_show_release_notes(app, "Release Notes".to_string(), content);
+    effects.push(Effect::PersistChangelogSeen {
+        version: xai_grok_shell::compat::changelog::prompt_version(),
+    });
+    effects
+}
+
 pub(super) fn dispatch_task_result(result: TaskResult, app: &mut AppView) -> Vec<Effect> {
     let result = match result {
         TaskResult::WithPinnedMemoryMode {
@@ -999,12 +1039,21 @@ pub(super) fn dispatch_task_result(result: TaskResult, app: &mut AppView) -> Vec
             }
             vec![]
         }
-        TaskResult::ChangelogFetched { markdown, entries } => {
+        TaskResult::ChangelogFetched {
+            markdown,
+            entries,
+            unseen,
+        } => {
             app.changelog_markdown = markdown;
             app.changelog_bullets =
                 xai_grok_shell::util::changelog::bullets_from_entries(&entries, 3);
-            vec![]
+            if unseen {
+                maybe_auto_open_release_notes(app)
+            } else {
+                vec![]
+            }
         }
+        TaskResult::ChangelogSeenPersisted => vec![],
         TaskResult::ClipboardAttachmentProbed {
             ctx,
             image,

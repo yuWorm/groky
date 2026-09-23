@@ -1,0 +1,67 @@
+[
+  {
+    "category": "features",
+    "description": "**`/default`** shows and sets the disk `[models].default` without switching the current session.",
+    "breaking_change": false
+  },
+  {
+    "category": "features",
+    "description": "**Release Notes** open once on Welcome after an upgrade. `/release-notes` uses groky notes bundled in the binary.",
+    "breaking_change": false
+  },
+  {
+    "category": "fixes",
+    "description": "**Default model** resolves with the vendor catalog overlay, so `[models].default` is not ignored.",
+    "breaking_change": false
+  },
+  {
+    "category": "fixes",
+    "description": "**Default fallback** uses the bundled default (`grok-4.6`) instead of the first catalog row (`grok-4.7`).",
+    "breaking_change": false
+  },
+  {
+    "category": "fixes",
+    "description": "**Resume** keeps a vanished model and blocks prompts instead of silently switching to the newest catalog model.",
+    "breaking_change": false
+  },
+  {
+    "category": "fixes",
+    "description": "**Settings Default model** reads and writes the disk `[models].default`, not the live session model.",
+    "breaking_change": false
+  },
+  {
+    "category": "features",
+    "description": "**Default `$GROK_HOME`** is `~/.groky`, so `config.toml` and `vendor-auth.json` are no longer shared with official grok.",
+    "breaking_change": false
+  },
+  {
+    "category": "features",
+    "description": "**First launch** copies missing files from `~/.grok`; existing groky files are left alone.",
+    "breaking_change": false
+  },
+  {
+    "category": "features",
+    "description": "**Sessions, xAI login, memory, skills, and plugins** stay shared via `~/.grok/` (directory links + `GROK_AUTH_PATH`).",
+    "breaking_change": false
+  },
+  {
+    "category": "features",
+    "description": "**`GROK_HOME`** isolates the whole tree; `GROKY_SKIP_HOME_MIGRATE=1` skips copy/link.",
+    "breaking_change": false
+  },
+  {
+    "category": "features",
+    "description": "**`groky update --version`** downloads the GitHub asset directly and does not call `api.github.com`.",
+    "breaking_change": false
+  },
+  {
+    "category": "features",
+    "description": "**`/memory`** can delete entries, shows empty states, and carries over legacy `MEMORY.md`.",
+    "breaking_change": false
+  },
+  {
+    "category": "fixes",
+    "description": "**Vendor catalog overlay** follows `ModelsManager` to `remote_config/manager` after the grok-build merge.",
+    "breaking_change": false
+  }
+]

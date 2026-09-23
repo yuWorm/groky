@@ -108,6 +108,18 @@ Switch models. Accepts a model ID or display name (case-insensitive), and for re
 /model Reasoning X high
 ```
 
+### `/default [name]`
+
+Show or set the default model for **new** sessions without switching the current one. Alias: `/default-model`. The value is stored as `[models].default` in config.
+
+```
+/default
+/default grok-4.6
+/default clear
+```
+
+Bare `/default` prints the persisted override, or says there is none. `/model` still switches this session and (without an effort token) also writes the same default.
+
 ### `/effort <level>`
 
 Set reasoning effort on the **current** model without reselecting it. Levels are `low`, `medium`, `high`, and `xhigh`, and it only applies when the active model supports reasoning effort.
@@ -361,7 +373,7 @@ Check the current session for terminal, clipboard, color, input, notification, a
 
 ### `/release-notes`
 
-View release notes for the current version. Alias: `/changelog`.
+View groky release notes for recent versions. Alias: `/changelog`. After an upgrade, the same notes open once on the Welcome screen.
 
 ### `/docs`
 

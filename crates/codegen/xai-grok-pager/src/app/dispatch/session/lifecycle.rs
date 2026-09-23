@@ -1879,7 +1879,8 @@ pub(in crate::app::dispatch) fn handle_switch_model_complete(
     result: Result<(), SwitchModelError>,
     prev_model_id: Option<acp::ModelId>,
 ) -> Vec<Effect> {
-    if let Some(agent) = app.agents.get_mut(&agent_id) {
+    let mut persist_preferred: Option<String> = None;
+    let effects = if let Some(agent) = app.agents.get_mut(&agent_id) {
         agent.session.model_switch_pending = false;
         let mut effects = match result {
             Ok(()) => {
@@ -1913,6 +1914,7 @@ pub(in crate::app::dispatch) fn handle_switch_model_complete(
                 if unchanged {
                     vec![]
                 } else {
+                    persist_preferred = Some(model_id.0.to_string());
                     vec![Effect::PersistPreferredModel {
                         model_id: model_id.clone(),
                         reasoning_effort: resolved_effort,
@@ -1940,7 +1942,11 @@ pub(in crate::app::dispatch) fn handle_switch_model_complete(
         effects
     } else {
         vec![]
+    };
+    if let Some(id) = persist_preferred {
+        app.persisted_default_model = Some(id);
     }
+    effects
 }
 pub(in crate::app::dispatch) fn dispatch_agent_type_mismatch_answered(
     app: &mut AppView,

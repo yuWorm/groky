@@ -698,6 +698,7 @@ pub(super) fn dispatch_send_prompt_submission(
     let auto_mode_gate_from_app = app.auto_mode_gate;
     let ask_user_question_timeout_enabled_from_app = app.ask_user_question_timeout_enabled;
     let voice_stt_language_from_app = app.voice_config.language.clone();
+    let persisted_default_from_app = app.persisted_default_model.clone();
     let login_method_id_from_app = app.login_method_id.as_ref().map(|id| id.0.to_string());
     let leader_mode = app.leader_mode;
     let screen_mode_is_minimal = app.screen_mode.is_minimal();
@@ -820,6 +821,7 @@ pub(super) fn dispatch_send_prompt_submission(
                     auto_mode: agent.session.is_auto(),
                     fast_mode: agent.session.is_fast(),
                     current_model_name: agent.session.models.current_model_name(),
+                    persisted_default_model_id: persisted_default_from_app.clone(),
                     available_models: agent
                         .session
                         .models

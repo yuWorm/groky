@@ -239,6 +239,9 @@ pub struct PagerLocalSnapshot {
     pub fast_mode: bool,
     /// Currently-selected model's display name, or `None` if no catalog has loaded yet.
     pub current_model_name: Option<String>,
+    /// User-layer `[models].default` catalog key. Empty/`None` means no override (the settings row shows "(no override)").
+    /// Distinct from `current_model_name`, which is the live session model.
+    pub persisted_default_model_id: Option<String>,
     /// `(display_name, ModelId)` pairs from the active session's catalog.
     /// Cloned into the snapshot so the modal's validator and resolver are self-contained (the modal outlives the borrow on `app.agents`).
     pub available_models: Vec<(String, acp::ModelId)>,
@@ -283,6 +286,7 @@ impl Default for PagerLocalSnapshot {
             auto_mode: false,
             fast_mode: false,
             current_model_name: None,
+            persisted_default_model_id: None,
             available_models: Vec::new(),
             coding_data_sharing_opt_out: true,
             coding_data_sharing_lock: None,
@@ -346,6 +350,23 @@ impl PagerLocalSnapshot {
     /// Iterate over just the display names, for validator paths that don't need the ids.
     pub fn available_model_names(&self) -> impl Iterator<Item = &str> {
         self.available_models.iter().map(|(name, _)| name.as_str())
+    }
+
+    /// Display name for the persisted default model, or empty when unset (the "(no override)" sentinel).
+    pub fn persisted_default_model_display(&self) -> String {
+        let Some(id) = self
+            .persisted_default_model_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        else {
+            return String::new();
+        };
+        self.available_models
+            .iter()
+            .find(|(_, mid)| mid.0.as_ref() == id)
+            .map(|(name, _)| name.clone())
+            .unwrap_or_else(|| id.to_string())
     }
 
     /// Resolve a user-supplied name to a `ModelId` via the snapshot.
@@ -635,10 +656,10 @@ pub fn current_value_for(
             )
             .as_canonical(),
         )),
-        // default_model: reads from the pager snapshot (not UiConfig)
-        // None (no catalog yet) renders as the empty string
+        // default_model: the user-layer persisted catalog key, resolved to a display name.
+        // Empty means no override (not the live session model).
         "default_model" => Some(SettingValue::String(
-            pager.current_model_name.clone().unwrap_or_default(),
+            pager.persisted_default_model_display(),
         )),
         // max_thoughts_width: `u16` widened to `i64`.
         "max_thoughts_width" => Some(SettingValue::Int(ui.max_thoughts_width as i64)),
@@ -896,8 +917,8 @@ mod tests {
                     assert_eq!(
                         *default, "",
                         "default_model registry default must be empty string — \
-                         the live default is resolved dynamically from \
-                         cfg.models.default at session start",
+                         the live default is the user-layer [models].default \
+                         (empty = no override)",
                     );
                 }
                 // max_thoughts_width: `u16` widened to `i64`.
@@ -1471,6 +1492,41 @@ mod tests {
         assert_eq!(
             current_value_for("fork_secondary_model", &stale_ui, &pager),
             Some(SettingValue::String("retired-model".to_string())),
+        );
+    }
+
+    /// Persisted `[models].default` resolves to the catalog display name, not the live session model.
+    #[test]
+    fn default_model_current_value_uses_persisted_id_not_session_model() {
+        let pager = PagerLocalSnapshot {
+            current_model_name: Some("Grok 4.7".to_string()),
+            persisted_default_model_id: Some("grok-4.6".to_string()),
+            available_models: vec![
+                (
+                    "Grok 4.7".to_string(),
+                    acp::ModelId::new(std::sync::Arc::from("grok-4.7")),
+                ),
+                (
+                    "Grok 4.6".to_string(),
+                    acp::ModelId::new(std::sync::Arc::from("grok-4.6")),
+                ),
+            ],
+            ..Default::default()
+        };
+        assert_eq!(
+            current_value_for("default_model", &UiConfig::default(), &pager),
+            Some(SettingValue::String("Grok 4.6".to_string())),
+        );
+        let empty = PagerLocalSnapshot {
+            current_model_name: Some("Grok 4.7".to_string()),
+            persisted_default_model_id: None,
+            available_models: pager.available_models.clone(),
+            ..Default::default()
+        };
+        assert_eq!(
+            current_value_for("default_model", &UiConfig::default(), &empty),
+            Some(SettingValue::String(String::new())),
+            "no override must render as empty even if the session is on another model",
         );
     }
 

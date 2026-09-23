@@ -1377,9 +1377,9 @@ fn set_default_model_resolves_known_name() {
         Some(id)
     );
 }
-/// Re-dispatching the same model id is idempotent: no PersistSetting, no SwitchModel, no reasoning_effort reset.
+/// Session already on this model but disk has no override: still persist so the next session keeps it.
 #[test]
-fn set_default_model_idempotent_when_already_current() {
+fn set_default_model_persists_when_session_already_on_model() {
     use agent_client_protocol as acp;
     use std::sync::Arc;
     let mut app = test_app_with_agent();
@@ -1399,11 +1399,77 @@ fn set_default_model_idempotent_when_already_current() {
         .session
         .models
         .set_current(id.clone(), None);
+    let effects = dispatch(Action::SetDefaultModel(id.clone()), &mut app);
+    assert_eq!(effects.len(), 1, "expected persist only, got {effects:?}");
+    assert!(matches!(effects.first(), Some(Effect::PersistSetting {
+            key: "default_model",
+            value: crate::settings::SettingValue::String(s),
+            .. }) if s == "grok-already"));
+    assert_eq!(app.persisted_default_model.as_deref(), Some("grok-already"));
+}
+
+/// Same session model and already persisted: no-op.
+#[test]
+fn set_default_model_idempotent_when_already_current_and_persisted() {
+    use agent_client_protocol as acp;
+    use std::sync::Arc;
+    let mut app = test_app_with_agent();
+    let id = acp::ModelId::new(Arc::from("grok-already"));
+    let info = acp::ModelInfo::new(id.clone(), "Grok Already".to_string());
+    let agent_id = AgentId(0);
+    app.agents
+        .get_mut(&agent_id)
+        .unwrap()
+        .session
+        .models
+        .available
+        .insert(id.clone(), info);
+    app.agents
+        .get_mut(&agent_id)
+        .unwrap()
+        .session
+        .models
+        .set_current(id.clone(), None);
+    app.persisted_default_model = Some("grok-already".to_string());
     let effects = dispatch(Action::SetDefaultModel(id), &mut app);
     assert!(
         effects.is_empty(),
-        "re-dispatching same model must be idempotent (no effects), got {effects:?}",
+        "re-dispatching same already-persisted model must be idempotent, got {effects:?}",
     );
+}
+
+#[test]
+fn persist_default_model_does_not_switch_session() {
+    use agent_client_protocol as acp;
+    use std::sync::Arc;
+    let mut app = test_app_with_agent();
+    let current = acp::ModelId::new(Arc::from("grok-4.7"));
+    let target = acp::ModelId::new(Arc::from("grok-4.6"));
+    let agent_id = AgentId(0);
+    {
+        let agent = app.agents.get_mut(&agent_id).unwrap();
+        agent.session.models.available.insert(
+            current.clone(),
+            acp::ModelInfo::new(current.clone(), "Grok 4.7".to_string()),
+        );
+        agent.session.models.available.insert(
+            target.clone(),
+            acp::ModelInfo::new(target.clone(), "Grok 4.6".to_string()),
+        );
+        agent.session.models.set_current(current.clone(), None);
+    }
+    let effects = dispatch(Action::PersistDefaultModel(target.clone()), &mut app);
+    assert_eq!(effects.len(), 1);
+    assert!(matches!(effects.first(), Some(Effect::PersistSetting {
+            key: "default_model",
+            value: crate::settings::SettingValue::String(s),
+            .. }) if s == "grok-4.6"));
+    assert_eq!(
+        expect_agent(&app, agent_id).session.models.current,
+        Some(current),
+        "persist-only must not switch the live session",
+    );
+    assert_eq!(app.persisted_default_model.as_deref(), Some("grok-4.6"));
 }
 /// `clamp_max_thoughts_width` clamps out-of-range values to the registered `[40, 500]` bounds.
 #[test]

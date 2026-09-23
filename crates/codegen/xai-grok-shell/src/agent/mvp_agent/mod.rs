@@ -40,7 +40,8 @@ use crate::agent::config::{self, Config as AgentConfig, ModelEntry, resolve_cred
 use crate::agent::feedback_client::FeedbackClient;
 use crate::agent::folder_trust;
 use crate::agent::remote_config::{
-    resolve_catalog_key, selectable_catalog_key_for_persisted,
+    RestoreModelDecision, resolve_catalog_key, resolve_restore_model,
+    selectable_catalog_key_for_persisted,
 };
 use crate::agent::session_config;
 use xai_grok_sampling_types::{

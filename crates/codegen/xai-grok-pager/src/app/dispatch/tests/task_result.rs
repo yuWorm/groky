@@ -3540,3 +3540,80 @@ fn compact_complete_renders_one_failure_line_per_completion() {
         "compact state must be exited after the first completion"
     );
 }
+
+fn changelog_fetched(markdown: Option<&str>, unseen: bool) -> TaskResult {
+    TaskResult::ChangelogFetched {
+        markdown: markdown.map(str::to_string),
+        entries: Vec::new(),
+        unseen,
+    }
+}
+
+#[test]
+fn changelog_fetched_auto_opens_on_welcome_when_unseen() {
+    let mut app = test_app();
+    let effects = dispatch_task_result(
+        changelog_fetched(Some("# 0.1.18 — notes\n"), true),
+        &mut app,
+    );
+    assert!(
+        matches!(
+            app.welcome_doc_viewer,
+            Some(crate::views::modal::ActiveModal::DocViewer {
+                standalone: true,
+                ..
+            })
+        ),
+        "unseen notes on Welcome must open the Release Notes modal"
+    );
+    assert!(
+        effects
+            .iter()
+            .any(|e| matches!(e, Effect::PersistChangelogSeen { .. })),
+        "opening the prompt must persist the seen version, got {effects:?}"
+    );
+    assert_eq!(
+        app.changelog_markdown.as_deref(),
+        Some("# 0.1.18 — notes\n")
+    );
+}
+
+#[test]
+fn changelog_fetched_skips_auto_open_when_already_seen() {
+    let mut app = test_app();
+    let effects = dispatch_task_result(changelog_fetched(Some("# 0.1.17\n"), false), &mut app);
+    assert!(
+        app.welcome_doc_viewer.is_none(),
+        "already-seen notes must not re-open the modal"
+    );
+    assert!(
+        effects
+            .iter()
+            .all(|e| !matches!(e, Effect::PersistChangelogSeen { .. })),
+        "must not persist seen when the prompt did not open, got {effects:?}"
+    );
+}
+
+#[test]
+fn changelog_fetched_skips_auto_open_off_welcome() {
+    let mut app = test_app_with_agent();
+    let effects = dispatch_task_result(changelog_fetched(Some("# 0.1.18\n"), true), &mut app);
+    assert!(
+        app.welcome_doc_viewer.is_none(),
+        "resume/agent view must not steal focus for Release Notes"
+    );
+    assert!(
+        effects
+            .iter()
+            .all(|e| !matches!(e, Effect::PersistChangelogSeen { .. })),
+        "blocked prompt must retry next Welcome launch, got {effects:?}"
+    );
+}
+
+#[test]
+fn changelog_fetched_skips_empty_markdown() {
+    let mut app = test_app();
+    let effects = dispatch_task_result(changelog_fetched(None, true), &mut app);
+    assert!(app.welcome_doc_viewer.is_none());
+    assert!(effects.is_empty());
+}

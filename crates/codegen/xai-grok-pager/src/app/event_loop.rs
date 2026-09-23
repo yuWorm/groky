@@ -1336,6 +1336,14 @@ pub(crate) async fn run(
     app.hidden_announcement_ids = xai_grok_announcements::read_hidden_announcement_ids().await;
     let requirements = xai_grok_shell::config::load_merged_requirements();
     let user_config = xai_grok_shell::config::load_from_disk().ok();
+    app.persisted_default_model = user_config.as_ref().and_then(|cfg| {
+        cfg.get("models")?
+            .get("default")?
+            .as_str()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned)
+    });
     let managed_config = xai_grok_shell::config::load_managed_config().ok();
     let effective_config = {
         let _t = xai_grok_telemetry::instrumentation::timer("startup.app_init.effective_config");

@@ -2267,22 +2267,39 @@ pub(crate) fn execute(
         Effect::FetchChangelog => {
             tasks
                 .spawn(async move {
-                    let changelog = tokio::task::spawn_blocking(|| {
-                            xai_grok_shell::util::changelog::ChangelogManager::new()
-                                .fetch()
+                    let (changelog, unseen) = tokio::task::spawn_blocking(|| {
+                            // GROK_COMPAT_HOOK: groky notes are bundled; skip x.ai/cli/changelogs.
+                            let changelog = xai_grok_shell::compat::changelog::fetch();
+                            let unseen = xai_grok_shell::compat::changelog::is_unseen();
+                            (changelog, unseen)
                         })
                         .await
                         .unwrap_or_else(|e| {
                             tracing::warn!(error = %e, "changelog fetch task failed");
-                            xai_grok_shell::util::changelog::Changelog {
-                                markdown: None,
-                                entries: None,
-                            }
+                            (
+                                xai_grok_shell::util::changelog::Changelog {
+                                    markdown: None,
+                                    entries: None,
+                                },
+                                false,
+                            )
                         });
                     TaskResult::ChangelogFetched {
                         markdown: changelog.markdown,
                         entries: changelog.entries.unwrap_or_default(),
+                        unseen,
                     }
+                });
+        }
+        Effect::PersistChangelogSeen { version } => {
+            tasks
+                .spawn(async move {
+                    tokio::task::spawn_blocking(move || {
+                            xai_grok_shell::compat::changelog::mark_prompted(&version)
+                        })
+                        .await
+                        .ok();
+                    TaskResult::ChangelogSeenPersisted
                 });
         }
         Effect::PersistAnnouncementsHidden { hidden_ids } => {

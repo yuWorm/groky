@@ -59,6 +59,7 @@ hook-file checklist. It does **not** merge.
 | Codex allowlist / SSE skip | Deleting upstream scripts |
 | Provider login TUI | Rewriting `/login` / AuthManager |
 | `xai-dirs` `~/.groky` home + `groky_layout.rs` | Project-local `.grok/` dirs |
+| Bundled notes in `compat/changelogs/` | CDN-only `/release-notes` (x.ai/cli) |
 
 Product `$GROK_HOME` is `~/.groky` (GROK_COMPAT_HOOK in `xai-dirs`). Official
 `grok` stays on `~/.grok`. Layout migration copies config / vendor files and

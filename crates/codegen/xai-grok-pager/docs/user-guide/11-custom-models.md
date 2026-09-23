@@ -56,12 +56,14 @@ A fleet pin matches the **model id** (not a user-chosen catalog key), so a local
 
 ### Config Default
 
-Set a persistent default in `~/.grok/config.toml`:
+Set a persistent default in config (`~/.groky/config.toml` for groky, `~/.grok/config.toml` for grok), or from the TUI with `/default <name>` (does not switch the current session) or `/model <name>` (switches this session and writes the default):
 
 ```toml
 [models]
 default = "grok-4.5"
 ```
+
+`/default` with no arguments prints the persisted override. `/default clear` removes it so new sessions follow the remote or built-in default.
 
 ---
 

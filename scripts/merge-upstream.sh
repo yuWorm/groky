@@ -58,6 +58,7 @@ HOOK_FILES=(
   crates/codegen/xai-grok-pager/src/app/dispatch/task_result.rs
   crates/codegen/xai-grok-pager/src/app/effects/mod.rs
   crates/codegen/xai-grok-pager/src/slash/commands/mod.rs
+  crates/codegen/xai-grok-pager/src/slash/commands/release_notes.rs
   crates/codegen/xai-grok-pager/src/views/mod.rs
   crates/codegen/xai-grok-pager/src/app/agent_view/mod.rs
   crates/codegen/xai-grok-pager/src/app/agent_view/modals.rs

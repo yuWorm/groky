@@ -6,6 +6,7 @@
 
 mod auth_store;
 mod catalog;
+pub mod changelog;
 pub mod custom;
 pub mod oauth;
 mod probe;

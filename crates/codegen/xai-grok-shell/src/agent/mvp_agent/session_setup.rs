@@ -1679,99 +1679,83 @@ impl MvpAgent {
             available_keys = ?available.keys().take(10).collect::<Vec<_>>(),
             "load_session: restoring persisted model (debug)"
         );
-        let is_grok_build = persisted_model.0.starts_with("grok-build");
-        let same_family_fallback = if is_grok_build {
-            available
-                .keys()
-                .find(|id| id.0.starts_with("grok-build"))
-                .cloned()
-        } else {
-            available
-                .keys()
-                .find(|id| !id.0.starts_with("grok-build"))
-                .cloned()
-        };
-        let selectable_catalog_key =
-            selectable_catalog_key_for_persisted(&models, &available, &persisted_model);
-        let model_id = if let Some(catalog_key) = selectable_catalog_key {
-            if catalog_key != persisted_model {
-                tracing::info!(
+        let model_id = match resolve_restore_model(&persisted_model, &models, &available) {
+            RestoreModelDecision::Use(catalog_key) => {
+                if catalog_key != persisted_model {
+                    tracing::info!(
+                        session_id = %session_id.0,
+                        persisted = %persisted_model.0,
+                        catalog_key = %catalog_key.0,
+                        "load_session: mapped persisted routing slug to catalog key"
+                    );
+                    xai_grok_telemetry::unified_log::info(
+                        "load_session: mapped persisted routing slug to catalog key",
+                        Some(session_id.0.as_ref()),
+                        Some(serde_json::json!({
+                            "persisted_model": persisted_model.0.as_ref(),
+                            "catalog_key": catalog_key.0.as_ref(),
+                        })),
+                    );
+                }
+                catalog_key
+            }
+            RestoreModelDecision::KeepUnverified(kept) => {
+                tracing::warn!(
                     session_id = %session_id.0,
-                    persisted = %persisted_model.0,
-                    catalog_key = %catalog_key.0,
-                    "load_session: mapped persisted routing slug to catalog key"
+                    persisted = %kept.0,
+                    "load_session: model catalog empty at load; keeping persisted model unverified (catalog fetch may still be in flight)"
                 );
-                xai_grok_telemetry::unified_log::info(
-                    "load_session: mapped persisted routing slug to catalog key",
+                xai_grok_telemetry::unified_log::warn(
+                    "load_session: model catalog empty, keeping persisted model unverified",
                     Some(session_id.0.as_ref()),
                     Some(serde_json::json!({
-                        "persisted_model": persisted_model.0.as_ref(),
-                        "catalog_key": catalog_key.0.as_ref(),
+                        "persisted_model": kept.0.as_ref(),
                     })),
                 );
+                kept
             }
-            catalog_key
-        } else if available.is_empty() {
-            tracing::warn!(
-                session_id = %session_id.0,
-                persisted = %persisted_model.0,
-                "load_session: model catalog empty at load; keeping persisted model unverified (catalog fetch may still be in flight)"
-            );
-            xai_grok_telemetry::unified_log::warn(
-                "load_session: model catalog empty, keeping persisted model unverified",
-                Some(session_id.0.as_ref()),
-                Some(serde_json::json!({
-                    "persisted_model": persisted_model.0.as_ref(),
-                })),
-            );
-            persisted_model
-        } else if let Some(fallback) = same_family_fallback {
-            tracing::warn!(
-                session_id = %session_id.0,
-                previous = %persisted_model.0,
-                new = %fallback.0,
-                "Persisted model no longer available, auto-switching within family"
-            );
-            let reason = format!(
-                "Model \"{}\" is no longer available for your account.",
-                persisted_model.0,
-            );
-            self.send_model_auto_switched(&session_id, &persisted_model, &fallback, &reason)
-                .await;
-            fallback
-        } else {
-            let fallback = available
-                .keys()
-                .next()
-                .cloned()
-                .unwrap_or_else(|| persisted_model.clone());
-            tracing::warn!(
-                session_id = %session_id.0,
-                previous = %persisted_model.0,
-                fallback = %fallback.0,
-                available_count = available.len(),
-                available_keys = ?available.keys().take(10).collect::<Vec<_>>(),
-                "Persisted model no longer available, no same-family fallback — blocking prompts for this session"
-            );
-            xai_grok_telemetry::unified_log::warn(
-                "load_session: persisted model unavailable, no same-family fallback",
-                Some(session_id.0.as_ref()),
-                Some(serde_json::json!({
-                    "persisted_model": persisted_model.0.as_ref(),
-                    "fallback_model": fallback.0.as_ref(),
-                    "available_count": available.len(),
-                })),
-            );
-            let reason = format!(
-                "Model \"{}\" is no longer available. Please start a new session.",
-                persisted_model.0,
-            );
-            let empty_id = acp::ModelId::new(String::new());
-            self.send_model_auto_switched(&session_id, &persisted_model, &empty_id, &reason)
-                .await;
-            self.session_registry
-                .set_unavailable_model(&session_id, persisted_model.clone());
-            fallback
+            RestoreModelDecision::AutoSwitch { from, to } => {
+                tracing::warn!(
+                    session_id = %session_id.0,
+                    previous = %from.0,
+                    new = %to.0,
+                    "Persisted model no longer available, auto-switching within grok-build family"
+                );
+                let reason = format!(
+                    "Model \"{}\" is no longer available for your account.",
+                    from.0,
+                );
+                self.send_model_auto_switched(&session_id, &from, &to, &reason)
+                    .await;
+                to
+            }
+            RestoreModelDecision::Unavailable(kept) => {
+                tracing::warn!(
+                    session_id = %session_id.0,
+                    previous = %kept.0,
+                    available_count = available.len(),
+                    available_keys = ?available.keys().take(10).collect::<Vec<_>>(),
+                    "Persisted model no longer available — keeping it and blocking prompts (not auto-switching to the newest catalog model)"
+                );
+                xai_grok_telemetry::unified_log::warn(
+                    "load_session: persisted model unavailable, blocking prompts",
+                    Some(session_id.0.as_ref()),
+                    Some(serde_json::json!({
+                        "persisted_model": kept.0.as_ref(),
+                        "available_count": available.len(),
+                    })),
+                );
+                let reason = format!(
+                    "Model \"{}\" is no longer available. Please start a new session.",
+                    kept.0,
+                );
+                let empty_id = acp::ModelId::new(String::new());
+                self.send_model_auto_switched(&session_id, &kept, &empty_id, &reason)
+                    .await;
+                self.session_registry
+                    .set_unavailable_model(&session_id, kept.clone());
+                kept
+            }
         };
         tracing::debug!(
             session_id = %session_id.0,
