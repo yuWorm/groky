@@ -366,6 +366,7 @@ mod tests {
                 free_tokens: 960_000,
                 usage_pct: 4,
                 auto_compact_threshold_percent: 85,
+                max_context_window: None,
                 usage_categories: vec![],
             },
         }

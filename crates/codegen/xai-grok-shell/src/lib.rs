@@ -29,6 +29,7 @@ pub mod compat;
 pub mod config;
 #[cfg(all(test, feature = "config-docs"))]
 pub mod config_docs;
+pub mod context_window;
 pub mod credential_factory;
 pub use xai_grok_shell_base::cpu_profile;
 pub use xai_grok_shell_base::env;

@@ -63,18 +63,50 @@ struct CustomModelPick {
     api_model: String,
     name: String,
     context_window: u64,
+    advertised_context_window: Option<u64>,
     supports_reasoning_effort: bool,
     enabled: bool,
+    auto_compact_threshold_percent: Option<u8>,
 }
 
 impl CustomModelPick {
+    fn from_custom_model(m: xai_grok_shell::compat::custom::CustomModel) -> Self {
+        Self {
+            api_model: m.api_model,
+            name: m.name,
+            context_window: m.context_window,
+            advertised_context_window: m.advertised_context_window,
+            supports_reasoning_effort: m.supports_reasoning_effort,
+            enabled: m.enabled,
+            auto_compact_threshold_percent: m.auto_compact_threshold_percent,
+        }
+    }
+
+    /// Provider/models.dev cap when known. `None` means the user may type any size.
+    fn provider_cap(&self) -> Option<u64> {
+        if let Some(adv) = self.advertised_context_window.filter(|c| *c > 0) {
+            return Some(adv);
+        }
+        let suggested = xai_grok_shell::compat::reasoning::suggest_model(&self.api_model);
+        suggested.matched.then_some(suggested.context_window.max(1))
+    }
+
+    fn advertised_window(&self) -> u64 {
+        self.provider_cap()
+            .unwrap_or(self.context_window)
+            .max(self.context_window)
+            .max(1)
+    }
+
     fn to_custom_model(&self) -> xai_grok_shell::compat::custom::CustomModel {
         xai_grok_shell::compat::custom::CustomModel {
             api_model: self.api_model.clone(),
             name: self.name.clone(),
             context_window: self.context_window,
+            advertised_context_window: self.advertised_context_window,
             supports_reasoning_effort: self.supports_reasoning_effort,
             enabled: self.enabled,
+            auto_compact_threshold_percent: self.auto_compact_threshold_percent,
         }
     }
 }
@@ -83,6 +115,8 @@ impl CustomModelPick {
 enum AddModelField {
     ApiModel,
     Name,
+    Context,
+    Threshold,
     Reasoning,
 }
 
@@ -90,25 +124,59 @@ enum AddModelField {
 struct AddModelDraft {
     api_model: LineEditor,
     name: LineEditor,
+    context_text: LineEditor,
     field: AddModelField,
     supports_reasoning_effort: bool,
     context_window: u64,
+    advertised_context_window: u64,
+    auto_compact_threshold_percent: Option<u8>,
     matched: bool,
     reasoning_touched: bool,
+    context_touched: bool,
     error: Option<String>,
 }
 
 impl AddModelDraft {
     fn new() -> Self {
+        let mut context_text = LineEditor::default();
+        context_text.set_text(&xai_grok_shell::context_window::format_window(128_000));
         Self {
             api_model: LineEditor::default(),
             name: LineEditor::default(),
+            context_text,
             field: AddModelField::ApiModel,
             supports_reasoning_effort: false,
             context_window: 128_000,
+            advertised_context_window: 128_000,
+            auto_compact_threshold_percent: None,
             matched: false,
             reasoning_touched: false,
+            context_touched: false,
             error: None,
+        }
+    }
+
+    fn set_context_window(&mut self, tokens: u64) {
+        self.context_window = tokens.max(1);
+        self.context_text
+            .set_text(&xai_grok_shell::context_window::format_window(
+                self.context_window,
+            ));
+    }
+
+    fn parsed_context_window(&self) -> Result<u64, String> {
+        let raw = self.context_text.text().trim();
+        if raw.is_empty() {
+            return Ok(self.context_window.max(1));
+        }
+        let hint_max = self.advertised_context_window.max(1);
+        let Some(parsed) = xai_grok_shell::context_window::parse_window_arg(raw, hint_max) else {
+            return Err(format!("Use 256k, 1M, or 1.05M (got '{raw}')"));
+        };
+        if self.matched {
+            Ok(parsed.min(hint_max).max(1))
+        } else {
+            Ok(parsed.max(1))
         }
     }
 
@@ -116,28 +184,40 @@ impl AddModelDraft {
         match self.field {
             AddModelField::ApiModel => Some(&mut self.api_model),
             AddModelField::Name => Some(&mut self.name),
-            AddModelField::Reasoning => None,
+            AddModelField::Context => Some(&mut self.context_text),
+            AddModelField::Threshold | AddModelField::Reasoning => None,
         }
     }
 
     fn cycle_field(&mut self, forward: bool) {
-        self.field = match (self.field, forward) {
-            (AddModelField::ApiModel, true) | (AddModelField::Reasoning, false) => {
-                AddModelField::Name
-            }
-            (AddModelField::Name, true) | (AddModelField::ApiModel, false) => {
-                AddModelField::Reasoning
-            }
-            (AddModelField::Reasoning, true) | (AddModelField::Name, false) => {
-                AddModelField::ApiModel
-            }
+        if self.field == AddModelField::Context
+            && let Ok(tokens) = self.parsed_context_window()
+        {
+            self.set_context_window(tokens);
+            self.context_touched = true;
+        }
+        const ORDER: [AddModelField; 5] = [
+            AddModelField::ApiModel,
+            AddModelField::Name,
+            AddModelField::Context,
+            AddModelField::Threshold,
+            AddModelField::Reasoning,
+        ];
+        let i = ORDER.iter().position(|f| *f == self.field).unwrap_or(0);
+        self.field = if forward {
+            ORDER[(i + 1) % ORDER.len()]
+        } else {
+            ORDER[(i + ORDER.len() - 1) % ORDER.len()]
         };
     }
 
     fn refresh_suggestion(&mut self) {
         let suggested =
             xai_grok_shell::compat::reasoning::suggest_model(self.api_model.text().trim());
-        self.context_window = suggested.context_window;
+        self.advertised_context_window = suggested.context_window;
+        if !self.context_touched {
+            self.set_context_window(suggested.context_window);
+        }
         self.matched = suggested.matched;
         if !self.reasoning_touched {
             self.supports_reasoning_effort = suggested.supports_reasoning_effort;
@@ -180,13 +260,8 @@ impl CustomDraft {
         let models = provider
             .models
             .iter()
-            .map(|m| CustomModelPick {
-                api_model: m.api_model.clone(),
-                name: m.name.clone(),
-                context_window: m.context_window,
-                supports_reasoning_effort: m.supports_reasoning_effort,
-                enabled: m.enabled,
-            })
+            .cloned()
+            .map(CustomModelPick::from_custom_model)
             .collect();
         Self {
             id: Some(provider.id),
@@ -316,6 +391,7 @@ pub(crate) struct VendorLoginState {
     row_map: Vec<(u16, usize)>,
     custom: Option<CustomDraft>,
     add_model: Option<AddModelDraft>,
+    context_edit: Option<LineEditor>,
 }
 
 impl VendorLoginState {
@@ -333,6 +409,7 @@ impl VendorLoginState {
             row_map: Vec::new(),
             custom: None,
             add_model: None,
+            context_edit: None,
         }
     }
 
@@ -422,13 +499,7 @@ impl VendorLoginState {
             .collect();
         draft.models = xai_grok_shell::compat::custom::merge_live_models(&stored, live)
             .into_iter()
-            .map(|m| CustomModelPick {
-                api_model: m.api_model,
-                name: m.name,
-                context_window: m.context_window,
-                supports_reasoning_effort: m.supports_reasoning_effort,
-                enabled: m.enabled,
-            })
+            .map(CustomModelPick::from_custom_model)
             .collect();
         draft.selected = 0;
         draft.scroll = 0;
@@ -766,6 +837,11 @@ pub(crate) fn handle_vendor_login_key(
             state.error = None;
             return VendorLoginOutcome::Changed;
         }
+        if state.context_edit.is_some() {
+            state.context_edit = None;
+            state.error = None;
+            return VendorLoginOutcome::Changed;
+        }
         match &state.step {
             VendorLoginStep::Key {
                 from_picker: true, ..
@@ -947,7 +1023,21 @@ pub(crate) fn handle_vendor_login_paste(
         return VendorLoginOutcome::Unchanged;
     }
     if matches!(state.step, VendorLoginStep::CustomModels) {
+        if let Some(editor) = state.context_edit.as_mut() {
+            match editor.insert_paste(text) {
+                LineEditOutcome::Unhandled | LineEditOutcome::HandledNoChange => {
+                    return VendorLoginOutcome::Unchanged;
+                }
+                _ => {
+                    state.error = None;
+                    return VendorLoginOutcome::Changed;
+                }
+            }
+        }
         if let Some(add) = state.add_model.as_mut() {
+            if add.field == AddModelField::Context && !add.context_touched {
+                add.context_text.reset();
+            }
             let Some(editor) = add.active_editor_mut() else {
                 return VendorLoginOutcome::Unchanged;
             };
@@ -956,7 +1046,12 @@ pub(crate) fn handle_vendor_login_paste(
                     return VendorLoginOutcome::Unchanged;
                 }
                 _ => {
-                    add.refresh_suggestion();
+                    if add.field == AddModelField::ApiModel {
+                        add.refresh_suggestion();
+                    }
+                    if add.field == AddModelField::Context {
+                        add.context_touched = true;
+                    }
                     add.error = None;
                     return VendorLoginOutcome::Changed;
                 }
@@ -1011,6 +1106,11 @@ pub(crate) fn handle_vendor_login_mouse(
         ModalWindowOutcome::ShortcutActivated(SHORTCUT_CANCEL) => {
             if state.add_model.is_some() {
                 state.add_model = None;
+                state.error = None;
+                return VendorLoginOutcome::Changed;
+            }
+            if state.context_edit.is_some() {
+                state.context_edit = None;
                 state.error = None;
                 return VendorLoginOutcome::Changed;
             }
@@ -1344,6 +1444,9 @@ fn handle_custom_models_key(state: &mut VendorLoginState, key: &KeyEvent) -> Ven
     if state.add_model.is_some() {
         return handle_add_model_key(state, key);
     }
+    if state.context_edit.is_some() {
+        return handle_context_edit_key(state, key);
+    }
     if key.modifiers.contains(KeyModifiers::CONTROL) {
         match key.code {
             KeyCode::Char('a') | KeyCode::Char('A') => {
@@ -1406,6 +1509,15 @@ fn handle_custom_models_key(state: &mut VendorLoginState, key: &KeyEvent) -> Ven
     }
     if matches!(key.code, KeyCode::Char('r')) {
         return toggle_selected_reasoning(state);
+    }
+    if matches!(key.code, KeyCode::Char('[') | KeyCode::Char(']')) {
+        return cycle_selected_context(state, matches!(key.code, KeyCode::Char(']')));
+    }
+    if matches!(key.code, KeyCode::Char('c')) {
+        return start_context_edit(state);
+    }
+    if matches!(key.code, KeyCode::Char('t')) {
+        return cycle_selected_threshold(state, true);
     }
     let Some(draft) = state.custom.as_mut() else {
         return VendorLoginOutcome::Unchanged;
@@ -1512,6 +1624,90 @@ fn open_add_model(state: &mut VendorLoginState) -> VendorLoginOutcome {
     VendorLoginOutcome::Changed
 }
 
+fn start_context_edit(state: &mut VendorLoginState) -> VendorLoginOutcome {
+    let Some(draft) = state.custom.as_ref() else {
+        return VendorLoginOutcome::Unchanged;
+    };
+    let Some(row) = draft.models.get(draft.selected) else {
+        return VendorLoginOutcome::Unchanged;
+    };
+    let _ = row;
+    state.context_edit = Some(LineEditor::default());
+    state.error = None;
+    VendorLoginOutcome::Changed
+}
+
+fn handle_context_edit_key(state: &mut VendorLoginState, key: &KeyEvent) -> VendorLoginOutcome {
+    if matches!(key.code, KeyCode::Enter) {
+        return commit_context_edit(state);
+    }
+    let Some(editor) = state.context_edit.as_mut() else {
+        return VendorLoginOutcome::Unchanged;
+    };
+    match editor.handle_key(key) {
+        LineEditOutcome::Unhandled | LineEditOutcome::HandledNoChange => {
+            VendorLoginOutcome::Unchanged
+        }
+        _ => {
+            state.error = None;
+            VendorLoginOutcome::Changed
+        }
+    }
+}
+
+fn commit_context_edit(state: &mut VendorLoginState) -> VendorLoginOutcome {
+    let raw = state
+        .context_edit
+        .as_ref()
+        .map(|e| e.text().trim().to_owned())
+        .unwrap_or_default();
+    let Some(draft) = state.custom.as_mut() else {
+        return VendorLoginOutcome::Unchanged;
+    };
+    let Some(row) = draft.models.get_mut(draft.selected) else {
+        return VendorLoginOutcome::Unchanged;
+    };
+    let advertised = row.advertised_window();
+    let Some(parsed) = xai_grok_shell::context_window::parse_window_arg(&raw, advertised) else {
+        state.error = Some(format!("Use 256k, 1M, or 1.05M (got '{raw}')"));
+        return VendorLoginOutcome::Changed;
+    };
+    row.context_window = match row.provider_cap() {
+        Some(cap) => parsed.min(cap).max(1),
+        None => parsed.max(1),
+    };
+    state.context_edit = None;
+    state.error = None;
+    VendorLoginOutcome::Changed
+}
+
+fn cycle_selected_context(state: &mut VendorLoginState, forward: bool) -> VendorLoginOutcome {
+    let Some(draft) = state.custom.as_mut() else {
+        return VendorLoginOutcome::Unchanged;
+    };
+    let Some(row) = draft.models.get_mut(draft.selected) else {
+        return VendorLoginOutcome::Unchanged;
+    };
+    let max = row.advertised_window();
+    row.context_window =
+        xai_grok_shell::context_window::cycle_gear(row.context_window, max, forward);
+    VendorLoginOutcome::Changed
+}
+
+fn cycle_selected_threshold(state: &mut VendorLoginState, forward: bool) -> VendorLoginOutcome {
+    let Some(draft) = state.custom.as_mut() else {
+        return VendorLoginOutcome::Unchanged;
+    };
+    let Some(row) = draft.models.get_mut(draft.selected) else {
+        return VendorLoginOutcome::Unchanged;
+    };
+    row.auto_compact_threshold_percent = xai_grok_shell::context_window::cycle_threshold(
+        row.auto_compact_threshold_percent,
+        forward,
+    );
+    VendorLoginOutcome::Changed
+}
+
 fn toggle_selected_reasoning(state: &mut VendorLoginState) -> VendorLoginOutcome {
     let Some(draft) = state.custom.as_mut() else {
         return VendorLoginOutcome::Unchanged;
@@ -1549,8 +1745,37 @@ fn handle_add_model_key(state: &mut VendorLoginState, key: &KeyEvent) -> VendorL
             add.reasoning_touched = true;
             VendorLoginOutcome::Changed
         }
+        KeyCode::Left | KeyCode::Right if add.field == AddModelField::Threshold => {
+            let forward = matches!(key.code, KeyCode::Right);
+            add.auto_compact_threshold_percent = xai_grok_shell::context_window::cycle_threshold(
+                add.auto_compact_threshold_percent,
+                forward,
+            );
+            VendorLoginOutcome::Changed
+        }
+        KeyCode::Char('[') | KeyCode::Char(']') if add.field == AddModelField::Context => {
+            if let Ok(tokens) = add.parsed_context_window() {
+                add.context_window = tokens;
+            }
+            let max = if add.matched {
+                add.advertised_context_window.max(1)
+            } else {
+                add.context_window.max(1)
+            };
+            add.set_context_window(xai_grok_shell::context_window::cycle_gear(
+                add.context_window,
+                max,
+                matches!(key.code, KeyCode::Char(']')),
+            ));
+            add.context_touched = true;
+            VendorLoginOutcome::Changed
+        }
         _ => {
             let on_id = add.field == AddModelField::ApiModel;
+            let on_ctx = add.field == AddModelField::Context;
+            if on_ctx && !add.context_touched {
+                add.context_text.reset();
+            }
             let changed = match add.active_editor_mut() {
                 Some(editor) => !matches!(
                     editor.handle_key(key),
@@ -1564,6 +1789,9 @@ fn handle_add_model_key(state: &mut VendorLoginState, key: &KeyEvent) -> VendorL
             if on_id {
                 add.refresh_suggestion();
             }
+            if on_ctx {
+                add.context_touched = true;
+            }
             add.error = None;
             VendorLoginOutcome::Changed
         }
@@ -1571,15 +1799,32 @@ fn handle_add_model_key(state: &mut VendorLoginState, key: &KeyEvent) -> VendorL
 }
 
 fn commit_add_model(state: &mut VendorLoginState) -> VendorLoginOutcome {
-    let (api_model, name, context_window, supports_reasoning_effort) = {
+    let parsed = {
+        let Some(add) = state.add_model.as_ref() else {
+            return VendorLoginOutcome::Unchanged;
+        };
+        add.parsed_context_window()
+    };
+    let context_window = match parsed {
+        Ok(tokens) => tokens,
+        Err(err) => {
+            if let Some(add) = state.add_model.as_mut() {
+                add.error = Some(err);
+            }
+            return VendorLoginOutcome::Changed;
+        }
+    };
+    let (api_model, name, advertised, matched, supports_reasoning_effort, threshold) = {
         let Some(add) = state.add_model.as_ref() else {
             return VendorLoginOutcome::Unchanged;
         };
         (
             add.api_model.text().trim().to_owned(),
             add.name.text().trim().to_owned(),
-            add.context_window,
+            add.advertised_context_window,
+            add.matched,
             add.supports_reasoning_effort,
+            add.auto_compact_threshold_percent,
         )
     };
     if api_model.is_empty() {
@@ -1604,8 +1849,14 @@ fn commit_add_model(state: &mut VendorLoginState) -> VendorLoginOutcome {
         api_model,
         name,
         context_window,
+        advertised_context_window: if matched {
+            Some(advertised.max(1))
+        } else {
+            None
+        },
         supports_reasoning_effort,
         enabled: true,
+        auto_compact_threshold_percent: threshold,
     };
     let Some(draft) = state.custom.as_mut() else {
         return VendorLoginOutcome::Unchanged;
@@ -1937,6 +2188,42 @@ fn render_oauth_wait(buf: &mut Buffer, area: Rect, state: &VendorLoginState, the
     }
 }
 
+fn render_cycle_row(
+    buf: &mut Buffer,
+    area: Rect,
+    y: u16,
+    label: &str,
+    value: &str,
+    focused: bool,
+    theme: &Theme,
+) {
+    if y >= area.y + area.height {
+        return;
+    }
+    let bg = if focused {
+        theme.bg_visual
+    } else {
+        theme.bg_base
+    };
+    let row = Rect {
+        x: area.x,
+        y,
+        width: area.width,
+        height: 1,
+    };
+    buf.set_style(row, Style::default().bg(bg));
+    let line = format!("{label}: {value}   ←→");
+    buf.set_span(
+        area.x,
+        y,
+        &Span::styled(
+            truncate_str(&line, area.width as usize),
+            Style::default().fg(theme.text_primary).bg(bg),
+        ),
+        area.width,
+    );
+}
+
 fn render_labeled_input(
     buf: &mut Buffer,
     area: Rect,
@@ -2116,7 +2403,26 @@ fn render_add_model(buf: &mut Buffer, area: Rect, state: &mut VendorLoginState, 
             theme,
         );
     }
-    let reasoning_y = area.y + 4;
+    render_labeled_input(
+        buf,
+        area,
+        area.y + 4,
+        "Context",
+        &add.context_text,
+        add.field == AddModelField::Context,
+        false,
+        theme,
+    );
+    render_cycle_row(
+        buf,
+        area,
+        area.y + 6,
+        "Compact",
+        &xai_grok_shell::context_window::format_threshold(add.auto_compact_threshold_percent),
+        add.field == AddModelField::Threshold,
+        theme,
+    );
+    let reasoning_y = area.y + 8;
     if reasoning_y < area.y + area.height {
         let focused = add.field == AddModelField::Reasoning;
         let bg = if focused {
@@ -2147,16 +2453,18 @@ fn render_add_model(buf: &mut Buffer, area: Rect, state: &mut VendorLoginState, 
             area.width,
         );
     }
-    let hint_y = area.y + 6;
+    let hint_y = area.y + 10;
     if hint_y < area.y + area.height {
         let hint = if let Some(err) = add.error.as_deref() {
             err.to_owned()
+        } else if add.field == AddModelField::Context {
+            "Type 256k, 1M, or 1.05M".to_owned()
         } else if add.api_model.text().trim().is_empty() {
             "Wire id sent to the provider".to_owned()
         } else if add.matched {
             format!(
-                "models.dev · {}k ctx{}",
-                add.context_window / 1000,
+                "models.dev · {} ctx  (256k / 1M){}",
+                xai_grok_shell::context_window::format_window(add.context_window),
                 if add.supports_reasoning_effort {
                     " · reasoning"
                 } else {
@@ -2165,8 +2473,8 @@ fn render_add_model(buf: &mut Buffer, area: Rect, state: &mut VendorLoginState, 
             )
         } else {
             format!(
-                "unknown to models.dev · {}k ctx{}",
-                add.context_window / 1000,
+                "unknown to models.dev · {} ctx  (256k / 1M){}",
+                xai_grok_shell::context_window::format_window(add.context_window),
                 if add.supports_reasoning_effort {
                     " · reasoning on"
                 } else {
@@ -2308,10 +2616,16 @@ fn render_custom_models(buf: &mut Buffer, area: Rect, state: &mut VendorLoginSta
         } else {
             ""
         };
+        let ctx = xai_grok_shell::context_window::format_window(row.context_window);
+        let thresh =
+            xai_grok_shell::context_window::format_threshold(row.auto_compact_threshold_percent);
         let label = if row.name.is_empty() {
-            format!("{mark} {}{think}", row.api_model)
+            format!("{mark} {}  {ctx}  {thresh}{think}", row.api_model)
         } else {
-            format!("{mark} {}  {}{think}", row.api_model, row.name)
+            format!(
+                "{mark} {}  {}  {ctx}  {thresh}{think}",
+                row.api_model, row.name
+            )
         };
         let style = if focused {
             Style::default()
@@ -2337,27 +2651,33 @@ fn render_custom_models(buf: &mut Buffer, area: Rect, state: &mut VendorLoginSta
 
     let status_y = area.y + area.height.saturating_sub(1);
     if status_y > search_y {
-        let hint = if probing {
-            "Saving provider…".to_owned()
-        } else if let Some(err) = error.as_deref() {
-            err.to_owned()
-        } else if !query.trim().is_empty() {
-            format!("{enabled_n}/{total_n} enabled · {} shown", filtered.len())
-        } else if total_n == 0 {
-            "No models — press i to add".to_owned()
+        if let Some(editor) = state.context_edit.as_ref() {
+            render_labeled_input(buf, area, status_y, "Context", editor, true, false, theme);
         } else {
-            format!("{enabled_n}/{total_n} enabled · Space toggle · r reasoning · i add")
-        };
-        let style = if error.is_some() {
-            Style::default().fg(theme.accent_error)
-        } else if probing {
-            Style::default().fg(theme.accent_model)
-        } else {
-            Style::default().fg(theme.gray_bright)
-        };
-        let text = truncate_str(&hint, area.width as usize);
-        let tw = text.width() as u16;
-        buf.set_span(area.x, status_y, &Span::styled(text, style), tw);
+            let hint = if probing {
+                "Saving provider…".to_owned()
+            } else if let Some(err) = error.as_deref() {
+                err.to_owned()
+            } else if !query.trim().is_empty() {
+                format!("{enabled_n}/{total_n} enabled · {} shown", filtered.len())
+            } else if total_n == 0 {
+                "No models — press i to add".to_owned()
+            } else {
+                format!(
+                    "{enabled_n}/{total_n} enabled · Space toggle · c type ctx · [] cycle · t compact · r reasoning · i add"
+                )
+            };
+            let style = if error.is_some() {
+                Style::default().fg(theme.accent_error)
+            } else if probing {
+                Style::default().fg(theme.accent_model)
+            } else {
+                Style::default().fg(theme.gray_bright)
+            };
+            let text = truncate_str(&hint, area.width as usize);
+            let tw = text.width() as u16;
+            buf.set_span(area.x, status_y, &Span::styled(text, style), tw);
+        }
     }
 }
 
@@ -2952,6 +3272,64 @@ mod tests {
         let row = &state.custom.as_ref().unwrap().models[0];
         assert!(row.supports_reasoning_effort);
         assert_eq!(row.context_window, 1_050_000);
+    }
+
+    #[test]
+    fn custom_models_add_accepts_k_m_units() {
+        let mut state = VendorLoginState::custom_form();
+        fill_custom_form(&mut state);
+        let _ = handle_vendor_login_key(&mut state, &ctrl(KeyCode::Enter));
+        let _ = handle_vendor_login_key(&mut state, &key(KeyCode::Char('i')));
+        let _ = handle_vendor_login_paste(&mut state, "proxy-wide-v1");
+        let _ = handle_vendor_login_key(&mut state, &key(KeyCode::Tab));
+        let _ = handle_vendor_login_key(&mut state, &key(KeyCode::Tab));
+        assert_eq!(
+            state.add_model.as_ref().unwrap().field,
+            AddModelField::Context
+        );
+        let _ = handle_vendor_login_paste(&mut state, "1.05M");
+        let _ = handle_vendor_login_key(&mut state, &key(KeyCode::Enter));
+        assert!(state.add_model.is_none());
+        let row = &state.custom.as_ref().unwrap().models[0];
+        assert_eq!(row.api_model, "proxy-wide-v1");
+        assert_eq!(row.context_window, 1_050_000);
+        assert!(row.advertised_context_window.is_none());
+    }
+
+    #[test]
+    fn custom_models_add_matched_clamps_typed_window() {
+        let mut state = VendorLoginState::custom_form();
+        fill_custom_form(&mut state);
+        let _ = handle_vendor_login_key(&mut state, &ctrl(KeyCode::Enter));
+        let _ = handle_vendor_login_key(&mut state, &key(KeyCode::Char('i')));
+        let _ = handle_vendor_login_paste(&mut state, "gpt-5.6-sol");
+        let _ = handle_vendor_login_key(&mut state, &key(KeyCode::Tab));
+        let _ = handle_vendor_login_key(&mut state, &key(KeyCode::Tab));
+        let _ = handle_vendor_login_paste(&mut state, "256k");
+        let _ = handle_vendor_login_key(&mut state, &key(KeyCode::Enter));
+        let row = &state.custom.as_ref().unwrap().models[0];
+        assert_eq!(row.context_window, 256_000);
+        assert_eq!(row.advertised_context_window, Some(1_050_000));
+    }
+
+    #[test]
+    fn custom_models_list_c_types_k_units() {
+        let mut state = VendorLoginState::custom_form();
+        fill_custom_form(&mut state);
+        state.apply_custom_models(vec![("wide".into(), "Wide".into(), 1_050_000)], None);
+        assert_eq!(
+            state.custom.as_ref().unwrap().models[0].context_window,
+            1_050_000
+        );
+        let _ = handle_vendor_login_key(&mut state, &key(KeyCode::Char('c')));
+        assert!(state.context_edit.is_some());
+        let _ = handle_vendor_login_paste(&mut state, "256k");
+        let _ = handle_vendor_login_key(&mut state, &key(KeyCode::Enter));
+        assert!(state.context_edit.is_none());
+        assert_eq!(
+            state.custom.as_ref().unwrap().models[0].context_window,
+            256_000
+        );
     }
 
     #[test]

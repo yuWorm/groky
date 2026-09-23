@@ -112,6 +112,11 @@ impl ModelState {
             .or_else(|| self.current_context_window_tokens())
     }
 
+    /// Catalog / user-max window for the current model, ignoring a session `/window` gear.
+    pub fn catalog_context_window(&self) -> Option<u64> {
+        self.current_context_window_tokens()
+    }
+
     /// Used for subagent views where SubagentProgress reports an actual window that may differ from the inherited model's metadata.
     pub fn override_context_window(&mut self, tokens: u64) {
         self.context_window_override = Some(tokens);

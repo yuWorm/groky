@@ -611,6 +611,7 @@ impl SessionActor {
                 None,
                 xai_grok_telemetry::events::CompactionTrigger::Manual,
                 false,
+                None,
             )
             .await
         {
@@ -924,6 +925,7 @@ impl SessionActor {
         auto_continue: Option<crate::extensions::notification::AutoContinueInfo>,
         trigger: xai_grok_telemetry::events::CompactionTrigger,
         lossy_input: bool,
+        target_window: Option<u64>,
     ) -> Result<(), acp::Error> {
         let (cancel, _cancel_scope) = self.compaction.cancel.enter();
         let tokens_before = self.chat_state_handle.get_total_tokens().await;
@@ -934,10 +936,11 @@ impl SessionActor {
             xai_grok_telemetry::events::CompactionTrigger::Auto => "auto",
         };
         let sampling_config = self.chat_state_handle.get_sampling_config().await;
-        let context_window = sampling_config
+        let sampling_window = sampling_config
             .as_ref()
             .map(|c| c.context_window.get())
             .unwrap_or(DEFAULT_CONTEXT_WINDOW);
+        let context_window = target_window.filter(|w| *w > 0).unwrap_or(sampling_window);
         {
             let span = tracing::Span::current();
             let trigger_pct = if context_window == 0 {
@@ -2216,7 +2219,7 @@ impl SessionActor {
             cfg.context_window.get(),
             trigger_info.percentage,
         );
-        if let Err(e) = self.run_compact_only(trigger_info, false).await {
+        if let Err(e) = self.run_compact_only(trigger_info, false, None).await {
             tracing::error!(error = %e, "Model-switch compaction failed");
             if Self::is_auth_compact_error(&e) {
                 return Err(self.surface_compact_auth_failure(e).await);
@@ -2255,6 +2258,7 @@ impl SessionActor {
         self: &Arc<Self>,
         trigger_info: AutoCompactTriggerInfo,
         lossy_input: bool,
+        target_window: Option<u64>,
     ) -> Result<(), acp::Error> {
         use crate::extensions::notification::SessionUpdate as XaiSessionUpdate;
         let (_cancel, _cancel_scope) = self.compaction.cancel.enter();
@@ -2293,6 +2297,7 @@ impl SessionActor {
                 None,
                 xai_grok_telemetry::events::CompactionTrigger::Auto,
                 lossy_input,
+                target_window,
             )
             .await;
         let elapsed_ms = compact_start.elapsed().as_millis() as i64;

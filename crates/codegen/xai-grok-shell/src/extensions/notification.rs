@@ -496,6 +496,9 @@ pub enum AutoCompactCancelReason {
 /// `Switching model…` loader (family-switch compact runs with no turn in flight).
 pub const MODEL_FAMILY_SWITCH_COMPACT_BANNER: &str = "Switching model. Compacting…";
 
+/// User-visible auto-compact start banner when shrinking the session window (`/window` or a smaller model).
+pub const WINDOW_FIT_COMPACT_BANNER: &str = "Fitting context window. Compacting…";
+
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
 #[serde(rename_all = "snake_case", tag = "sessionUpdate")]
 pub enum SessionUpdate {

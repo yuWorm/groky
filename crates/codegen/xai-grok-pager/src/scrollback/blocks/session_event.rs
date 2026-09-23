@@ -20,7 +20,7 @@ use crate::theme::Theme;
 use crate::util::format_duration;
 use crate::views::plan_approval_view::PlanReviewOutcome;
 use xai_grok_shell::extensions::notification::{
-    MODEL_FAMILY_SWITCH_COMPACT_BANNER, MemoryCaptureDebugEntry,
+    MODEL_FAMILY_SWITCH_COMPACT_BANNER, MemoryCaptureDebugEntry, WINDOW_FIT_COMPACT_BANNER,
 };
 
 /// Shared text-selection range id for recap body lines (header is excluded).
@@ -418,6 +418,8 @@ impl SessionEvent {
             SessionEvent::CompactionStarted { percentage, reason } => {
                 if reason == MODEL_FAMILY_SWITCH_COMPACT_BANNER {
                     MODEL_FAMILY_SWITCH_COMPACT_BANNER.to_string()
+                } else if reason == WINDOW_FIT_COMPACT_BANNER {
+                    WINDOW_FIT_COMPACT_BANNER.to_string()
                 } else {
                     format!("Context {percentage}% full. Compacting…")
                 }

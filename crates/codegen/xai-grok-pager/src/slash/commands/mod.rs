@@ -72,6 +72,7 @@ pub mod usage;
 pub mod view_plan;
 pub mod vim_mode;
 pub mod voice;
+pub mod window;
 pub mod workflow;
 pub mod workflows;
 use super::command::SlashCommand;
@@ -96,6 +97,7 @@ pub fn builtin_commands() -> Vec<Arc<dyn SlashCommand>> {
         Arc::new(model::ModelCommand),
         Arc::new(default_model::DefaultModelCommand),
         Arc::new(context::ContextCommand),
+        Arc::new(window::WindowCommand),
         Arc::new(compact::CompactCommand),
         Arc::new(fork::ForkCommand),
         Arc::new(resume::ResumeCommand),

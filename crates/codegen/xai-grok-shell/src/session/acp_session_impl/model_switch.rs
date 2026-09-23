@@ -27,6 +27,23 @@ impl SessionActor {
                     .expect("DEFAULT_CONTEXT_WINDOW is non-zero")
             })
         });
+        let turn_in_flight = self.state.lock().await.running_task.is_some();
+        if !turn_in_flight {
+            if is_family_switch {
+                self.sanitize_history_for_family_switch().await;
+            }
+            if let Err(e) = self
+                .ensure_history_fits_window(
+                    new_context_window.get(),
+                    auto_compact_threshold_percent,
+                )
+                .await
+            {
+                return Err(e);
+            }
+        } else if is_family_switch {
+            tracing::warn!("Family-switch history sanitize skipped: turn in flight");
+        }
         let prev_threshold = self.compaction.threshold_percent.get();
         if prev_threshold != auto_compact_threshold_percent {
             tracing::info!(
@@ -144,30 +161,6 @@ impl SessionActor {
                 reasoning_effort: Some(sampling_config.reasoning_effort),
             });
         self.emit_status_snapshot_detached();
-        let turn_in_flight = self.state.lock().await.running_task.is_some();
-        if turn_in_flight && is_family_switch {
-            tracing::warn!("Family-switch compact skipped: turn in flight");
-        }
-        if is_family_switch && !turn_in_flight && self.history_has_model_minted_items().await {
-            self.abort_and_clear_prefire().await;
-            let estimated_total_tokens = self.chat_state_handle.get_estimated_total_tokens().await;
-            let context_window = new_context_window.get();
-            let trigger_info = compaction::AutoCompactTriggerInfo {
-                tokens_used: estimated_total_tokens,
-                context_window,
-                percentage: xai_token_estimation::usage_percentage_u8(
-                    estimated_total_tokens,
-                    context_window,
-                ),
-                reason_override: Some(
-                    crate::extensions::notification::MODEL_FAMILY_SWITCH_COMPACT_BANNER,
-                ),
-            };
-            tracing::info!("Family-switch compact: -> {}", sampling_config.model);
-            if let Err(e) = self.run_compact_only(trigger_info, true).await {
-                tracing::error!(error = %e, "Family-switch compaction failed; switching anyway");
-            }
-        }
         Ok(model_id)
     }
     /// `running_task` is re-checked with no await before the `borrow_mut`: a running turn pins `Ref<Agent>`.
@@ -211,6 +204,38 @@ impl SessionActor {
             "system_prompt_label updated for model switch"
         );
     }
+    /// Session-scoped `/window` gear change. Compact-fits before shrinking.
+    pub(super) async fn handle_set_context_window(
+        self: &std::sync::Arc<Self>,
+        requested: u64,
+    ) -> Result<u64, acp::Error> {
+        if self.state.lock().await.running_task.is_some() {
+            return Err(acp::Error::internal_error()
+                .data("Cannot change context window while a turn is running"));
+        }
+        let Some(mut cfg) = self.chat_state_handle.get_sampling_config().await else {
+            return Err(acp::Error::internal_error().data("session has no sampling config"));
+        };
+        let catalog_max = crate::agent::config::find_model_by_id(
+            &self.models_manager.models(),
+            cfg.model.as_str(),
+        )
+        .map(|e| e.info.context_window.get())
+        .unwrap_or(cfg.context_window.get())
+        .max(1);
+        let dest =
+            crate::context_window::snap_to_gear(requested, catalog_max).unwrap_or(catalog_max);
+        if dest == cfg.context_window.get() {
+            return Ok(dest);
+        }
+        self.ensure_history_fits_window(dest, self.compaction.threshold_percent.get())
+            .await?;
+        cfg.context_window = std::num::NonZeroU64::new(dest).unwrap_or(cfg.context_window);
+        self.chat_state_handle.update_sampling_config(cfg);
+        self.emit_status_snapshot_detached();
+        Ok(dest)
+    }
+
     /// Set the reasoning effort on the live sampling config, applying the same
     /// support check and per-effort model routing as `apply_supported_effort`.
     pub(super) async fn handle_set_reasoning_effort(
@@ -430,7 +455,92 @@ impl SessionActor {
             );
         }
     }
-    /// Whether the conversation has anything a family switch must compact away.
+    /// Drop provider-minted blobs a foreign family cannot replay. Does not summarize.
+    async fn sanitize_history_for_family_switch(&self) {
+        if !self.history_has_model_minted_items().await {
+            return;
+        }
+        self.abort_and_clear_prefire().await;
+        let conversation = self.chat_state_handle.get_conversation().await;
+        let sanitized: Vec<_> = conversation
+            .into_iter()
+            .filter_map(|item| match item {
+                ConversationItem::BackendToolCall(_) => None,
+                ConversationItem::Reasoning(mut reasoning) => {
+                    reasoning.encrypted_content = None;
+                    let has_text = reasoning
+                        .content
+                        .as_ref()
+                        .is_some_and(|parts| parts.iter().any(|part| !part.text.is_empty()))
+                        || !reasoning.summary.is_empty();
+                    has_text.then_some(ConversationItem::Reasoning(reasoning))
+                }
+                other => Some(other),
+            })
+            .collect();
+        self.chat_state_handle.replace_conversation(sanitized);
+        let snapshot = self.chat_state_handle.get_conversation().await;
+        persist_chat_history_jsonl_sync(&self.session_info, &snapshot);
+        tracing::info!(
+            session_id = %self.session_info.id.0,
+            "family-switch history sanitized (encrypted reasoning / backend tools dropped)"
+        );
+    }
+
+    /// Compact at the current (larger) window so `dest_window` can hold the history.
+    /// No-op when usage already fits the destination compact budget.
+    pub(super) async fn ensure_history_fits_window(
+        self: &std::sync::Arc<Self>,
+        dest_window: u64,
+        threshold_percent: u8,
+    ) -> Result<(), acp::Error> {
+        if dest_window == 0 {
+            return Ok(());
+        }
+        let src_window = self
+            .chat_state_handle
+            .get_sampling_config()
+            .await
+            .map(|c| c.context_window.get())
+            .unwrap_or(dest_window);
+        if dest_window >= src_window {
+            return Ok(());
+        }
+        let used = self.chat_state_handle.get_estimated_total_tokens().await;
+        let budget = crate::context_window::compact_budget(dest_window, threshold_percent);
+        if used < budget {
+            return Ok(());
+        }
+        self.abort_and_clear_prefire().await;
+        let percentage = xai_token_estimation::usage_percentage_u8(used, dest_window);
+        let trigger_info = compaction::AutoCompactTriggerInfo {
+            tokens_used: used,
+            context_window: dest_window,
+            percentage,
+            reason_override: Some(crate::extensions::notification::WINDOW_FIT_COMPACT_BANNER),
+        };
+        tracing::info!(
+            session_id = %self.session_info.id.0,
+            src_window,
+            dest_window,
+            used,
+            budget,
+            "compacting to fit a smaller context window"
+        );
+        self.run_compact_only(trigger_info, false, Some(dest_window))
+            .await?;
+        let used_after = self.chat_state_handle.get_estimated_total_tokens().await;
+        if used_after > dest_window {
+            return Err(acp::Error::internal_error().data(format!(
+                "Could not fit conversation into {} (still {} tokens)",
+                crate::context_window::format_window(dest_window),
+                crate::context_window::format_window(used_after)
+            )));
+        }
+        Ok(())
+    }
+
+    /// Whether the conversation has anything a family switch must strip.
     async fn history_has_model_minted_items(&self) -> bool {
         self.chat_state_handle
             .get_conversation()

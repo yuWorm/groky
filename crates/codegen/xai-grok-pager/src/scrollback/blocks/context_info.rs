@@ -370,12 +370,18 @@ impl ContextInfoBlock {
             // at-a-glance numbers stand apart from the breakdown/footer rows. The percentage is recomputed from `used / total`
             // so we get two decimal places of precision.
             Line::from(Span::styled(
-                format!(
-                    "{} / {} tokens ({:.2}%)",
-                    fmt_tok_big(used),
-                    fmt_tok_big(total),
-                    precise_usage_percent(used, total),
-                ),
+                {
+                    let mut line = format!(
+                        "{} / {} tokens ({:.2}%)",
+                        fmt_tok_big(used),
+                        fmt_tok_big(total),
+                        precise_usage_percent(used, total),
+                    );
+                    if let Some(max) = snapshot.max_context_window.filter(|m| *m > total) {
+                        line.push_str(&format!(" · max {}", fmt_tok_big(max)));
+                    }
+                    line
+                },
                 Style::default().fg(theme.text_secondary),
             )),
             // Model name (one step dimmer than the tokens line so it reads as a supporting caption rather than the primary number)
@@ -606,6 +612,7 @@ mod tests {
             free_tokens: 963_300,
             usage_pct: 4,
             auto_compact_threshold_percent: 85,
+            max_context_window: None,
             usage_categories: vec![],
         }
     }
@@ -988,6 +995,7 @@ mod tests {
             free_tokens: 400_000,
             usage_pct: 20,
             auto_compact_threshold_percent: 65,
+            max_context_window: None,
             usage_categories: vec![],
         };
         let block = ContextInfoBlock::new(snap, "grok-build");

@@ -1340,7 +1340,7 @@ impl SessionActor {
                     percentage,
                     reason_override: None,
                 };
-                if let Err(e) = self.run_compact_only(trigger_info, false).await {
+                if let Err(e) = self.run_compact_only(trigger_info, false, None).await {
                     if Self::is_auth_compact_error(&e) {
                         return Err(self.surface_compact_auth_failure(e).await);
                     }

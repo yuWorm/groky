@@ -1330,6 +1330,12 @@ pub(super) fn handle_session_notification_with_origin(
             }
         }
         XaiSessionUpdate::SessionStatus(status) => {
+            if let Some(size) = status.context_window.context_window_size.filter(|s| *s > 0) {
+                agent.session.models.override_context_window(size);
+                if let Some(used) = agent.context_state.as_ref().map(|c| c.used) {
+                    agent.apply_context_used(used, size);
+                }
+            }
             agent.status_context = Some(*status);
             status_snapshot_applied = true;
             false

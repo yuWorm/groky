@@ -482,6 +482,9 @@ pub struct ContextInfo {
     /// Used by the TUI `/context` view so the displayed “Auto-compact at X%” matches the actual trigger (e.g. 65 for grok-build in remote settings).
     #[serde(default = "default_auto_compact_threshold")]
     pub auto_compact_threshold_percent: u8,
+    /// Catalog / user-max window when the live gear (`total`) is smaller.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_context_window: Option<u64>,
     /// Itemized usage rows (skills, workflows, MCP servers, AGENTS.md).
     /// Empty on partial snapshots.
     #[serde(skip_serializing_if = "Vec::is_empty")]

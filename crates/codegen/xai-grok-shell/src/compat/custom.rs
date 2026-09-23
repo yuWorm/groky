@@ -48,12 +48,27 @@ pub struct CustomModel {
     pub api_model: String,
     #[serde(default)]
     pub name: String,
+    /// User max context for this model (clamped to the advertised provider window).
     #[serde(default = "default_context_window")]
     pub context_window: u64,
+    /// Provider/models.dev advertised window, used as the ceiling when cycling gears.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub advertised_context_window: Option<u64>,
     #[serde(default)]
     pub supports_reasoning_effort: bool,
     #[serde(default = "default_enabled")]
     pub enabled: bool,
+    /// Per-model auto-compact percent. `None` inherits `[session] auto_compact_threshold_percent`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auto_compact_threshold_percent: Option<u8>,
+}
+
+impl CustomModel {
+    pub fn advertised_window(&self) -> u64 {
+        self.advertised_context_window
+            .unwrap_or(self.context_window)
+            .max(1)
+    }
 }
 
 fn default_context_window() -> u64 {
@@ -598,6 +613,16 @@ pub fn merge_one(resolved: &mut IndexMap<String, ModelEntry>, provider: &CustomP
             &spec.api_model,
             spec.supports_reasoning_effort,
         );
+        let advertised = spec
+            .advertised_context_window
+            .unwrap_or_else(|| info.context_window.get());
+        let user_max = spec.context_window.min(advertised).max(1);
+        if let Some(cw) = NonZeroU64::new(user_max) {
+            info.context_window = cw;
+        }
+        info.auto_compact_threshold_percent = spec
+            .auto_compact_threshold_percent
+            .filter(|p| (1..=100).contains(p));
         resolved.insert(
             key,
             ModelEntry {
@@ -634,14 +659,23 @@ pub fn merge_live_models(stored: &[CustomModel], live: Vec<RemoteModel>) -> Vec<
         } else {
             model.name
         };
+        let advertised = model.context_window.max(1);
+        let context_window = match prev {
+            Some(p) if p.context_window < p.advertised_window() => {
+                p.context_window.min(advertised).max(1)
+            }
+            _ => advertised,
+        };
         out.push(CustomModel {
             api_model: api_model.to_owned(),
             name,
-            context_window: model.context_window,
+            context_window,
+            advertised_context_window: Some(advertised),
             supports_reasoning_effort: prev
                 .map(|m| m.supports_reasoning_effort)
                 .unwrap_or_else(|| crate::compat::reasoning::model_supports(api_model)),
             enabled: prev.map(|m| m.enabled).unwrap_or(true),
+            auto_compact_threshold_percent: prev.and_then(|m| m.auto_compact_threshold_percent),
         });
     }
     for model in stored {
@@ -803,8 +837,10 @@ mod tests {
             api_model: id.into(),
             name: name.into(),
             context_window: 32_000,
+            advertised_context_window: None,
             supports_reasoning_effort: reasoning,
             enabled,
+            auto_compact_threshold_percent: None,
         }
     }
 
@@ -835,6 +871,7 @@ mod tests {
         assert_eq!(merged[0].api_model, "keep");
         assert_eq!(merged[0].name, "Keep v2");
         assert_eq!(merged[0].context_window, 64_000);
+        assert_eq!(merged[0].advertised_context_window, Some(64_000));
         assert!(merged[0].enabled);
         assert!(merged[0].supports_reasoning_effort);
         assert!(!merged[1].enabled);
@@ -861,8 +898,10 @@ mod tests {
                     api_model: "acme-large".into(),
                     name: "Acme Large".into(),
                     context_window: 64_000,
+                    advertised_context_window: None,
                     supports_reasoning_effort: false,
                     enabled: true,
+                    auto_compact_threshold_percent: None,
                 }],
             })
             .unwrap();
@@ -898,15 +937,19 @@ mod tests {
                     api_model: "keep".into(),
                     name: "Keep".into(),
                     context_window: 32_000,
+                    advertised_context_window: None,
                     supports_reasoning_effort: false,
                     enabled: true,
+                    auto_compact_threshold_percent: None,
                 },
                 CustomModel {
                     api_model: "skip".into(),
                     name: "Skip".into(),
                     context_window: 32_000,
+                    advertised_context_window: None,
                     supports_reasoning_effort: false,
                     enabled: false,
+                    auto_compact_threshold_percent: None,
                 },
             ],
         };
@@ -939,8 +982,10 @@ mod tests {
                 api_model: "gpt-5.6-sol".into(),
                 name: "GPT-5.6 Sol".into(),
                 context_window: 400_000,
+                advertised_context_window: None,
                 supports_reasoning_effort: true,
                 enabled: true,
+                auto_compact_threshold_percent: None,
             }],
         };
         let mut resolved = IndexMap::new();
@@ -948,7 +993,7 @@ mod tests {
         let info = &resolved.get("openai/gpt-5.6-sol").unwrap().info;
         assert!(info.supports_reasoning_effort);
         assert!(!info.reasoning_efforts.is_empty());
-        assert_eq!(info.context_window.get(), 1_050_000);
+        assert_eq!(info.context_window.get(), 400_000);
         assert_eq!(info.max_completion_tokens, Some(128_000));
     }
 
@@ -965,8 +1010,10 @@ mod tests {
                 api_model: "gpt-5.6-sol".into(),
                 name: "GPT-5.6 Sol".into(),
                 context_window: 400_000,
+                advertised_context_window: None,
                 supports_reasoning_effort: false,
                 enabled: true,
+                auto_compact_threshold_percent: None,
             }],
         };
         let mut resolved = IndexMap::new();
@@ -974,7 +1021,7 @@ mod tests {
         let info = &resolved.get("openai/gpt-5.6-sol").unwrap().info;
         assert!(!info.supports_reasoning_effort);
         assert!(info.reasoning_efforts.is_empty());
-        assert_eq!(info.context_window.get(), 1_050_000);
+        assert_eq!(info.context_window.get(), 400_000);
     }
 
     #[test]
@@ -990,8 +1037,10 @@ mod tests {
                 api_model: "proxy-mystery-v1".into(),
                 name: "Mystery".into(),
                 context_window: 64_000,
+                advertised_context_window: None,
                 supports_reasoning_effort: true,
                 enabled: true,
+                auto_compact_threshold_percent: None,
             }],
         };
         let mut resolved = IndexMap::new();

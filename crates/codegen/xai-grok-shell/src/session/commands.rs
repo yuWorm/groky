@@ -423,6 +423,11 @@ pub enum SessionCommand {
         effort: xai_grok_sampling_types::ReasoningEffort,
         responds_to: oneshot::Sender<Result<acp::ModelId, acp::Error>>,
     },
+    /// Session-scoped context-window gear (`/window`). Compact-fits before shrinking.
+    SetContextWindow {
+        tokens: u64,
+        responds_to: oneshot::Sender<Result<u64, acp::Error>>,
+    },
     /// Zero-turn harness rebuild: build a brand-new `Agent` from the session's `AgentRebuildSpec` and the new `AgentDefinition`.
     /// Re-register MCP tools, swap the live `Agent`, and rewrite the system message in the conversation.
     /// Triggered by `MvpAgent::set_session_model` when the new model's `agent_type` differs from the session's current one.

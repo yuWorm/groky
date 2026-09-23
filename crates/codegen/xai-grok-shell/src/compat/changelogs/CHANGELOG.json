@@ -1,6 +1,21 @@
 [
   {
     "category": "features",
+    "description": "**`/window`** picks a session context-window gear. Type `256k`, `1M`, `1.05M`, or `max`.",
+    "breaking_change": false
+  },
+  {
+    "category": "features",
+    "description": "**Custom provider models** can set max context (`c` types `256k`/`1M`) and compact threshold in the model list.",
+    "breaking_change": false
+  },
+  {
+    "category": "features",
+    "description": "**Model switch** no longer auto-compacts across providers; foreign history is sanitized instead.",
+    "breaking_change": false
+  },
+  {
+    "category": "features",
     "description": "**`/default`** shows and sets the disk `[models].default` without switching the current session.",
     "breaking_change": false
   },

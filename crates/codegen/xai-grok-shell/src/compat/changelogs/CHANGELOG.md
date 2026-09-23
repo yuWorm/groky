@@ -1,3 +1,13 @@
+# Unreleased
+
+# 0.1.19 — 2026-09-24
+
+## Features
+
+- **`/window`** picks a session context-window gear cut from the model's max. Type `256k`, `1M`, `1.05M`, or `max`. Shrinking compact-fits at the current window first.
+- **Custom provider models** can set max context (`c` to type `256k`/`1M`, `[]` to cycle) and compact threshold (`t`) in the model list and when adding a model.
+- **Model switch** no longer auto-compacts across providers. Foreign encrypted reasoning and backend tool calls are stripped instead.
+
 # 0.1.18 — 2026-09-23
 
 ## Features

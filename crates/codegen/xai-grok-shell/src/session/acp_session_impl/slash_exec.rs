@@ -72,6 +72,10 @@ impl SessionActor {
                 ok_end_turn(0, None)
             }
             BuiltinAction::ContextInfo => ok_end_turn(0, None),
+            BuiltinAction::SetContextWindow { spec } => {
+                self.execute_window_command(spec).await?;
+                ok_end_turn(0, None)
+            }
             BuiltinAction::HooksTrust => {
                 let msg = match Self::do_hooks_trust_project(&self.session_info.cwd) {
                     Ok(root) => {
@@ -917,6 +921,63 @@ impl SessionActor {
                 ok_end_turn(0, None)
             }
         }
+    }
+
+    async fn execute_window_command(
+        self: &Arc<Self>,
+        spec: Option<String>,
+    ) -> Result<(), acp::Error> {
+        let Some(cfg) = self.chat_state_handle.get_sampling_config().await else {
+            self.send_host_turn_slash_command_output("No sampling config on this session.")
+                .await;
+            return Ok(());
+        };
+        let catalog_max = crate::agent::config::find_model_by_id(
+            &self.models_manager.models(),
+            cfg.model.as_str(),
+        )
+        .map(|e| e.info.context_window.get())
+        .unwrap_or(cfg.context_window.get())
+        .max(1);
+        let current = cfg.context_window.get();
+        let gears = crate::context_window::gears_for_max(catalog_max);
+        let Some(spec) = spec else {
+            let mut lines = vec![format!(
+                "Context window: {} (max {})",
+                crate::context_window::format_window(current),
+                crate::context_window::format_window(catalog_max)
+            )];
+            if gears.len() > 1 {
+                lines.push("Gears:".to_string());
+                for gear in &gears {
+                    let mark = if *gear == current { " (current)" } else { "" };
+                    lines.push(format!(
+                        "  {}{mark}",
+                        crate::context_window::format_window(*gear)
+                    ));
+                }
+                lines.push("Usage: /window 256k".to_string());
+            }
+            self.send_host_turn_slash_command_output(&lines.join("\n"))
+                .await;
+            return Ok(());
+        };
+        let Some(parsed) = crate::context_window::parse_window_arg(&spec, catalog_max) else {
+            self.send_host_turn_slash_command_output(&format!(
+                "Unknown window '{spec}'. Try 256k, 1M, 1.05M, or max."
+            ))
+            .await;
+            return Ok(());
+        };
+        let dest = crate::context_window::snap_to_gear(parsed, catalog_max).unwrap_or(catalog_max);
+        let applied = self.handle_set_context_window(dest).await?;
+        self.send_host_turn_slash_command_output(&format!(
+            "Context window: {} (max {})",
+            crate::context_window::format_window(applied),
+            crate::context_window::format_window(catalog_max)
+        ))
+        .await;
+        Ok(())
     }
 
     async fn execute_feedback_command(self: &Arc<Self>, text: String) -> PromptTurnResult {

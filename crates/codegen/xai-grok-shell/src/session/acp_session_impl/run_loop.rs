@@ -844,6 +844,10 @@ pub(super) async fn run_session(
                             let updated_model_id = session.handle_set_reasoning_effort(effort).await;
                             let _ = responds_to.send(updated_model_id);
                         }
+                        SessionCommand::SetContextWindow { tokens, responds_to } => {
+                            let outcome = session.handle_set_context_window(tokens).await;
+                            let _ = responds_to.send(outcome);
+                        }
                         SessionCommand::RebuildAgentForDefinition { definition, system_prompt_label, responds_to } => {
                             let outcome = session.handle_rebuild_agent_for_definition(definition, system_prompt_label).await;
                             let _ = responds_to.send(outcome);

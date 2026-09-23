@@ -30,11 +30,11 @@ Pin a version (downloads `github.com/.../releases/download/...` and does
 **not** call `api.github.com` — useful behind a shared VPN IP):
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/yuWorm/groky/main/scripts/install-groky.sh | bash -s 0.1.18
-groky update --version 0.1.18
+curl -fsSL https://raw.githubusercontent.com/yuWorm/groky/main/scripts/install-groky.sh | bash -s 0.1.19
+groky update --version 0.1.19
 ```
 
-PowerShell: `$env:GROKY_VERSION="0.1.18"; irm ... | iex`
+PowerShell: `$env:GROKY_VERSION="0.1.19"; irm ... | iex`
 
 Unpinned `groky update` / the installer without a version still query
 `/releases/latest`. A `GROKY_GITHUB_TOKEN` (or `GITHUB_TOKEN`) raises that

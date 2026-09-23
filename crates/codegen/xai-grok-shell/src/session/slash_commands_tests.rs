@@ -191,6 +191,18 @@ fn resolve_builtin(name: &str, args: &str) -> Option<BuiltinAction> {
 }
 
 #[test]
+fn window_parses_optional_spec() {
+    assert!(matches!(
+        resolve_builtin("window", ""),
+        Some(BuiltinAction::SetContextWindow { spec: None })
+    ));
+    assert!(matches!(
+        resolve_builtin("window", "256k"),
+        Some(BuiltinAction::SetContextWindow { spec: Some(s) }) if s == "256k"
+    ));
+}
+
+#[test]
 fn compact_parses_optional_context() {
     assert!(matches!(
         resolve_builtin("compact", ""),

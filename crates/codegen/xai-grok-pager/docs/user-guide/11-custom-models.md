@@ -119,6 +119,8 @@ Grok resolves the API key in this order:
 
 The `context_window` value tells Grok when to trigger auto-compaction. When you override a known model, Grok inherits that model's context window. When you define a new model and omit `context_window`, Grok defaults to 200,000 tokens, so set it explicitly to match your provider.
 
+In `/provider-login` custom model list, press `c` to type a size (`256k`, `1M`, `1.05M`) or `[]` to cycle gears. The add-model Context field accepts the same units. A known provider/models.dev cap still clamps the value. `/window` uses the same suffixes for the live session gear.
+
 ### Global Default Headers
 
 To apply the same headers to *every* model in the catalog -- built-in, prefetched from `/v1/models`, or custom -- set them once under the global `[models]` section instead of repeating them per model:

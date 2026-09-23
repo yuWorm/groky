@@ -2822,7 +2822,7 @@ impl SessionActor {
                 && !turn_parked.is_parked()
                 && !salvage.awaiting_continuation()
                 && let Some(trigger_info) = self.check_auto_compact_needed().await
-                && let Err(e) = self.run_compact_only(trigger_info, false).await
+                && let Err(e) = self.run_compact_only(trigger_info, false, None).await
             {
                 tracing::error!(error = %e, "Pre-sampling auto-compaction failed");
                 if Self::is_auth_compact_error(&e) {
@@ -3786,7 +3786,7 @@ impl SessionActor {
             if self.tool_context.task_output_token_budget.is_none()
                 && let Some(trigger_info) = self.check_preflight_overflow().await
             {
-                if let Err(e) = self.run_compact_only(trigger_info, false).await {
+                if let Err(e) = self.run_compact_only(trigger_info, false, None).await {
                     tracing::error!(error = %e, "Preflight overflow compaction failed");
                     if Self::is_auth_compact_error(&e) {
                         return Err(self.surface_compact_auth_failure(e).await);

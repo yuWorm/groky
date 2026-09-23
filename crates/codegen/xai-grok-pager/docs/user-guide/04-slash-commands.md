@@ -35,10 +35,14 @@ Compress conversation history to reclaim context-window space. Pass a note to te
 
 Grok also auto-compacts once the context window hits 85% (tune it with `[session] auto_compact_threshold_percent`).
 
+### `/window [256k|512k|max]`
+
+Set this session's context-window gear without changing the model. Gears are cut from the model's max (`256k`, `512k`, `1024k`, plus the max itself). Sizes accept `k`/`M` (`256k`, `1M`, `1.05M`). Shrinking compact-fits the history at the current window first so the smaller gear cannot overflow. `/window` with no argument lists the gears.
+
 ### `/context`
 
 Show the context window split into System prompt, Messages, Reasoning/overhead, and Free.
-Rows for Tool definitions, Skills, and MCP servers are already counted in those totals.
+Rows for Tool definitions, Skills, and MCP servers are already counted in those totals. When a `/window` gear is active, the header also shows the model's max.
 
 ### `/session-info`
 

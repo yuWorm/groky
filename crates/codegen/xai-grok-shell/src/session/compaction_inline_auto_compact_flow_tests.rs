@@ -822,9 +822,9 @@ fn switch_target_config(model: &str, base_url: String) -> xai_grok_sampler::Samp
         ..Default::default()
     }
 }
-/// A family switch compacts with the new model over the lossy view: the request must contain nothing but plain `{role, content}` text messages.
+/// A same-window family switch strips encrypted reasoning / backend tools and does not LLM-compact.
 #[tokio::test(flavor = "current_thread")]
-async fn family_switch_compacts_lossy_with_new_model() {
+async fn family_switch_sanitizes_without_compacting() {
     let local = tokio::task::LocalSet::new();
     local
         .run_until(async {
@@ -868,30 +868,25 @@ async fn family_switch_compacts_lossy_with_new_model() {
                     system_prompt_label: xai_grok_agent::DEFAULT_SYSTEM_PROMPT_LABEL.to_owned(),
                 })
                 .await
-                .expect("compact failure is log-only; the switch must succeed");
-            let requests = server.requests();
+                .expect("same-window family switch must succeed without compacting");
             assert!(
-                !requests.is_empty(),
-                "family switch must fire a compaction sample"
+                server.requests().is_empty(),
+                "family switch must not fire a compaction sample"
             );
-            let body = at(&requests, 0).body.as_ref().unwrap();
-            assert_eq!(
-                j(body, "model"),
-                "new-model",
-                "summarizer must be the NEW model"
+            let conversation = actor.chat_state_handle.get_conversation().await;
+            assert!(
+                conversation
+                    .iter()
+                    .all(|item| !matches!(item, ConversationItem::BackendToolCall(_))),
+                "backend tool calls must be dropped"
             );
-            for message in j(body, "input").as_array().unwrap() {
-                let keys: Vec<&String> = message.as_object().unwrap().keys().collect();
-                assert!(
-                    keys.iter()
-                        .all(|k| *k == "type" || *k == "role" || *k == "content"),
-                    "lossy view must send plain text messages, got keys {keys:?} in {message}"
-                );
-                assert_eq!(j(message, "type"), "message", "non-message item: {message}");
-                assert!(
-                    j(message, "content").is_string(),
-                    "non-text content in {message}"
-                );
+            for item in &conversation {
+                if let ConversationItem::Reasoning(reasoning) = item {
+                    assert!(
+                        reasoning.encrypted_content.is_none(),
+                        "encrypted reasoning must be stripped"
+                    );
+                }
             }
         })
         .await;
@@ -928,6 +923,7 @@ async fn e2e_auto_compact_401_suppresses_auth_and_surfaces_reauth() {
                         reason_override: None,
                     },
                     false,
+                    None,
                 )
                 .await
                 .expect_err("401 mock must fail auto-compact");
@@ -1034,6 +1030,7 @@ async fn e2e_auto_compact_413_steps_ladder_then_sticky_size_suppress() {
                         reason_override: None,
                     },
                     false,
+                    None,
                 )
                 .await
                 .expect_err("413 mock must fail auto-compact");
@@ -1281,6 +1278,7 @@ async fn bare_manual_compact_failure_does_not_suppress_auto() {
                         reason_override: None,
                     },
                     false,
+                    None,
                 )
                 .await;
             assert!(result.is_err(), "mock 400 must fail the compaction");
@@ -1322,6 +1320,7 @@ async fn transient_auto_compact_failure_notifies_with_real_error() {
                         reason_override: None,
                     },
                     false,
+                    None,
                 )
                 .await;
             assert!(result.is_err(), "mock 500 must fail the compaction");

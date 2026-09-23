@@ -624,6 +624,11 @@ impl SessionActor {
         let usage_categories = self.usage_categories().await;
         let free_tokens = xai_token_estimation::free_tokens(context_window, total_tokens);
         let usage_pct = xai_token_estimation::usage_percentage_u8(total_tokens, context_window);
+        let catalog_max = model.as_deref().and_then(|id| {
+            crate::agent::config::find_model_by_id(&self.models_manager.models(), id)
+                .map(|e| e.info.context_window.get())
+        });
+        let max_context_window = catalog_max.filter(|&max| max > context_window);
         let api_backend = config.as_ref().map(|c| format!("{:?}", c.api_backend));
         let agent_name = self.agent.borrow().definition().name.clone();
         let conversation_id = None;
@@ -652,6 +657,7 @@ impl SessionActor {
                 free_tokens,
                 usage_pct,
                 auto_compact_threshold_percent: self.compaction.threshold_percent.get(),
+                max_context_window,
                 usage_categories,
             },
         }
