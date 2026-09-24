@@ -85,7 +85,7 @@ mod tests {
         let changelog = fetch();
         let md = changelog.markdown.expect("bundled markdown");
         assert!(
-            md.contains("0.1.19"),
+            md.contains("0.1.20"),
             "bundled notes must include the latest shipped groky version, got {md}"
         );
         let entries = changelog.entries.expect("bundled json entries");

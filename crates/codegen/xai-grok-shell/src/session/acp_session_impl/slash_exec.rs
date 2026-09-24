@@ -73,7 +73,7 @@ impl SessionActor {
             }
             BuiltinAction::ContextInfo => ok_end_turn(0, None),
             BuiltinAction::SetContextWindow { spec } => {
-                self.execute_window_command(spec).await?;
+                self.execute_window_command(spec).await;
                 ok_end_turn(0, None)
             }
             BuiltinAction::HooksTrust => {
@@ -923,14 +923,11 @@ impl SessionActor {
         }
     }
 
-    async fn execute_window_command(
-        self: &Arc<Self>,
-        spec: Option<String>,
-    ) -> Result<(), acp::Error> {
+    async fn execute_window_command(self: &Arc<Self>, spec: Option<String>) {
         let Some(cfg) = self.chat_state_handle.get_sampling_config().await else {
             self.send_host_turn_slash_command_output("No sampling config on this session.")
                 .await;
-            return Ok(());
+            return;
         };
         let catalog_max = crate::agent::config::find_model_by_id(
             &self.models_manager.models(),
@@ -960,24 +957,34 @@ impl SessionActor {
             }
             self.send_host_turn_slash_command_output(&lines.join("\n"))
                 .await;
-            return Ok(());
+            return;
         };
         let Some(parsed) = crate::context_window::parse_window_arg(&spec, catalog_max) else {
             self.send_host_turn_slash_command_output(&format!(
                 "Unknown window '{spec}'. Try 256k, 1M, 1.05M, or max."
             ))
             .await;
-            return Ok(());
+            return;
         };
         let dest = crate::context_window::snap_to_gear(parsed, catalog_max).unwrap_or(catalog_max);
-        let applied = self.handle_set_context_window(dest).await?;
-        self.send_host_turn_slash_command_output(&format!(
-            "Context window: {} (max {})",
-            crate::context_window::format_window(applied),
-            crate::context_window::format_window(catalog_max)
-        ))
-        .await;
-        Ok(())
+        match self.apply_context_window_from_slash(dest).await {
+            Ok(applied) => {
+                self.send_host_turn_slash_command_output(&format!(
+                    "Context window: {} (max {})",
+                    crate::context_window::format_window(applied),
+                    crate::context_window::format_window(catalog_max)
+                ))
+                .await;
+            }
+            Err(err) => {
+                let msg = err
+                    .data
+                    .as_ref()
+                    .and_then(|d| d.as_str())
+                    .unwrap_or("failed to set context window");
+                self.send_host_turn_slash_command_output(msg).await;
+            }
+        }
     }
 
     async fn execute_feedback_command(self: &Arc<Self>, text: String) -> PromptTurnResult {

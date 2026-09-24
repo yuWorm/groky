@@ -1,5 +1,11 @@
 # Unreleased
 
+# 0.1.20 — 2026-09-24
+
+## Bug Fixes
+
+- **`/window`** can set a gear during its own slash turn. It no longer fails with "Cannot change context window while a turn is running".
+
 # 0.1.19 — 2026-09-24
 
 ## Features

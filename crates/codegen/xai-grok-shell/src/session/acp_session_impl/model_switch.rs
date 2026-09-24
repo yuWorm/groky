@@ -205,11 +205,31 @@ impl SessionActor {
         );
     }
     /// Session-scoped `/window` gear change. Compact-fits before shrinking.
+    ///
+    /// `require_idle` is for a concurrent ACP/actor request while a prompt is
+    /// streaming. `/window` itself runs as a host slash turn, so that path
+    /// passes `false` — otherwise every `/window 256k` fails because the
+    /// command's own turn set `running_task`.
     pub(super) async fn handle_set_context_window(
         self: &std::sync::Arc<Self>,
         requested: u64,
     ) -> Result<u64, acp::Error> {
-        if self.state.lock().await.running_task.is_some() {
+        self.apply_context_window(requested, true).await
+    }
+
+    pub(super) async fn apply_context_window_from_slash(
+        self: &std::sync::Arc<Self>,
+        requested: u64,
+    ) -> Result<u64, acp::Error> {
+        self.apply_context_window(requested, false).await
+    }
+
+    async fn apply_context_window(
+        self: &std::sync::Arc<Self>,
+        requested: u64,
+        require_idle: bool,
+    ) -> Result<u64, acp::Error> {
+        if require_idle && self.state.lock().await.running_task.is_some() {
             return Err(acp::Error::internal_error()
                 .data("Cannot change context window while a turn is running"));
         }

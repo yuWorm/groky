@@ -1,5 +1,10 @@
 [
   {
+    "category": "fixes",
+    "description": "**`/window`** can set a gear during its own slash turn instead of failing with a running-turn error.",
+    "breaking_change": false
+  },
+  {
     "category": "features",
     "description": "**`/window`** picks a session context-window gear. Type `256k`, `1M`, `1.05M`, or `max`.",
     "breaking_change": false
