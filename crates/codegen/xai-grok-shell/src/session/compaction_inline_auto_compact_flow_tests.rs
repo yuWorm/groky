@@ -7,6 +7,7 @@ fn at<T>(xs: &[T], i: usize) -> &T {
 }
 use super::super::*;
 use super::{AutoCompactTriggerInfo, SuppressReason};
+use crate::session::SwitchContextWindow;
 use crate::session::acp_session::McpReminderMode;
 use crate::terminal::AsyncTerminalRunner;
 use crate::terminal::runner::{TerminalError, TerminalRunRequest, TerminalRunResult};
@@ -120,20 +121,13 @@ async fn create_test_actor(
         rewind_pending_prompt: std::sync::Mutex::new(None),
         startup_hints: StartupHints::default(),
         forked_tool_override: None,
-        compaction: crate::session::compaction_config::CompactionConfig {
-            threshold_percent: std::cell::Cell::new(threshold_percent),
-            force_compact: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            context_window_override: None,
-            count: std::sync::atomic::AtomicU64::new(0),
-            auto_compact_suppressed: std::sync::atomic::AtomicU8::new(0),
-            previous_model: std::cell::Cell::new(None),
-            compaction_mode: xai_chat_state::CompactionMode::Transcript,
-            verbatim_input: true,
-            tool_choice: crate::util::config::CompactionToolChoice::Auto,
-            prefire: crate::session::compaction_config::PrefireState::default(),
-            prefix_released: std::sync::atomic::AtomicBool::new(false),
-            cancel: Default::default(),
+        compaction: test_compaction_config(threshold_percent),
+        long_reasoning_reminder: crate::session::long_reasoning_reminder::LongReasoningReminder {
+            enabled: false,
+            tokens: crate::session::long_reasoning_reminder::DEFAULT_TOKENS,
+            delay: crate::session::long_reasoning_reminder::DEFAULT_DELAY,
         },
+        long_reasoning_turn_state: Default::default(),
         memory: crate::session::memory_state::SessionMemory {
             configured_mode: None,
             v2_config: Default::default(),
@@ -234,7 +228,7 @@ async fn create_test_actor(
         pending_classifier_completions: parking_lot::Mutex::new(std::collections::VecDeque::new()),
         goal_classifier_in_flight: std::sync::atomic::AtomicBool::new(false),
         managed_mcp_handle: Default::default(),
-        initial_client_mcp_servers: vec![],
+        initial_client_mcp_servers: Default::default(),
         tool_metadata_snapshot: Arc::new(std::sync::Mutex::new(Default::default())),
         mcp_announcements: Default::default(),
         mcp_reminder_mode: McpReminderMode::Delta,
@@ -368,6 +362,62 @@ async fn suppression_gates_and_reset_is_reason_scoped() {
                 .auto_compact_suppressed
                 .store(SUPPRESS_NONE, Relaxed);
             assert!(actor.check_auto_compact_needed().await.is_some());
+        })
+        .await;
+}
+#[tokio::test(flavor = "current_thread")]
+async fn schema_rejection_suppresses_auto_compaction_on_later_turns() {
+    use crate::session::compaction_config::{SUPPRESS_NONE, SUPPRESS_STICKY, SUPPRESS_TURN};
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (gateway_tx, _gateway_rx) = mpsc::unbounded_channel();
+            let (persistence_tx, _persistence_rx) = mpsc::unbounded_channel();
+            let actor = create_test_actor(
+                    214_000,
+                    200_000,
+                    85,
+                    gateway_tx,
+                    persistence_tx,
+                )
+                .await;
+            let schema = r#"{"error":{"message":"the summary request does not match the schema","type":"invalid_request_error"}}"#;
+            assert_eq!(
+                SessionActor::classify_suppress_reason(schema),
+                SuppressReason::Schema
+            );
+            assert_eq!(
+                SessionActor::classify_suppress_reason("mock upstream failure 400"),
+                SuppressReason::Other
+            );
+            actor
+                .suppress_auto_compaction(SuppressReason::Schema, "", 1_000, 200_000)
+                .await;
+            assert_eq!(
+                actor.compaction.auto_compact_suppressed.load(Relaxed),
+                SUPPRESS_STICKY
+            );
+            assert!(actor.check_auto_compact_needed().await.is_none());
+            let _ = actor
+                .compaction
+                .auto_compact_suppressed
+                .compare_exchange(SUPPRESS_TURN, SUPPRESS_NONE, Relaxed, Relaxed);
+            assert!(
+                actor.check_auto_compact_needed().await.is_none(),
+                "a schema rejection must keep auto-compaction off after the turn resets"
+            );
+            actor.compaction.auto_compact_suppressed.store(SUPPRESS_NONE, Relaxed);
+            actor
+                .suppress_auto_compaction(SuppressReason::Other, "", 1_000, 200_000)
+                .await;
+            let _ = actor
+                .compaction
+                .auto_compact_suppressed
+                .compare_exchange(SUPPRESS_TURN, SUPPRESS_NONE, Relaxed, Relaxed);
+            assert!(
+                actor.check_auto_compact_needed().await.is_some(),
+                "a plain summary failure must let the next turn compact"
+            );
         })
         .await;
 }
@@ -866,6 +916,8 @@ async fn family_switch_sanitizes_without_compacting() {
                     skip_prompt_rewrite: true,
                     auto_compact_threshold_percent: 85,
                     system_prompt_label: xai_grok_agent::DEFAULT_SYSTEM_PROMPT_LABEL.to_owned(),
+                    context_window_selection: SwitchContextWindow::Set(None),
+                    supported_context_windows: Vec::new(),
                 })
                 .await
                 .expect("same-window family switch must succeed without compacting");
@@ -1257,7 +1309,7 @@ async fn bare_manual_compact_failure_does_not_suppress_auto() {
                 ConversationItem::system("sys"),
                 ConversationItem::user("hello"),
             ]);
-            let result = actor.run_compact(None).await;
+            let result = actor.run_compact().await;
             let err = result.expect_err("mock 400 must fail the compaction");
             assert_eq!(
                 crate::session::helpers::session_compact::compact_error_kind(&err),
@@ -1361,12 +1413,26 @@ async fn transient_auto_compact_failure_notifies_with_real_error() {
         })
         .await;
 }
+/// Point the actor's sampling at a mock server that answers every request with `summary`.
+/// Callers keep the returned server bound: dropping it shuts the server down.
+async fn route_compaction_to_mock_server(
+    actor: &SessionActor,
+    summary: String,
+) -> xai_grok_test_support::MockInferenceServer {
+    let server = xai_grok_test_support::MockInferenceServer::start()
+        .await
+        .unwrap();
+    server.set_response(summary);
+    let mut cfg = actor.chat_state_handle.get_sampling_config().await.unwrap();
+    cfg.base_url = server.url();
+    actor.chat_state_handle.update_sampling_config(cfg);
+    server
+}
 /// A successful compaction lets failed-server announcements fire again.
 /// The failure reminder was dropped with the compacted context (unlike connected servers, which the compaction context carries).
 /// So the announced episodes clear and the MCP reminder goes dirty for a re-announcement at the next injection.
 #[tokio::test(flavor = "current_thread")]
 async fn compaction_rearms_failed_server_announcements() {
-    use xai_grok_test_support::MockInferenceServer;
     let local = tokio::task::LocalSet::new();
     local
         .run_until(async {
@@ -1374,11 +1440,8 @@ async fn compaction_rearms_failed_server_announcements() {
             let (persistence_tx, _persistence_rx) = mpsc::unbounded_channel();
             let actor =
                 Arc::new(create_test_actor(50_000, 200_000, 85, gateway_tx, persistence_tx).await);
-            let server = MockInferenceServer::start().await.unwrap();
-            server.set_response("Summary of prior work. ".repeat(30));
-            let mut cfg = actor.chat_state_handle.get_sampling_config().await.unwrap();
-            cfg.base_url = server.url();
-            actor.chat_state_handle.update_sampling_config(cfg);
+            let _server =
+                route_compaction_to_mock_server(&actor, "Summary of prior work. ".repeat(30)).await;
             let filler = "x".repeat(8_000);
             actor.chat_state_handle.replace_conversation(vec![
                 ConversationItem::system("sys"),
@@ -1394,7 +1457,7 @@ async fn compaction_rearms_failed_server_announcements() {
             actor
                 .mcp_reminder_dirty
                 .store(false, std::sync::atomic::Ordering::Relaxed);
-            let result = actor.run_compact(None).await;
+            let result = actor.run_compact().await;
             assert!(result.is_ok(), "compaction should succeed: {result:?}");
             assert!(
                 actor.mcp_announcements.lock().failed.is_empty(),
@@ -1409,13 +1472,172 @@ async fn compaction_rearms_failed_server_announcements() {
         })
         .await;
 }
+/// The re-added last query keeps the image parts and `<image_files>` block of the turn it came from,
+/// both in the live conversation and in the persisted compaction checkpoint.
+#[tokio::test(flavor = "current_thread")]
+async fn compaction_keeps_last_user_turn_images_and_paths() {
+    const IMAGE_SENTINEL: &str = "data:image/png;base64,last-turn-image-sentinel";
+    const IMAGE_FILES_BLOCK: &str =
+        "<image_files>\n1. /tmp/test-session/assets/image-1.png\n</image_files>";
+    fn carried_image_item(items: &[ConversationItem]) -> Option<&ConversationItem> {
+        items
+            .iter()
+            .find(|item| {
+                matches!(
+                item,
+                ConversationItem::User(user)
+                    if user.synthetic_reason.is_human()
+                        && user.content.iter().any(|part| {
+                            matches!(part, ContentPart::Image { url } if url.as_ref() == IMAGE_SENTINEL)
+                        })
+            )
+            })
+    }
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (gateway_tx, _gateway_rx) = mpsc::unbounded_channel();
+            let (persistence_tx, mut persistence_rx) = mpsc::unbounded_channel();
+            let actor = Arc::new(
+                create_test_actor(50_000, 200_000, 85, gateway_tx, persistence_tx).await,
+            );
+            let _server = route_compaction_to_mock_server(
+                    &actor,
+                    "Summary of prior work. ".repeat(30),
+                )
+                .await;
+            let filler = "x".repeat(8_000);
+            actor
+                .chat_state_handle
+                .replace_conversation(
+                    vec![
+                ConversationItem::system("sys"),
+                ConversationItem::user(format!("u0 {filler}")),
+                ConversationItem::assistant(format!("a0 {filler}")),
+                ConversationItem::user_with_parts(vec![
+                    ContentPart::Text {
+                        text: format!(
+                            "{IMAGE_FILES_BLOCK}\n\n<user_query>\nwhat is in this screenshot?\n</user_query>"
+                        )
+                        .into(),
+                    },
+                    ContentPart::Image {
+                        url: IMAGE_SENTINEL.into(),
+                    },
+                ]),
+            ],
+                );
+            let result = actor.run_compact().await;
+            assert!(result.is_ok(), "compaction should succeed: {result:?}");
+            let conversation = actor.chat_state_handle.get_conversation().await;
+            let carried = carried_image_item(&conversation)
+                .expect("compacted history must keep a human item with the image");
+            let text = carried.text_content();
+            assert!(text.contains(IMAGE_FILES_BLOCK), "{text}");
+            assert!(
+                text.contains("<user_query>\nwhat is in this screenshot?\n</user_query>"),
+                "{text}"
+            );
+            let mut checkpoint = None;
+            while let Ok(message) = persistence_rx.try_recv() {
+                if let PersistenceMsg::CompactionCheckpoint(file) = message {
+                    checkpoint = Some(file);
+                }
+            }
+            let checkpoint = checkpoint.expect("compaction must persist a checkpoint");
+            let persisted = carried_image_item(&checkpoint.compacted_history)
+                .expect("checkpoint must keep the human item with the image");
+            assert!(persisted.text_content().contains(IMAGE_FILES_BLOCK));
+        })
+        .await;
+}
+/// Paths of earlier attachments come back as one note listing only regular files inside the session
+/// assets dir, and a second compaction re-harvests that note instead of losing it.
+#[tokio::test(flavor = "current_thread")]
+async fn compaction_paths_note_survives_second_compaction_and_filters_missing_files() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (gateway_tx, _gateway_rx) = mpsc::unbounded_channel();
+            let (persistence_tx, _persistence_rx) = mpsc::unbounded_channel();
+            let actor = Arc::new(
+                create_test_actor(50_000, 200_000, 85, gateway_tx, persistence_tx).await,
+            );
+            let assets_dir = crate::session::image_describe::session_assets_dir(
+                &crate::session::persistence::ensure_owner_only_session_dir(
+                        &actor.session_info,
+                    )
+                    .unwrap(),
+            );
+            crate::util::grok_home::create_dir_all_owner_only(&assets_dir).unwrap();
+            let existing = assets_dir.join("image-note-flow.png");
+            std::fs::write(&existing, b"png").unwrap();
+            let existing = existing.to_string_lossy().into_owned();
+            let missing = assets_dir
+                .join("image-gone.png")
+                .to_string_lossy()
+                .into_owned();
+            let planted = "/etc/hostname";
+            let _server = route_compaction_to_mock_server(
+                    &actor,
+                    "Summary of prior work. ".repeat(30),
+                )
+                .await;
+            let filler = "x".repeat(8_000);
+            actor
+                .chat_state_handle
+                .replace_conversation(
+                    vec![
+                ConversationItem::system("sys"),
+                ConversationItem::user(format!(
+                    "<image_files>\n1. {existing}\n2. {planted}\n</image_files>\n\n<user_query>\nu0 {filler}\n</user_query>"
+                )),
+                ConversationItem::assistant(format!("a0 {filler}")),
+                ConversationItem::user(format!(
+                    "<image_files>\n1. {missing}\n</image_files>\n\n<user_query>\nu1\n</user_query>"
+                )),
+                ConversationItem::assistant("a1"),
+                ConversationItem::user("final query"),
+            ],
+                );
+            let result = actor.run_compact().await;
+            assert!(result.is_ok(), "first compaction should succeed: {result:?}");
+            let mut conversation = actor.chat_state_handle.get_conversation().await;
+            conversation
+                .push(ConversationItem::user("<user_query>\nnext task\n</user_query>"));
+            conversation.push(ConversationItem::assistant("on it"));
+            actor.chat_state_handle.replace_conversation(conversation);
+            let result = actor.run_compact().await;
+            assert!(result.is_ok(), "second compaction should succeed: {result:?}");
+            let conversation = actor.chat_state_handle.get_conversation().await;
+            std::fs::remove_file(&existing).unwrap();
+            let notes: Vec<String> = conversation
+                .iter()
+                .filter(|item| {
+                    matches!(
+                        item,
+                        ConversationItem::User(user)
+                            if user.synthetic_reason == SyntheticReason::CompactionMeta
+                    )
+                })
+                .map(ConversationItem::text_content)
+                .filter(|text| text.starts_with("<image_files>"))
+                .collect();
+            let [note] = notes.as_slice() else {
+                panic!("exactly one paths note expected, got: {notes:?}");
+            };
+            assert_eq!(note.matches(existing.as_str()).count(), 1, "{note}");
+            assert!(!note.contains(missing.as_str()), "{note}");
+            assert!(!note.contains(planted), "{note}");
+        })
+        .await;
+}
 /// A forked session whose whole-transcript inherited prefix alone exceeds the auto-compact threshold releases the prefix on compaction.
 /// That lets the conversation actually shrink below the threshold.
 /// The release stays sticky across further compactions (no unbounded compaction loop).
 #[tokio::test(flavor = "current_thread")]
 async fn forked_prefix_released_under_pressure_and_stays_released() {
     use crate::session::compaction_config::SUPPRESS_NONE;
-    use xai_grok_test_support::MockInferenceServer;
     let local = tokio::task::LocalSet::new();
     local
         .run_until(async {
@@ -1432,11 +1654,8 @@ async fn forked_prefix_released_under_pressure_and_stays_released() {
             let mut actor = create_test_actor(0, 40_000, 80, gateway_tx, persistence_tx).await;
             actor.startup_hints.inherited_prefix_len = Some(prefix_len);
             let actor = Arc::new(actor);
-            let server = MockInferenceServer::start().await.unwrap();
-            server.set_response("Summary of prior work. ".repeat(30));
-            let mut cfg = actor.chat_state_handle.get_sampling_config().await.unwrap();
-            cfg.base_url = server.url();
-            actor.chat_state_handle.update_sampling_config(cfg);
+            let _server =
+                route_compaction_to_mock_server(&actor, "Summary of prior work. ".repeat(30)).await;
             actor.chat_state_handle.replace_conversation(conv);
             let threshold_tokens = 40_000u64 * 80 / 100;
             let before = actor.chat_state_handle.get_total_tokens().await;
@@ -1444,7 +1663,7 @@ async fn forked_prefix_released_under_pressure_and_stays_released() {
                 before > threshold_tokens,
                 "seed must exceed threshold: {before} <= {threshold_tokens}"
             );
-            let result = actor.run_compact(None).await;
+            let result = actor.run_compact().await;
             assert!(result.is_ok(), "compaction should succeed: {result:?}");
             assert!(
                 actor.compaction.prefix_released.load(Relaxed),
@@ -1464,7 +1683,7 @@ async fn forked_prefix_released_under_pressure_and_stays_released() {
                 SUPPRESS_NONE,
                 "a shrunk conversation must not suppress AUTO"
             );
-            let result = actor.run_compact(None).await;
+            let result = actor.run_compact().await;
             assert!(
                 result.is_ok(),
                 "second compaction should succeed: {result:?}"
@@ -1487,7 +1706,6 @@ async fn forked_prefix_released_under_pressure_and_stays_released() {
 #[tokio::test(flavor = "current_thread")]
 async fn forked_release_still_over_threshold_suppresses_auto() {
     use crate::session::compaction_config::SUPPRESS_STICKY;
-    use xai_grok_test_support::MockInferenceServer;
     let local = tokio::task::LocalSet::new();
     local
         .run_until(async {
@@ -1504,11 +1722,7 @@ async fn forked_release_still_over_threshold_suppresses_auto() {
             let mut actor = create_test_actor(0, 40_000, 80, gateway_tx, persistence_tx).await;
             actor.startup_hints.inherited_prefix_len = Some(prefix_len);
             let actor = Arc::new(actor);
-            let server = MockInferenceServer::start().await.unwrap();
-            server.set_response("Summary. ".repeat(70));
-            let mut cfg = actor.chat_state_handle.get_sampling_config().await.unwrap();
-            cfg.base_url = server.url();
-            actor.chat_state_handle.update_sampling_config(cfg);
+            let _server = route_compaction_to_mock_server(&actor, "Summary. ".repeat(70)).await;
             actor.chat_state_handle.replace_conversation(conv);
             let threshold_tokens = 40_000u64 * 80 / 100;
             let before = actor.chat_state_handle.get_total_tokens().await;
@@ -1516,7 +1730,7 @@ async fn forked_release_still_over_threshold_suppresses_auto() {
                 before > threshold_tokens,
                 "seed must exceed threshold: {before}"
             );
-            let result = actor.run_compact(None).await;
+            let result = actor.run_compact().await;
             assert!(result.is_ok(), "compaction should succeed: {result:?}");
             assert!(
                 actor.compaction.prefix_released.load(Relaxed),

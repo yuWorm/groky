@@ -15,8 +15,8 @@ use xai_tool_protocol::{
     COMMAND_REJECTED_ATTACHMENT_NOT_READY, COMMAND_REJECTED_ATTACHMENT_TOO_LARGE,
     COMMAND_REJECTED_ATTACHMENT_WRONG_SOURCE, COMMAND_REJECTED_ATTACHMENTS_NOT_SUPPORTED_IN_LIVE,
     COMMAND_REJECTED_AUDIENCE_UNSUPPORTED, COMMAND_REJECTED_GATEWAY_UNKNOWN_METHOD,
-    COMMAND_REJECTED_VOICE_CALL_UNAVAILABLE, HubChannel, HubResyncRequiredEvent,
-    HubTurnFinishedEvent,
+    COMMAND_REJECTED_MAIN_AGENT_NOT_ENABLED, COMMAND_REJECTED_VOICE_CALL_UNAVAILABLE, HubChannel,
+    HubResyncRequiredEvent, HubTurnFinishedEvent,
 };
 
 const ERROR_IDENTITY_UNAVAILABLE: &str =
@@ -75,6 +75,8 @@ const ERROR_COMMAND_REJECTED_GATEWAY_UNKNOWN_METHOD: &str =
     include_str!("../fixtures/bot_relay/error_command_rejected_gateway_unknown_method.json");
 const ERROR_COMMAND_REJECTED_VOICE_CALL_UNAVAILABLE: &str =
     include_str!("../fixtures/bot_relay/error_command_rejected_voice_call_unavailable.json");
+const ERROR_COMMAND_REJECTED_MAIN_AGENT_NOT_ENABLED: &str =
+    include_str!("../fixtures/bot_relay/error_command_rejected_main_agent_not_enabled.json");
 const ERROR_COMPUTER_UNAVAILABLE: &str =
     include_str!("../fixtures/bot_relay/error_computer_unavailable.json");
 const ERROR_UPSTREAM_ERROR: &str = include_str!("../fixtures/bot_relay/error_upstream_error.json");
@@ -487,6 +489,25 @@ fn handwritten_voice_call_unavailable_reason_keeps_upstream_detail() {
     );
     assert_eq!(
         Some("Voice call is not enabled for this account."),
+        err.detail.upstream_message.as_deref()
+    );
+}
+
+#[test]
+fn handwritten_main_agent_not_enabled_reason_keeps_upstream_detail() {
+    let err = assert_error(
+        ERROR_COMMAND_REJECTED_MAIN_AGENT_NOT_ENABLED,
+        "command_rejected",
+        false,
+        json!({
+            "upstream": "status=400 connect=invalid_argument",
+            "upstreamMessage": "Main bot is not enabled.",
+        }),
+        Some(COMMAND_REJECTED_MAIN_AGENT_NOT_ENABLED),
+        BotRelayErrorCode::CommandRejected,
+    );
+    assert_eq!(
+        Some("Main bot is not enabled."),
         err.detail.upstream_message.as_deref()
     );
 }

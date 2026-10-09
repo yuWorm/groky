@@ -100,6 +100,7 @@ pub enum McpFileLimitKind {
 #[derive(Serialize)]
 pub struct McpFileInputUsed {
     pub kind: McpFileInputKind,
+    pub model_id: String,
 }
 
 #[derive(Serialize)]
@@ -109,6 +110,7 @@ pub struct McpFileInputCompleted {
     pub source_bytes: u64,
     pub snapshot_bytes: u64,
     pub duration_ms: u64,
+    pub model_id: String,
 }
 
 #[derive(Serialize)]
@@ -116,6 +118,7 @@ pub struct McpFileInputLimitHit {
     pub kind: McpFileLimitKind,
     pub limit_bytes: u64,
     pub observed_bytes: u64,
+    pub model_id: String,
 }
 
 /// How a `tools/call` failed before the server answered with a result.

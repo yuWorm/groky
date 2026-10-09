@@ -31,6 +31,7 @@
 
 use std::collections::HashMap;
 
+use crate::types::context::WholeReadPolicy;
 use crate::types::definition::ToolDefinition;
 use crate::types::description::make_desc_env;
 use crate::types::tool::ToolKind;
@@ -66,6 +67,8 @@ struct TemplateContext {
     system_reminders_enabled: bool,
     /// Absolute path to this session's drafts file, when known.
     feedback_drafts_path: String,
+    /// Which file classes `read_file` returns whole; read descriptions only promise it for classes that are on.
+    whole_read: WholeReadPolicy,
 }
 
 /// Shared render implementation: fast-path check + MiniJinja render.
@@ -259,8 +262,16 @@ impl TemplateRenderer {
                 has_unix_utilities: xai_grok_config::shell::has_unix_utilities(),
                 system_reminders_enabled: true,
                 feedback_drafts_path: String::new(),
+                whole_read: WholeReadPolicy::default(),
             },
         }
+    }
+
+    /// Set from the finalized `TruncationConfig`; every other construction site keeps the default (both on).
+    #[must_use]
+    pub fn with_whole_read(mut self, policy: WholeReadPolicy) -> Self {
+        self.ctx.whole_read = policy;
+        self
     }
 
     /// Absolute drafts file for this session. Session id and cwd are already
@@ -646,6 +657,40 @@ mod tests {
     }
 
     #[test]
+    fn read_description_whole_read_note_follows_policy_and_param_names() {
+        let base = make_renderer(
+            &[(ToolKind::Read, "read_file")],
+            &[(
+                ToolKind::Read,
+                &[("offset", "start_line"), ("limit", "num_lines")],
+            )],
+        );
+        let template = crate::implementations::grok_build::read_file::DESCRIPTION_FULL;
+
+        let on = base.clone().render(template).unwrap();
+        assert!(
+            on.contains("start_line and num_lines are ignored for them"),
+            "note must use the client-facing param names, got: {on}"
+        );
+
+        let off = base
+            .with_whole_read(WholeReadPolicy {
+                skill_markdown: false,
+                instruction_files: false,
+            })
+            .render(template)
+            .unwrap();
+        assert!(
+            !off.contains("returned whole"),
+            "note must vanish with both bits off, got: {off}"
+        );
+        assert!(
+            off.contains("beginning of the file\n"),
+            "bullet must end cleanly, got: {off}"
+        );
+    }
+
+    #[test]
     fn render_conditional_absent() {
         let r = make_renderer(&[], &[]);
         let result = r
@@ -716,22 +761,24 @@ mod tests {
                 (ToolKind::Task, "spawn_subagent"),
             ],
             &[
-                (ToolKind::Execute, &[("is_background", "background")]),
+                (ToolKind::Execute, &[("block_until_ms", "block_until_ms")]),
                 (ToolKind::Task, &[("run_in_background", "background")]),
             ],
         );
         let desc = r#"Get output and status from a background task or subagent.
 
 Usage notes:
-- Use the task_id from a command run with ${{ params.execute.is_background }}=true, or a subagent launched with ${{ params.task.run_in_background }}=true
+- Use the task_id from a command run with ${{ params.execute.block_until_ms }}=0, or a subagent launched with ${{ params.task.run_in_background }}=true
 - Omit timeout_ms (or pass 0) for a non-blocking status poll; set a positive timeout_ms to wait up to that many milliseconds for completion (capped at ~10 min)."#;
+
         let rendered = r.render(desc).expect("task_output description must render");
         let _ = std::fs::write("/tmp/task_output_tool_description.txt", &rendered);
+
         assert!(
             !rendered.contains("${{"),
             "must not leak raw template source: {rendered}"
         );
-        assert!(rendered.contains("background=true"));
+        assert!(rendered.contains("block_until_ms=0") && rendered.contains("background=true"));
         assert!(rendered.contains("Omit timeout_ms") || rendered.contains("positive timeout_ms"));
     }
 

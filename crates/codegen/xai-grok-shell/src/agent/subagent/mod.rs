@@ -451,6 +451,20 @@ impl SubagentSpawnContext {
     pub(crate) fn resolve_compaction_verbatim_input(&self) -> bool {
         self.resolve_feature(crate::agent::config::Feature::CompactionVerbatimInput)
     }
+    pub(crate) fn resolve_long_reasoning_reminder(
+        &self,
+    ) -> crate::session::long_reasoning_reminder::LongReasoningReminder {
+        let local = self
+            .agent_config
+            .as_ref()
+            .map(|c| &c.long_reasoning_reminder);
+        crate::session::long_reasoning_reminder::LongReasoningReminder::resolve(
+            local.unwrap_or(&crate::util::config::LongReasoningReminderSettings::default()),
+            self.remote_settings
+                .as_ref()
+                .and_then(|s| s.long_reasoning_reminder.as_ref()),
+        )
+    }
     pub(crate) fn resolve_compaction_tool_choice(
         &self,
     ) -> crate::util::config::CompactionToolChoice {
@@ -793,6 +807,7 @@ async fn read_parent_sampling_config(
                 query_params: cfg.query_params.clone(),
                 env_http_headers: cfg.env_http_headers.clone(),
                 context_window: cfg.context_window.get(),
+                max_request_bytes: cfg.max_request_bytes,
                 client_version: creds.client_version,
                 reasoning_effort: cfg.reasoning_effort,
                 reasoning_summary: cfg.reasoning_summary,
@@ -2520,7 +2535,7 @@ fn completed_finish_from_inspection(
     })
 }
 /// Heal subagents stuck "Running" after a dead process: emit exactly one `SubagentFinished` per id. Two id-keyed sources are unioned, so a crash orphan present in both heals once.
-/// They are `unfinished` (replayed spawns whose finish a rewind dropped, or a forked-in subagent with no meta) and on-disk `running` metas. Ids still active or pending are skipped.
+/// They are `unfinished` (replayed spawns whose finish a rewind dropped, or a forked-in subagent with no meta) and on-disk `running` metas. Ids still live under `parent_session_id` are skipped; a fork source's live children are not.
 /// A `running` meta becomes `cancelled`, unless the coordinator still holds its terminal result, which is then re-emitted. Runs after replay so the finish orders after the spawn. Pre-existing recovery entry point: args are independent handles/sources from two call sites, not one groupable object
 #[allow(clippy::too_many_arguments)]
 #[tracing::instrument(skip_all)]
@@ -2535,6 +2550,7 @@ pub(crate) async fn reconcile_orphaned_subagents_with_backend(
     heal_lock: Arc<tokio::sync::Mutex<()>>,
 ) {
     let _heal_guard = heal_lock.lock().await;
+    let backend = backend.scoped_to_session(parent_session_id);
     let subagents_dir = session_dir.join("subagents");
     let mut candidates: std::collections::BTreeMap<
         String,

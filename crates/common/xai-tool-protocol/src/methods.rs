@@ -112,6 +112,10 @@ define_methods! {
     /// metrics. Donor service.name must be hub-allowlisted. No envelope
     /// `session_id` — metrics are process-aggregate.
     MetricsDonate => "metrics.donate",
+    /// A token-bound tool server presents its refreshed bearer on the live
+    /// socket so the hub moves the socket's expiry deadline instead of
+    /// closing it. Optional: advertised in `hello_ack.capabilities`.
+    AuthRefresh => "auth.refresh",
 
     // service → tool_server
     ToolCallRequest => "tool_call_request",

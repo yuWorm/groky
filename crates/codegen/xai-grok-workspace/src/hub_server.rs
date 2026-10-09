@@ -163,7 +163,8 @@ impl crate::worktree::WorktreeNotificationSender for NoOpNotifier {
 }
 /// Escape hatch: `WORKSPACE_CLIENT_FS_QUERIES=0` (or `false`) disables the client-facing `workspace.client_fs_*` ops with a graceful `HubError`.
 /// The variable is read per call, so flipping it needs no process restart and tests can toggle it under a lock.
-fn client_fs_queries_enabled() -> bool {
+/// Also gates the staged-upload maintenance (orphan sweep and GC ticker) started with the workspace.
+pub(crate) fn client_fs_queries_enabled() -> bool {
     !matches!(
         std::env::var("WORKSPACE_CLIENT_FS_QUERIES").as_deref(),
         Ok("0") | Ok("false")
@@ -680,6 +681,10 @@ impl WorkspaceRpcHandler {
                 ensure_client_fs_queries_enabled()?;
                 dispatch_op::<ClientFsReadFileReq>(params, &self.workspace, bound_session).await
             }
+            <ClientFsWriteFileReq as WorkspaceRpc>::METHOD => {
+                ensure_client_fs_queries_enabled()?;
+                dispatch_op::<ClientFsWriteFileReq>(params, &self.workspace, bound_session).await
+            }
             <DiscoverSkillsReq as WorkspaceRpc>::METHOD => {
                 let cwd = self.workspace.root_cwd()?;
                 let skills = crate::discovery::discover_skills(
@@ -721,7 +726,16 @@ impl WorkspaceRpcHandler {
             }
             <LoadEnvrcReq as WorkspaceRpc>::METHOD => {
                 let cwd = self.workspace.root_cwd()?;
-                let env = crate::envrc::spawn_envrc_load(cwd, true).join().await;
+                let sandbox = self.workspace.sandbox();
+                if let Some(sandbox) = &sandbox {
+                    sandbox.engage_unless_off().await;
+                }
+                let sandbox = sandbox.map(|sandbox| {
+                    sandbox as std::sync::Arc<dyn xai_grok_tools::sandbox_launch::SandboxLaunch>
+                });
+                let env = crate::envrc::spawn_envrc_load_sandboxed(cwd, true, sandbox)
+                    .join()
+                    .await;
                 serde_json::to_value(env).map_err(|e| WorkspaceError::HubError(e.to_string()))
             }
             <InstallPluginReq as WorkspaceRpc>::METHOD => {
@@ -1263,6 +1277,7 @@ impl ToolServerHandler for WorkspaceRpcHandler {
             (empty, start, removed)
         };
         if let Some(session) = &removed {
+            session.staged_uploads().abandon_all();
             self.workspace.teardown_session_mcp_arc(session, None).await;
         }
         self.workspace.on_session_ended(sid);

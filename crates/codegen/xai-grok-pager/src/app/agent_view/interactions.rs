@@ -1070,7 +1070,9 @@ impl AgentView {
             if ev.is_url_waiting() {
                 return false;
             }
-            if let Some(mut ev) = self.elicitation_view.take() {
+            if let Some(mut ev) = self.take_unanswered_elicitation(
+                crate::app::agent_view::UnansweredElicitation::ClosedElsewhere,
+            ) {
                 let _ = ev.take_response_tx();
                 self.restore_elicitation_prompt(ev.stashed_prompt);
             }
@@ -2024,7 +2026,6 @@ mod question_no_freeform_tests {
     pub(super) fn draw_frame(agent: &mut AgentView) {
         let area = Rect::new(0, 0, 80, 30);
         let reg = ActionRegistry::defaults();
-        let bundle = crate::app::bundle::BundleState::default();
         let mut buf = Buffer::empty(area);
         let mut scratch = crate::scrollback::render::ScratchBuffer::new();
         agent.last_terminal_size = (80, 30);
@@ -2036,7 +2037,6 @@ mod question_no_freeform_tests {
             None,
             false,
             crate::app::agent_view::BannerSlotParams::none(),
-            &bundle,
             false,
             &mut Vec::new(),
             crate::app::agent_view::AppRenderParams::default(),

@@ -6,6 +6,7 @@ pub(crate) const MAX_PLAN_FILE_BYTES: usize = 256 * 1024;
 pub mod leader_bridge;
 pub mod meta;
 pub mod model_state;
+pub(crate) mod skills_listing;
 pub mod spawn;
 pub(crate) mod subagent_label_registry;
 mod subagent_message;
@@ -127,7 +128,8 @@ pub struct AcpConnection {
 /// CLI flags that affect agent configuration, threaded from PagerArgs.
 #[derive(Debug, Clone, Default)]
 pub struct ConnectFlags {
-    pub subagents: bool,
+    /// `--no-subagents`. Only an explicit flag reaches the CLI tier of the resolver; otherwise env, config.toml, and the default decide, exactly as in `grok agent stdio`.
+    pub no_subagents: bool,
     /// CLI memory override set by a legacy compatibility flag.
     pub memory_enabled_override: Option<bool>,
     /// Original compatibility flag spelling for leader-mode warnings.
@@ -191,7 +193,7 @@ pub async fn connect(cancel: &CancellationToken, flags: ConnectFlags) -> Result<
                 raw_config: &raw_config,
                 remote_settings: flags.remote_settings.as_ref(),
                 is_headless: false,
-                cli_subagents: Some(flags.subagents),
+                cli_subagents: flags.no_subagents.then_some(false),
                 cli_web_search_model: None,
                 cli_session_summary_model: None,
                 memory_enabled_override: flags.memory_enabled_override,
@@ -292,7 +294,7 @@ pub async fn connect_via_leader(
     );
     apply_config_writes(&flags);
     startup::enter(StartupPhase::ConfigLoad);
-    startup::set_auth_mode(xai_grok_shell::managed_config::classify_auth_mode());
+    startup::set_auth_mode(xai_grok_cloud_config::managed_config::classify_auth_mode());
     let mut agent_config = AgentConfig::new_from_toml_cfg(raw_config)
         .map_err(|e| anyhow::anyhow!("Failed to create agent config: {e}"))?;
     agent_config.remote_settings = flags.remote_settings.clone();
@@ -380,8 +382,8 @@ fn unsupported_leader_flags(flags: &ConnectFlags) -> Vec<&'static str> {
     if flags.storage_mode.is_some() {
         out.push("--storage-mode");
     }
-    if flags.subagents {
-        out.push("--subagents");
+    if flags.no_subagents {
+        out.push("--no-subagents");
     }
     if !flags.permission_rules.is_empty() {
         out.push("--allow/--deny permission rules");
@@ -940,7 +942,7 @@ mod tests {
             memory_override_flag: Some("--experimental-memory"),
             disable_web_search: true,
             storage_mode: Some("writeback".into()),
-            subagents: true,
+            no_subagents: true,
             ..Default::default()
         };
         let detected = unsupported_leader_flags(&flags);
@@ -948,7 +950,7 @@ mod tests {
         assert!(detected.contains(&"--experimental-memory"));
         assert!(detected.contains(&"--disable-web-search"));
         assert!(detected.contains(&"--storage-mode"));
-        assert!(detected.contains(&"--subagents"));
+        assert!(detected.contains(&"--no-subagents"));
     }
     #[test]
     fn unsupported_leader_flags_preserves_no_memory_spelling() {

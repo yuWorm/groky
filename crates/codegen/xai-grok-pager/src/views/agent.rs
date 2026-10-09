@@ -35,7 +35,6 @@ pub enum ActivePane {
     Queue,
     Prompt,
     Tasks,
-    Catalog,
     /// Consolidated panel dock above the prompt (remote `dock_enabled`).
     Dock,
 }
@@ -53,7 +52,6 @@ pub struct PaneAreas {
     pub queue: Rect,
     pub prompt: Rect,
     pub tasks: Rect,
-    pub catalog: Rect,
     /// Consolidated panel dock (remote `dock_enabled`); the embedded
     /// queue body inside it hit-tests as `Queue` (checked first).
     pub dock: Rect,
@@ -64,9 +62,6 @@ impl PaneAreas {
         let pos = (col, row).into();
         if self.tasks.area() > 0 && self.tasks.contains(pos) {
             return Some(ActivePane::Tasks);
-        }
-        if self.catalog.area() > 0 && self.catalog.contains(pos) {
-            return Some(ActivePane::Catalog);
         }
         if self.todo.area() > 0 && self.todo.contains(pos) {
             return Some(ActivePane::Todo);
@@ -114,7 +109,6 @@ pub struct AgentViewLayoutParams {
     pub timeline_width: u16,
     pub prompt_height: u16,
     pub tasks_height: u16,
-    pub catalog_height: u16,
     pub todo_height: u16,
     pub queue_height: u16,
     pub btw_height: u16,
@@ -129,6 +123,8 @@ pub struct AgentViewLayoutParams {
     pub dock_height: u16,
     /// 0 or 1: the gap row between turn status (or scrollback) and the prompt.
     pub prompt_gap: u16,
+    /// The current model's notice row directly above the prompt, 0 when it has none.
+    pub model_notice_height: u16,
     pub voice_recording_height: u16,
     pub shortcuts_height: u16,
     /// Clamped to the rows left over once every other row and the scrollback minimum are counted.
@@ -141,7 +137,6 @@ pub struct AgentViewLayoutParams {
 pub struct AgentViewLayout {
     pub status_bar: Rect,
     pub tasks: Rect,
-    pub catalog: Rect,
     pub scrollback: Rect,
     pub todo: Rect,
     pub queue: Rect,
@@ -157,6 +152,8 @@ pub struct AgentViewLayout {
     /// Consolidated panel dock (Subagents/Tasks/Watchers/Queued) directly
     /// above the prompt; zero-area when hidden.
     pub dock: Rect,
+    /// The current model's notice, directly above the record indicator and the prompt.
+    pub model_notice: Rect,
     /// Single-row record indicator ("◉ Recording") directly above the prompt, shown only while voice capture is active.
     pub voice_recording: Rect,
     pub prompt: Rect,
@@ -186,7 +183,6 @@ impl AgentViewLayout {
             timeline_width,
             prompt_height,
             tasks_height,
-            catalog_height,
             todo_height,
             queue_height,
             btw_height,
@@ -196,6 +192,7 @@ impl AgentViewLayout {
             follow_ups_height,
             dock_height,
             prompt_gap,
+            model_notice_height,
             voice_recording_height,
             shortcuts_height,
             status_line_height,
@@ -232,10 +229,6 @@ impl AgentViewLayout {
         if tasks_height > 0 {
             constraints.push(Constraint::Length(pane_gap));
             constraints.push(Constraint::Length(tasks_height));
-        }
-        if catalog_height > 0 {
-            constraints.push(Constraint::Length(pane_gap));
-            constraints.push(Constraint::Length(catalog_height));
         }
         if todo_height > 0 {
             constraints.push(Constraint::Length(pane_gap));
@@ -275,6 +268,9 @@ impl AgentViewLayout {
         if prompt_gap > 0 {
             constraints.push(Constraint::Length(prompt_gap));
         }
+        if model_notice_height > 0 {
+            constraints.push(Constraint::Length(model_notice_height));
+        }
         if voice_recording_height > 0 {
             constraints.push(Constraint::Length(voice_recording_height));
         }
@@ -300,12 +296,6 @@ impl AgentViewLayout {
         let mut chunks = chunks.iter().copied();
         let status_bar = chunks.next().unwrap_or_default();
         let tasks = if tasks_height > 0 {
-            chunks.next();
-            chunks.next().unwrap_or_default()
-        } else {
-            Rect::default()
-        };
-        let catalog = if catalog_height > 0 {
             chunks.next();
             chunks.next().unwrap_or_default()
         } else {
@@ -364,6 +354,11 @@ impl AgentViewLayout {
         if prompt_gap > 0 {
             chunks.next();
         }
+        let model_notice = if model_notice_height > 0 {
+            chunks.next().unwrap_or_default()
+        } else {
+            Rect::default()
+        };
         let voice_recording = if voice_recording_height > 0 {
             chunks.next().unwrap_or_default()
         } else {
@@ -403,7 +398,6 @@ impl AgentViewLayout {
         Self {
             status_bar,
             tasks,
-            catalog,
             scrollback,
             todo,
             queue,
@@ -413,6 +407,7 @@ impl AgentViewLayout {
             plugin_cta,
             follow_ups,
             dock,
+            model_notice,
             voice_recording,
             prompt,
             shortcuts,
@@ -453,7 +448,6 @@ impl AgentViewLayout {
             queue: self.queue,
             prompt: self.prompt,
             tasks: self.tasks,
-            catalog: self.catalog,
             dock: self.dock,
         }
     }
@@ -853,7 +847,6 @@ pub(crate) fn build_hints(
             ));
             hints
         }
-        ActivePane::Catalog => vec![],
         ActivePane::Scrollback if scrollback_search.is_some() => {
             let mut hints = Vec::new();
             if vim_mode {
@@ -2099,6 +2092,21 @@ mod tests {
             25 - 11 - 4,
             "each row above the prompt takes its own height plus the gap above it"
         );
+    }
+    #[test]
+    fn model_notice_row_sits_above_the_record_indicator_and_prompt() {
+        let layout = AgentViewLayout::compute(AgentViewLayoutParams {
+            prompt_height: 3,
+            prompt_gap: 1,
+            model_notice_height: 1,
+            voice_recording_height: 1,
+            ..base_params(Rect::new(0, 0, 80, 30))
+        });
+        assert_eq!(1, layout.model_notice.height);
+        assert_eq!(layout.voice_recording.y, layout.model_notice.y + 1);
+        assert_eq!(layout.prompt.y, layout.voice_recording.y + 1);
+        assert_eq!(layout.prompt.x, layout.model_notice.x);
+        assert_eq!(layout.prompt.width, layout.model_notice.width);
     }
     #[test]
     fn prompt_budget_excludes_the_prompts_own_requested_height() {

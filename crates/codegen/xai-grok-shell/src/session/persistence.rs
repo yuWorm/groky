@@ -88,6 +88,40 @@ pub fn sanitize_rename_title(title: &str) -> Cow<'_, str> {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ValidatedRenameTitle {
+    Manual(String),
+    ResetToAuto,
+}
+
+/// Applies the shared `x.ai/session/rename` title boundary.
+pub fn validate_rename_title(
+    title: &str,
+    reset_to_auto: bool,
+) -> Result<ValidatedRenameTitle, acp::Error> {
+    if reset_to_auto {
+        if !sanitize_rename_title(title).is_empty() {
+            return Err(
+                acp::Error::invalid_request().data("title must be empty when resetToAuto is set")
+            );
+        }
+        return Ok(ValidatedRenameTitle::ResetToAuto);
+    }
+    if title.len() > MAX_TITLE_BYTES {
+        return Err(acp::Error::invalid_request().data("title too large"));
+    }
+    let title = sanitize_rename_title(title).into_owned();
+    if title.is_empty() {
+        return Err(acp::Error::invalid_request().data("title must not be blank"));
+    }
+    if title.chars().count() > MAX_TITLE_SCALARS {
+        return Err(acp::Error::invalid_request().data(format!(
+            "title too long (max {MAX_TITLE_SCALARS} characters after removing control characters)"
+        )));
+    }
+    Ok(ValidatedRenameTitle::Manual(title))
+}
+
 /// Sanitize then cap. `None` when the result is blank.
 /// Overlong titles are truncated (ingest/pull defense); the ext rename path rejects instead.
 pub fn sanitize_and_cap_title(title: &str) -> Option<String> {
@@ -240,6 +274,8 @@ pub enum PersistenceMsg {
         /// The active agent, persisted so session resume doesn't depend on the mutable model catalog.
         agent: PersistedAgent,
         reasoning_effort: Option<Option<ReasoningEffort>>,
+        /// Outer `None` keeps the saved context window. `Some(None)` resets it to the model default.
+        context_window: Option<Option<std::num::NonZeroU64>>,
     },
     PlanState(TodoState),
     PlanModeState(crate::session::plan_mode::PlanModeSnapshot),
@@ -277,9 +313,12 @@ pub enum PersistenceMsg {
         release: tokio::sync::oneshot::Receiver<()>,
     },
     Signals(SessionSignals),
+    /// Persist this turn's session usage, then ack. Callers that publish turn-end
+    /// (and `x.ai/session/state`) wait so `usage.json` is visible before the turn resolves.
     UsageTurn {
         turn_number: u32,
         live: crate::session::usage_file::UsageSummary,
+        respond_to: tokio::sync::oneshot::Sender<io::Result<()>>,
     },
     /// Persist announcement tracking state (MCP and skill announcement dedup).
     AnnouncementState(crate::session::announcement_state::AnnouncementState),
@@ -1217,6 +1256,8 @@ pub struct Summary {
     pub sandbox_profile: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning_effort: Option<ReasoningEffort>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_window: Option<std::num::NonZeroU64>,
     /// Ultra-short summary of the most recent successful turn, shown as the dashboard row's secondary line (via the roster for non-attached clients).
     /// Displayed until replaced by the next successful turn (or cleared by a conversation rewind).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1317,6 +1358,7 @@ impl Summary {
             agent: PersistedAgentSelection::default(),
             sandbox_profile: None,
             reasoning_effort: None,
+            context_window: None,
             last_turn_summary: None,
             last_turn_summary_prompt_id: None,
             last_recap: None,
@@ -2203,6 +2245,7 @@ impl SessionPersistence {
                     model_id,
                     agent,
                     reasoning_effort,
+                    context_window,
                 } => {
                     if let Err(e) = self
                         .storage
@@ -2211,6 +2254,7 @@ impl SessionPersistence {
                             &model_id,
                             Some(&agent),
                             reasoning_effort,
+                            context_window,
                         )
                         .await
                     {
@@ -2446,10 +2490,16 @@ impl SessionPersistence {
                         tracing::warn!(?e, "failed to write session signals");
                     }
                 }
-                PersistenceMsg::UsageTurn { turn_number, live } => {
-                    if let Err(e) = self.persist_usage_turn(turn_number, &live).await {
+                PersistenceMsg::UsageTurn {
+                    turn_number,
+                    live,
+                    respond_to,
+                } => {
+                    let result = self.persist_usage_turn(turn_number, &live).await;
+                    if let Err(e) = &result {
                         tracing::warn!(?e, turn_number, "failed to write session usage");
                     }
+                    let _ = respond_to.send(result);
                 }
                 PersistenceMsg::AnnouncementState(state) => {
                     if let Err(e) = self
@@ -2573,6 +2623,9 @@ impl SessionPersistence {
     }
 }
 
+#[path = "persistence_archive_logs.rs"]
+mod archive_logs;
+
 /// Collect MCP server stderr logs from `~/.grok/logs/mcp/` for inclusion in the session archive.
 fn collect_mcp_stderr_logs(files: &mut Vec<CopiedSessionFile>) {
     let mcp_log_dir = xai_grok_config::grok_home().join("logs").join("mcp");
@@ -2583,7 +2636,8 @@ fn collect_mcp_stderr_logs(files: &mut Vec<CopiedSessionFile>) {
         let path = entry.path();
         if path.is_file()
             && path.extension().is_some_and(|ext| ext == "log")
-            && let Ok(data) = std::fs::read(&path)
+            && let Ok(data) =
+                std::fs::File::open(&path).and_then(archive_logs::read_log_for_archive)
             && !data.is_empty()
         {
             let name = format!(
@@ -2600,6 +2654,7 @@ fn collect_mcp_stderr_logs(files: &mut Vec<CopiedSessionFile>) {
 fn collect_session_files_recursive(base: &Path, dir: &Path, files: &mut Vec<CopiedSessionFile>) {
     let artifacts = xai_grok_feedback::FeedbackDraftArtifactSet::for_session(base);
     collect_session_files_recursive_with_artifacts(base, dir, files, &artifacts);
+    archive_logs::collect_terminal_logs(base, files, &artifacts);
 }
 
 fn collect_session_files_recursive_with_artifacts(
@@ -2645,7 +2700,7 @@ fn collect_session_files_recursive_with_artifacts(
                 name: name.to_string(),
                 data,
             });
-        } else if file_type.is_dir() {
+        } else if file_type.is_dir() && path != base.join(archive_logs::TERMINAL_DIR) {
             collect_session_files_recursive_with_artifacts(base, &path, files, artifacts);
         }
     }
@@ -3320,7 +3375,7 @@ static CLEANUP_SESSIONS_ONCE: std::sync::Once = std::sync::Once::new();
 
 /// The only files swept inside a live session: everything else there is a write-once artifact
 /// `updates.jsonl` still references, so its own age says nothing about whether it is needed.
-const SWEPT_BLOB_DIRS: [&str; 4] = ["images", "videos", "downloads", "terminal"];
+const SWEPT_BLOB_DIRS: [&str; 4] = ["images", "videos", "downloads", archive_logs::TERMINAL_DIR];
 
 /// Mid-attach `live_session_dir` is never deleted whole; callers `mark_session_live` first so
 /// other processes do not treat it as idle.

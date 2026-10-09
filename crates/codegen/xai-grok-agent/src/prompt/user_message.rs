@@ -177,6 +177,14 @@ pub struct RuleEntry {
     /// Raw file body.
     pub content: String,
 }
+const AVOID_CONTRASTIVE_NEGATION_PROSE_RULE: &str = "State points directly in affirmative language. Avoid unnecessary contrastive negation such as “X, not Y,” especially clarifications about alternatives the user did not mention.";
+/// Product-authored rules injected ahead of discovered user rules.
+pub fn built_in_user_rules() -> Vec<RuleEntry> {
+    vec![RuleEntry {
+        path: String::new(),
+        content: AVOID_CONTRASTIVE_NEGATION_PROSE_RULE.to_owned(),
+    }]
+}
 impl From<AgentConfigFile> for RuleEntry {
     fn from(f: AgentConfigFile) -> Self {
         Self {
@@ -406,6 +414,16 @@ mod tests {
             "<user_rule>\nVerify UI.\n</user_rule>\n\n<user_rule>\nUser prefs.\n</user_rule>"
         ));
         assert!(block.ends_with("</rules>"));
+    }
+    #[test]
+    fn built_in_user_rules_use_the_standard_user_rule_renderer() {
+        let block = format_rules_section(&[], &built_in_user_rules()).unwrap();
+        assert_eq!(block.matches("<user_rule>").count(), 1);
+        assert_eq!(block.matches("</user_rule>").count(), 1);
+        assert!(!block.contains("<user_rule name="));
+        assert!(block.contains(&format!(
+            "<user_rule>\n{AVOID_CONTRASTIVE_NEGATION_PROSE_RULE}\n</user_rule>"
+        )));
     }
     #[test]
     fn format_rules_section_neutralizes_file_backed_wrappers() {

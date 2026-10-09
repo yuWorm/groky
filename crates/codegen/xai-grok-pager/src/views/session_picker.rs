@@ -254,7 +254,10 @@ impl SourceFilter {
         match self {
             Self::Grok => !crate::app::is_foreign_picker_source(source) && !is_headless,
             Self::Headless => is_headless && !crate::app::is_foreign_picker_source(source),
-            Self::Local => (source == "local" || source == "both") && !is_headless,
+            Self::Local => {
+                (source == "local" || source == "both" || crate::app::is_daemon_session_row(source))
+                    && !is_headless
+            }
             Self::Remote => {
                 (source == "remote" || source == "both" || source == "conversation") && !is_headless
             }

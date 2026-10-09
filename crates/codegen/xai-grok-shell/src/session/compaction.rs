@@ -14,7 +14,7 @@ use crate::session::helpers::compaction_context::CompactionInputs;
 use crate::session::helpers::compaction_context::to_system_reminder;
 use crate::session::helpers::session_compact::{
     COMPACT_FAILED_PREFIX, CompactOutput, CompactionOutcome, build_compaction_prompt,
-    generate_session_compact, is_context_length_error,
+    generate_session_compact, is_context_length_error, retain_session_asset_files,
 };
 use crate::session::persistence::PersistenceMsg;
 use crate::session::two_pass::{
@@ -23,6 +23,7 @@ use crate::session::two_pass::{
 };
 use agent_client_protocol as acp;
 use std::sync::Arc;
+use xai_chat_state::compaction_image_context::CompactionImageContext;
 use xai_chat_state::compaction_utils::{
     CompactedHistoryInput, CompactionAttempt, build_compacted_history, is_degenerate_summary,
     prepare_conversation_for_verbatim_summarization, sanitize_compacted_history,
@@ -424,7 +425,11 @@ async fn apply_turn_image_budget_and_prune(
     chat_state: &xai_chat_state::ChatStateHandle,
     items: Vec<ConversationItem>,
 ) -> Vec<ConversationItem> {
-    let items = xai_chat_state::image_budget::apply_image_budget(items).items;
+    let max_request_bytes = chat_state
+        .get_sampling_config()
+        .await
+        .and_then(|config| config.max_request_bytes);
+    let items = xai_chat_state::image_budget::apply_image_budget(items, max_request_bytes).items;
     chat_state.apply_turn_request_pruning(items).await
 }
 /// Start fitted when the (already image-budgeted and pruned) estimate cannot leave room for tools + summary.
@@ -590,10 +595,7 @@ impl SessionActor {
             error = tracing::field::Empty,
         )
     )]
-    pub(crate) async fn run_compact(
-        self: &Arc<Self>,
-        user_context: Option<String>,
-    ) -> Result<(), acp::Error> {
+    pub(crate) async fn run_compact(self: &Arc<Self>) -> Result<(), acp::Error> {
         let (_cancel, _cancel_scope) = self.compaction.cancel.enter();
         self.record_compaction_variant();
         let total_tokens = self.chat_state_handle.get_total_tokens().await;
@@ -607,7 +609,6 @@ impl SessionActor {
             .await;
         if let Err(e) = self
             .run_compact_inner(
-                user_context,
                 None,
                 xai_grok_telemetry::events::CompactionTrigger::Manual,
                 false,
@@ -921,7 +922,6 @@ impl SessionActor {
     )]
     async fn run_compact_inner(
         &self,
-        user_context: Option<String>,
         auto_continue: Option<crate::extensions::notification::AutoContinueInfo>,
         trigger: xai_grok_telemetry::events::CompactionTrigger,
         lossy_input: bool,
@@ -966,7 +966,6 @@ impl SessionActor {
                 tokens_used: tokens_before,
                 context_window,
                 model_id: model_id.clone(),
-                user_context_provided: user_context.is_some(),
                 compaction_mode: match self.compaction.compaction_mode {
                     xai_chat_state::CompactionMode::Summary => {
                         xai_grok_telemetry::events::CompactionModeLabel::Summary
@@ -982,7 +981,7 @@ impl SessionActor {
                 is_subagent: self.startup_hints.is_subagent,
             },
         );
-        let user_context = self.merge_goal_compaction_user_context(user_context);
+        let user_context = self.goal_compaction_user_context();
         let compact_source = trigger_str;
         self.dispatch_hook(
             xai_grok_hooks::event::HookEventName::PreCompact,
@@ -1307,7 +1306,6 @@ impl SessionActor {
             self.persist_compaction_request_artifact(
                 request_chat_history,
                 compaction_tools,
-                user_context.as_deref(),
                 use_short_prompt,
                 &sampling_config.model,
                 trigger,
@@ -1358,7 +1356,7 @@ impl SessionActor {
         let generate_session_compact = compact_output.content.clone();
         let user_message_prefix = self.build_user_message_prefix().await;
         let conversation = self.chat_state_handle.get_conversation().await;
-        let (discovered_agents_md, all_skills_for_compaction, _agent_edited_paths, state_context) =
+        let (discovered_agents_md, all_skills_for_compaction, _edited_paths, mut state_context) =
             if use_short_prompt {
                 let empty_edited: std::collections::BTreeSet<String> = Default::default();
                 let ctx = CompactionStateContext::build(
@@ -1570,6 +1568,38 @@ impl SessionActor {
                 };
                 (agents_md, skills, edited_paths, ctx)
             };
+        if self.is_cursor_harness() {
+            state_context.images = CompactionImageContext::default();
+        }
+        let harvested_paths = std::mem::take(&mut state_context.images.attached_paths);
+        let (kept, dropped_paths) = if harvested_paths.is_empty() {
+            (Vec::new(), 0)
+        } else {
+            match crate::session::persistence::ensure_owner_only_session_dir(&self.session_info) {
+                Ok(session_dir) => {
+                    retain_session_asset_files(
+                        harvested_paths,
+                        &crate::session::image_describe::session_assets_dir(&session_dir),
+                    )
+                    .await
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        ?error,
+                        "compaction: session dir unavailable; attached image paths dropped"
+                    );
+                    (Vec::new(), harvested_paths.len())
+                }
+            }
+        };
+        state_context.images.attached_paths = kept;
+        if dropped_paths > 0 {
+            tracing::debug!(
+                session_id = %self.session_info.id.0,
+                dropped_paths,
+                "compaction: dropped attached image paths that are not session asset files"
+            );
+        }
         use crate::session::helpers::compaction_context::SubagentToolNames;
         let subagent_tool_names: Option<SubagentToolNames> =
             if use_short_prompt || state_context.running_subagents.is_empty() {
@@ -1666,8 +1696,12 @@ impl SessionActor {
         };
         let v2_memory_context = if self.memory.can_expose_v2() {
             if let Some(storage) = self.memory.storage() {
+                let compact_index = self.memory.v2_config.compact_index_enabled;
                 match tokio::task::spawn_blocking(move || {
-                    crate::session::helpers::memory_context::format_v2_memory_context(&storage)
+                    crate::session::helpers::memory_context::format_v2_memory_context(
+                        &storage,
+                        compact_index,
+                    )
                 })
                 .await
                 {
@@ -1687,6 +1721,7 @@ impl SessionActor {
                                 ),
                                 global_entry_count: context.global_entry_count,
                                 workspace_entry_count: context.workspace_entry_count,
+                                compact_index,
                                 ..Default::default()
                             },
                         );
@@ -1701,7 +1736,10 @@ impl SessionActor {
                         crate::session::memory_observation::log_memory_injection(
                             self.session_info.id.to_string(),
                             xai_grok_telemetry::memory_telemetry::MemoryInjectionOutcome::Error,
-                            Default::default(),
+                            crate::session::memory_observation::MemoryInjectionMetrics {
+                                compact_index,
+                                ..Default::default()
+                            },
                         );
                         None
                     }
@@ -1714,7 +1752,10 @@ impl SessionActor {
                         crate::session::memory_observation::log_memory_injection(
                             self.session_info.id.to_string(),
                             xai_grok_telemetry::memory_telemetry::MemoryInjectionOutcome::Error,
-                            Default::default(),
+                            crate::session::memory_observation::MemoryInjectionMetrics {
+                                compact_index,
+                                ..Default::default()
+                            },
                         );
                         None
                     }
@@ -1807,6 +1848,16 @@ impl SessionActor {
         let agents_md_reminder = self.agent.borrow().agents_md_user_reminder();
         let compaction_context = state_context.for_compaction();
         let compaction_state_context: &CompactionStateContext = &compaction_context;
+        tracing::debug!(
+            session_id = %self.session_info.id.0,
+            has_last_user_query = compaction_state_context.last_user_query.is_some(),
+            last_turn_image_parts = compaction_state_context.images.last_turn_image_parts.len(),
+            has_last_turn_image_files = compaction_state_context
+                .images
+                .last_turn_image_files
+                .is_some(),
+            "compaction: last-turn image context"
+        );
         let transcript_hint = self.transcript_hint();
         let summary_count = self
             .compaction
@@ -2294,7 +2345,6 @@ impl SessionActor {
         let result = self
             .run_compact_inner(
                 None,
-                None,
                 xai_grok_telemetry::events::CompactionTrigger::Auto,
                 lossy_input,
                 target_window,
@@ -2349,7 +2399,6 @@ impl SessionActor {
         &self,
         chat_history: Vec<ConversationItem>,
         tools: Vec<xai_grok_sampling_types::ToolSpec>,
-        user_context: Option<&str>,
         use_short_prompt: bool,
         model: &str,
         trigger: xai_grok_telemetry::events::CompactionTrigger,
@@ -2384,7 +2433,6 @@ impl SessionActor {
             trigger: trigger_str.to_owned(),
             prompt_variant: prompt_variant.to_owned(),
             model: model.to_owned(),
-            user_context: user_context.map(str::to_owned),
             chat_history,
             tools,
             summary: summary.map(str::to_owned),

@@ -161,7 +161,6 @@ impl DashboardState {
     ) -> Option<PathBuf> {
         let reply_agent = match selected {
             DashboardRowId::TopLevel(id) => Some(*id),
-            DashboardRowId::Subagent { parent, .. } => Some(*parent),
             DashboardRowId::Roster { .. } | DashboardRowId::Workspace { .. } => None,
         };
         reply_agent.and_then(|id| agents.get(&id).map(|agent| agent.session.cwd.clone()))

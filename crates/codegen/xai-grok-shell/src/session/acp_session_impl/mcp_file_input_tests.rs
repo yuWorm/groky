@@ -754,7 +754,7 @@ async fn transport_memory_policy_validates_and_denies_without_model_bookkeeping(
                 let hooks = Arc::new(parking_lot::Mutex::new(Vec::new()));
                 let responder = record_client_hooks(gateway, hooks.clone(), json!({}));
                 actor
-                    .execute_tool_calls(vec![call(json!({"file":logical}))])
+                    .execute_tool_calls(vec![call(json!({"file":logical}))], None)
                     .await
                     .unwrap();
                 let mut expected_paths = vec![logical.clone()];
@@ -823,15 +823,22 @@ async fn deadline_or_cancelled_preparation_never_dispatches() {
             fs.blocked.store(true, Ordering::Relaxed);
             let mut deferred = vec![];
             let result = actor
-                .prepare_tool_call(call(json!({"file":"/tmp/mcp-source.json"})), &mut deferred)
+                .prepare_tool_call(
+                    call(json!({"file":"/tmp/mcp-source.json"})),
+                    &mut deferred,
+                    None,
+                )
                 .await
                 .unwrap();
             assert!(matches!(result, Err(ToolLoop::Continue)));
             let mut deferred = vec![];
             let cancelled = tokio::time::timeout(
                 Duration::from_millis(1),
-                actor
-                    .prepare_tool_call(call(json!({"file":"/tmp/mcp-source.json"})), &mut deferred),
+                actor.prepare_tool_call(
+                    call(json!({"file":"/tmp/mcp-source.json"})),
+                    &mut deferred,
+                    None,
+                ),
             )
             .await;
             assert!(cancelled.is_err());
@@ -850,6 +857,7 @@ async fn approval_preview_preserves_arguments_and_obeys_remaining_budget() {
                 let mut source = McpFileSource::start(
                     PathBuf::from("/tmp/mcp-source.json"),
                     xai_grok_telemetry::events::McpFileInputKind::Invocation,
+                    "grok-4.6".to_owned(),
                 );
                 source.operation_remaining = remaining;
                 let preparation = McpFilePreparation::Resolved {
@@ -903,7 +911,11 @@ async fn snapshot_overflow_emits_once_on_the_session_task_with_measured_bytes() 
         Arc::new(tokio::sync::Mutex::new(7)),
     );
     let (error, events) = capture_events(with_session_ctx(context, async {
-        let mut source = McpFileSource::start(PathBuf::from("source"), xai_grok_telemetry::events::McpFileInputKind::Arguments);
+        let mut source = McpFileSource::start(
+            PathBuf::from("source"),
+            xai_grok_telemetry::events::McpFileInputKind::Arguments,
+            "grok-4.6".to_owned(),
+        );
         source.bytes = 42;
         let arguments = json!({"tool_name":"fixture__update","tool_input":{"body":"x".repeat(MAX_BATCH_SNAPSHOT_BYTES)}});
         PreparedMcpFile::freeze(source, arguments).await.unwrap_err()
@@ -924,6 +936,13 @@ async fn snapshot_overflow_emits_once_on_the_session_task_with_measured_bytes() 
         ],
         names
     );
+    for event in &events {
+        assert_eq!(
+            Some(&json!("grok-4.6")),
+            event.pointer("/payload/model_id"),
+            "{event}"
+        );
+    }
     let completion = events.last().unwrap();
     assert_eq!(
         Some(&json!("failed")),

@@ -1,4 +1,5 @@
 use super::*;
+use xai_grok_test_support::acp_fixtures::text_block;
 use xai_grok_tools::implementations::skills::types::SkillScope;
 
 /// Shadows [`super::resolve_human_intent`] for the cases that route something other than `/loop`.
@@ -121,10 +122,6 @@ fn all_gated() -> CommandAvailability {
     CommandAvailability::all_enabled()
 }
 
-fn text_block(s: &str) -> acp::ContentBlock {
-    acp::ContentBlock::Text(acp::TextContent::new(s.to_string()))
-}
-
 fn make_skill(name: &str, user_invocable: bool) -> SkillInfo {
     SkillInfo {
         name: name.to_string(),
@@ -151,6 +148,7 @@ fn make_skill(name: &str, user_invocable: bool) -> SkillInfo {
         disable_model_invocation: false,
         has_user_specified_description: false,
         paths: None,
+        origin: None,
         enabled: true,
         body: None,
     }
@@ -203,18 +201,6 @@ fn window_parses_optional_spec() {
 }
 
 #[test]
-fn compact_parses_optional_context() {
-    assert!(matches!(
-        resolve_builtin("compact", ""),
-        Some(BuiltinAction::Compact { user_context: None })
-    ));
-    assert!(matches!(
-        resolve_builtin("compact", "keep auth"),
-        Some(BuiltinAction::Compact { user_context: Some(ctx) }) if ctx == "keep auth"
-    ));
-}
-
-#[test]
 fn always_approve_parses_on_off() {
     for arg in ["", "on", "true", "1", "yes", "enable"] {
         assert!(
@@ -260,8 +246,7 @@ fn resolve_routes_builtin() {
     .unwrap_err();
     assert!(matches!(
         outcome,
-        SlashCommandOutcome::Builtin(BuiltinAction::Compact { user_context: Some(ctx) })
-        if ctx == "preserve auth"
+        SlashCommandOutcome::Builtin(BuiltinAction::Compact)
     ));
 }
 
@@ -879,8 +864,11 @@ fn available_commands_populates_acp_fields() {
     let skills = vec![make_skill("commit", true)];
     let commands = available_commands(&skills, all_gated(), &[]);
 
-    let builtin = commands.iter().find(|c| c.name == "compact").unwrap();
-    assert!(builtin.input.is_some());
+    let builtin = commands
+        .iter()
+        .find(|c| c.name == "always-approve")
+        .unwrap();
+    assert!(builtin.input.is_some()); // always-approve has argument_hint "on|off"
 
     let flush = commands.iter().find(|c| c.name == "flush").unwrap();
     assert!(flush.input.is_none()); // no argument_hint
@@ -1056,6 +1044,7 @@ fn make_scoped_skill(name: &str, scope: SkillScope) -> SkillInfo {
         disable_model_invocation: false,
         has_user_specified_description: false,
         paths: None,
+        origin: None,
         enabled: true,
         body: None,
     }
@@ -1323,9 +1312,7 @@ fn resolve_mixed_case_builtin() {
     .unwrap_err();
     assert!(matches!(
         outcome,
-        SlashCommandOutcome::Builtin(BuiltinAction::Compact {
-            user_context: Some(ref ctx)
-        }) if ctx == "keep auth"
+        SlashCommandOutcome::Builtin(BuiltinAction::Compact)
     ));
 }
 
@@ -1642,6 +1629,19 @@ fn parse_skill_refs_qualified_name() {
     assert_eq!(r0.name, "local:commit");
     assert_eq!(r0.args, "fix typo");
     assert_eq!(r0.qualified_name, "local:commit");
+}
+
+#[test]
+fn parse_skill_refs_carry_the_skill_origin() {
+    let mut generated = make_skill("triage", true);
+    generated.origin = Some("learn".into());
+    let skills = vec![generated, make_skill("commit", true)];
+    let refs = parse_skill_references("/triage then /commit", &skills, all_gated()).unwrap();
+    let [generated_ref, hand_written_ref] = refs.as_slice() else {
+        panic!("expected two skill refs: {refs:?}");
+    };
+    assert_eq!(Some("learn"), generated_ref.origin.as_deref());
+    assert_eq!(None, hand_written_ref.origin);
 }
 
 #[test]

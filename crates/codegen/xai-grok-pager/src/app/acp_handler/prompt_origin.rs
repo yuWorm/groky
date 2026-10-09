@@ -16,7 +16,7 @@ pub(crate) fn is_scheduler_fired_prompt(prompt_id: &str) -> bool {
 }
 
 /// Decides which replayed turns close without a terminal marker.
-/// A wake stays markerless when it streamed nothing visible; a wake that errored always keeps its marker.
+/// A wake stays markerless when it streamed nothing visible or when it errored, matching live.
 /// A direct-bash turn keeps its marker only for cancel and error, matching live.
 pub(crate) fn suppress_replay_marker_for_origin(
     is_direct_bash: bool,
@@ -28,10 +28,8 @@ pub(crate) fn suppress_replay_marker_for_origin(
         return matches!(stop, crate::app::turn_completion::TurnStopReason::EndTurn);
     }
     if is_wake_prompt(prompt_id) {
-        if matches!(stop, crate::app::turn_completion::TurnStopReason::Error) {
-            return false;
-        }
-        return !had_visible_output;
+        return matches!(stop, crate::app::turn_completion::TurnStopReason::Error)
+            || !had_visible_output;
     }
     is_server_initiated_prompt(prompt_id) && !is_scheduler_fired_prompt(prompt_id)
 }
@@ -198,11 +196,20 @@ pub(super) struct WakeTerminal<'a> {
     pub agent_result: Option<&'a str>,
     pub cancel_trigger: Option<&'a str>,
     pub cancellation_category: Option<&'a str>,
-    pub error_kind: Option<crate::app::error_display::WireErrorType>,
+}
+
+/// Errored wakes close like a success (no scrollback row); the trace log is their only record.
+pub(super) fn log_failed_wake(prompt_id: &str, agent_result: Option<&str>, rail: &str) {
+    tracing::info!(
+        prompt_id,
+        rail,
+        reason = agent_result.unwrap_or("unknown error"),
+        "background wake turn failed; closing without a marker"
+    );
 }
 
 /// Close out a wake turn. This is the only place that flushes its streamed entries still in flight, because wake turns skip `PromptResponse`.
-/// Failures are the exception and still get a marker when silent, because the user's standing instruction stopped executing invisibly.
+/// An errored wake closes silently (see [`log_failed_wake`]); a chatty rate-limited wake keeps its upgrade-URL row.
 /// The `HookAnnotation` warning attributes the deny but is not turn output, so a silently blocked wake closes without a marker.
 /// Returns true when the wake closed with a visible `TurnCompleted` marker (chatty EndTurn).
 pub(super) fn finish_wake_turn(
@@ -215,7 +222,6 @@ pub(super) fn finish_wake_turn(
         agent_result,
         cancel_trigger,
         cancellation_category,
-        error_kind,
     } = terminal;
 
     let had_output = agent.session.tracker.output_since_last_finish();
@@ -241,21 +247,18 @@ pub(super) fn finish_wake_turn(
     let already_failed = agent.failed_wake_marker_for.as_deref() == Some(prompt_id);
     let elapsed_ms = crate::app::turn_completion::duration_to_elapsed_ms(elapsed);
     let event = match stop_reason {
-        "error" | "rate_limit"
-            if already_failed || (stop_reason == "rate_limit" && !had_output) =>
-        {
+        "error" => {
+            if !already_failed {
+                agent.failed_wake_marker_for = Some(prompt_id.to_string());
+                log_failed_wake(prompt_id, agent_result, "idle");
+            }
             None
         }
-        "error" | "rate_limit" => {
+        "rate_limit" if already_failed || !had_output => None,
+        "rate_limit" => {
             agent.failed_wake_marker_for = Some(prompt_id.to_string());
             if crate::app::dispatch::scrollback_has_recent_error_banner(&agent.scrollback) {
                 None
-            } else if stop_reason == "error" {
-                Some(crate::app::turn_completion::failed_turn_event(
-                    error_kind,
-                    agent_result,
-                    elapsed,
-                ))
             } else {
                 Some(rate_limited_wake_failure_event(agent_result, elapsed))
             }
@@ -270,7 +273,7 @@ pub(super) fn finish_wake_turn(
                 send_now_cancel,
                 cancel_trigger,
                 cancellation_category,
-                // Failures were handled above, so the Error arm is unreachable here
+                // The error arm above closed silently, so this Error arm is unreachable
                 error_kind: None,
                 error_banner_present: false,
             },

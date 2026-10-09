@@ -46,6 +46,17 @@ Update to the latest version at any time:
 grok update
 ```
 
+If you installed Grok Build with WinGet, update it with WinGet instead. Quit
+Grok first, then run:
+
+```powershell
+winget upgrade --id xAI.GrokBuild -e
+```
+
+On a WinGet install, `grok update` prints this command and changes nothing.
+The WinGet package tracks the stable channel, and new releases can take a few
+days to reach it.
+
 To fetch a repository through Grove (NFS on macOS, FUSE on Linux), enable
 `grok clone` with `[clone] enabled = true` in Grove config, `GROK_CLONE=1`,
 or the enable-both convenience `GROK_GROVE=1` / `[cli] grove = true` in

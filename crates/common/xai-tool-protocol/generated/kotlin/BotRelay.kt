@@ -450,6 +450,8 @@ const val COMMAND_REJECTED_GATEWAY_UNKNOWN_METHOD: String = "gateway/unknown-met
 const val COMMAND_REJECTED_TEMPORAL_UNSUPPORTED: String = "temporal_unsupported"
 /** `reason` on `command_rejected` when the upstream answered the voice mint with `invalid_argument` or a voice harness call with `not_found`: voice calling is not enabled for this account, or the mint was refused. */
 const val COMMAND_REJECTED_VOICE_CALL_UNAVAILABLE: String = "voice_call_unavailable"
+/** `reason` on `command_rejected` when the upstream refused `setMainAgent` because the main bot feature is not enabled for this account: `getMainAgent` still reads the pointer, but nothing can write it until the account is enrolled. */
+const val COMMAND_REJECTED_MAIN_AGENT_NOT_ENABLED: String = "main_agent_not_enabled"
 
 fun isGatewayMethodUnsupported(error: BotRelayError): Boolean =
     error.code == "command_rejected" &&

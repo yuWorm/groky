@@ -377,6 +377,7 @@ mod tests {
             when_to_use: None,
             has_user_specified_description: false,
             paths: None,
+            origin: None,
             enabled: true,
             body: None,
         }

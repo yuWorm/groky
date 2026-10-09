@@ -155,7 +155,7 @@ fn plural(count: usize, noun: &str) -> String {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum MemoryFlushDisposition {
-    /// Every completed turn is captured and indexed.
+    /// Every finished or stopped turn is captured and indexed.
     Flushed,
     /// Capture failed but will be retried in the background.
     RetryRequired,
@@ -340,10 +340,9 @@ async fn handle_compact(agent: &MvpAgent, args: &acp::ExtRequest) -> ExtResult {
     let session_handle = agent.resident_handle(&sid);
     let (tx, rx) = oneshot::channel();
     if let Some(session) = session_handle {
-        let _ = session.cmd_tx.send(SessionCommand::CompactSession {
-            user_context: req.user_context,
-            respond_to: tx,
-        });
+        let _ = session
+            .cmd_tx
+            .send(SessionCommand::CompactSession { respond_to: tx });
     }
     // Pass the session error through; rewrapping buries the detail in a Debug dump.
     rx.await

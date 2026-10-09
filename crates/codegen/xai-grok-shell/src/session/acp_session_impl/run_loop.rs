@@ -1186,10 +1186,10 @@ pub(super) async fn run_session(
                                 }
                             }
                         }
-                        SessionCommand::CompactSession { user_context, respond_to } => {
+                        SessionCommand::CompactSession { respond_to } => {
                             let s = session.clone();
                             tokio::task::spawn_local(async move {
-                                let compact_session = s.run_compact(user_context).await;
+                                let compact_session = s.run_compact().await;
                                 let _ = respond_to.send(compact_session);
                             });
                         }
@@ -1407,6 +1407,14 @@ pub(super) async fn run_session(
                                     request_id,
                                 });
                         }
+                        SessionCommand::NoteInterruptedTurn { turn } => {
+                            session.push_system_reminder(&turn.model_reminder());
+                            tracing::info!(
+                                trace_turn = turn.trace_turn,
+                                prompt_id = %turn.prompt_id,
+                                "Injected interrupted-turn reminder for the model"
+                            );
+                        }
                         SessionCommand::CopyFile { respond_to } => {
                             // Flush the actor-owned replay buffer before tearing down the running turn.
                             // Chunks still pending at cancel (notably AgentThoughtChunk reasoning text) then get committed to updates.jsonl.
@@ -1462,7 +1470,10 @@ pub(super) async fn run_session(
                         SessionCommand::UpdateAttachPolicy { startup_hints } => {
                             session.apply_attach_policy(&startup_hints);
                         }
-                        SessionCommand::UpdateMcpServers { mcp_servers, respond_to } => {
+                        SessionCommand::UpdateMcpServers { mcp_servers, client_seed, respond_to } => {
+                            if let Some(seed) = client_seed {
+                                *session.initial_client_mcp_servers.borrow_mut() = seed;
+                            }
                             if session.startup_hints.is_subagent {
                                 tracing::debug!(
                                     session_id = %session.session_info.id.0,
@@ -1471,6 +1482,12 @@ pub(super) async fn run_session(
                                 let _ = respond_to.send(Ok(()));
                                 continue;
                             }
+                            let mut mcp_servers = mcp_servers;
+                            crate::session::agent_mcp::apply_agent_mcp_overlay(
+                                &mut mcp_servers,
+                                session.agent.borrow().definition(),
+                                std::path::Path::new(&session.session_info.cwd),
+                            );
                             tracing::info!(
                                 "Updating MCP servers for session '{}' ({} servers)",
                                 session.session_info.id.0,
@@ -2334,23 +2351,11 @@ pub(super) async fn run_session(
                             ..
                         })
                     );
-                    // Capture only a genuine root query that completed its tool loop with
-                    // EndTurn. Synthetic wakes and built-ins also produce PromptTurnOk, but
-                    // neither is durable conversation evidence for memory extraction.
-                    let v2_capture_eligible = super::memory_capture::is_successful_query_loop(
-                        &result,
-                    ) && {
-                        let state = session.state.lock().await;
-                        state.pending_inputs.front().is_some_and(|input| {
-                            input.prompt_id == prompt_id
-                                && input.queue_meta.is_some()
-                                && !input.input_origin.is_synthetic()
-                                && crate::session::slash_authority::parse_slash_prefix(
-                                    &input.prompt_blocks,
-                                )
-                                .is_none()
-                        })
-                    };
+                    let v2_capture_eligible =
+                        super::memory_capture::is_capturable_turn_result(&result) && {
+                            let state = session.state.lock().await;
+                            SessionActor::is_capturable_front(&state, &prompt_id)
+                        };
                     let v2_capture_source_prompt_index = if v2_capture_eligible {
                         Some(*session.tool_context.prompt_index.lock().await)
                     } else {
@@ -2369,9 +2374,10 @@ pub(super) async fn run_session(
                     }
                     if let Some(source_prompt_index) = v2_capture_source_prompt_index {
                         session
-                            .enqueue_v2_completed_turn(source_prompt_index)
+                            .enqueue_v2_turn_capture(source_prompt_index)
                             .await;
                     }
+                    session.schedule_v2_dream_check_after_turn();
                     #[cfg(test)]
                     if let Some(processed) = processed {
                         let _ = processed.send(());

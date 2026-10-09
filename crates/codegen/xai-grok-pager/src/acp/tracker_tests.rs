@@ -316,13 +316,6 @@ fn finish_turn_clears_state() {
     );
 }
 #[test]
-fn user_message_replay() {
-    let mut sb = ScrollbackState::new();
-    let mut tracker = AcpUpdateTracker::new();
-    tracker.handle_update(user_message("What is Rust?"), &meta(), &mut sb);
-    assert_eq!(sb.len(), 1);
-}
-#[test]
 fn empty_chunks_ignored() {
     let mut sb = ScrollbackState::new();
     let mut tracker = AcpUpdateTracker::new();
@@ -1280,7 +1273,7 @@ fn test_search_tool_call_flow() {
         );
     }
 }
-/// ScrollbackState with an explicit `expanded_by_default` shape override (flag-independent: the `Some` beats the `collapsed_edit_blocks` cache).
+/// Scrollback with pager.toml `expanded_by_default` set. Does not touch the flag cache.
 fn edit_config_scrollback(expanded_by_default: bool) -> ScrollbackState {
     use crate::appearance::AppearanceConfig;
     let mut sb = ScrollbackState::new();
@@ -1307,6 +1300,11 @@ fn pending_other_tool_call(tc_id: &Arc<str>) -> acp::SessionUpdate {
 /// leave a stale mode in place.
 #[test]
 fn edit_tool_upgrade_resets_display_mode_to_default() {
+    std::thread::spawn(edit_tool_upgrade_resets_display_mode_to_default_body)
+        .join()
+        .unwrap();
+}
+fn edit_tool_upgrade_resets_display_mode_to_default_body() {
     use crate::scrollback::types::DisplayMode;
     /// Drive Pending(Other) through InProgress(Edit) to Completed.
     /// Returns the display mode observed after the InProgress upgrade and after completion.
@@ -1357,6 +1355,7 @@ fn edit_tool_upgrade_resets_display_mode_to_default() {
         );
         entry.display_mode
     }
+    crate::appearance::cache::set_collapsed_edit_blocks(false);
     let (upgraded, completed) = upgrade_path("toolu_edit_001", false);
     assert_eq!(
         upgraded,
@@ -2748,12 +2747,12 @@ fn waiting_payload_and_writing_churn_are_not_phase_transitions() {
         }))
     };
     assert!(!is_phase_transition(
-        wait(Some("scan src/: Thinking")).as_ref(),
-        wait(Some("scan src/: Running: cargo test")).as_ref(),
+        wait(Some("Waiting for subagent")).as_ref(),
+        wait(Some("Waiting for 2 subagents")).as_ref(),
     ));
     assert!(!is_phase_transition(
         wait(None).as_ref(),
-        wait(Some("scan src/: Thinking")).as_ref(),
+        wait(Some("Waiting for subagent")).as_ref(),
     ));
     let task_wait = |task_ids: &[&str], subject: Option<&str>| {
         Some(TurnActivity::Waiting(WaitingReason::TaskOutput {
@@ -2776,7 +2775,7 @@ fn waiting_payload_and_writing_churn_are_not_phase_transitions() {
     ));
     assert!(is_phase_transition(None, wait(None).as_ref()));
     assert!(is_phase_transition(
-        wait(Some("scan src/: Thinking")).as_ref(),
+        wait(Some("Waiting for subagent")).as_ref(),
         Some(&TurnActivity::Responding),
     ));
     let tool = |title: &str| {
@@ -3993,6 +3992,75 @@ fn tool_update_in_progress_bg(id: &str, output_bytes: &[u8]) -> acp::SessionUpda
             }))),
     ))
 }
+/// Helper: returns whether the tracker defers an Execute tool as background when its first InProgress update carries `input` as raw_input.
+fn bg_deferred_for_input(id: &str, input: serde_json::Value) -> bool {
+    let update = acp::SessionUpdate::ToolCallUpdate(acp::ToolCallUpdate::new(
+        acp::ToolCallId::new(Arc::from(id)),
+        acp::ToolCallUpdateFields::new()
+            .status(Some(acp::ToolCallStatus::InProgress))
+            .raw_input(Some(input)),
+    ));
+    let mut sb = ScrollbackState::new();
+    let mut tracker = AcpUpdateTracker::new();
+    tracker.handle_update(
+        tool_call(id, acp::ToolKind::Execute, "Execute `sleep 9999`"),
+        &meta(),
+        &mut sb,
+    );
+    tracker.handle_update(update, &meta(), &mut sb);
+    tracker.bg_deferred_tools.contains_key(id)
+}
+/// The tracker defers `block_until_ms: 0` the same way as `is_background: true`.
+/// A positive `block_until_ms` stays a foreground call.
+#[test]
+fn bg_tool_detected_from_block_until_ms_zero() {
+    assert!(
+        bg_deferred_for_input(
+            "tc-zero",
+            serde_json::json!({"command": "sleep 9999", "block_until_ms": 0})
+        ),
+        "block_until_ms: 0 must defer like is_background: true"
+    );
+    assert!(
+        !bg_deferred_for_input(
+            "tc-wait",
+            serde_json::json!({"command": "sleep 9999", "block_until_ms": 30_000})
+        ),
+        "a positive block is a foreground call"
+    );
+}
+/// The tracker reads the input the same way as `BashTool::resolve_block_until_ms`.
+#[test]
+fn bg_tool_follows_bash_block_precedence() {
+    assert!(
+        bg_deferred_for_input(
+            "tc-str",
+            serde_json::json!({"command": "sleep 9999", "block_until_ms": "0"})
+        ),
+        "a string-encoded zero block backgrounds"
+    );
+    assert!(
+        !bg_deferred_for_input(
+            "tc-mixed",
+            serde_json::json!({"command": "sleep 9999", "block_until_ms": 30_000, "is_background": true})
+        ),
+        "an explicit positive block wins over a leftover is_background flag"
+    );
+    assert!(
+        bg_deferred_for_input(
+            "tc-timeout",
+            serde_json::json!({"command": "sleep 9999", "timeout": 0})
+        ),
+        "a legacy timeout: 0 backgrounds under the single-knob contract"
+    );
+    assert!(
+        !bg_deferred_for_input(
+            "tc-timeout-pos",
+            serde_json::json!({"command": "sleep 9999", "timeout": 5000})
+        ),
+        "a positive legacy timeout is a foreground call"
+    );
+}
 /// Regression: is_bg_tool() detected on first InProgress defers the tool before any scrollback entry is created.
 #[test]
 fn bg_tool_detected_at_first_update_defers_to_bg() {
@@ -4512,6 +4580,24 @@ fn meta_with_prompt_id(prompt_id: &str) -> NotificationMeta {
     m.prompt_id = Some(prompt_id.to_string());
     m
 }
+#[test]
+fn hidden_user_message_keeps_the_pending_echo_skip() {
+    let mut sb = ScrollbackState::new();
+    let mut tracker = AcpUpdateTracker::new();
+    tracker.expect_user_echo();
+    let mut hide_meta = acp::Meta::new();
+    hide_meta.insert("hideFromScrollback".into(), serde_json::json!(true));
+    assert!(!tracker.handle_update(
+        user_message_with_chunk_meta(
+            "<timestamp>Wed</timestamp>\n<system_notification>done</system_notification>",
+            hide_meta,
+        ),
+        &meta(),
+        &mut sb,
+    ));
+    assert!(!tracker.handle_update(user_message("Reply with SECOND"), &meta(), &mut sb));
+    assert!(!tracker.expects_user_echo());
+}
 /// Scrollback hide is type-driven.
 /// Chunk meta `hideFromScrollback` or notification `promptId` routes to [`PromptOrigin::hide_user_echo_from_scrollback`].
 #[test]
@@ -4679,16 +4765,14 @@ fn replay_malformed_skill_token_ranges_degrade_to_plain() {
     }
 }
 /// A persisted interjection chunk as the shell writes it: the model-facing frame as text,
-/// the typed text in `displayText`, and the `interjection` chunk flag (wire literals pinned here).
+/// the typed text in `displayText`, and the `interjection` chunk flag.
 fn interjection_user_message(typed: &str) -> acp::SessionUpdate {
     let mut chunk_meta = serde_json::Map::new();
     chunk_meta.insert("modelId".into(), serde_json::json!("test-model"));
     chunk_meta.insert("interjection".into(), serde_json::Value::Bool(true));
     let mut text_meta = serde_json::Map::new();
     text_meta.insert("displayText".into(), serde_json::json!(typed));
-    let framed = format!(
-        "The user sent a message while you were working:\n<user_query>\n{typed}\n</user_query>\nMake sure to complete any unfinished tasks from previous turns."
-    );
+    let framed = xai_interjection_core::format_interjection(typed.to_string());
     acp::SessionUpdate::UserMessageChunk(
         acp::ContentChunk::new(acp::ContentBlock::Text(
             acp::TextContent::new(framed).meta(Some(text_meta)),

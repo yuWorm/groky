@@ -4,6 +4,9 @@ use crate::session::storage::StorageAdapter;
 use crate::terminal::AsyncTerminalRunner;
 use crate::terminal::runner::{TerminalError, TerminalRunRequest, TerminalRunResult};
 use xai_grok_paths::AbsPathBuf;
+use xai_grok_tools::implementations::grok_build::task::types::{
+    HandedOffForegroundSubagent, SubagentEvent, SubagentHandOffForegroundRequest,
+};
 #[derive(Debug)]
 struct DummyTerminal;
 #[async_trait::async_trait]
@@ -144,20 +147,14 @@ async fn persist_ack_waits_for_disk_flush_before_success() {
                 rewind_pending_prompt: std::sync::Mutex::new(None),
                 startup_hints: StartupHints::default(),
                 forked_tool_override: None,
-                compaction: crate::session::compaction_config::CompactionConfig {
-                    threshold_percent: std::cell::Cell::new(85),
-                    force_compact: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
-                    context_window_override: None,
-                    count: std::sync::atomic::AtomicU64::new(0),
-                    auto_compact_suppressed: std::sync::atomic::AtomicU8::new(0),
-                    previous_model: std::cell::Cell::new(None),
-                    compaction_mode: xai_chat_state::CompactionMode::Transcript,
-                    verbatim_input: true,
-                    tool_choice: crate::util::config::CompactionToolChoice::Auto,
-                    prefire: crate::session::compaction_config::PrefireState::default(),
-                    prefix_released: std::sync::atomic::AtomicBool::new(false),
-                    cancel: Default::default(),
-                },
+                compaction: test_compaction_config(85),
+                long_reasoning_reminder:
+                    crate::session::long_reasoning_reminder::LongReasoningReminder {
+                        enabled: false,
+                        tokens: crate::session::long_reasoning_reminder::DEFAULT_TOKENS,
+                        delay: crate::session::long_reasoning_reminder::DEFAULT_DELAY,
+                    },
+                long_reasoning_turn_state: Default::default(),
                 memory: crate::session::memory_state::SessionMemory {
                     configured_mode: None,
                     v2_config: Default::default(),
@@ -261,7 +258,7 @@ async fn persist_ack_waits_for_disk_flush_before_success() {
                 ),
                 goal_classifier_in_flight: std::sync::atomic::AtomicBool::new(false),
                 managed_mcp_handle: Default::default(),
-                initial_client_mcp_servers: vec![],
+                initial_client_mcp_servers: Default::default(),
                 tool_metadata_snapshot: Arc::new(std::sync::Mutex::new(Default::default())),
                 mcp_announcements: Default::default(),
                 mcp_reminder_mode: McpReminderMode::Delta,
@@ -685,20 +682,14 @@ async fn first_turn_memory_injection_disabled_does_not_persist_to_chat_history()
                 rewind_pending_prompt: std::sync::Mutex::new(None),
                 startup_hints: StartupHints::default(),
                 forked_tool_override: None,
-                compaction: crate::session::compaction_config::CompactionConfig {
-                    threshold_percent: std::cell::Cell::new(85),
-                    force_compact: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
-                    context_window_override: None,
-                    count: std::sync::atomic::AtomicU64::new(0),
-                    auto_compact_suppressed: std::sync::atomic::AtomicU8::new(0),
-                    previous_model: std::cell::Cell::new(None),
-                    compaction_mode: xai_chat_state::CompactionMode::Transcript,
-                    verbatim_input: true,
-                    tool_choice: crate::util::config::CompactionToolChoice::Auto,
-                    prefire: crate::session::compaction_config::PrefireState::default(),
-                    prefix_released: std::sync::atomic::AtomicBool::new(false),
-                    cancel: Default::default(),
-                },
+                compaction: test_compaction_config(85),
+                long_reasoning_reminder:
+                    crate::session::long_reasoning_reminder::LongReasoningReminder {
+                        enabled: false,
+                        tokens: crate::session::long_reasoning_reminder::DEFAULT_TOKENS,
+                        delay: crate::session::long_reasoning_reminder::DEFAULT_DELAY,
+                    },
+                long_reasoning_turn_state: Default::default(),
                 memory: crate::session::memory_state::SessionMemory {
                     configured_mode: Some(crate::config::MemoryMode::Legacy),
                     v2_config: Default::default(),
@@ -805,7 +796,7 @@ async fn first_turn_memory_injection_disabled_does_not_persist_to_chat_history()
                 ),
                 goal_classifier_in_flight: std::sync::atomic::AtomicBool::new(false),
                 managed_mcp_handle: Default::default(),
-                initial_client_mcp_servers: vec![],
+                initial_client_mcp_servers: Default::default(),
                 tool_metadata_snapshot: Arc::new(std::sync::Mutex::new(Default::default())),
                 mcp_announcements: Default::default(),
                 mcp_reminder_mode: McpReminderMode::Delta,
@@ -1022,22 +1013,13 @@ async fn cancel_running_task_teardown_clears_running_and_pending_work() {
                 rewind_pending_prompt: std::sync::Mutex::new(None),
                 startup_hints: StartupHints::default(),
                 forked_tool_override: None,
-                compaction: crate::session::compaction_config::CompactionConfig {
-                    threshold_percent: std::cell::Cell::new(85),
-                    force_compact: std::sync::Arc::new(
-                        std::sync::atomic::AtomicBool::new(false),
-                    ),
-                    context_window_override: None,
-                    count: std::sync::atomic::AtomicU64::new(0),
-                    auto_compact_suppressed: std::sync::atomic::AtomicU8::new(0),
-                    previous_model: std::cell::Cell::new(None),
-                    compaction_mode: xai_chat_state::CompactionMode::Transcript,
-                    verbatim_input: true,
-                    tool_choice: crate::util::config::CompactionToolChoice::Auto,
-                    prefire: crate::session::compaction_config::PrefireState::default(),
-                    prefix_released: std::sync::atomic::AtomicBool::new(false),
-                    cancel: Default::default(),
+                compaction: test_compaction_config(85),
+                long_reasoning_reminder: crate::session::long_reasoning_reminder::LongReasoningReminder {
+                    enabled: false,
+                    tokens: crate::session::long_reasoning_reminder::DEFAULT_TOKENS,
+                    delay: crate::session::long_reasoning_reminder::DEFAULT_DELAY,
                 },
+                long_reasoning_turn_state: Default::default(),
                 memory: crate::session::memory_state::SessionMemory {
                     configured_mode: None,
                     v2_config: Default::default(),
@@ -1156,7 +1138,7 @@ async fn cancel_running_task_teardown_clears_running_and_pending_work() {
                 ),
                 goal_classifier_in_flight: std::sync::atomic::AtomicBool::new(false),
                 managed_mcp_handle: Default::default(),
-                initial_client_mcp_servers: vec![],
+                initial_client_mcp_servers: Default::default(),
                 tool_metadata_snapshot: Arc::new(
                     std::sync::Mutex::new(Default::default()),
                 ),
@@ -2589,22 +2571,13 @@ async fn cancel_propagates_to_sampler_handle_so_no_further_emission() {
                 rewind_pending_prompt: std::sync::Mutex::new(None),
                 startup_hints: StartupHints::default(),
                 forked_tool_override: None,
-                compaction: crate::session::compaction_config::CompactionConfig {
-                    threshold_percent: std::cell::Cell::new(85),
-                    force_compact: std::sync::Arc::new(
-                        std::sync::atomic::AtomicBool::new(false),
-                    ),
-                    context_window_override: None,
-                    count: std::sync::atomic::AtomicU64::new(0),
-                    auto_compact_suppressed: std::sync::atomic::AtomicU8::new(0),
-                    previous_model: std::cell::Cell::new(None),
-                    compaction_mode: xai_chat_state::CompactionMode::Transcript,
-                    verbatim_input: true,
-                    tool_choice: crate::util::config::CompactionToolChoice::Auto,
-                    prefire: crate::session::compaction_config::PrefireState::default(),
-                    prefix_released: std::sync::atomic::AtomicBool::new(false),
-                    cancel: Default::default(),
+                compaction: test_compaction_config(85),
+                long_reasoning_reminder: crate::session::long_reasoning_reminder::LongReasoningReminder {
+                    enabled: false,
+                    tokens: crate::session::long_reasoning_reminder::DEFAULT_TOKENS,
+                    delay: crate::session::long_reasoning_reminder::DEFAULT_DELAY,
                 },
+                long_reasoning_turn_state: Default::default(),
                 memory: crate::session::memory_state::SessionMemory {
                     configured_mode: None,
                     v2_config: Default::default(),
@@ -2723,7 +2696,7 @@ async fn cancel_propagates_to_sampler_handle_so_no_further_emission() {
                 ),
                 goal_classifier_in_flight: std::sync::atomic::AtomicBool::new(false),
                 managed_mcp_handle: Default::default(),
-                initial_client_mcp_servers: vec![],
+                initial_client_mcp_servers: Default::default(),
                 tool_metadata_snapshot: Arc::new(
                     std::sync::Mutex::new(Default::default()),
                 ),
@@ -3020,6 +2993,88 @@ async fn cancel_keeps_remaining_queued_prompts_visible_to_clients() {
                     .expect("current_prompt_id mutex poisoned")
                     .is_none(),
                 "cancel must clear current_prompt_id so the next prompt can start"
+            );
+        })
+        .await;
+}
+#[tokio::test(flavor = "current_thread")]
+async fn send_now_answers_blocking_spawn_with_background_notice() {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let (gateway_tx, _gateway_rx) =
+                tokio::sync::mpsc::unbounded_channel::<xai_acp_lib::AcpClientMessage>();
+            let (persistence_tx, _persistence_rx) =
+                tokio::sync::mpsc::unbounded_channel::<PersistenceMsg>();
+            let mut actor = create_test_actor(0, 256_000, 85, gateway_tx, persistence_tx).await;
+            let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel::<SubagentEvent>();
+            let (seen_tx, mut seen_rx) = tokio::sync::mpsc::unbounded_channel();
+            tokio::task::spawn_local(async move {
+                while let Some(event) = event_rx.recv().await {
+                    match event {
+                        SubagentEvent::HandOffForeground(SubagentHandOffForegroundRequest {
+                            parent_session_id,
+                            prompt_id,
+                            respond_to,
+                        }) => {
+                            let _ = seen_tx.send((parent_session_id, prompt_id));
+                            let _ = respond_to.send(vec![HandedOffForegroundSubagent {
+                                subagent_id: "sub-1".to_owned(),
+                                tool_call_id: "call-1".to_owned(),
+                                description: "long task".to_owned(),
+                                state: xai_tool_types::HandedOffSubagentState::Running,
+                            }]);
+                        }
+                        SubagentEvent::Outstanding(req) => {
+                            let _ = req.respond_to.send(Default::default());
+                        }
+                        _ => {}
+                    }
+                }
+            });
+            actor.tool_context.subagent_event_tx = Some(event_tx);
+            actor.chat_state_handle.push_assistant_response(
+                ConversationItem::assistant_tool_calls(vec![xai_grok_sampling_types::ToolCall {
+                    id: "call-1".into(),
+                    name: "spawn_subagent".into(),
+                    arguments: "{}".into(),
+                }]),
+            );
+            *actor
+                .current_prompt_id
+                .lock()
+                .expect("current_prompt_id mutex poisoned") = Some("running".to_string());
+            {
+                let mut state = actor.state.lock().await;
+                state.running_task = Some(running_task_stub("running"));
+                state.pending_inputs.push_back(user_item("running", "test"));
+            }
+            let mut replay_buffer = ReplayBuffer::new(None);
+            let _ = actor.cancel_turn_for_send_now(&mut replay_buffer).await;
+            let snapshot = actor
+                .chat_state_handle
+                .snapshot()
+                .await
+                .expect("chat state alive");
+            let results: Vec<&str> = snapshot
+                .conversation
+                .iter()
+                .filter_map(|item| match item {
+                    ConversationItem::ToolResult(tr) if tr.tool_call_id == "call-1" => {
+                        Some(tr.content.as_ref())
+                    }
+                    _ => None,
+                })
+                .collect();
+            let [result] = results.as_slice() else {
+                panic!("exactly one result for the spawn call: {results:?}");
+            };
+            assert!(
+                result.contains("subagent_id: sub-1") && result.contains("do not spawn it again"),
+                "{result}"
+            );
+            assert_eq!(
+                Some((actor.session_info.id.0.to_string(), "running".to_owned())),
+                seen_rx.try_recv().ok()
             );
         })
         .await;

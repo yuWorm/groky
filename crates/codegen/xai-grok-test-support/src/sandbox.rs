@@ -239,12 +239,15 @@ impl TestSandboxBuilder {
 }
 
 impl TestSandbox {
-    fn init_git_workspace(&self) {
+    /// Leaves an existing `README.md` in place.
+    pub fn init_git_workspace(&self) {
         run_git(self, &["init"]);
         run_git(self, &["config", "user.email", "test@test.invalid"]);
         run_git(self, &["config", "user.name", "Grok Test"]);
-        std::fs::write(self.workspace.join("README.md"), "test file\n")
-            .expect("write sandbox git fixture");
+        let readme = self.workspace.join("README.md");
+        if !readme.exists() {
+            std::fs::write(&readme, "test file\n").expect("write sandbox git fixture");
+        }
         run_git(self, &["add", "-A"]);
         run_git(self, &["commit", "-m", "init", "--no-gpg-sign"]);
     }
@@ -365,6 +368,12 @@ fn baseline_env_from_parent(
     env.insert(
         "GIT_CONFIG_GLOBAL".into(),
         grok_home.join("gitconfig").into_os_string(),
+    );
+    // Leader-lock acquire slots stay inside the sandbox instead of the developer's `/tmp/grok-file-lock-<uid>`.
+    // Literal on purpose: `xai_grok_file_lock::SLOT_DIR_ENV` lives in a crate this one does not depend on.
+    env.insert(
+        "GROK_FILE_LOCK_SLOT_DIR".into(),
+        temp.join("lock-slots").into_os_string(),
     );
     env
 }
@@ -775,6 +784,10 @@ mod tests {
         assert_eq!(
             env_value(&sandbox, "TMPDIR"),
             Some(sandbox.temp_dir().into())
+        );
+        assert_eq!(
+            env_value(&sandbox, "GROK_FILE_LOCK_SLOT_DIR"),
+            Some(sandbox.temp_dir().join("lock-slots").into())
         );
         assert_eq!(
             env_value(&sandbox, "XAI_API_KEY").as_deref(),

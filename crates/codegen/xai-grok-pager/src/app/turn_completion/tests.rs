@@ -1385,6 +1385,10 @@ fn turn_stop_reason_parses_exact_tokens() {
         TurnStopReason::from("max_turn_requests"),
         TurnStopReason::MaxTurnRequests
     );
+    assert_eq!(
+        TurnStopReason::from("interrupted"),
+        TurnStopReason::Interrupted
+    );
     assert_eq!(TurnStopReason::from("nope"), TurnStopReason::Unknown);
 }
 

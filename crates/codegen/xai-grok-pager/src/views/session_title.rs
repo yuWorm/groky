@@ -204,8 +204,6 @@ pub(crate) fn format_relative_time(elapsed: Duration) -> String {
 mod tests {
     use super::*;
 
-    // ── sanitize_display_text ───────────────────────────────────────
-
     #[test]
     fn sanitize_passes_through_clean_ascii_unchanged_no_alloc() {
         let s = "session foo bar";
@@ -282,8 +280,6 @@ mod tests {
         assert!(matches!(out, Cow::Borrowed(_)));
     }
 
-    // ── rename_source_title ─────────────────────────────────────────
-
     #[test]
     fn rename_source_title_prefers_display_name() {
         let mut agent =
@@ -323,8 +319,6 @@ mod tests {
         );
     }
 
-    // ── truncate_title ──────────────────────────────────────────────
-
     #[test]
     fn truncate_title_keeps_short_strings() {
         assert_eq!(truncate_title("hello"), "hello");
@@ -348,8 +342,6 @@ mod tests {
         assert!(out.ends_with("..."));
         assert_eq!(out.chars().count(), MAX_TITLE_CHARS + 3);
     }
-
-    // ── format_relative_time ────────────────────────────────────────
 
     #[test]
     fn format_relative_time_sub_second_is_now() {

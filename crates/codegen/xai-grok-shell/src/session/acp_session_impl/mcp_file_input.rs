@@ -40,6 +40,7 @@ pub(super) struct McpFileSource {
     snapshot_bytes: usize,
     operation_remaining: Duration,
     pub(super) kind: xai_grok_telemetry::events::McpFileInputKind,
+    model_id: String,
     pub(super) started: Instant,
     completed: std::sync::atomic::AtomicBool,
 }
@@ -51,11 +52,19 @@ impl Drop for McpFileSource {
 }
 
 impl McpFileSource {
-    fn start(path: PathBuf, kind: xai_grok_telemetry::events::McpFileInputKind) -> Self {
-        log_file_event(xai_grok_telemetry::events::McpFileInputUsed { kind });
+    fn start(
+        path: PathBuf,
+        kind: xai_grok_telemetry::events::McpFileInputKind,
+        model_id: String,
+    ) -> Self {
+        log_file_event(xai_grok_telemetry::events::McpFileInputUsed {
+            kind,
+            model_id: model_id.clone(),
+        });
         McpFileSource {
             path,
             kind,
+            model_id,
             bytes: 0,
             snapshot_bytes: 0,
             operation_remaining: FILE_OPERATION_TIMEOUT,
@@ -97,7 +106,7 @@ impl PreparedMcpFile {
             Ok(bytes) | Err(bytes) => bytes,
         };
         measured.map_err(|observed| {
-            log_limit(
+            source.log_limit(
                 xai_grok_telemetry::events::McpFileLimitKind::Snapshots,
                 MAX_BATCH_SNAPSHOT_BYTES,
                 observed,
@@ -137,6 +146,21 @@ impl McpFileSource {
             source_bytes: self.bytes as u64,
             snapshot_bytes: self.snapshot_bytes as u64,
             duration_ms: self.started.elapsed().as_millis() as u64,
+            model_id: self.model_id.clone(),
+        });
+    }
+
+    fn log_limit(
+        &self,
+        kind: xai_grok_telemetry::events::McpFileLimitKind,
+        limit: usize,
+        observed: usize,
+    ) {
+        log_file_event(xai_grok_telemetry::events::McpFileInputLimitHit {
+            kind,
+            limit_bytes: limit as u64,
+            observed_bytes: observed as u64,
+            model_id: self.model_id.clone(),
         });
     }
 }
@@ -184,7 +208,7 @@ impl McpFileBatchBudget {
             ),
         ] {
             if observed > limit {
-                log_limit(kind, limit, observed);
+                file.source.log_limit(kind, limit, observed);
                 return Err("MCP file input batch budget exceeded".to_owned());
             }
         }
@@ -192,14 +216,6 @@ impl McpFileBatchBudget {
         self.snapshot_bytes += file.source.snapshot_bytes;
         Ok(())
     }
-}
-
-fn log_limit(kind: xai_grok_telemetry::events::McpFileLimitKind, limit: usize, observed: usize) {
-    log_file_event(xai_grok_telemetry::events::McpFileInputLimitHit {
-        kind,
-        limit_bytes: limit as u64,
-        observed_bytes: observed as u64,
-    });
 }
 
 pub(super) enum McpFilePreparation {
@@ -361,6 +377,7 @@ impl SessionActor {
         call: &crate::sampling::types::ToolCallResponse,
         tool_call_id: &acp::ToolCallId,
         input: &UseToolInput,
+        model_id: &str,
     ) -> Result<Result<(ToolInput, Value, McpFileSource), ToolLoop>, acp::Error> {
         let Some(path) = input.source_path() else {
             return Err(acp::Error::internal_error().data("expected file-backed invocation"));
@@ -374,7 +391,7 @@ impl SessionActor {
             }
             UseToolInput::Inline(_) => return Err(acp::Error::internal_error()),
         };
-        let mut source = McpFileSource::start(path.to_path_buf(), kind);
+        let mut source = McpFileSource::start(path.to_path_buf(), kind, model_id.to_owned());
         let resources = self.tool_bridge_handle().shared_resources().await;
         let fs = resources
             .lock()
@@ -445,7 +462,7 @@ impl SessionActor {
                 .await
                 .map_err(|error| {
                     if error.io_error_kind() == Some(io::ErrorKind::FileTooLarge) {
-                        log_limit(
+                        source.log_limit(
                             xai_grok_telemetry::events::McpFileLimitKind::Source,
                             MAX_SOURCE_BYTES,
                             MAX_SOURCE_BYTES + 1,

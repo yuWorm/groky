@@ -1417,8 +1417,7 @@ impl BlockContent for EditToolCallBlock {
     }
 
     fn default_display_mode(&self) -> DisplayMode {
-        // Context-free: the effective expanded default and the untrusted-summary escape live in ScrollbackState's materialize policy
-        // That policy runs in push / replace_tool_block; the pager.toml shape wins over the collapsed_edit_blocks flag
+        // Context-free. Expanded default and the untrusted-summary escape are applied in ScrollbackState push / replace_tool_block.
         DisplayMode::Collapsed
     }
 
@@ -2581,8 +2580,6 @@ mod tests {
         );
     }
 
-    // --- dual_line_numbers = true snapshots ---
-
     fn dual_config() -> DiffRenderConfig {
         DiffRenderConfig {
             dual_line_numbers: true,
@@ -2763,7 +2760,6 @@ mod tests {
         );
     }
 
-    // ── Edit syntax-highlight harness (triple-quote spill) ──
     // Asserts use **raw syntect RGB** (not ratatui FG after quantize)
     // Under `NO_COLOR` quantize maps every RGB to Reset, which would make keyword vs string asserts tautological / false
 

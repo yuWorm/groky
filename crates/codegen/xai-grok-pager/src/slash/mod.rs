@@ -1260,11 +1260,18 @@ impl SlashController {
         let rows: Vec<SuggestionRow> = if trimmed.is_empty() {
             items.iter().map(SuggestionRow::from_arg).collect()
         } else {
-            let hits = self
-                .matcher
-                .rank(items.as_slice(), trimmed, items.len(), |item| {
-                    item.match_text.as_str()
-                });
+            let fallbacks: Vec<String> = items.iter().map(label_match_haystack).collect();
+            let cands: Vec<(&ArgItem, &str)> = items
+                .iter()
+                .zip(fallbacks.iter().map(String::as_str))
+                .collect();
+            let hits = self.matcher.rank_either(
+                cands.as_slice(),
+                trimmed,
+                cands.len(),
+                |cand| cand.0.match_text.as_str(),
+                |cand| cand.1,
+            );
             hits.into_iter()
                 .filter_map(|(idx, _)| {
                     let mut row = SuggestionRow::from_arg(items.get(idx)?);
@@ -1277,6 +1284,31 @@ impl SlashController {
             target.and_then(|target| rows.iter().position(|row| row.insert_text == target));
         ArgSuggestions { rows, preselected }
     }
+}
+
+/// Label haystack. Keeps the model-name prefix when the label is not already in `match_text`.
+fn label_match_haystack(item: &ArgItem) -> String {
+    let label = item
+        .display
+        .strip_suffix(" (active)")
+        .or_else(|| item.display.strip_suffix(" (current)"))
+        .unwrap_or(item.display.as_str());
+    if contains_ignore_ascii_case(&item.match_text, label) {
+        return label.to_string();
+    }
+    match item.match_text.rsplit_once(' ') {
+        Some((prefix, _)) => format!("{prefix} {label}"),
+        None => label.to_string(),
+    }
+}
+
+fn contains_ignore_ascii_case(haystack: &str, needle: &str) -> bool {
+    let needle = needle.as_bytes();
+    needle.is_empty()
+        || haystack
+            .as_bytes()
+            .windows(needle.len())
+            .any(|window| window.eq_ignore_ascii_case(needle))
 }
 
 /// Conversely, [`SlashCommand::dashboard_only`] commands (`/cd`) are offered only when `hide_session_scoped` is set
@@ -1693,9 +1725,9 @@ mod tests {
     #[test]
     fn optional_arg_command_is_complete_without_args() {
         let reg = test_registry();
-        // /compact has takes_args=true, args_required=false.
-        assert!(is_command_complete("/compact", &reg));
-        assert!(is_command_complete("/compact some context", &reg));
+        // /copy has takes_args=true, args_required=false.
+        assert!(is_command_complete("/copy", &reg));
+        assert!(is_command_complete("/copy 2 out.md", &reg));
     }
 
     #[test]
@@ -3560,6 +3592,85 @@ mod tests {
         let text = "/model Reasoning X h";
         ctrl.refresh(&state, text, text.len(), &models);
         assert_eq!(0, state.snapshot().selected);
+    }
+
+    #[test]
+    fn model_effort_phase_matches_a_catalog_id_prefix() {
+        let mut ctrl = SlashController::with_builtins(std::path::PathBuf::from("."));
+        let state = SlashState::default();
+        let mut models = ModelState::default();
+        let id = acp::ModelId::new(Arc::from("grok-4.7"));
+        models.available.insert(
+            id.clone(),
+            acp::ModelInfo::new(id, "Grok 4.7").meta(
+                serde_json::json!({ "supportsReasoningEffort": true, "reasoningEffort": "high" })
+                    .as_object()
+                    .cloned(),
+            ),
+        );
+
+        // `grok-4.7` is not a subsequence of `Grok 4.7` (the hyphen). Rows must carry the id.
+        let text = "/model grok-4.7 ";
+        ctrl.refresh(&state, text, text.len(), &models);
+        let snap = state.snapshot();
+        assert!(snap.open, "effort menu closed for a catalog id");
+        assert_eq!(
+            Some("grok-4.7 high"),
+            snap.selection().map(|row| row.insert_text.as_str())
+        );
+
+        let text = "/model grok-4.7 hi";
+        ctrl.refresh(&state, text, text.len(), &models);
+        let snap = state.snapshot();
+        assert!(
+            snap.matches
+                .iter()
+                .any(|row| row.insert_text == "grok-4.7 high"),
+            "id prefix filtered out the effort rows: {:?}",
+            snap.matches
+                .iter()
+                .map(|row| row.insert_text.as_str())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn effort_active_suffix_is_not_searchable() {
+        let mut ctrl = SlashController::with_builtins(std::path::PathBuf::from("."));
+        let state = SlashState::default();
+        let mut models = ModelState::default();
+        let id = acp::ModelId::new(Arc::from("reasoning-x"));
+        models.available.insert(
+            id.clone(),
+            acp::ModelInfo::new(id.clone(), "Reasoning X").meta(
+                serde_json::json!({ "supportsReasoningEffort": true, "reasoningEffort": "high" })
+                    .as_object()
+                    .cloned(),
+            ),
+        );
+        models.current = Some(id);
+        models.reasoning_effort = Some(xai_grok_shell::sampling::types::ReasoningEffort::High);
+
+        let text = "/effort ";
+        ctrl.refresh(&state, text, text.len(), &models);
+        let open = state.snapshot();
+        assert!(
+            open.matches
+                .iter()
+                .any(|row| row.display == "high (active)"),
+            "expected the active row before filtering"
+        );
+
+        let text = "/effort act";
+        ctrl.refresh(&state, text, text.len(), &models);
+        let filtered = state.snapshot();
+        assert!(
+            filtered
+                .matches
+                .iter()
+                .all(|row| row.display != "high (active)"),
+            "active suffix matched"
+        );
     }
 
     #[test]

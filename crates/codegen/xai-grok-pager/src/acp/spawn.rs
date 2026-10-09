@@ -290,7 +290,7 @@ pub async fn spawn_grok_shell(
     xai_grok_shell::agent::app::apply_otel_config(&auth_manager, &agent_config.grok_com_config);
 
     // Policy repair must finish before any authenticated settings load.
-    xai_grok_shell::managed_config::ensure_managed_policy_present(&auth_manager).await;
+    xai_grok_cloud_config::managed_config::ensure_managed_policy_present(&auth_manager).await;
     // This worker is a current-thread runtime. Resolve settings here so the
     // sync bootstrap below observes a finished wait instead of falling open.
     let mut agent_config = agent_config;
@@ -369,10 +369,13 @@ async fn spawn_agent_thread_direct(
     skills_paths: Vec<String>,
 ) -> Result<thread::JoinHandle<Result<()>>> {
     spawn_runtime_thread("acp-agent-worker", move |rt| {
+        // Declared before the `LocalSet` so an unwind also drops it last: tokio drops tasks in spawn order, so the gateway task would free the agent before its `LocalRef` tasks are dropped.
+        let mut keepalive: Option<Rc<MvpAgent>> = None;
         let local = tokio::task::LocalSet::new();
-        let result = local.block_on(&rt, async move {
+        let result = local.block_on(&rt, async {
             let client_tx = channel.tx.clone();
             let agent_rc = spawn_agent(client_tx)?;
+            keepalive = Some(agent_rc.clone());
 
             let gw_rx = AcpGatewayReceiver::new(channel.rx, agent_rc.clone()).with_tracing(true);
             tokio::task::spawn_local(gw_rx.run());
@@ -390,8 +393,9 @@ async fn spawn_agent_thread_direct(
             );
             anyhow::Result::Ok(())
         });
-        // LocalSet before runtime, as an implicit scope-end drop would do.
+        // LocalSet before runtime, as an implicit scope-end drop would do; the agent last.
         drop(local);
+        drop(keepalive);
         shutdown_worker_runtime(rt);
         result
     })

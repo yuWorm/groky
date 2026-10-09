@@ -27,16 +27,23 @@ pub(crate) const CLI_BASE_URLS: &[&str] = &[CLI_BASE_URL_PRIMARY, CLI_BASE_URL_F
 /// [`CLI_BASE_URLS`], unless tests set `GROK_CLI_BASE_URL` to point fetches and downloads at one base (as they set `GROK_INSTALLER`).
 /// Loopback-only: downloads are verified by a smoke test, not a checksum, so redirecting to an arbitrary base could serve a hijacked install.
 pub(crate) fn cli_base_urls() -> Vec<String> {
-    if let Ok(base) = std::env::var("GROK_CLI_BASE_URL") {
-        let base = base.trim();
-        if is_loopback_base(base) {
-            return vec![base.to_owned()];
-        }
-        if !base.is_empty() {
-            tracing::warn!("GROK_CLI_BASE_URL ignored: only loopback bases are honored");
-        }
+    if let Some(base) = loopback_base_override() {
+        return vec![base];
     }
     CLI_BASE_URLS.iter().map(|s| (*s).to_owned()).collect()
+}
+
+/// `GROK_CLI_BASE_URL` when it names a loopback base.
+pub(crate) fn loopback_base_override() -> Option<String> {
+    let base = std::env::var("GROK_CLI_BASE_URL").ok()?;
+    let base = base.trim();
+    if is_loopback_base(base) {
+        return Some(base.to_owned());
+    }
+    if !base.is_empty() {
+        tracing::warn!("GROK_CLI_BASE_URL ignored: only loopback bases are honored");
+    }
+    None
 }
 
 /// Parsed, not prefix-matched: `http://127.0.0.1:9@evil.com` starts with a
@@ -361,6 +368,8 @@ pub async fn fetch_latest_version(installer: &str, config: &UpdateConfig) -> Res
     match installer {
         "npm" => fetch_npm_version(&config.channel, config.npm_registry.as_deref()).await,
         "gh-release" => fetch_gh_release_version(&config.channel).await,
+        // The WinGet package ships only stable releases, whatever channel is configured.
+        crate::winget::WINGET => fetch_gcs_version("stable").await,
         _ => fetch_gcs_version(&config.channel).await,
     }
 }
@@ -482,6 +491,11 @@ pub fn cached_stable_version() -> Option<String> {
     let content = std::fs::read_to_string(&version_path).ok()?;
     let gv: GrokVersion = serde_json::from_str(&content).ok()?;
     gv.stable_version
+}
+
+/// An empty or `"stable"` channel means stable, the installers' default (`CHANNEL="${GROK_CHANNEL:-stable}"` in install.sh).
+pub(crate) fn is_stable_channel(channel: &str) -> bool {
+    channel.is_empty() || channel == "stable"
 }
 
 /// Returns `Some("alpha")` when `current > stable`, `Some("stable")` when `current <= stable`, or `None` when either version fails to parse.

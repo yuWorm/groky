@@ -4004,7 +4004,10 @@ mod tests {
         let _inject = create_root::lock_grove_parent_inject();
 
         let temp = tempfile::TempDir::new().unwrap();
-        let repo = temp.path().join("repo");
+        // tempfile `.../.tmp*/repo` slugs to shared ~/.grok/worktrees/tmp-repo; shards
+        // then race `git worktree add` on label `strategy-wt-N`.
+        let unique = uuid::Uuid::new_v4().simple().to_string();
+        let repo = temp.path().join(format!("src-{unique}"));
         std::fs::create_dir(&repo).unwrap();
         init_git_repo(&repo);
         std::fs::write(repo.join("tracked.txt"), "x").unwrap();
@@ -4012,11 +4015,11 @@ mod tests {
 
         let req = CreateWorktreeFromWorktreeRequest {
             source_worktree_path: repo.to_string_lossy().into_owned(),
-            new_session_id: format!("strategy-{}", std::process::id()),
+            new_session_id: format!("strategy-{unique}"),
             copy_mode: WorktreeCopyMode::Dirty,
             git_ref: None,
             worktree_type: Some(WorktreeType::Linked),
-            label: Some("strategy-wt".into()),
+            label: Some(format!("strategy-wt-{unique}")),
             grove_worktree: Some(true),
             grove_gate_source: Some("request".into()),
             cancellation_token: None,
@@ -4253,5 +4256,75 @@ mod tests {
         assert!(!text.contains("url"), "{text}");
         assert!(!text.contains("repo"), "{text}");
         assert!(!text.contains("/dev/fuse"), "{text}");
+    }
+
+    #[test]
+    fn repeated_label_leaves_the_existing_directory_alone() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path();
+        std::fs::create_dir_all(base.join("keep")).unwrap();
+        std::fs::write(base.join("keep/ahead.txt"), "AHEAD").unwrap();
+        assert_eq!(resolve_label_collision(base, "keep"), "keep-2");
+        assert_eq!(
+            std::fs::read_to_string(base.join("keep/ahead.txt")).unwrap(),
+            "AHEAD"
+        );
+        assert_eq!(resolve_label_collision(base, "fresh"), "fresh");
+    }
+
+    #[tokio::test]
+    async fn apply_merge_reports_a_conflict_and_keeps_the_source_edit() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("repo");
+        std::fs::create_dir_all(&root).unwrap();
+        let git = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&root)
+                .env("GIT_AUTHOR_NAME", "t")
+                .env("GIT_AUTHOR_EMAIL", "t@x")
+                .env("GIT_COMMITTER_NAME", "t")
+                .env("GIT_COMMITTER_EMAIL", "t@x")
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "{args:?} {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        git(&["init", "-q", "-b", "main"]);
+        std::fs::write(root.join("README.md"), "committed\n").unwrap();
+        git(&["add", "README.md"]);
+        git(&["commit", "-q", "-m", "base"]);
+        let wt = tmp.path().join("wt-merge");
+        git(&["worktree", "add", "-q", wt.to_str().unwrap()]);
+        std::fs::write(wt.join("README.md"), "THEIRS").unwrap();
+        std::fs::write(wt.join("added.txt"), "NEW").unwrap();
+        std::fs::write(root.join("README.md"), "OURS").unwrap();
+        let response = apply_worktree(&ApplyWorktreeRequest {
+            session_id: "s".to_owned(),
+            worktree_path: wt.to_string_lossy().into_owned(),
+            mode: ApplyMode::Merge,
+        })
+        .await
+        .unwrap();
+        match response {
+            ApplyWorktreeResponse::Conflicts { conflicts, .. } => {
+                let [conflict] = conflicts.as_slice() else {
+                    panic!("expected one conflict, got {conflicts:?}");
+                };
+                assert_eq!(conflict.path, "README.md");
+            }
+            other => panic!("expected conflicts, got {other:?}"),
+        }
+        assert_eq!(
+            std::fs::read_to_string(root.join("README.md")).unwrap(),
+            "OURS"
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join("added.txt")).unwrap(),
+            "NEW"
+        );
     }
 }

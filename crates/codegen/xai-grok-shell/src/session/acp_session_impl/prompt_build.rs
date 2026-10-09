@@ -539,28 +539,34 @@ impl SessionActor {
             )
         };
         let mut prefix_carries_fallback_date = false;
-        let mut out = if !matches!(template, UserMessageTemplate::Default) {
+        let (mut out, uses_legacy_prefix) = if !matches!(template, UserMessageTemplate::Default) {
             if let Some(rendered) = self
                 .build_templated_user_message(cwd, template.clone())
                 .await
             {
-                rendered
+                (rendered, false)
             } else {
                 tracing::warn!(
                     "templated user message render failed; falling back to legacy prefix"
                 );
                 prefix_carries_fallback_date = !template.surfaces_local_date();
-                self.construct_legacy_prefix(cwd)
+                (self.construct_legacy_prefix(cwd), true)
             }
         } else {
-            self.construct_legacy_prefix(cwd)
+            (self.construct_legacy_prefix(cwd), true)
         };
-        if matches!(template, UserMessageTemplate::Default) && include_verification {
-            let (workspace_rules, mut user_rules) = self.gather_partitioned_rules();
-            user_rules.splice(
-                0..0,
-                xai_grok_agent::prompt::browser_verification::synthetic_user_rules(),
-            );
+        if uses_legacy_prefix {
+            let (workspace_rules, discovered_user_rules) = if include_verification {
+                self.gather_partitioned_rules()
+            } else {
+                (Vec::new(), Vec::new())
+            };
+            let mut user_rules = xai_grok_agent::prompt::user_message::built_in_user_rules();
+            if include_verification {
+                user_rules
+                    .extend(xai_grok_agent::prompt::browser_verification::synthetic_user_rules());
+                user_rules.extend(discovered_user_rules);
+            }
             xai_grok_agent::prompt::user_message::append_rules_section(
                 &mut out,
                 &workspace_rules,
@@ -623,8 +629,8 @@ impl SessionActor {
         self.wait_for_mcp_startup_grace().await;
         let bridge = self.agent.borrow().tool_bridge().clone();
         let vcs_root = self.vcs_root.clone();
-        let (workspace_rules, user_rules) = self.gather_partitioned_rules();
-        let mut user_rules = user_rules;
+        let (workspace_rules, discovered_user_rules) = self.gather_partitioned_rules();
+        let mut user_rules = xai_grok_agent::prompt::user_message::built_in_user_rules();
         let skills = self.slash_skills_for_resolve().await;
         let mcp_servers = self.gather_mcp_servers(cwd).await;
         if self
@@ -633,11 +639,9 @@ impl SessionActor {
             .definition()
             .include_browser_verification()
         {
-            user_rules.splice(
-                0..0,
-                xai_grok_agent::prompt::browser_verification::synthetic_user_rules(),
-            );
+            user_rules.extend(xai_grok_agent::prompt::browser_verification::synthetic_user_rules());
         }
+        user_rules.extend(discovered_user_rules);
         let shell = resolve_session_shell();
         let today_local = chrono::Local::now().date_naive();
         let mcps_root = Self::workspace_mcps_root(cwd).map(|p| p.to_string_lossy().to_string());

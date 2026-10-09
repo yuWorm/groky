@@ -766,20 +766,16 @@ pub fn worktree_session_cwd(
     source_git_root: Option<&str>,
     launch_cwd: &Path,
 ) -> PathBuf {
-    let Some(git_root) = source_git_root else {
+    let Some(relative) = source_git_root.and_then(|root| launch_cwd.strip_prefix(root).ok()) else {
         return worktree_root.to_path_buf();
     };
-    let cwd_str = launch_cwd.to_string_lossy();
-    match cwd_str.strip_prefix(git_root) {
-        Some(relative) => {
-            let relative = relative.trim_start_matches('/');
-            if relative.is_empty() {
-                worktree_root.to_path_buf()
-            } else {
-                worktree_root.join(relative)
-            }
-        }
-        None => worktree_root.to_path_buf(),
+    let stays_inside = relative
+        .components()
+        .all(|c| matches!(c, std::path::Component::Normal(_)));
+    if relative.as_os_str().is_empty() || !stays_inside {
+        worktree_root.to_path_buf()
+    } else {
+        worktree_root.join(relative)
     }
 }
 /// Cwd where a forked child session is written (the interactive and headless SSOT).
@@ -1111,14 +1107,14 @@ pub(crate) fn in_place_restore_code_allowed(
     requested_id == resolved_id
 }
 pub(crate) fn plan_remote_miss(ctx: MaterializeCtx, arg_is_uuid: bool) -> RemoteMissPlan {
-    if ctx.has_worktree {
-        return RemoteMissPlan::DeferToWorktree {
-            deferred_local_miss: !arg_is_uuid,
-        };
-    }
     if !ctx.allow_remote_restore {
         return RemoteMissPlan::NotFound {
             title_miss_hint: !arg_is_uuid,
+        };
+    }
+    if ctx.has_worktree {
+        return RemoteMissPlan::DeferToWorktree {
+            deferred_local_miss: !arg_is_uuid,
         };
     }
     if ctx.restore_code {
@@ -1650,6 +1646,34 @@ mod tests {
         );
     }
     #[test]
+    fn worktree_session_cwd_never_leaves_the_worktree_root() {
+        let wt = Path::new("/wt/abc");
+        assert_eq!(
+            worktree_session_cwd(wt, Some("/repo"), Path::new("/repository/crates")),
+            PathBuf::from("/wt/abc")
+        );
+        assert_eq!(
+            worktree_session_cwd(wt, Some("/repo"), Path::new("/repo/../etc")),
+            PathBuf::from("/wt/abc")
+        );
+        assert_eq!(
+            worktree_session_cwd(wt, Some("/repo/"), Path::new("/repo/crates")),
+            PathBuf::from("/wt/abc/crates")
+        );
+    }
+    #[cfg(windows)]
+    #[test]
+    fn worktree_session_cwd_keeps_subdirectory_offset_on_windows() {
+        assert_eq!(
+            worktree_session_cwd(
+                Path::new(r"C:\wt\abc"),
+                Some(r"C:\repo"),
+                Path::new(r"C:\repo\crates\pager")
+            ),
+            PathBuf::from(r"C:\wt\abc\crates\pager")
+        );
+    }
+    #[test]
     fn fork_session_params_sets_new_session_id_and_workspace_dir() {
         let cwd = PathBuf::from("/wt");
         let p = fork_session_params("parent-1", &cwd, Some("child-uuid"), true);
@@ -1739,11 +1763,11 @@ mod tests {
     async fn continue_skips_empty_worktree_stamped_husk() {
         let mut fx = crate::test_util::GrokHomeFixture::new();
         let cwd = fx.cwd_str();
-        let real_id = "aaaaaaaa-1111-2222-3333-444444444444";
-        let husk_id = "bbbbbbbb-1111-2222-3333-444444444444";
+        let real_id = uuid::Uuid::new_v4().to_string();
+        let husk_id = uuid::Uuid::new_v4().to_string();
         fx.write_summary(
             &cwd,
-            real_id,
+            &real_id,
             serde_json::json!({
                 "updated_at": "2026-07-01T00:00:00Z",
                 "generated_title": "real work",
@@ -1752,7 +1776,7 @@ mod tests {
         );
         fx.write_summary(
             &cwd,
-            husk_id,
+            &husk_id,
             serde_json::json!({
                 "updated_at": "2026-07-02T00:00:00Z",
                 "session_kind": "worktree",
@@ -1781,11 +1805,11 @@ mod tests {
     async fn continue_keeps_empty_worktree_fork() {
         let mut fx = crate::test_util::GrokHomeFixture::new();
         let cwd = fx.cwd_str();
-        let older_id = "aaaaaaaa-1111-2222-3333-444444444444";
-        let fork_id = "bbbbbbbb-1111-2222-3333-444444444444";
+        let older_id = uuid::Uuid::new_v4().to_string();
+        let fork_id = uuid::Uuid::new_v4().to_string();
         fx.write_summary(
             &cwd,
-            older_id,
+            &older_id,
             serde_json::json!({
                 "updated_at": "2026-07-01T00:00:00Z",
                 "generated_title": "older",
@@ -1794,7 +1818,7 @@ mod tests {
         );
         fx.write_summary(
             &cwd,
-            fork_id,
+            &fork_id,
             serde_json::json!({
                 "updated_at": "2026-07-02T00:00:00Z",
                 "session_kind": "worktree",
@@ -1825,26 +1849,29 @@ mod tests {
     async fn most_recent_fork_selection_follows_surface() {
         let mut fx = crate::test_util::GrokHomeFixture::new();
         let cwd = fx.cwd_str();
-        let interactive_id = "aaaaaaaa-1111-2222-3333-444444444444";
-        let headless_id = "bbbbbbbb-1111-2222-3333-444444444444";
+        let interactive_id = uuid::Uuid::new_v4().to_string();
+        let headless_id = uuid::Uuid::new_v4().to_string();
         fx.write_summary(
             &cwd,
-            interactive_id,
+            &interactive_id,
             serde_json::json!({ "updated_at": "2026-07-01T00:00:00Z" }),
         );
         fx.write_summary(
             &cwd,
-            headless_id,
+            &headless_id,
             serde_json::json!({
                 "updated_at": "2026-07-02T00:00:00Z",
                 "session_kind": "headless",
             }),
         );
         for (args, expected_parent) in [
-            (["grok", "-c", "--fork-session"].as_slice(), interactive_id),
+            (
+                ["grok", "-c", "--fork-session"].as_slice(),
+                interactive_id.as_str(),
+            ),
             (
                 ["grok", "-p", "run", "-c", "--fork-session"].as_slice(),
-                headless_id,
+                headless_id.as_str(),
             ),
         ] {
             let args = parse(args);
@@ -2263,7 +2290,7 @@ mod tests {
         unsafe { std::env::set_var("GROK_HOME", home.path()) };
         let cwd = tempfile::tempdir().expect("cwd tempdir");
         let cwd_str = cwd.path().to_string_lossy().to_string();
-        let id = "aaaaaaaa-1111-2222-3333-444444444444";
+        let id = uuid::Uuid::new_v4().to_string();
         let encoded = xai_grok_shell::util::grok_home::encode_cwd_dirname(&cwd_str);
         let sessions_cwd_dir = xai_grok_shell::util::grok_home::grok_home()
             .join("sessions")
@@ -2275,13 +2302,13 @@ mod tests {
             }
         }
         let _cleanup = RmDirOnDrop(sessions_cwd_dir.clone());
-        let session_dir = sessions_cwd_dir.join(id);
+        let session_dir = sessions_cwd_dir.join(&id);
         std::fs::create_dir_all(&session_dir).unwrap();
         std::fs::write(session_dir.join("summary.json"), "{}").unwrap();
         let out = materialize_startup_for_cwd(
             chat_ctx(),
             SessionStartupIntent::Resume {
-                session_id: Some(id.into()),
+                session_id: Some(id.clone()),
                 most_recent_for_cwd: false,
             },
             &cwd_str,
@@ -2290,7 +2317,7 @@ mod tests {
         .unwrap();
         match &out {
             MaterializedStartup::Resume { session_id, .. } => {
-                assert_eq!(session_id, id);
+                assert_eq!(session_id, &id);
                 assert!(
                     chat_mode_refuses_local_build_load(true, false, session_id, cwd.path()),
                     "cwd-local Build collision must still be refused after passthrough"
@@ -2342,7 +2369,7 @@ mod tests {
             let cwd_str = fx.cwd_str();
             fx.write_summary(
                 &cwd_str,
-                "bbbbbbbb-1111-2222-3333-444444444444",
+                &uuid::Uuid::new_v4().to_string(),
                 serde_json::json!({
                     "generated_title": "Fix Login Bug",
                     "session_kind": "headless",
@@ -2358,10 +2385,10 @@ mod tests {
         async fn headless_title_resume_keeps_headless_matches() {
             let mut fx = GrokHomeFixture::new();
             let cwd_str = fx.cwd_str();
-            let id = "aaaaaaaa-1111-2222-3333-444444444444";
+            let id = uuid::Uuid::new_v4().to_string();
             fx.write_summary(
                 &cwd_str,
-                id,
+                &id,
                 serde_json::json!({
                     "generated_title": "Batch Run",
                     "session_kind": "headless",
@@ -2383,15 +2410,15 @@ mod tests {
         async fn title_fallback_resumes_single_match_case_insensitively() {
             let mut fx = GrokHomeFixture::new();
             let cwd_str = fx.cwd_str();
-            let id = "bbbbbbbb-1111-2222-3333-444444444444";
+            let id = uuid::Uuid::new_v4().to_string();
             fx.write_summary(
                 &cwd_str,
-                id,
+                &id,
                 serde_json::json!({ "generated_title": "Fix Login Bug", "title_is_manual": true }),
             );
             fx.write_summary(
                 &cwd_str,
-                "bbbbbbbb-1111-2222-3333-555555555555",
+                &uuid::Uuid::new_v4().to_string(),
                 serde_json::json!({ "generated_title": "Other Work" }),
             );
             match resume("fix login bug", &cwd_str).await.unwrap() {
@@ -2445,6 +2472,7 @@ mod tests {
             fx.write_summary(&cwd_str, "release-notes", serde_json::json!({}));
             let worktree_ctx = MaterializeCtx {
                 has_worktree: true,
+                allow_remote_restore: true,
                 ..local_ctx()
             };
             let resume_intent = |arg: &str| SessionStartupIntent::Resume {

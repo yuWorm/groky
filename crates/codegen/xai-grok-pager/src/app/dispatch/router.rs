@@ -50,9 +50,9 @@ use super::prompt::{
 use super::queue;
 use super::queue::dispatch_drain_queue;
 use super::rewind::{
-    dispatch_inline_edit_submit, dispatch_rewind, dispatch_rewind_cancel_offer,
-    dispatch_rewind_confirm, dispatch_rewind_confirm_never_ask, dispatch_rewind_dismiss,
-    dispatch_rewind_dismiss_error, dispatch_rewind_picker_select, dispatch_rewind_show_picker,
+    dispatch_rewind, dispatch_rewind_cancel_offer, dispatch_rewind_confirm,
+    dispatch_rewind_confirm_never_ask, dispatch_rewind_dismiss, dispatch_rewind_dismiss_error,
+    dispatch_rewind_picker_select, dispatch_rewind_show_picker,
 };
 use super::session::foreign::dispatch_fetch_session_list;
 use super::session::fork::{
@@ -62,7 +62,7 @@ use super::session::fork::{
 use super::session::lifecycle::{
     clear_startup_actions, dispatch_accept_consent, dispatch_agent_type_mismatch_answered,
     dispatch_delete_current_session_answered, dispatch_exit_session, dispatch_new_session,
-    dispatch_new_session_inner, dispatch_new_session_with_id, dispatch_new_worktree_session,
+    dispatch_new_session_from_tab, dispatch_new_session_with_id, dispatch_new_worktree_session,
     dispatch_trust_folder, leave_welcome_for_session, open_delete_current_session_question,
     open_new_session_question,
 };
@@ -75,8 +75,8 @@ use super::session::load::{
 };
 use super::session::modal::{dispatch_rename_session, dispatch_reset_session_title};
 use super::settings::setters::{
-    clear_default_model, clear_fork_secondary_model, persist_default_model,
-    preview_auto_dark_theme, preview_auto_light_theme, preview_theme,
+    clear_default_model, clear_fork_secondary_model, clear_subagent_model_inheritance,
+    persist_default_model, preview_auto_dark_theme, preview_auto_light_theme, preview_theme,
     set_ask_user_question_timeout_enabled, set_auto_dark_theme, set_auto_light_theme,
     set_auto_update, set_collapsed_edit_blocks, set_combine_queued_prompts, set_compact_mode,
     set_confirm_before_rewind, set_contextual_hint_export_copy, set_contextual_hint_image_input,
@@ -87,9 +87,9 @@ use super::settings::setters::{
     set_invert_scroll, set_keep_text_selection, set_max_thoughts_width, set_multiline_mode,
     set_page_flip_on_send, set_prompt_suggestions, set_remember_tool_approvals, set_render_mermaid,
     set_respect_manual_folds, set_screen_mode, set_scroll_lines, set_scroll_mode, set_scroll_speed,
-    set_show_thinking_blocks, set_show_tips, set_simple_mode, set_theme, set_timeline,
-    set_timestamps, set_vim_mode, set_voice_capture_mode, set_voice_keybind_enabled,
-    set_voice_stt_language,
+    set_show_thinking_blocks, set_show_tips, set_simple_mode, set_subagent_model_inheritance,
+    set_theme, set_timeline, set_timestamps, set_vim_mode, set_voice_capture_mode,
+    set_voice_keybind_enabled, set_voice_stt_language,
 };
 use super::settings::ui::{
     dispatch_confirm_reset_setting, dispatch_open_command_palette, dispatch_open_howto_guides,
@@ -115,7 +115,7 @@ use super::turn::{
     dispatch_demote_to_background, dispatch_kill_bg_task, dispatch_kill_subagent,
 };
 use super::voice::{dispatch_enable_voice_mode, dispatch_voice_stop, dispatch_voice_toggle};
-use crate::app::actions::{Action, Effect};
+use crate::app::actions::{Action, Effect, ModelChoice};
 use crate::app::agent_view::ActivePane;
 use crate::app::app_view::{ActiveView, AppView, AuthState};
 use crate::app::consent::ConsentState;
@@ -777,14 +777,19 @@ fn dispatch_inner(action: Action, app: &mut AppView) -> Vec<Effect> {
             let Some(session_id) = agent.session.session_id.clone() else {
                 return vec![];
             };
-            if let Some(ref mut modal) = agent.extensions_modal {
-                modal.skills_data = crate::views::extensions_modal::TabDataState::Loading;
-                modal.workflows_data = crate::views::extensions_modal::TabDataState::Loading;
-            }
+            let Some(ref mut modal) = agent.extensions_modal else {
+                return vec![];
+            };
+            modal.skills_data = crate::views::extensions_modal::TabDataState::Loading;
+            modal.workflows_data = crate::views::extensions_modal::TabDataState::Loading;
             vec![
                 Effect::FetchSkillsList {
                     agent_id: id,
                     session_id: session_id.clone(),
+                    // `r` on the Workflows tab reloads the skills too, from the cache
+                    refresh: modal.active_tab
+                        == crate::views::extensions_modal::ExtensionsTab::Skills,
+                    fetch: modal.next_skills_fetch(),
                 },
                 Effect::FetchWorkflowsList {
                     agent_id: id,
@@ -956,14 +961,39 @@ fn dispatch_inner(action: Action, app: &mut AppView) -> Vec<Effect> {
             }]
         }
         Action::NextModel => vec![],
-        Action::SwitchModel { model_id, effort } => {
+        Action::SwitchModel(mut choice) => {
             let ActiveView::Agent(id) = app.active_view else {
                 return vec![];
             };
             let Some(agent) = app.agents.get_mut(&id) else {
                 return vec![];
             };
+            if choice.context_window_selection.is_some() && agent.session.model_switch_pending {
+                agent
+                    .scrollback
+                    .push_block(crate::scrollback::block::RenderBlock::system(
+                        "Model switch in progress; retry once it completes",
+                    ));
+                return vec![];
+            }
+            let models = &agent.session.models;
+            choice.context_window_selection = choice.context_window_selection.filter(|window| {
+                models.current.as_ref() == Some(&choice.model_id)
+                    || Some(window.get()) != models.window_after_switch_to(&choice.model_id)
+            });
             let Some(session_id) = agent.session.session_id.clone() else {
+                if choice.context_window_selection.is_some() {
+                    agent
+                        .scrollback
+                        .push_block(
+                            crate::scrollback::block::RenderBlock::system(
+                                "Context window applies once the session starts; run /context-window then",
+                            ),
+                        );
+                }
+                let ModelChoice {
+                    model_id, effort, ..
+                } = choice;
                 let prev_model = agent.session.models.current.clone();
                 let prev_effort = agent.session.models.reasoning_effort;
                 agent.session.models.set_current(model_id.clone(), effort);
@@ -995,8 +1025,7 @@ fn dispatch_inner(action: Action, app: &mut AppView) -> Vec<Effect> {
             vec![Effect::SwitchModel {
                 agent_id: id,
                 session_id,
-                model_id,
-                effort,
+                choice,
                 prev_model_id: None,
             }]
         }
@@ -1054,9 +1083,6 @@ fn dispatch_inner(action: Action, app: &mut AppView) -> Vec<Effect> {
         Action::CancelScheduledTask(task_id) => dispatch_cancel_scheduled_task(app, task_id),
         Action::DemoteToBackground => dispatch_demote_to_background(app),
         Action::RequestBundleStatus => vec![Effect::FetchBundleStatus],
-        Action::ViewCatalogEntry { kind, name } => {
-            vec![Effect::FetchCatalogEntry { kind, name }]
-        }
         Action::CycleMode => dispatch_cycle_mode(app),
         Action::ShareSession => dispatch_share_session(app),
         Action::ShowSessionInfo => dispatch_show_session_info(app),
@@ -1117,6 +1143,8 @@ fn dispatch_inner(action: Action, app: &mut AppView) -> Vec<Effect> {
         Action::SetAskUserQuestionTimeoutEnabled(v) => {
             set_ask_user_question_timeout_enabled(app, v)
         }
+        Action::SetSubagentModelInheritance(v) => set_subagent_model_inheritance(app, v),
+        Action::ClearSubagentModelInheritance => clear_subagent_model_inheritance(app),
         Action::SetKeepTextSelection(v) => set_keep_text_selection(app, v),
         Action::SetScrollSpeed(v) => set_scroll_speed(app, v),
         Action::SetScrollMode(v) => set_scroll_mode(app, v),
@@ -1376,7 +1404,7 @@ fn dispatch_inner(action: Action, app: &mut AppView) -> Vec<Effect> {
             let mut effects = if worktree {
                 dispatch_new_worktree_session(app, None, None, None, None, None, None)
             } else {
-                dispatch_new_session_inner(app, None)
+                dispatch_new_session_from_tab(app)
             };
             apply_persist_worktree_mode(
                 &mut app.new_session_worktree_mode,
@@ -1644,7 +1672,6 @@ fn dispatch_inner(action: Action, app: &mut AppView) -> Vec<Effect> {
         Action::RewindCancelOffer => dispatch_rewind_cancel_offer(app),
         Action::RewindDismiss => dispatch_rewind_dismiss(app),
         Action::RewindDismissError => dispatch_rewind_dismiss_error(app),
-        Action::InlineEditSubmit => dispatch_inline_edit_submit(app),
         Action::JumpShowPicker => dispatch_jump_show_picker(app),
         Action::JumpPickerSelect(turn_idx) => dispatch_jump_picker_select(app, turn_idx),
         Action::JumpDismiss => dispatch_jump_dismiss(app),

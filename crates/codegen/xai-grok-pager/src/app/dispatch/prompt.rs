@@ -221,6 +221,32 @@ pub(super) fn dispatch_execute_plan(
     }]
 }
 
+pub(in crate::app::dispatch) const LOAD_FAILED_NOTICE: &str =
+    "This session didn't open. Open it again with /resume, or start a new one with /new.";
+
+/// A tab whose session never opened has nothing to send to, so its prompt or command would queue forever.
+fn refuse_if_load_failed(app: &mut AppView, id: AgentId) -> bool {
+    let minimal = app.screen_mode.is_minimal();
+    app.agents
+        .get_mut(&id)
+        .is_some_and(|agent| refuse_on_failed_tab(agent, minimal))
+}
+
+/// Minimal mode shows no toasts, so the notice goes to the scrollback there.
+fn refuse_on_failed_tab(agent: &mut AgentView, minimal: bool) -> bool {
+    if !agent.load_failed {
+        return false;
+    }
+    if minimal {
+        agent
+            .scrollback
+            .push_block(RenderBlock::system(LOAD_FAILED_NOTICE.to_owned()));
+    } else {
+        agent.show_toast(LOAD_FAILED_NOTICE);
+    }
+    true
+}
+
 pub(super) fn dispatch_send_prompt(app: &mut AppView, text: String) -> Vec<Effect> {
     crate::unified_log::info(
         "prompt.enqueue",
@@ -643,6 +669,13 @@ pub(super) fn dispatch_send_prompt_submission(
         }
         return prelude;
     };
+    // A slash command is refused below only if it would queue, so `/new`, `/resume`, and `exit` still run
+    let runs_locally = !literal
+        && (text.trim().starts_with('/')
+            || crate::slash::commands::exit::is_exit_alias(text.trim()));
+    if !runs_locally && refuse_if_load_failed(app, id) {
+        return prelude;
+    }
     // Match the later slash path: only a line that itself starts with `/` is a command.
     // Chip-stripped text can look like `/feedback` after a leading image without being one.
     if !literal && text.trim().starts_with('/') {
@@ -699,6 +732,7 @@ pub(super) fn dispatch_send_prompt_submission(
     let ask_user_question_timeout_enabled_from_app = app.ask_user_question_timeout_enabled;
     let voice_stt_language_from_app = app.voice_config.language.clone();
     let persisted_default_from_app = app.persisted_default_model.clone();
+    let subagent_model_inheritance_from_app = app.subagent_model_inheritance;
     let login_method_id_from_app = app.login_method_id.as_ref().map(|id| id.0.to_string());
     let leader_mode = app.leader_mode;
     let screen_mode_is_minimal = app.screen_mode.is_minimal();
@@ -841,6 +875,7 @@ pub(super) fn dispatch_send_prompt_submission(
                     auto_mode_gate: auto_mode_gate_from_app,
                     ask_user_question_timeout_enabled: ask_user_question_timeout_enabled_from_app,
                     voice_stt_language: voice_stt_language_from_app,
+                    subagent_model_inheritance: subagent_model_inheritance_from_app,
                 },
             };
 
@@ -896,6 +931,15 @@ pub(super) fn dispatch_send_prompt_submission(
         // Map CommandResult to pager behavior. (MRU persistence is queued off-thread inside `record_command_use` above.)
         // The feedback modal owns the composer only once it accepts the open, so it settles before the
         // shared image disposition below.
+        if matches!(
+            exec_result,
+            CommandResult::QueueCommand(_)
+                | CommandResult::InjectSkill { .. }
+                | CommandResult::PassThrough(_)
+        ) && refuse_on_failed_tab(agent, app.screen_mode.is_minimal())
+        {
+            return effects;
+        }
         let exec_result = match exec_result {
             CommandResult::Action(Action::OpenFeedbackModal(mut open)) => {
                 // Composer chips stay put until this open is accepted. A no-session
@@ -1298,6 +1342,9 @@ pub(super) fn dispatch_send_bash_command(app: &mut AppView, command: String) -> 
     let ActiveView::Agent(id) = app.active_view else {
         return vec![];
     };
+    if refuse_if_load_failed(app, id) {
+        return vec![];
+    }
     let leader_mode = app.leader_mode;
     let Some(agent) = app.agents.get_mut(&id) else {
         return vec![];
@@ -1693,6 +1740,9 @@ pub(super) fn handle_prompt_response(
 
         let was_bash_turn = agent.bash_turn;
         finish_turn_view(agent, TurnEnd::Completed);
+        // Worker threads go idle holding this turn's freed pages, and jemalloc on macOS has no decay thread to return them.
+        // Here, not in `finish_turn_view`: that also runs on the animation tick, where purges must wait for the frame to draw.
+        crate::memory_release::release_retained_memory("turn-end");
 
         // In-turn reviews die with their ext method. A post-turn review is the waiting UI and stays.
         // Cancelled or failed turns do not open approve/build for an in-progress or rejected plan.

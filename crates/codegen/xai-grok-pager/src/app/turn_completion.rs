@@ -41,6 +41,8 @@ pub(crate) enum TurnStopReason {
     Error,
     MaxTokens,
     MaxTurnRequests,
+    /// The agent process died or was restarted mid-turn; the shell closes the turn on the next load.
+    Interrupted,
     Unknown,
 }
 
@@ -54,6 +56,7 @@ impl From<&str> for TurnStopReason {
             "error" => Self::Error,
             "max_tokens" => Self::MaxTokens,
             "max_turn_requests" => Self::MaxTurnRequests,
+            xai_grok_shell::session::interrupted_turn::INTERRUPTED_STOP_REASON => Self::Interrupted,
             _ => Self::Unknown,
         }
     }
@@ -105,11 +108,19 @@ pub(crate) fn terminal_marker(input: TerminalMarkerInput<'_>) -> Option<SessionE
             input.agent_result,
             elapsed,
         )),
+        // The shell's text names the cause; the request-failure formatter would relabel it "Request failed"
+        TurnStopReason::Interrupted => Some(SessionEvent::TurnFailed {
+            error: input
+                .agent_result
+                .unwrap_or(xai_grok_shell::session::interrupted_turn::INTERRUPTED_MESSAGE)
+                .to_string(),
+            elapsed,
+        }),
     }
 }
 
 /// The turn-failed terminal marker: formats `agent_result` with the typed kind.
-/// One builder for all rails (classifier, wake failure, busy-wake pierce) so the failure copy can't drift between them.
+/// One builder for every rail that paints a failure so the copy can't drift between them.
 pub(super) fn failed_turn_event(
     error_kind: Option<WireErrorType>,
     agent_result: Option<&str>,

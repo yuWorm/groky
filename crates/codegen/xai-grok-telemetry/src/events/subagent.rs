@@ -219,6 +219,7 @@ pub struct SubagentRateLimitWaited {
 #[serde(rename_all = "snake_case")]
 pub enum WorkflowSourceKind {
     Builtin,
+    Bundled,
     File,
     Inline,
 }
@@ -261,6 +262,10 @@ pub enum WorkflowRunEndStatus {
 pub struct WorkflowRunEnded {
     pub run_id: String,
     pub parent_session_id: String,
+    pub source: WorkflowSourceKind,
+    /// Built-in workflow names only; user script names stay local.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub workflow_name: Option<String>,
     pub status: WorkflowRunEndStatus,
     /// Cumulative across the run's episodes.
     pub duration_ms: u64,

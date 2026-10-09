@@ -909,13 +909,6 @@ fn dedup_persona_role<'a, 'b>(
     }
 }
 
-pub(crate) fn format_type_label(subagent_type: &str) -> &str {
-    match subagent_type {
-        "general-purpose" => "general",
-        other => other,
-    }
-}
-
 pub(crate) fn format_context_badge(info: &SubagentInfo) -> &str {
     match info.attempt.context_source.as_deref() {
         Some("resumed") => "resumed",
@@ -977,12 +970,10 @@ pub(crate) fn format_subagent_label(info: &SubagentInfo) -> (String, String) {
         .filter(|s| !s.is_empty())
     {
         r.to_string()
-    } else if info.subagent_type.as_ref() != "general-purpose" {
-        format_type_label(&info.subagent_type).to_string()
     } else if let Some(tag) = tag {
         tag.to_string()
     } else {
-        "general".to_string()
+        "subagent".to_string()
     };
 
     // Iterating handles uppercase mappings that span several codepoints (`ß` becomes `SS`)

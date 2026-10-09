@@ -17,21 +17,42 @@ pub async fn resolve_read_path(logical: &Path) -> (PathBuf, Option<String>) {
     }
 }
 
-/// Apply memory and opted-in ignored-file policy without recording a model read.
-///
-/// # Errors
-/// Returns the existing memory-policy or ignored-file denial message.
-pub async fn validate_read_paths(
+#[derive(Debug)]
+pub(crate) enum ReadPathDenial {
+    Ignored,
+    Other(String),
+}
+
+pub(crate) struct ReadPathFacts {
+    pub in_memory: bool,
+}
+
+pub(crate) fn ignored_message(display: &Path) -> String {
+    format!(
+        "Error: {} is ignored by .gitignore and cannot be read.",
+        display.display()
+    )
+}
+
+/// Same checks as [`validate_read_paths`], plus whether the path is in memory.
+pub(crate) async fn inspect_read_paths(
     resources: &SharedResources,
     logical: &Path,
     physical: &Path,
     ignored_display: Option<&Path>,
-) -> Result<(), String> {
-    crate::types::memory_v2::validate_memory_v2_read(resources, logical).await?;
+) -> Result<ReadPathFacts, ReadPathDenial> {
+    let mut in_memory =
+        match crate::types::memory_v2::validate_memory_v2_read(resources, logical).await {
+            Ok(flag) => flag,
+            Err(error) => return Err(ReadPathDenial::Other(error)),
+        };
     if physical != logical {
-        crate::types::memory_v2::validate_memory_v2_read(resources, physical).await?;
+        match crate::types::memory_v2::validate_memory_v2_read(resources, physical).await {
+            Ok(flag) => in_memory |= flag,
+            Err(error) => return Err(ReadPathDenial::Other(error)),
+        }
     }
-    if let Some(display) = ignored_display {
+    if let Some(_display) = ignored_display {
         let filter = {
             let resources = resources.lock().await;
             if resources
@@ -51,14 +72,33 @@ pub async fn validate_read_paths(
                     filter.is_logical_path_ignored(&logical) || filter.is_ignored(&physical)
                 }))
                 .await
-                .map_err(|_| "Read policy worker failed".to_owned())?;
+                .map_err(|_| ReadPathDenial::Other("Read policy worker failed".to_owned()))?;
             if ignored {
-                return Err(format!(
-                    "Error: {} is ignored by .gitignore and cannot be read.",
-                    display.display()
-                ));
+                return Err(ReadPathDenial::Ignored);
             }
         }
     }
-    Ok(())
+    Ok(ReadPathFacts { in_memory })
+}
+
+/// Apply memory and opted-in ignored-file policy without recording a model read.
+///
+/// # Errors
+/// Returns the existing memory-policy or ignored-file denial message.
+pub async fn validate_read_paths(
+    resources: &SharedResources,
+    logical: &Path,
+    physical: &Path,
+    ignored_display: Option<&Path>,
+) -> Result<(), String> {
+    inspect_read_paths(resources, logical, physical, ignored_display)
+        .await
+        .map(|_| ())
+        .map_err(|denial| match denial {
+            ReadPathDenial::Ignored => match ignored_display {
+                Some(display) => ignored_message(display),
+                None => "Error: path is ignored by .gitignore and cannot be read.".to_owned(),
+            },
+            ReadPathDenial::Other(error) => error,
+        })
 }

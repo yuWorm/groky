@@ -22,6 +22,7 @@ mod task_result;
 mod transcript;
 mod turn;
 mod voice;
+mod voice_clip;
 use super::billing::{
     CreditLimitUpsellMode, credit_limit_upsell_mode, is_max_tier, open_credit_limit_upsell,
     open_free_usage_upsell,
@@ -56,6 +57,7 @@ use super::session::modal::{
     dispatch_rename_session, dispatch_reset_session_title, dispatch_sessions_confirm_close,
     drop_other_agents_in_minimal,
 };
+use super::settings::handle_feature_override_persisted;
 use super::settings::setters::set_default_model_inner;
 use super::settings::ui::{action_for_reset, apply_setting_rollback};
 use super::status::scrub_error_for_toast;
@@ -64,14 +66,14 @@ use super::*;
 use crate::acp::model_state::ModelState;
 use crate::acp::tracker::AcpUpdateTracker;
 use crate::app::actions::{
-    Action, Effect, SubagentKillOutcome, SwitchModelError, TaskResult, WorkspaceMutation,
-    WorkspaceWriteCompletion,
+    Action, Effect, ModelChoice, SubagentKillOutcome, SwitchModelError, TaskResult,
+    WorkspaceMutation, WorkspaceWriteCompletion,
 };
 use crate::app::agent::{AgentId, AgentSession, AgentState};
 use crate::app::agent_view::{ActivePane, AgentView, PromptMode};
 use crate::app::app_view::{
-    ActiveView, AppView, AuthMode, AuthState, PendingCodingDataWrite, TrustState, VoiceState,
-    VoiceTarget, WelcomeAnnouncementState,
+    ActiveView, AppView, AuthMode, AuthState, Partial, PendingCodingDataWrite, TrustState,
+    VoiceState, VoiceTarget, WelcomeAnnouncementState,
 };
 use crate::scrollback::block::RenderBlock;
 use crate::scrollback::blocks::{SessionEvent, ToolCallBlock};
@@ -168,6 +170,7 @@ fn test_app() -> AppView {
             "Grok".to_string(),
         ))],
         auth_state: AuthState::Done,
+        logout_pending: false,
         trust_state: TrustState::Done,
         consent_state: crate::app::consent::ConsentState::Done,
         account_email: None,
@@ -185,9 +188,11 @@ fn test_app() -> AppView {
         auth_clipboard_delivery: None,
         auth_clipboard_feedback_generation: 0,
         team_id: None,
+        is_team_principal: false,
         team_name: None,
         is_zdr: false,
         team_role: None,
+        can_administer_team: None,
         coding_data_retention_opt_out: false,
         privacy_notice_rollout: false,
         privacy_banner_reshow_days: None,
@@ -197,6 +202,9 @@ fn test_app() -> AppView {
         show_tips: None,
         auto_update: None,
         ask_user_question_timeout_enabled: None,
+        subagent_model_inheritance: crate::settings::FeatureOverrideState::new(
+            xai_grok_shell::agent::config::Feature::SubagentModelInheritance,
+        ),
         zdr_access_enabled: false,
         usage_billing_redirect_url: None,
         access_gate_shown_logged: false,
@@ -326,9 +334,13 @@ fn test_app() -> AppView {
         keyboard_normalizer: crate::input::KeyboardNormalizer::from_terminal_context(),
         has_claude_import: false,
         voice_mode_enabled: false,
+        distribution: xai_grok_config::Distribution::STOCK,
         voice_ui_active: false,
         voice_config: xai_grok_voice::VoiceConfig::default(),
         voice_auth: None,
+        voice_session: xai_grok_voice::VoiceSessionId::default(),
+        voice_trailing_final: None,
+        voice_clip_deadline: None,
         voice_cmd_tx: None,
         voice_state: VoiceState::Idle,
     }

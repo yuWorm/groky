@@ -411,66 +411,6 @@ pub(crate) async fn run_shell_child(
             None,
         );
     }
-    let Some(mut definition) = resolve_agent_definition(&request.subagent_type, &ctx) else {
-        let msg = format!("Unknown subagent type: {}", request.subagent_type);
-        return child_run_output(failure_result(&request, &msg), completion_data, None);
-    };
-    match gate_subagent_type(&request.subagent_type, &ctx) {
-        SubagentValidateTypeOutcome::Disabled => {
-            let msg = format!(
-                "Subagent '{}' is disabled via [subagents.toggle] in config.toml",
-                request.subagent_type
-            );
-            return child_run_output(failure_result(&request, &msg), completion_data, None);
-        }
-        SubagentValidateTypeOutcome::NotAllowed { allowed } => {
-            let msg = format!(
-                "agent can only spawn: {}; '{}' not allowed",
-                allowed.join(", "),
-                request.subagent_type
-            );
-            return child_run_output(failure_result(&request, &msg), completion_data, None);
-        }
-        SubagentValidateTypeOutcome::Ok => {}
-        _ => {
-            let msg = format!("Cannot validate subagent '{}'", request.subagent_type);
-            return child_run_output(failure_result(&request, &msg), completion_data, None);
-        }
-    }
-    resolve_subagent_toolset(
-        &request.subagent_type,
-        request.runtime_overrides.harness_agent_type.as_deref(),
-        &ctx,
-        &mut definition,
-    );
-    let cwd = ctx
-        .parent_session_info
-        .as_ref()
-        .map(|i| std::path::Path::new(&i.cwd));
-    let mut effective_runtime = xai_grok_subagent_resolution::resolve_runtime_config(
-        &request.subagent_type,
-        &request.runtime_overrides,
-        &ctx.subagent_roles,
-        &ctx.subagent_personas,
-        cwd,
-        &definition,
-    );
-    let prompt = request.prompt.clone();
-    if let Some(ref err) = effective_runtime.persona_error {
-        tracing::error!(
-            subagent_id = %request.id,
-            error = err,
-            "Persona resolution failed, aborting subagent spawn"
-        );
-        return child_run_output(failure_result(&request, err), completion_data, None);
-    }
-    if let Some(ref warn) = effective_runtime.role_prompt_warning {
-        tracing::warn!(
-            subagent_id = %request.id,
-            warning = warn,
-            "Role prompt_file degraded, continuing without role prompt"
-        );
-    }
     let resume_source = if is_wake {
         #[cfg(test)]
         {
@@ -540,6 +480,72 @@ pub(crate) async fn run_shell_child(
             request.id
         );
         return child_run_output(failure_result(&request, &error), completion_data, None);
+    }
+    if let Some(source) = resume_source.as_ref() {
+        request.subagent_type = source.subagent_type.clone();
+        let _ = reporter
+            .set_resolved_subagent_type(source.subagent_type.clone())
+            .await;
+    }
+    let Some(mut definition) = resolve_agent_definition(&request.subagent_type, &ctx) else {
+        let msg = format!("Unknown subagent type: {}", request.subagent_type);
+        return child_run_output(failure_result(&request, &msg), completion_data, None);
+    };
+    match gate_subagent_type(&request.subagent_type, &ctx) {
+        SubagentValidateTypeOutcome::Disabled => {
+            let msg = format!(
+                "Subagent '{}' is disabled via [subagents.toggle] in config.toml",
+                request.subagent_type
+            );
+            return child_run_output(failure_result(&request, &msg), completion_data, None);
+        }
+        SubagentValidateTypeOutcome::NotAllowed { allowed } => {
+            let msg = format!(
+                "agent can only spawn: {}; '{}' not allowed",
+                allowed.join(", "),
+                request.subagent_type
+            );
+            return child_run_output(failure_result(&request, &msg), completion_data, None);
+        }
+        SubagentValidateTypeOutcome::Ok => {}
+        _ => {
+            let msg = format!("Cannot validate subagent '{}'", request.subagent_type);
+            return child_run_output(failure_result(&request, &msg), completion_data, None);
+        }
+    }
+    resolve_subagent_toolset(
+        &request.subagent_type,
+        request.runtime_overrides.harness_agent_type.as_deref(),
+        &ctx,
+        &mut definition,
+    );
+    let cwd = ctx
+        .parent_session_info
+        .as_ref()
+        .map(|i| std::path::Path::new(&i.cwd));
+    let mut effective_runtime = xai_grok_subagent_resolution::resolve_runtime_config(
+        &request.subagent_type,
+        &request.runtime_overrides,
+        &ctx.subagent_roles,
+        &ctx.subagent_personas,
+        cwd,
+        &definition,
+    );
+    let prompt = request.prompt.clone();
+    if let Some(ref err) = effective_runtime.persona_error {
+        tracing::error!(
+            subagent_id = %request.id,
+            error = err,
+            "Persona resolution failed, aborting subagent spawn"
+        );
+        return child_run_output(failure_result(&request, err), completion_data, None);
+    }
+    if let Some(ref warn) = effective_runtime.role_prompt_warning {
+        tracing::warn!(
+            subagent_id = %request.id,
+            warning = warn,
+            "Role prompt_file degraded, continuing without role prompt"
+        );
     }
     if let Some(ref source) = resume_source {
         if request.runtime_overrides.model.is_some() {
@@ -1374,76 +1380,9 @@ pub(crate) async fn run_shell_child(
             }
         }
     }
-    let agent_mcp_servers: Vec<_> = if definition.mcp_servers.is_empty() {
-        vec![]
-    } else if is_plugin_agent {
-        tracing::warn!(
-            agent = %definition.name,
-            plugin = ?definition.plugin_name,
-            "ignoring mcpServers on plugin agent (not supported for security)"
-        );
-        vec![]
-    } else if !crate::agent::folder_trust::agent_inline_hooks_allowed(definition.scope, || {
-        crate::agent::folder_trust::project_scope_allowed(&ctx.parent_cwd)
-    }) {
-        tracing::warn!(
-            agent = %definition.name,
-            "ignoring mcpServers on untrusted project agent (folder not trusted; re-run with --trust)"
-        );
-        vec![]
-    } else {
-        definition
-                .mcp_servers
-                .iter()
-                .filter_map(|entry| match entry {
-                    xai_grok_agent::config::McpServerRef::Named(name) => {
-                        ctx.parent_mcp_configs
-                            .iter()
-                            .find(|s| {
-                                crate::session::mcp_servers::mcp_server_name(s) == name
-                            })
-                            .cloned()
-                            .or_else(|| {
-                                tracing::warn!(agent = %definition.name, server = name, "mcpServers: named ref not found in parent");
-                                None
-                            })
-                    }
-                    xai_grok_agent::config::McpServerRef::Inline { name, config } => {
-                        if let serde_json::Value::Object(obj) = config
-                            && obj.contains_key("type")
-                        {
-                            let mut flat = obj.clone();
-                            flat.insert(
-                                "name".to_string(),
-                                serde_json::Value::String(name.clone()),
-                            );
-                            if let Ok(server) = serde_json::from_value::<
-                                agent_client_protocol::McpServer,
-                            >(serde_json::Value::Object(flat)) {
-                                return Some(server);
-                            }
-                            tracing::debug!(agent = %definition.name, server = name, "ACP wire format parse failed, trying map-keyed");
-                        }
-                        if let Some(inner_obj) = config.as_object() {
-                            let mut flat = inner_obj.clone();
-                            flat.insert(
-                                "name".to_string(),
-                                serde_json::Value::String(name.clone()),
-                            );
-                            if let Ok(server) = serde_json::from_value::<
-                                agent_client_protocol::McpServer,
-                            >(serde_json::Value::Object(flat)) {
-                                return Some(server);
-                            }
-                        }
-                        tracing::warn!(agent = %definition.name, server = name, "mcpServers: inline config could not be parsed");
-                        None
-                    }
-                })
-                .collect()
-    };
-    let agent_mcp_servers = crate::session::managed_mcp::filter_policy_blocked_agent_mcp(
-        agent_mcp_servers,
+    let agent_mcp_servers = crate::session::agent_mcp::materialize_agent_mcp_servers(
+        &definition,
+        &ctx.parent_mcp_configs,
         &ctx.parent_cwd,
     );
     let parent_mcp_pool =
@@ -1529,6 +1468,7 @@ pub(crate) async fn run_shell_child(
                 model_id: effective_model_id.clone(),
                 agent: crate::session::persistence::PersistedAgent::from(&definition),
                 reasoning_effort: Some(effective_sampling_config.reasoning_effort),
+                context_window: None,
             });
     }
     crate::waterfall::mark(&request.id, crate::waterfall::stage::SESSION_SPAWN);
@@ -1567,6 +1507,7 @@ pub(crate) async fn run_shell_child(
             parent_session_id: Some(ctx.parent_session_id.clone()),
             subagent_type: Some(request.subagent_type.clone()),
             preserve_inherited_system: verbatim_mirror_fork,
+            parent_cwd: Some(ctx.parent_cwd.clone()),
             ..Default::default()
         },
         xai_grok_workspace::permission::ClientType::Generic,
@@ -1574,6 +1515,7 @@ pub(crate) async fn run_shell_child(
         xai_grok_agent::DEFAULT_SYSTEM_PROMPT_LABEL.to_string(),
         pins.mode,
         ctx.resolve_compaction_verbatim_input(),
+        ctx.resolve_long_reasoning_reminder(),
         ctx.resolve_compaction_tool_choice(),
         pins.two_pass,
         None,
@@ -1590,6 +1532,10 @@ pub(crate) async fn run_shell_child(
         None,
         false,
         false,
+        ctx.agent_config
+            .as_ref()
+            .map(crate::session::file_acceleration::settings)
+            .unwrap_or_default(),
         std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
         definition,
         subagent_session_default_agent_profile,

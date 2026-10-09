@@ -6,6 +6,7 @@ use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::AbortOnDropHandle;
 use xai_grok_pager::agent_runtime::AgentRuntime;
+use xai_grok_pager::signal_streams::SignalStreams;
 use xai_grok_shell::agent::config::Config;
 
 use crate::shutdown_and_flush_telemetry;
@@ -31,11 +32,12 @@ pub(crate) fn spawn_signal_flush() -> AgentSignals {
     let (sender, received) = oneshot::channel();
     let cancel = CancellationToken::new();
     let cancelled = cancel.clone();
+    let mut streams = SignalStreams::install();
     // Signal observation must remain independent of synchronous agent startup
     let listener = AbortOnDropHandle::new(tokio::spawn(async move {
         let code = tokio::select! {
             () = cancelled.cancelled() => return,
-            code = next_signal_code() => code,
+            code = streams.next_code() => code,
         };
         if !defer_exit_for_listener.load(Ordering::Acquire) || sender.send(code).is_err() {
             shutdown_and_flush_telemetry(code);
@@ -44,7 +46,7 @@ pub(crate) fn spawn_signal_flush() -> AgentSignals {
         let code = tokio::select! {
             () = cancelled.cancelled() => return,
             () = tokio::time::sleep(STDIO_SHUTDOWN_TIMEOUT) => code,
-            again = next_signal_code() => again,
+            again = streams.next_code() => again,
         };
         shutdown_and_flush_telemetry(code);
     }));
@@ -53,31 +55,6 @@ pub(crate) fn spawn_signal_flush() -> AgentSignals {
         received,
         cancel,
         _listener: listener,
-    }
-}
-
-async fn next_signal_code() -> i32 {
-    #[cfg(unix)]
-    {
-        use tokio::signal::unix::{SignalKind, signal};
-
-        let mut term = signal(SignalKind::terminate())
-            .inspect_err(|error| tracing::warn!(%error, "failed to listen for SIGTERM"))
-            .ok();
-        let mut hup = signal(SignalKind::hangup())
-            .inspect_err(|error| tracing::warn!(%error, "failed to listen for SIGHUP"))
-            .ok();
-
-        xai_grok_pager::app::signal_handler::next_signal_code(&mut term, &mut hup).await
-    }
-
-    #[cfg(not(unix))]
-    {
-        if let Err(error) = tokio::signal::ctrl_c().await {
-            tracing::warn!(%error, "failed to listen for Ctrl-C");
-            std::future::pending::<()>().await;
-        }
-        130
     }
 }
 

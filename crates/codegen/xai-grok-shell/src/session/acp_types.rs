@@ -31,11 +31,9 @@ pub(crate) struct AllSessionOverviewResponse {
 // ── Compaction ──────────────────────────────────────────────────────────
 
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
-pub(crate) struct CompactConversationRequest {
+pub struct CompactConversationRequest {
     #[serde(alias = "sessionId")]
     pub session_id: String,
-    #[serde(default, alias = "userContext")]
-    pub user_context: Option<String>,
 }
 
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
@@ -626,6 +624,9 @@ pub struct StartupHints {
     /// Tool names the session delivers its reply through (e.g. a messaging MCP tool); listing any keeps the full MCP waits at the prefix and tool-definition gates instead of the short startup grace.
     #[serde(default)]
     pub delivery_tools: Vec<String>,
+    /// Parent project cwd for child/worktree overlay kill-switch. Not on the wire.
+    #[serde(skip)]
+    pub parent_cwd: Option<PathBuf>,
     /// Only `"alwaysAllow"` is honored: would-be prompts resolve as allow at the manager's dispatch gate.
     /// Clamped off by the managed always-approve pin; a configured `defaultMode` wins.
     /// Unlike `yoloMode` / `autoMode`, a warm re-attach to an already-resident actor does NOT re-apply it.

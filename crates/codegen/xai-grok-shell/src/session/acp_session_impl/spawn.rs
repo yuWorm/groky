@@ -244,6 +244,7 @@ pub(crate) async fn spawn_session_actor(
     system_prompt_label: String,
     compaction_mode: xai_chat_state::CompactionMode,
     compaction_verbatim_input: bool,
+    long_reasoning_reminder: crate::session::long_reasoning_reminder::LongReasoningReminder,
     compaction_tool_choice: crate::util::config::CompactionToolChoice,
     two_pass_enabled: bool,
     buffering_settings: Option<BufferingSettings>,
@@ -258,6 +259,7 @@ pub(crate) async fn spawn_session_actor(
     deployment_key: Option<String>,
     client_terminal_capable: bool,
     client_fs_capable: bool,
+    file_acceleration: crate::session::file_acceleration::FileAccelerationSettings,
     gateway_enabled: std::sync::Arc<std::sync::atomic::AtomicBool>,
     agent_definition: AgentDefinition,
     session_default_agent_profile: Option<String>,
@@ -345,6 +347,14 @@ pub(crate) async fn spawn_session_actor(
     }
     let wf_sid: String = session_info.id.0.to_string();
     let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
+    let mut mcp_servers = mcp_servers;
+    if !startup_hints.is_subagent {
+        crate::session::agent_mcp::apply_agent_mcp_overlay(
+            &mut mcp_servers,
+            &agent_definition,
+            tool_context.cwd.as_path(),
+        );
+    }
     tracing::info!(
         "Session '{}' created with {} MCP servers",
         session_info.id.0,
@@ -602,6 +612,7 @@ pub(crate) async fn spawn_session_actor(
         query_params: sampling_config.query_params.clone(),
         env_http_headers: sampling_config.env_http_headers.clone(),
         context_window: context_window_override.unwrap_or(baseline_context_window),
+        max_request_bytes: sampling_config.max_request_bytes,
         reasoning_effort: sampling_config.reasoning_effort,
         reasoning_summary: sampling_config.reasoning_summary,
         stream_tool_calls: Some(sampling_config.stream_tool_calls),
@@ -813,15 +824,18 @@ pub(crate) async fn spawn_session_actor(
         drop(terminal_backend_span);
     }
     drop(terminal_backend_timer);
-    let fs_backend: std::sync::Arc<dyn xai_grok_tools::computer::types::AsyncFileSystem> =
-        if client_fs_capable && tool_context.gateway.is_some() {
+    let xai_grok_tools::computer::file_acceleration::AcceleratedFs {
+        fs: fs_backend,
+        session: file_acceleration_session,
+    } = crate::session::file_acceleration::select_session_fs(
+        (client_fs_capable && tool_context.gateway.is_some()).then(|| {
             std::sync::Arc::new(xai_grok_workspace::file_system::AcpFsAdapter::new(
                 tool_context.gateway.clone().unwrap(),
                 tool_context.session_id.clone().unwrap(),
-            ))
-        } else {
-            std::sync::Arc::new(xai_grok_tools::computer::local::LocalFs)
-        };
+            )) as std::sync::Arc<dyn xai_grok_tools::computer::types::AsyncFileSystem>
+        }),
+        || crate::session::file_acceleration::gate(file_acceleration, &session_info.id.0),
+    );
     let bridge_state_path =
         crate::session::persistence::session_dir(&session_info).join("tool_state.json");
     let initial_agent_name = agent_definition.name.clone();
@@ -871,6 +885,13 @@ pub(crate) async fn spawn_session_actor(
         )
     });
     let mut memory_storage_for_session = None;
+    if let Some(config) = memory_config.as_ref() {
+        xai_grok_memory::set_configured_manifest_budget(if config.v2.compact_index_enabled {
+            xai_grok_memory::V2ManifestBudget::compact()
+        } else {
+            xai_grok_memory::V2ManifestBudget::default()
+        });
+    }
     match select_memory_storage(configured_memory_storage.as_ref(), memory_config.as_ref()) {
         MemoryStorageSelection::Enabled => {
             memory_storage_for_session = configured_memory_storage.clone();
@@ -1115,8 +1136,9 @@ pub(crate) async fn spawn_session_actor(
             },
         ))
     });
-    let mcp_state = {
+    let (mcp_state, admitted_mcp_servers) = {
         let mut state = McpState::new_with_meta(mcp_servers.clone(), mcp_meta_config_map);
+        let admitted_mcp_servers = state.admitted_servers();
         if let Some(ref pool) = parent_mcp_pool {
             state.import_shared_clients(pool);
             tracing::info!(
@@ -1137,7 +1159,7 @@ pub(crate) async fn spawn_session_actor(
                 "Registered in-process SDK MCP servers (x.ai/mcp/sdk_call)"
             );
         }
-        Arc::new(TokioMutex::new(state))
+        (Arc::new(TokioMutex::new(state)), admitted_mcp_servers)
     };
     let (plugin_registry_wait_timer, plugin_registry_wait_span) =
         spawn_await_step!("plugin_registry_wait");
@@ -1160,7 +1182,7 @@ pub(crate) async fn spawn_session_actor(
         models_manager: models_manager.clone(),
         task_model_policy: TaskModelPolicyInputs {
             inheritance: subagent_model_inheritance,
-            remote_fetch_enabled: crate::util::config::resolve_remote_fetch_enabled(),
+            remote_fetch_enabled: models_manager.is_models_fetch_enabled(),
             forked_selection,
         },
         task_model_selection: task_model_selection.clone(),
@@ -1550,37 +1572,56 @@ pub(crate) async fn spawn_session_actor(
     let allowed_subagent_types_for_handle = agent.definition().allowed_subagent_types.clone();
     let mut hook_discovery_errors: Vec<xai_grok_hooks::error::HookError> = Vec::new();
     let hooks_discovery = spawn_step!("hooks_discovery");
-    let built_hook_registry: Option<Arc<xai_grok_hooks::discovery::HookRegistry>> =
-        if let Some(override_reg) = hook_registry_override {
-            Some(override_reg)
+    let (built_hook_registry, hook_disabled) = if let Some(override_reg) = hook_registry_override {
+        (
+            Some(override_reg),
+            xai_grok_workspace::permission::resolution::disabled_hooks_snapshot(
+                xai_grok_workspace::permission::resolution::managed_settings(),
+                xai_grok_config::user_grok_home().as_deref(),
+            ),
+        )
+    } else {
+        let cwd_path = std::path::Path::new(&session_info.cwd);
+        let project_trusted = if prefetch.scan().is_gathered() {
+            prefetch.resolve_trust(cwd_path, remote_settings.as_ref())
         } else {
-            let cwd_path = std::path::Path::new(&session_info.cwd);
-            let project_trusted = if prefetch.scan().is_gathered() {
-                prefetch.resolve_trust(cwd_path, remote_settings.as_ref())
-            } else {
-                crate::agent::folder_trust::resolve_and_record(
-                    cwd_path,
-                    remote_settings.as_ref(),
-                    false,
-                )
-            };
-            let git_root = xai_grok_workspace::session::git::find_git_root_from_path(cwd_path).ok();
-            let (registry, errors) = crate::util::hooks::discover_hooks(
-                git_root.as_deref(),
-                &rebuild_spec.compat,
-                project_trusted,
-            );
-            for e in &errors {
-                tracing::warn!(error = ?e, "hook loading error");
-            }
-            hook_discovery_errors = errors;
-            if registry.is_empty() {
-                None
-            } else {
-                tracing::info!(hook_count = registry.len(), "loaded hooks");
-                Some(Arc::new(registry))
-            }
+            crate::agent::folder_trust::resolve_and_record(
+                cwd_path,
+                remote_settings.as_ref(),
+                false,
+            )
         };
+        let git_root = xai_grok_workspace::session::git::find_git_root_from_path(cwd_path).ok();
+        let (inputs, disabled) = crate::util::hooks::session_hook_inputs();
+        let (registry, errors) = crate::util::hooks::discover_hooks(
+            &inputs,
+            git_root.as_deref(),
+            &rebuild_spec.compat,
+            xai_grok_hooks::trust::Trust::from_verdict(project_trusted),
+        );
+        for e in &errors {
+            tracing::warn!(error = ?e, "hook loading error");
+        }
+        hook_discovery_errors = errors;
+        let registry = if registry.is_empty() {
+            None
+        } else {
+            tracing::info!(hook_count = registry.len(), "loaded hooks");
+            Some(Arc::new(registry))
+        };
+        (registry, disabled)
+    };
+    let plugin_hook_source = if is_subagent_spawn {
+        xai_grok_agent::plugins::hooks_adapter::PluginHookSource::Parent
+    } else {
+        xai_grok_agent::plugins::hooks_adapter::PluginHookSource::Registry(
+            plugin_registry.as_deref(),
+        )
+    };
+    let built_hook_registry = xai_grok_agent::plugins::hooks_adapter::with_plugin_hooks(
+        built_hook_registry,
+        plugin_hook_source,
+    );
     drop(hooks_discovery);
     let hook_registry_for_handle = built_hook_registry.clone();
     let workspace_ops_for_handle = workspace_ops.clone();
@@ -1758,6 +1799,7 @@ pub(crate) async fn spawn_session_actor(
     let vcs_root = discover_vcs_root(&prefix_cwd);
     drop(git_scan);
     let actor_build = spawn_step!("actor_build");
+    let context_window_selection = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let session = Arc::new_cyclic(|weak: &std::sync::Weak<SessionActor>| SessionActor {
         status_wake: Default::default(),
         session_info: session_info.clone(),
@@ -1787,7 +1829,7 @@ pub(crate) async fn spawn_session_actor(
         deny_read_globs,
         mcp_state: mcp_state.clone(),
         mcp_strategy: std::cell::Cell::new(mcp_strategy),
-        initial_client_mcp_servers: initial_client_mcp_servers.clone(),
+        initial_client_mcp_servers: std::cell::RefCell::new(initial_client_mcp_servers.clone()),
         chat_state_handle,
         unattributed_background_usage: std::sync::atomic::AtomicBool::new(false),
         current_prompt_id: current_prompt_id.clone(),
@@ -1814,6 +1856,7 @@ pub(crate) async fn spawn_session_actor(
             threshold_percent: std::cell::Cell::new(auto_compact_threshold_percent),
             force_compact: force_compact.clone(),
             context_window_override,
+            context_window_selection: context_window_selection.clone(),
             count: std::sync::atomic::AtomicU64::new(0),
             auto_compact_suppressed: std::sync::atomic::AtomicU8::new(0),
             previous_model: std::cell::Cell::new(None),
@@ -1824,6 +1867,8 @@ pub(crate) async fn spawn_session_actor(
             prefix_released: std::sync::atomic::AtomicBool::new(false),
             cancel: Default::default(),
         },
+        long_reasoning_reminder,
+        long_reasoning_turn_state: Default::default(),
         memory: super::memory_state::SessionMemory {
             configured_mode: memory_config.as_ref().map(|mc| mc.mode),
             v2_config: memory_config
@@ -2010,9 +2055,7 @@ pub(crate) async fn spawn_session_actor(
         last_search_prompt_index: std::sync::atomic::AtomicI64::new(-1),
         last_api_request_at: std::sync::atomic::AtomicI64::new(0),
         hook_registry: std::cell::RefCell::new(built_hook_registry),
-        hook_disabled: std::cell::RefCell::new(Arc::new(
-            crate::util::hooks::disabled_hooks_snapshot(),
-        )),
+        hook_disabled: std::cell::RefCell::new(Arc::new(hook_disabled)),
         turn_report: Default::default(),
         turn_abort: Default::default(),
         turn_end_tx: Default::default(),
@@ -2387,6 +2430,9 @@ pub(crate) async fn spawn_session_actor(
             ),
         )
         .await;
+        if let Some(file_acceleration_session) = file_acceleration_session {
+            file_acceleration_session.finish();
+        }
         let _ = session_done_tx.send(());
     });
     let handle = SessionHandle {
@@ -2406,7 +2452,7 @@ pub(crate) async fn spawn_session_actor(
         gateway_enabled,
         emit_local_background_tasks,
         client_caps,
-        mcp_servers,
+        mcp_servers: admitted_mcp_servers,
         initial_client_mcp_servers,
         display_cwd: None,
         feedback_manager: feedback_manager.clone(),
@@ -2415,6 +2461,7 @@ pub(crate) async fn spawn_session_actor(
         tool_context: tool_context_for_handle,
         model_id: session_model_id,
         reasoning_effort: sampling_config.reasoning_effort,
+        context_window_selection,
         yolo_mode: session_yolo_mode,
         origin_client: origin_client.clone(),
         code_nav_enabled,
@@ -2528,6 +2575,7 @@ pub(crate) async fn spawn_session_on_thread(
     system_prompt_label: String,
     compaction_mode: xai_chat_state::CompactionMode,
     compaction_verbatim_input: bool,
+    long_reasoning_reminder: crate::session::long_reasoning_reminder::LongReasoningReminder,
     compaction_tool_choice: crate::util::config::CompactionToolChoice,
     two_pass_enabled: bool,
     buffering_settings: Option<BufferingSettings>,
@@ -2542,6 +2590,7 @@ pub(crate) async fn spawn_session_on_thread(
     deployment_key: Option<String>,
     client_terminal_capable: bool,
     client_fs_capable: bool,
+    file_acceleration: crate::session::file_acceleration::FileAccelerationSettings,
     gateway_enabled: std::sync::Arc<std::sync::atomic::AtomicBool>,
     agent_definition: AgentDefinition,
     session_default_agent_profile: Option<String>,
@@ -2742,6 +2791,7 @@ pub(crate) async fn spawn_session_on_thread(
                     system_prompt_label,
                     compaction_mode,
                     compaction_verbatim_input,
+                    long_reasoning_reminder,
                     compaction_tool_choice,
                     two_pass_enabled,
                     buffering_settings,
@@ -2756,6 +2806,7 @@ pub(crate) async fn spawn_session_on_thread(
                     deployment_key,
                     client_terminal_capable,
                     client_fs_capable,
+                    file_acceleration,
                     gateway_enabled,
                     agent_definition,
                     session_default_agent_profile,

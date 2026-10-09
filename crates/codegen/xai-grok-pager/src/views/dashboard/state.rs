@@ -21,15 +21,10 @@ use xai_grok_shell::session::persistence::MAX_TITLE_SCALARS as MAX_RENAME_SCALAR
 
 const PROMPT_MULTI_CLICK_MS: u128 = 300;
 
-/// Stable identity for a dashboard row. When the parent closes, the subagent rows naturally
-/// disappear because the row builder iterates `app.agents.values()`; no separate cleanup needed.
+/// Stable identity for a dashboard row.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum DashboardRowId {
     TopLevel(AgentId),
-    Subagent {
-        parent: AgentId,
-        child_session_id: String,
-    },
     /// A leader-roster-only row: a session hosted by the leader (or a remote host) that this client is NOT locally attached to.
     /// Keyed by the roster `session_id`.
     /// Not locally controllable.
@@ -42,12 +37,6 @@ pub enum DashboardRowId {
 }
 
 impl DashboardRowId {
-    /// True for a subagent row.
-    /// Used to gate the "rename" affordance; subagents are read-only in this version.
-    pub fn is_subagent(&self) -> bool {
-        matches!(self, Self::Subagent { .. })
-    }
-
     pub fn is_workspace(&self) -> bool {
         matches!(self, Self::Workspace { .. })
     }
@@ -58,7 +47,6 @@ impl DashboardRowId {
 
     pub(crate) fn is_owned_by_agent(&self, agent_id: AgentId) -> bool {
         matches!(self, Self::TopLevel(id) if *id == agent_id)
-            || matches!(self, Self::Subagent { parent, .. } if *parent == agent_id)
     }
 }
 
@@ -74,13 +62,6 @@ pub(crate) fn scrollback_mut_for_row<'a>(
 ) -> Option<&'a mut crate::scrollback::state::ScrollbackState> {
     match row {
         DashboardRowId::TopLevel(id) => agents.get_mut(id).map(|a| &mut a.scrollback),
-        DashboardRowId::Subagent {
-            parent,
-            child_session_id,
-        } => agents
-            .get_mut(parent)
-            .and_then(|p| p.subagent_view_mut(child_session_id))
-            .map(|c| &mut c.scrollback),
         DashboardRowId::Roster { .. } | DashboardRowId::Workspace { .. } => None,
     }
 }
@@ -91,12 +72,6 @@ pub(crate) fn scrollback_available_for_row(
 ) -> bool {
     match row {
         DashboardRowId::TopLevel(id) => agents.contains_key(id),
-        DashboardRowId::Subagent {
-            parent,
-            child_session_id,
-        } => agents
-            .get(parent)
-            .is_some_and(|p| p.has_subagent_view(child_session_id)),
         DashboardRowId::Roster { .. } | DashboardRowId::Workspace { .. } => false,
     }
 }
@@ -121,51 +96,28 @@ pub(crate) struct DeferredPeekSend {
 /// the current process lifetime.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum PersistedRowId {
-    TopLevel {
-        session_id: String,
-    },
-    Subagent {
-        parent_session_id: String,
-        child_session_id: String,
-    },
+    TopLevel { session_id: String },
 }
 
 impl PersistedRowId {
-    /// On-disk serialisation. `top:<session_id>` or `sub:<parent_session_id>:<child_session_id>`. The
-    /// session ids themselves are opaque to the dashboard; we never split them. The first colon after
-    /// `sub:` is the only one we split on.
+    /// On-disk serialisation: `top:<session_id>`.
     pub fn to_key(&self) -> String {
         match self {
             Self::TopLevel { session_id } => format!("top:{session_id}"),
-            Self::Subagent {
-                parent_session_id,
-                child_session_id,
-            } => format!("sub:{parent_session_id}:{child_session_id}"),
         }
     }
 
     /// Parse a persisted key back.
-    /// Returns `None` for malformed input.
+    /// Returns `None` for malformed input. A `sub:` key is a pinned or reordered subagent row from
+    /// before those rows were removed; dropping it keeps the rest of the dashboard config loadable.
     pub fn from_key(s: &str) -> Option<Self> {
-        if let Some(sid) = s.strip_prefix("top:") {
-            if sid.is_empty() {
-                return None;
-            }
-            return Some(Self::TopLevel {
-                session_id: sid.to_string(),
-            });
+        let sid = s.strip_prefix("top:")?;
+        if sid.is_empty() {
+            return None;
         }
-        if let Some(rest) = s.strip_prefix("sub:")
-            && let Some((parent, child)) = rest.split_once(':')
-            && !parent.is_empty()
-            && !child.is_empty()
-        {
-            return Some(Self::Subagent {
-                parent_session_id: parent.to_string(),
-                child_session_id: child.to_string(),
-            });
-        }
-        None
+        Some(Self::TopLevel {
+            session_id: sid.to_string(),
+        })
     }
 }
 
@@ -183,11 +135,11 @@ pub(crate) fn send_echo_window_open(since_send: std::time::Duration) -> bool {
 
 /// Coarse state used for the dashboard grouping.
 ///
-/// See [`super::row::classify_top_level`] / [`super::row::classify_subagent`] for the mapping rules.
+/// See [`super::row::classify_top_level`] for the mapping rules.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 #[cfg_attr(test, derive(strum::EnumIter))]
 pub enum RowState {
-    /// Pending permission OR pending ask_user_question (top-level only; subagents never enter this state in this version).
+    /// Pending permission OR pending ask_user_question.
     NeedsInput,
     /// Live turn or command running.
     Working,
@@ -692,13 +644,14 @@ impl RenameDraft {
     }
 
     pub(crate) fn set_text(&mut self, text: impl Into<String>) {
-        let text = text
+        // The cap runs before the tag pass, so a cut can never leave half a flag
+        let capped: String = text
             .into()
             .chars()
             .filter(|character| rename_wire_character_allowed(*character))
             .take(MAX_RENAME_SCALARS)
-            .collect::<String>();
-        self.editor.set_text(text);
+            .collect();
+        self.editor.set_text(strip_loose_tags(&capped));
     }
 }
 
@@ -707,8 +660,43 @@ fn rename_character_allowed(character: char) -> bool {
 }
 
 fn rename_wire_character_allowed(character: char) -> bool {
-    // Preserve an existing emoji ZWJ sequence; interactive inserts still reject format chars.
-    character == '\u{200d}' || rename_character_allowed(character)
+    // Preserve an existing emoji ZWJ or flag tag sequence; interactive inserts still reject format chars.
+    matches!(character, '\u{200d}' | '\u{e0020}'..='\u{e007f}')
+        || rename_character_allowed(character)
+}
+
+/// Keeps tags only in a subdivision flag (black flag, 1 to 7 tag letters or digits, cancel tag); others hide text
+fn strip_loose_tags(text: &str) -> String {
+    let is_tag = |c: char| ('\u{e0020}'..='\u{e007f}').contains(&c);
+    let is_flag_tag = |c: char| matches!(c, '\u{e0030}'..='\u{e0039}' | '\u{e0061}'..='\u{e007a}');
+    let chars: Vec<char> = text.chars().collect();
+    let mut kept = String::with_capacity(text.len());
+    let mut at = 0;
+    while let Some(&character) = chars.get(at) {
+        at += 1;
+        if is_tag(character) {
+            continue;
+        }
+
+        kept.push(character);
+        if character != '\u{1f3f4}' {
+            continue;
+        }
+
+        let run: Vec<char> = chars
+            .iter()
+            .skip(at)
+            .take_while(|&&c| is_tag(c))
+            .copied()
+            .collect();
+        let valid = matches!(run.split_last(), Some((&'\u{e007f}', letters))
+            if (1..=7).contains(&letters.len()) && letters.iter().all(|&c| is_flag_tag(c)));
+        if valid {
+            kept.extend(&run);
+        }
+        at += run.len();
+    }
+    kept
 }
 
 /// One selectable directory in the location picker (see [`LocationPickerState`]).
@@ -1019,11 +1007,6 @@ fn location_picker_config<'a>() -> crate::views::picker::PickerConfig<'a> {
 pub struct SessionIdResolver {
     /// Maps session_id to AgentId (top-level).
     top: std::collections::HashMap<String, crate::app::agent::AgentId>,
-    /// Maps agent_session_id to a set of (child_session_id, AgentId-of-parent).
-    subs: std::collections::HashMap<
-        String,
-        std::collections::HashMap<String, crate::app::agent::AgentId>,
-    >,
     /// Reverse: maps AgentId to session_id (for `to_persisted`).
     top_rev: std::collections::HashMap<crate::app::agent::AgentId, String>,
     workspace: std::collections::HashSet<String>,
@@ -1044,47 +1027,19 @@ impl SessionIdResolver {
     ) -> Self {
         let mut top = std::collections::HashMap::new();
         let mut top_rev = std::collections::HashMap::new();
-        let mut subs: std::collections::HashMap<
-            String,
-            std::collections::HashMap<String, crate::app::agent::AgentId>,
-        > = std::collections::HashMap::new();
         for (id, agent) in agents {
             if let Some(sid) = agent.session.session_id.as_ref() {
                 let sid_str = sid.0.to_string();
                 if let Some(prev) = top.get(&sid_str) {
-                    // Top-level collision: keep first mapping.
-                    // And call out the subagents we're dropping by name so a debugger can correlate the missing children back to the losing parent
-                    let dropped: Vec<&str> =
-                        agent.subagent_sessions.keys().map(String::as_str).collect();
                     tracing::warn!(
                         session_id = %sid_str,
                         first = ?prev,
                         duplicate = ?id,
-                        dropped_subagents = ?dropped,
-                        "SessionIdResolver: duplicate session_id; keeping first mapping (subagents of losing parent are dropped)"
+                        "SessionIdResolver: duplicate session_id; keeping first mapping"
                     );
                 } else {
                     top.insert(sid_str.clone(), *id);
-                    top_rev.insert(*id, sid_str.clone());
-                    // Populate the subs map via the entry()/or_insert_with() API so the "first wins" rule is explicit
-                    // Defensive: a colliding child_session_id within a single parent's map would also warn rather than silently overwrite
-                    let children = subs.entry(sid_str.clone()).or_default();
-                    for child_sid in agent.subagent_sessions.keys() {
-                        if let Some(prev_child) = children.get(child_sid) {
-                            tracing::warn!(
-                                parent_session_id = %sid_str,
-                                child_session_id = %child_sid,
-                                first = ?prev_child,
-                                duplicate = ?id,
-                                "SessionIdResolver: duplicate child session_id under same parent; keeping first mapping"
-                            );
-                        } else {
-                            children.insert(child_sid.clone(), *id);
-                        }
-                    }
-                    if children.is_empty() {
-                        subs.remove(&sid_str);
-                    }
+                    top_rev.insert(*id, sid_str);
                 }
             }
         }
@@ -1097,7 +1052,6 @@ impl SessionIdResolver {
             .collect();
         Self {
             top,
-            subs,
             top_rev,
             workspace,
         }
@@ -1108,7 +1062,6 @@ impl SessionIdResolver {
     pub fn empty() -> Self {
         Self {
             top: std::collections::HashMap::new(),
-            subs: std::collections::HashMap::new(),
             top_rev: std::collections::HashMap::new(),
             workspace: std::collections::HashSet::new(),
         }
@@ -1128,17 +1081,6 @@ impl SessionIdResolver {
                             session_id: session_id.clone(),
                         })
                 }),
-            PersistedRowId::Subagent {
-                parent_session_id,
-                child_session_id,
-            } => self
-                .subs
-                .get(parent_session_id)
-                .and_then(|m| m.get(child_session_id).copied())
-                .map(|parent| DashboardRowId::Subagent {
-                    parent,
-                    child_session_id: child_session_id.clone(),
-                }),
         }
     }
 
@@ -1150,16 +1092,6 @@ impl SessionIdResolver {
                     .map(|sid| PersistedRowId::TopLevel {
                         session_id: sid.clone(),
                     })
-            }
-            DashboardRowId::Subagent {
-                parent,
-                child_session_id,
-            } => {
-                let parent_sid = self.top_rev.get(parent)?.clone();
-                Some(PersistedRowId::Subagent {
-                    parent_session_id: parent_sid,
-                    child_session_id: child_session_id.clone(),
-                })
             }
             DashboardRowId::Workspace { session_id } => Some(PersistedRowId::TopLevel {
                 session_id: session_id.clone(),
@@ -1769,7 +1701,7 @@ impl DashboardState {
     }
 
     /// Garbage-collect stale row ids from `pinned` / `reorder`. Called on dashboard open: any persisted
-    /// id whose underlying agent/subagent no longer exists is silently dropped (e.g. a pinned row whose
+    /// id whose underlying agent no longer exists is silently dropped (e.g. a pinned row whose
     /// agent was deleted).
     pub fn gc_stale_refs(&mut self, alive: &dyn Fn(&DashboardRowId) -> bool) {
         self.pinned.retain(|id| alive(id));
@@ -4142,18 +4074,15 @@ impl DashboardState {
                 self.focus_section(key);
             }
         }
-        // Skip non-selectable placeholders ("… N more").
-        let selectable: Vec<&DashboardRow> =
-            rows.iter().filter(|r| !r.is_more_placeholder).collect();
-        if selectable.is_empty() {
+        if rows.is_empty() {
             self.selected = None;
             self.delete_confirm = None;
             return;
         }
         if let Some(sel) = self.selected.as_ref()
-            && !selectable.iter().any(|r| r.id == *sel)
+            && !rows.iter().any(|r| r.id == *sel)
         {
-            // The previously selected row was filtered out / closed / lost its parent
+            // The previously selected row was filtered out or closed.
             // Drop the cursor; re-selecting is the user's job
             self.selected = None;
         }
@@ -4302,10 +4231,15 @@ fn handle_rename_key(draft: &mut RenameDraft, key: &KeyEvent) -> InputOutcome {
 
 fn handle_rename_paste(draft: &mut RenameDraft, text: &str) -> InputOutcome {
     let remaining = MAX_RENAME_SCALARS.saturating_sub(draft.text().chars().count());
-    let outcome =
-        draft
-            .editor
-            .insert_paste_with_policy(text, rename_wire_character_allowed, remaining);
+    let allowed = text
+        .chars()
+        .filter(|character| rename_wire_character_allowed(*character));
+    let capped: String = allowed.take(remaining).collect();
+    let outcome = draft.editor.insert_paste_with_policy(
+        &strip_loose_tags(&capped),
+        rename_wire_character_allowed,
+        remaining,
+    );
     rename_edit_outcome(outcome)
 }
 
@@ -4480,24 +4414,14 @@ pub fn write_persisted_to_path(
     t.insert("reorder", toml_edit::value(reorder_arr));
     // The onboarding hint was removed; drop the stale table so old configs don't carry a dead `[dashboard.onboarding]` key forever
     t.remove("onboarding");
-    atomic_write(path, doc.to_string().as_bytes())
+    atomic_write(path, &doc.to_string())
 }
 
-/// Atomic write via `<path>.dashboard.tmp.<pid>` then `rename`. Concurrent readers see either the
-/// old file or the new file, never a partial truncated copy that would parse as `None` and trigger
-/// the catastrophic clobber on the next writer.
-fn atomic_write(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
-    use std::io::Write;
-    let pid = std::process::id();
-    let tmp = path.with_extension(format!("toml.dashboard.tmp.{pid}"));
-    {
-        let mut f = std::fs::File::create(&tmp)?;
-        f.write_all(bytes)?;
-        // Ensure the bytes are physically on disk before the rename.
-        // Without this, the rename can complete and the file system can later observe the renamed inode pointing at zeroed data
-        f.sync_all()?;
-    }
-    std::fs::rename(&tmp, path)?;
+/// Atomic write through a symlinked `config.toml`. Concurrent readers see either the old file or
+/// the new file, never a partial truncated copy that would parse as `None` and trigger the
+/// catastrophic clobber on the next writer.
+fn atomic_write(path: &std::path::Path, contents: &str) -> std::io::Result<()> {
+    xai_grok_config::fs_atomic::write_user_file_atomically(path, contents, None)?;
     // Parent directory fsync (defense in depth on unusual filesystems / network mounts)
     if let Some(parent) = path.parent()
         && let Ok(dir) = std::fs::File::open(parent)

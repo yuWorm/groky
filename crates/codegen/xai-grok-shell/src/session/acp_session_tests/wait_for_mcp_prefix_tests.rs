@@ -22,7 +22,7 @@ async fn prepare(a: &SessionActor, id: &str, tool: &str) -> Result<PreparedToolC
         function: crate::sampling::types::ToolCallFunction::new(tool, "{}".to_string()),
     };
     let mut deferred = Vec::new();
-    a.prepare_tool_call(call, &mut deferred)
+    a.prepare_tool_call(call, &mut deferred, None)
         .await
         .expect("prepare")
 }

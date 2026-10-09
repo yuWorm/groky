@@ -614,33 +614,42 @@
     }
 
     #[test]
-    fn silent_errored_wake_pushes_failure_marker() {
-        // Failures are shown even when the wake is invisible: the standing instruction silently stopped
+    fn silent_errored_wake_closes_without_marker() {
+        // An errored wake closes like a success: no row, state cleared, duplicates deduped per pid
+        let mut app = make_app_with_agent("sess-wake");
+        seed_two_bg_tasks(&mut app, "sess-wake");
+        let len_before = app.agents.get(&AgentId(0)).unwrap_or_else(|| panic!("missing map entry")).scrollback.len();
+
+        for _ in 0..2 {
+            let _ = handle_ext_notification(
+                &xai_turn_completed_notif("sess-wake", "task-completed-bg1", "error", false),
+                &mut app,
+            );
+        }
+
+        let agent = app.agents.get(&AgentId(0)).unwrap();
+        assert_eq!(agent.scrollback.len(), len_before, "an errored wake pushes no marker");
+        assert!(agent.session.state.is_idle());
+        assert!(agent.running_wake_turn.is_none());
+        assert!(agent.finished_wake_prompts.contains("task-completed-bg1"));
+        assert_eq!(
+            agent.failed_wake_marker_for.as_deref(),
+            Some("task-completed-bg1")
+        );
+        assert_eq!(agent.watchers().commands, 2);
+    }
+
+    #[test]
+    fn errored_wake_with_error_kind_closes_without_marker() {
+        // The typed kind used to pick failure copy; an errored wake now paints nothing regardless of kind
         let mut app = make_app_with_agent("sess-wake");
         let len_before = app.agents.get(&AgentId(0)).unwrap_or_else(|| panic!("missing map entry")).scrollback.len();
 
         let _ = handle_ext_notification(
-            &xai_turn_completed_notif("sess-wake", "task-completed-bg1", "error", false),
-            &mut app,
-        );
-
-        let agent = app.agents.get(&AgentId(0)).unwrap();
-        assert_eq!(agent.scrollback.len(), len_before + 1);
-        assert!(matches!(
-            last_session_event(&agent.scrollback),
-            Some(SessionEvent::TurnFailed { .. })
-        ));
-    }
-
-    #[test]
-    fn errored_wake_error_kind_renders_truncation_copy() {
-        let mut app = make_app_with_agent("sess-wake");
-
-        let _ = handle_ext_notification(
             &xai_turn_completed_failed_with_error_kind(
                 "sess-wake",
                 "task-completed-bg1",
-                "turn ended early",
+                "[unknown] Premature close",
                 "max_tokens_truncation",
                 false,
             ),
@@ -648,37 +657,46 @@
         );
 
         let agent = app.agents.get(&AgentId(0)).unwrap();
-        match last_session_event(&agent.scrollback) {
-            Some(SessionEvent::TurnFailed { error, .. }) => {
-                assert_eq!(error, "Response truncated: turn ended early")
-            }
-            other => panic!("expected TurnFailed, got {other:?}"),
-        }
+        assert_eq!(agent.scrollback.len(), len_before);
+        assert!(agent.session.state.is_idle());
     }
 
     #[test]
-    fn errored_wake_during_local_turn_error_kind_renders_truncation_copy() {
-        // The busy-wake pierce arm reads the typed kind itself (it never reaches `finish_wake_turn`)
-        use crate::app::agent::AgentState;
-
-        let mut app = make_app_with_agent("sess-wake");
-        app.agents.get_mut(&AgentId(0)).unwrap().session.state = AgentState::TurnRunning;
-
-        let _ = handle_ext_notification(
-            &xai_turn_completed_failed_with_error_kind(
-                "sess-wake",
-                "task-completed-bg1",
-                "turn ended early",
-                "max_tokens_truncation",
-                false,
-            ),
+    fn errored_user_prompt_terminal_still_pushes_turn_failed() {
+        // Only wake pids close silently; a viewer's adopted user turn keeps the failure banner
+        let mut app = make_app_with_agent("sess-view");
+        app.agents.get_mut(&AgentId(0)).unwrap().attached_as_viewer = true;
+        let _ = handle(
+            make_agent_chunk_message_with_prompt("sess-view", "chunk", "pid-driver", false),
             &mut app,
         );
 
+        let payload = SessionNotification {
+            session_id: acp::SessionId::new("sess-view"),
+            update: XaiSessionUpdate::TurnCompleted {
+                prompt_id: "pid-driver".into(),
+                stop_reason: "error".into(),
+                agent_result: Some("[unknown] Premature close".into()),
+                error_kind: None,
+                usage: None,
+                elapsed_ms: None,
+            },
+            meta: Some(serde_json::json!({ "isReplay": false })),
+        };
+        let notif = acp::ExtNotification::new(
+            "x.ai/session/update",
+            std::sync::Arc::from(serde_json::value::to_raw_value(&payload).unwrap()),
+        );
+        let _ = handle_ext_notification(&notif, &mut app);
+
         let agent = app.agents.get(&AgentId(0)).unwrap();
+        assert!(agent.session.state.is_idle());
         match last_session_event(&agent.scrollback) {
             Some(SessionEvent::TurnFailed { error, .. }) => {
-                assert_eq!(error, "Response truncated: turn ended early")
+                assert_eq!(
+                    error,
+                    "Request failed: [unknown] Premature close. Try sending again."
+                );
             }
             other => panic!("expected TurnFailed, got {other:?}"),
         }
@@ -724,9 +742,9 @@
     }
 
     #[test]
-    fn errored_wake_skips_marker_when_banner_already_on_screen() {
+    fn errored_wake_with_banner_on_screen_still_records_pid() {
         // The retry-state rail already pushed the formatted RequestFailed banner for this failure
-        // The wake rail must not add a second near-identical warning line (same dedupe as the local rails)
+        // The wake rail paints nothing either way; the pid still records so the other rail stays quiet
         let mut app = make_app_with_agent("sess-wake");
         {
             let agent = app.agents.get_mut(&AgentId(0)).unwrap();
@@ -748,21 +766,16 @@
         );
 
         let agent = app.agents.get(&AgentId(0)).unwrap();
-        assert_eq!(
-            agent.scrollback.len(),
-            len_before,
-            "banner already covers the failure; no TurnFailed marker"
-        );
-        // The failure is still recorded, so the other wake rail stays quiet too.
+        assert_eq!(agent.scrollback.len(), len_before);
         assert_eq!(
             agent.failed_wake_marker_for.as_deref(),
             Some("task-completed-bg1")
         );
     }
 
-    /// Same dedupe on the busy-wake rail (a local turn is running, so the terminal takes the `is_busy` branch instead of `finish_wake_turn`).
+    /// Same on the busy-wake rail (a local turn is running, so the terminal takes the `is_busy` branch instead of `finish_wake_turn`).
     #[test]
-    fn errored_wake_during_local_turn_skips_marker_when_banner_on_screen() {
+    fn errored_wake_during_local_turn_with_banner_on_screen_still_records_pid() {
         use crate::app::agent::AgentState;
 
         let mut app = make_app_with_agent("sess-wake");
@@ -787,34 +800,11 @@
         );
 
         let agent = app.agents.get(&AgentId(0)).unwrap();
-        assert_eq!(
-            agent.scrollback.len(),
-            len_before,
-            "banner already covers the failure; no TurnFailed marker"
-        );
+        assert_eq!(agent.scrollback.len(), len_before);
         assert_eq!(
             agent.failed_wake_marker_for.as_deref(),
             Some("task-completed-bg1")
         );
-    }
-
-    #[test]
-    fn silent_errored_wake_ignores_stale_turn_start_ms() {
-        // A silent wake streamed no deltas, so the stored `turn_start_ms` is an earlier turn's.
-        let mut app = make_app_with_agent("sess-wake");
-        app.agents.get_mut(&AgentId(0)).unwrap().turn_start_ms =
-            Some(chrono::Utc::now().timestamp_millis() - 600_000);
-
-        let _ = handle_ext_notification(
-            &xai_turn_completed_notif("sess-wake", "task-completed-bg1", "error", false),
-            &mut app,
-        );
-
-        let agent = app.agents.get(&AgentId(0)).unwrap();
-        assert!(matches!(
-            last_session_event(&agent.scrollback),
-            Some(SessionEvent::TurnFailed { elapsed: None, .. })
-        ));
     }
 
     #[test]
@@ -848,8 +838,8 @@
     }
 
     #[test]
-    fn errored_wake_terminal_during_local_turn_still_pushes_failure() {
-        // Failure visibility survives the busy skip: no tracker finish, no elapsed (the anchor is the local turn's), but the row must land
+    fn errored_wake_terminal_during_local_turn_pushes_nothing() {
+        // The busy arm never touches the local turn's tracker; an errored wake leaves no row under the local prompt either
         use crate::app::agent::AgentState;
 
         let mut app = make_app_with_agent("sess-wake");
@@ -857,18 +847,21 @@
         let len_before = app.agents.get(&AgentId(0)).unwrap_or_else(|| panic!("missing map entry")).scrollback.len();
 
         for _ in 0..2 {
-            let _ = handle_ext_notification(
+            let affected = handle_ext_notification(
                 &xai_turn_completed_notif("sess-wake", "task-completed-bg1", "error", false),
                 &mut app,
             );
+            assert!(!affected);
         }
 
         let agent = app.agents.get(&AgentId(0)).unwrap();
-        assert_eq!(agent.scrollback.len(), len_before + 1, "one row, deduped");
-        assert!(matches!(
-            last_session_event(&agent.scrollback),
-            Some(SessionEvent::TurnFailed { elapsed: None, .. })
-        ));
+        assert_eq!(agent.scrollback.len(), len_before);
+        assert!(agent.session.state.is_turn_running(), "the local turn is untouched");
+        assert!(agent.finished_wake_prompts.contains("task-completed-bg1"));
+        assert_eq!(
+            agent.failed_wake_marker_for.as_deref(),
+            Some("task-completed-bg1")
+        );
     }
 
     #[test]
@@ -929,49 +922,6 @@
         ));
     }
 
-    #[test]
-    fn silent_errored_wake_after_goal_turn_has_no_elapsed() {
-        let mut app = make_app_with_agent("sess-wake");
-        let _ = handle(
-            make_viewer_chunk_with_turn_start("sess-wake", "goal-summary-g1", 5_000),
-            &mut app,
-        );
-        let _ = handle_ext_notification(
-            &xai_turn_completed_notif("sess-wake", "goal-summary-g1", "end_turn", false),
-            &mut app,
-        );
-
-        let _ = handle_ext_notification(
-            &xai_turn_completed_notif("sess-wake", "task-completed-bg1", "error", false),
-            &mut app,
-        );
-
-        let agent = app.agents.get(&AgentId(0)).unwrap();
-        assert!(matches!(
-            last_session_event(&agent.scrollback),
-            Some(SessionEvent::TurnFailed { elapsed: None, .. })
-        ));
-    }
-
-    #[test]
-    fn duplicate_errored_wake_terminal_pushes_one_failure_marker() {
-        // Failures bypass the output-epoch dedupe, so duplicates are deduped by prompt id.
-        let mut app = make_app_with_agent("sess-wake");
-        let len_before = app.agents.get(&AgentId(0)).unwrap_or_else(|| panic!("missing map entry")).scrollback.len();
-
-        for _ in 0..2 {
-            let _ = handle_ext_notification(
-                &xai_turn_completed_notif("sess-wake", "task-completed-bg1", "error", false),
-                &mut app,
-            );
-        }
-
-        assert_eq!(
-            app.agents.get(&AgentId(0)).unwrap_or_else(|| panic!("missing map entry")).scrollback.len(),
-            len_before + 1,
-            "one failure marker for the wake, duplicates dropped"
-        );
-    }
 
     #[test]
     fn silent_cancelled_or_rate_limited_wake_stays_markerless() {
@@ -1103,23 +1053,31 @@
     }
 
     #[test]
-    fn chatty_errored_wake_pushes_failure_marker_not_worked_for() {
+    fn chatty_errored_wake_closes_without_marker_and_clears_wake_state() {
+        // Streamed output does not earn an errored wake a row: no "Worked for", no failure; the tracker still finishes
+        use crate::app::agent_view::test_fixtures::count_turn_markers;
+
         let mut app = make_app_with_agent("sess-wake");
         let _ = handle(
             make_viewer_chunk_with_turn_start("sess-wake", "task-completed-bg1", 5_000),
             &mut app,
         );
+        assert!(app.agents.get(&AgentId(0)).unwrap_or_else(|| panic!("missing map entry")).running_wake_turn.is_some());
 
-        let _ = handle_ext_notification(
+        let affected = handle_ext_notification(
             &xai_turn_completed_notif("sess-wake", "task-completed-bg1", "error", false),
             &mut app,
         );
+        assert!(affected, "the wake back-to-idle point still redraws");
 
         let agent = app.agents.get(&AgentId(0)).unwrap();
-        assert!(matches!(
-            last_session_event(&agent.scrollback),
-            Some(SessionEvent::TurnFailed { .. })
-        ));
+        assert_eq!(count_turn_markers(agent), 0);
+        assert!(agent.running_wake_turn.is_none());
+        assert!(agent.session.state.is_idle());
+        assert!(
+            !agent.session.tracker.output_since_last_finish(),
+            "the errored wake's output must not leak into the next silent wake"
+        );
     }
 
     #[test]
@@ -1868,6 +1826,37 @@
             "a suppressed TodoWrite must not count as visible output"
         );
         assert_eq!(agent.scrollback.len(), len_before);
+    }
+
+    #[test]
+    fn replay_chatty_errored_wake_records_pid_no_marker() {
+        // Visible output earns a replayed wake a "Worked for"; an errored one closes silently like live
+        let mut app = make_app_with_agent("sess-wake");
+        begin_replay(&mut app);
+        let _ = handle(
+            make_replay_chunk_with_turn_start("sess-wake", "task-completed-bg1", 5_000),
+            &mut app,
+        );
+        let len_before = app.agents.get(&AgentId(0)).unwrap_or_else(|| panic!("missing map entry")).scrollback.len();
+        let _ = handle_ext_notification(
+            &xai_turn_completed_replay(
+                "sess-wake",
+                "task-completed-bg1",
+                "error",
+                Some(100),
+                Some("[unknown] Premature close"),
+                serde_json::json!({}),
+            ),
+            &mut app,
+        );
+        let agent = app.agents.get(&AgentId(0)).unwrap();
+        assert!(agent.replayed_terminal_prompts.contains("task-completed-bg1"));
+        assert!(agent.replayed_visible_prompts.contains("task-completed-bg1"));
+        assert_eq!(agent.scrollback.len(), len_before);
+        assert_eq!(
+            agent.failed_wake_marker_for.as_deref(),
+            Some("task-completed-bg1")
+        );
     }
 
     #[test]

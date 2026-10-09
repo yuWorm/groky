@@ -1,9 +1,10 @@
 use super::super::load::load_config_from_toml;
-use super::super::mcp::{McpConfig, parse_mcp_config_with_oauth};
-use super::super::settings_writes::write_dashboard_preview;
+use super::super::mcp::McpConfig;
+use super::super::settings_writes::{write_dashboard_preview, write_feature_override};
 use super::*;
 use toml::Value as TomlValue;
 use toml::map::Map as TomlMap;
+use xai_grok_config::mcp_servers::parse_mcp_config_with_oauth;
 /// First-run `ensure` creates a 0-byte `$GROK_HOME/config.toml`.
 /// Empty and whitespace-only files must parse as an empty table so the first settings write is not "refusing to overwrite unparseable".
 /// Non-empty garbage still refuses.
@@ -557,6 +558,45 @@ fn dashboard_preview_writer_refuses_a_retargeted_symlink() {
     assert_eq!(first_content, std::fs::read_to_string(&first).unwrap());
     assert_eq!(second_content, std::fs::read_to_string(&second).unwrap());
     assert_eq!(second, std::fs::read_link(&slot).unwrap());
+}
+/// `Some` inserts or replaces the key, `None` deletes it (and an emptied `[features]` table), and sibling keys survive every step.
+#[test]
+fn feature_override_writer_inserts_replaces_and_removes_the_key() {
+    use crate::agent::config::Feature;
+    let feature = Feature::SubagentModelInheritance;
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("config.toml");
+    std::fs::write(&path, "features = { web_fetch = true }\n").unwrap();
+    let read_features = |path: &std::path::Path| -> Option<TomlValue> {
+        toml::from_str::<TomlValue>(&std::fs::read_to_string(path).unwrap())
+            .unwrap()
+            .get("features")
+            .cloned()
+    };
+    for value in [Some(true), Some(false), None] {
+        write_feature_override(&path, feature, value, atomic_write_follow_bound).unwrap();
+        let features = read_features(&path).expect("sibling key keeps the table");
+        assert_eq!(
+            value,
+            features.get(feature.key()).and_then(TomlValue::as_bool)
+        );
+        assert_eq!(
+            Some(true),
+            features.get("web_fetch").and_then(TomlValue::as_bool)
+        );
+    }
+    std::fs::write(&path, "").unwrap();
+    write_feature_override(&path, feature, Some(true), atomic_write_follow_bound).unwrap();
+    assert_eq!(
+        Some(true),
+        read_features(&path).and_then(|f| f.get(feature.key()).and_then(TomlValue::as_bool))
+    );
+    write_feature_override(&path, feature, None, atomic_write_follow_bound).unwrap();
+    assert_eq!(
+        None,
+        read_features(&path),
+        "an emptied [features] table is dropped"
+    );
 }
 #[test]
 fn unrelated_ui_write_preserves_managed_dashboard_preview_default() {

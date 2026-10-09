@@ -6,6 +6,7 @@ use super::ScreenMode;
 use crate::acp::model_state::ModelState;
 use crate::actions::{ActionId, ActionRegistry, When};
 use crate::app::consent::ConsentState;
+pub use crate::app::voice_state::{Partial, VoiceState, VoiceTarget};
 use crate::appearance::AppearanceConfig;
 use crate::input::KeyboardNormalizer;
 use crate::input::key::KeyShortcut;
@@ -261,74 +262,6 @@ fn reconnect_success_hides_mismatch(current: Option<&str>, incoming: &str) -> bo
     current.is_some_and(crate::acp::is_version_mismatch_banner)
         && (incoming.starts_with("Reconnected.") || incoming.starts_with("Session restored."))
 }
-/// Which prompt box in-flight voice dictation appends its finalized text to.
-/// Captured when recording **starts** so a trailing STT final still lands where the user was dictating.
-/// That holds even if they navigate away, or toggle a dashboard row's peek panel, mid-utterance.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum VoiceTarget {
-    /// A live agent session's prompt box.
-    Agent(AgentId),
-    /// The dashboard's new-agent dispatch input (no row peek was open at start).
-    DashboardDispatch,
-    /// The dashboard's peek reply input, bound to the agent whose peek was open at start.
-    /// The id pins the row: selecting a different row mid-utterance stops capture (the reply widget is shared and clears on row change).
-    /// A final therefore can't land on the wrong agent's reply.
-    DashboardPeekReply(AgentId),
-}
-/// The mic-live, start-queued, Ctrl+Space-hold, and finals-target facts can thus never disagree; as separate booleans they repeatedly drifted apart.
-/// `hold` marks a session begun by a Ctrl+Space hold-press: its matching Ctrl+Space release ends it (and only it).
-/// `/voice` and toggle sessions leave `hold` false so a Ctrl+Space release can't touch them.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub enum VoiceState {
-    /// No dictation in flight.
-    #[default]
-    Idle,
-    /// A start was requested before the lazy pipeline existed; the event loop spawns it once and then opens the mic.
-    ColdStart { hold: bool, target: VoiceTarget },
-    /// Mic is open and streaming audio to STT.
-    Recording {
-        hold: bool,
-        target: VoiceTarget,
-        interim: Option<String>,
-    },
-    /// Capture was explicitly stopped (Esc / Ctrl+Space / [stop] / Ctrl+Space release).
-    /// The target (and the last interim) are kept so a trailing STT final still lands without the overlay flickering in the meantime.
-    Stopping {
-        target: VoiceTarget,
-        interim: Option<String>,
-    },
-}
-impl VoiceState {
-    /// Mic is live (the `Recording` state).
-    pub fn listening(&self) -> bool {
-        matches!(self, Self::Recording { .. })
-    }
-    /// A start is queued for the lazy pipeline (the `ColdStart` state).
-    pub fn pending_cold_start(&self) -> bool {
-        matches!(self, Self::ColdStart { .. })
-    }
-    /// The prompt box that owns this session's dictation, if any.
-    pub fn target(&self) -> Option<VoiceTarget> {
-        match self {
-            Self::ColdStart { target, .. }
-            | Self::Recording { target, .. }
-            | Self::Stopping { target, .. } => Some(*target),
-            Self::Idle => None,
-        }
-    }
-    /// The live partial transcript shown in the prompt overlay, if any.
-    pub fn interim(&self) -> Option<&str> {
-        match self {
-            Self::Recording { interim, .. } | Self::Stopping { interim, .. } => interim.as_deref(),
-            _ => None,
-        }
-    }
-    /// Whether a hold-press owns the current session (so its key release ends it).
-    /// `/voice` and toggle-style starts leave this false.
-    pub(crate) fn hold(&self) -> bool {
-        matches!(self, Self::ColdStart { hold, .. } | Self::Recording { hold, .. } if *hold)
-    }
-}
 /// Entry from the session list wire: welcome/resume pickers and non-leader dashboard roster fallback (`session_picker_entry_to_roster`).
 #[derive(Debug, Clone)]
 pub struct SessionPickerEntry {
@@ -550,6 +483,18 @@ pub struct PendingCodingDataWrite {
     /// Replies are not ordered by server commit, so a late older success can still overwrite a newer value here.
     pub rollback_to_opted_in: bool,
 }
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AuthIdentity {
+    pub email: Option<String>,
+    pub team_id: Option<String>,
+    pub team_principal: bool,
+}
+impl AuthIdentity {
+    /// An absent email never matches: two users without one would otherwise compare equal.
+    pub fn matches(&self, other: &AuthIdentity) -> bool {
+        self.email.is_some() && self == other
+    }
+}
 /// Root view component: owns all application state.
 pub struct AppView {
     /// Taken by whichever path reaches a usable session (or interactive idle) first.
@@ -614,7 +559,7 @@ pub struct AppView {
     /// Tracing log channel receiver. Set by the event loop after `init_tracing()`.
     /// Drained into `tracing_pane` each tick in debug/dev builds; otherwise drained-and-discarded.
     pub tracing_rx: Option<crate::tracing::LogRx>,
-    /// Scroll-diagnostics HUD (`GROK_SCROLL_DEBUG` env / `/scroll-debug`).
+    /// Scroll-diagnostics HUD (`GROK_SCROLL_DEBUG` env / `/debug scroll`).
     /// Release-compiled behind its runtime gate; see the module doc.
     pub scroll_debug_hud: crate::views::scroll_debug_hud::ScrollDebugHud,
     /// Release-safe FPS HUD (`/debug fps`; `GROK_FPS` env on release builds, where the dev overlay is compiled out); see the module doc.
@@ -987,6 +932,8 @@ pub struct AppView {
     pub auth_methods: Vec<acp::AuthMethod>,
     /// Authentication state for the welcome screen login flow.
     pub auth_state: AuthState,
+    /// Set by `/logout` until the shell answers, while `auth_state` still reads `Done`
+    pub logout_pending: bool,
     /// Folder-trust state for the welcome screen.
     /// Mirrors [`AppView::auth_state`]: when `Pending`, the welcome screen shows the trust question.
     /// Session creation is deferred (gated after auth) until it is answered.
@@ -1016,14 +963,18 @@ pub struct AppView {
     pub auth_clipboard_delivery: Option<crate::clipboard::ClipboardDelivery>,
     /// Generation of the current auth copy feedback and its clear timer.
     pub auth_clipboard_feedback_generation: u64,
-    /// Team principal UUID from auth (`None` for personal sessions).
+    /// Team id from the token: the team principal's id, or a personal account's billing team.
     pub team_id: Option<String>,
+    /// The credential is a team principal, so `/user` can resolve `can_administer_team`. A personal account never resolves it.
+    pub is_team_principal: bool,
     /// Team name from auth (displayed in the shortcuts bar).
     pub team_name: Option<String>,
     /// Whether the user's team has enterprise Zero Data Retention enabled.
     pub is_zdr: bool,
-    /// Team role (e.g. "Admin", "Member", "Read Only") for access-control checks.
+    /// Team role from auth (e.g. "Admin", "Member").
     pub team_role: Option<String>,
+    /// Advisory `canAdministerTeam` from auth meta. `None` is unknown, never false.
+    pub can_administer_team: Option<bool>,
     /// Whether the user has opted out of coding data retention.
     pub coding_data_retention_opt_out: bool,
     /// Remote settings `privacy_notice_rollout` (cohort on for this user).
@@ -1043,6 +994,8 @@ pub struct AppView {
     /// Persisted `[toolset.ask_user_question].timeout_enabled` mirror, seeded from the effective TOML merge like `show_tips`.
     /// `None` means unset in TOML (default `true`); toggles write the user layer.
     pub ask_user_question_timeout_enabled: Option<bool>,
+    /// `[features].subagent_model_inheritance` as the settings modal shows it: the saved user key plus the tiers seeded at startup.
+    pub subagent_model_inheritance: crate::settings::FeatureOverrideState,
     /// Whether ZDR users are allowed to use the product.
     /// Server-controlled via RemoteSettings (remote settings). Default `false` (blocked) during beta.
     pub zdr_access_enabled: bool,
@@ -1125,6 +1078,8 @@ pub struct AppView {
     /// When false (remote kill switch or `GROK_VOICE_MODE=0`) the STT pipeline is not started and session voice mode cannot turn on.
     /// Unit tests leave this false until they call [`Self::apply_voice_mode_enabled`].
     pub voice_mode_enabled: bool,
+    /// What this build may do. Tests set it; everything else takes [`Distribution::current`].
+    pub distribution: xai_grok_config::Distribution,
     /// Session UI mode from `/voice` (this CLI process only, not in config.toml).
     /// When true and the pipeline is up, the in-prompt dictation overlay can show and capture may start.
     /// Cleared on exit or when the remote flag turns off.
@@ -1140,6 +1095,15 @@ pub struct AppView {
     /// One state at a time, so inconsistent combinations are unrepresentable.
     /// Production mutates it only through the `AppView::voice_*` transition methods.
     pub voice_state: VoiceState,
+    /// Minted per press; the pipeline stamps events with it and [`crate::voice::handle_tagged_voice_event`] drops
+    /// older ones.
+    pub voice_session: xai_grok_voice::VoiceSessionId,
+    /// The session the last press superseded while it was stopping, and its target: its one trailing final is
+    /// still let through (the last sentence of the previous dictation), where every other stale event is dropped.
+    pub voice_trailing_final: Option<(xai_grok_voice::VoiceSessionId, VoiceTarget)>,
+    /// When an outstanding clip (stopped or uploading) is given up on if its final never arrives; see
+    /// [`AppView::voice_expire_outstanding_clip`].
+    pub voice_clip_deadline: Option<Instant>,
 }
 /// Reshow window elapsed? None or 0 means never. Unparseable ack fails open (show).
 fn privacy_banner_reshow_elapsed(acked_at: &str, reshow_days: Option<u64>) -> bool {
@@ -1192,25 +1156,30 @@ impl AppView {
     pub fn is_access_blocked(&self) -> bool {
         !self.has_access() || self.is_zdr_blocked()
     }
-    /// Coding-data preference is team-admin-owned for non-admin members.
-    pub fn is_team_non_admin(&self) -> bool {
-        self.team_name.is_some()
-            && !self
-                .team_role
-                .as_deref()
-                .is_some_and(|r| r.eq_ignore_ascii_case("admin"))
-    }
     /// Whether `/feedback` may offer the trace-consent question: the shell advertised the offer and no card answer latched it off this session.
     /// Derived so no code path can fabricate an offer the shell never made.
     pub fn feedback_trace_offer(&self) -> bool {
         self.shell_feedback_trace_offer && !self.feedback_trace_choice_latched
     }
+    /// A cached team credential from before `canAdministerTeam` reads unknown and nothing refetches `/user` at startup; a personal account (which also carries a `team_id`) reads unknown on every call and is not asked.
+    pub fn needs_team_capability_hydration(&self) -> bool {
+        self.is_team_principal
+            && self.can_administer_team.is_none()
+            && !self.is_api_key_auth
+            && self.account_email.is_some()
+    }
+    pub fn auth_identity(&self) -> AuthIdentity {
+        AuthIdentity {
+            email: self.account_email.clone(),
+            team_id: self.team_id.clone(),
+            team_principal: self.is_team_principal,
+        }
+    }
     /// Why `coding_data_sharing` is locked for this user (`None` means editable).
-    /// Mirrors the dispatch guards in `set_coding_data_sharing`.
     pub fn coding_data_sharing_lock(&self) -> Option<crate::settings::CodingDataSharingLock> {
         if self.is_zdr {
             Some(crate::settings::CodingDataSharingLock::Zdr)
-        } else if self.is_team_non_admin() {
+        } else if self.can_administer_team == Some(false) {
             Some(crate::settings::CodingDataSharingLock::TeamManaged)
         } else {
             None
@@ -1228,7 +1197,9 @@ impl AppView {
         if !self.privacy_notice_rollout {
             return false;
         }
-        if self.is_zdr || self.is_team_non_admin() {
+        if self.coding_data_sharing_lock().is_some()
+            || (self.is_team_principal && self.can_administer_team.is_none())
+        {
             return false;
         }
         if self.coding_data_pending_write.is_some() {
@@ -1289,12 +1260,14 @@ impl AppView {
         let was_gated = self.gate.is_some();
         self.account_email = meta.email.clone();
         self.team_id = meta.team_id.clone();
+        self.is_team_principal = meta.is_team_principal;
         self.team_name = meta.team_name.clone();
         self.is_zdr = meta.is_zdr;
         self.team_role = meta.team_role.clone();
         if let Some(pending) = self.coding_data_pending_write.as_mut() {
             pending.rollback_to_opted_in = !meta.coding_data_retention_opt_out;
         }
+        self.can_administer_team = meta.can_administer_team;
         self.coding_data_retention_opt_out = meta.coding_data_retention_opt_out;
         self.shell_feedback_trace_offer = meta.feedback_trace_offer;
         self.gate = meta.gate.clone();
@@ -1328,6 +1301,7 @@ impl AppView {
         if let Some(show) = meta.show_resolved_model {
             self.show_resolved_model = show;
         }
+        super::dispatch::refresh_open_settings_modals(self);
     }
     /// Mirror the billing and `/usage` gates onto every slash surface (agents, welcome, dashboard dispatch / peek-reply).
     pub(crate) fn sync_billing_surface_to_agents(&mut self) {
@@ -1538,6 +1512,7 @@ impl AppView {
             bootstrap_acp_commands,
             auth_methods: Vec::new(),
             auth_state: AuthState::Done,
+            logout_pending: false,
             trust_state: TrustState::Done,
             consent_state: crate::app::consent::ConsentState::Done,
             account_email: None,
@@ -1552,9 +1527,11 @@ impl AppView {
             auth_clipboard_delivery: None,
             auth_clipboard_feedback_generation: 0,
             team_id: None,
+            is_team_principal: false,
             team_name: None,
             is_zdr: false,
             team_role: None,
+            can_administer_team: None,
             coding_data_retention_opt_out: true,
             privacy_notice_rollout: false,
             privacy_banner_reshow_days: None,
@@ -1564,6 +1541,9 @@ impl AppView {
             show_tips: None,
             auto_update: None,
             ask_user_question_timeout_enabled: None,
+            subagent_model_inheritance: crate::settings::FeatureOverrideState::new(
+                xai_grok_shell::agent::config::Feature::SubagentModelInheritance,
+            ),
             zdr_access_enabled: false,
             usage_billing_redirect_url: None,
             access_gate_shown_logged: false,
@@ -1621,11 +1601,15 @@ impl AppView {
             dashboard_persisted: None,
             keyboard_normalizer: KeyboardNormalizer::from_terminal_context(),
             voice_mode_enabled: false,
+            distribution: xai_grok_config::Distribution::current(),
             voice_ui_active: false,
             voice_config: xai_grok_voice::VoiceConfig::default(),
             voice_auth: None,
             voice_cmd_tx: None,
             voice_state: VoiceState::Idle,
+            voice_session: xai_grok_voice::VoiceSessionId::default(),
+            voice_trailing_final: None,
+            voice_clip_deadline: None,
         }
     }
     /// Seed `deferred_model_switch` from CLI `-m`.
@@ -1750,92 +1734,6 @@ impl AppView {
             }
         }
     }
-    /// Mic is live (the [`VoiceState::Recording`] state).
-    pub fn voice_listening(&self) -> bool {
-        self.voice_state.listening()
-    }
-    /// Whether the in-flight session is owned by a hold-press (so its key release ends it).
-    /// `/voice` and toggle-style starts leave this false.
-    pub fn voice_hold_owned(&self) -> bool {
-        self.voice_state.hold()
-    }
-    /// The prompt box that owns in-flight dictation, if any.
-    pub fn voice_recording_target(&self) -> Option<VoiceTarget> {
-        self.voice_state.target()
-    }
-    /// The live partial transcript shown in the prompt overlay, if any.
-    pub fn voice_interim(&self) -> Option<&str> {
-        self.voice_state.interim()
-    }
-    /// Best-effort one-shot command into the voice pipeline (no-op if it isn't up).
-    fn voice_send(&self, cmd: xai_grok_voice::VoiceCommand) {
-        if let Some(tx) = &self.voice_cmd_tx
-            && tx.try_send(cmd).is_err()
-        {
-            tracing::trace!("voice command dropped: pipeline channel full or closed");
-        }
-    }
-    /// Open the mic now (pipeline already up) and enter [`VoiceState::Recording`] bound to `target`.
-    /// `hold` marks a Ctrl+Space hold-press start.
-    pub(crate) fn voice_begin_recording(&mut self, target: VoiceTarget, hold: bool) {
-        self.voice_send(xai_grok_voice::VoiceCommand::PttPress);
-        self.voice_state = VoiceState::Recording {
-            hold,
-            target,
-            interim: None,
-        };
-    }
-    /// Set the live interim transcript.
-    /// No-op unless recording, so a late event after a stop can't repopulate the overlay.
-    pub(crate) fn voice_set_interim(&mut self, text: String) -> bool {
-        if let VoiceState::Recording { interim, .. } = &mut self.voice_state {
-            *interim = Some(text);
-            true
-        } else {
-            false
-        }
-    }
-    /// Clear the interim in place, keeping the current state.
-    /// Called when a final commits (or yields empty) so the overlay drops the partial without a teardown.
-    pub(crate) fn voice_clear_interim(&mut self) {
-        match &mut self.voice_state {
-            VoiceState::Recording { interim, .. } | VoiceState::Stopping { interim, .. } => {
-                *interim = None;
-            }
-            VoiceState::Idle | VoiceState::ColdStart { .. } => {}
-        }
-    }
-    /// Explicit stop (Esc / Ctrl+Space / `[stop]`): release the mic but keep the target and last interim so a trailing STT final still lands.
-    /// Always allowed (never leaves a hot mic). No-op unless recording.
-    pub(crate) fn voice_stop_keeping_final(&mut self) {
-        let VoiceState::Recording {
-            target, interim, ..
-        } = &mut self.voice_state
-        else {
-            return;
-        };
-        let target = *target;
-        let interim = interim.take();
-        self.voice_send(xai_grok_voice::VoiceCommand::PttRelease);
-        self.voice_state = VoiceState::Stopping { target, interim };
-    }
-    /// Hard teardown (submit / error / kill-switch / navigate-away): release the mic and forget the session (no trailing final, no queued start).
-    pub(crate) fn voice_reset(&mut self) {
-        if self.voice_state.listening() {
-            self.voice_send(xai_grok_voice::VoiceCommand::PttRelease);
-        }
-        self.voice_state = VoiceState::Idle;
-    }
-    /// Ctrl+Space hold release: end only a session a Ctrl+Space hold started.
-    /// Cancel a queued hold cold-start, or stop a live hold recording (keeping its trailing final).
-    /// A `/voice` / toggle session (`hold` false) is left untouched, so a Ctrl+Space release can neither cancel nor stop it.
-    pub(crate) fn voice_hold_release(&mut self) {
-        match self.voice_state {
-            VoiceState::ColdStart { hold: true, .. } => self.voice_reset(),
-            VoiceState::Recording { hold: true, .. } => self.voice_stop_keeping_final(),
-            _ => {}
-        }
-    }
     /// Whether the active view still owns the bound dictation `target`: the box dictation started in is the one currently on screen and selected.
     /// The target is bound at capture start.
     /// On the dashboard, dispatch requires no peek open, and a peek reply requires the *same* top-level row still peeked.
@@ -1873,7 +1771,8 @@ impl AppView {
     /// Keeps stop controls and the recording session aligned.
     /// Run by the event loop each tick; no-op unless recording.
     pub fn enforce_voice_session_bound(&mut self) {
-        if !self.voice_state.listening() || self.voice_target_on_active_surface() {
+        let in_flight = self.voice_state.is_listening() || self.voice_state.blocks_new_capture();
+        if !in_flight || self.voice_target_on_active_surface() {
             return;
         }
         self.voice_reset();
@@ -1891,8 +1790,12 @@ impl AppView {
         }
         if self.voice_listening() {
             Some(InputOutcome::Action(Action::VoiceToggle))
-        } else if self.voice_state.pending_cold_start() {
+        } else if self.voice_state.is_pending_cold_start() {
             self.voice_reset();
+            Some(InputOutcome::Changed)
+        } else if self.voice_state.blocks_new_capture() {
+            self.voice_reset();
+            self.show_toast(crate::voice::RECORDING_DISCARDED_TOAST);
             Some(InputOutcome::Changed)
         } else {
             None
@@ -3712,6 +3615,14 @@ fn handle_welcome_input(ev: &Event, ctx: &mut WelcomeInputCtx<'_>) -> InputOutco
             if ctx.registry.matches_id(ActionId::OpenSessions, key) {
                 return InputOutcome::Action(Action::FetchSessionList);
             }
+            if ctx.registry.matches_id(ActionId::CommandPalette, key)
+                && !crate::input::key::is_text_input_key(key)
+            {
+                return InputOutcome::ActionThenForward(Action::LeaveHome);
+            }
+            if ctx.has_pending_update && key!('u', CONTROL).matches(key) {
+                return InputOutcome::Action(Action::QuitForUpdate);
+            }
             if ctx.has_foreign_resume && key!('u', CONTROL).matches(key) {
                 return InputOutcome::Action(Action::ResumeForeignSession);
             }
@@ -4469,7 +4380,8 @@ impl AppView {
                                 }
                                 Some((false, false, true)) if welcome_auto_gate => {
                                     flags_vec.push(crate::views::prompt_widget::PromptFlag {
-                                        text: "auto",
+                                        text: crate::app::actions::PermissionLabel::Auto
+                                            .display_name(),
                                         color: Some(theme.accent_system),
                                         bold: false,
                                     });
@@ -4497,6 +4409,7 @@ impl AppView {
                                 Some(eff) => format!("{model_name_base} ({eff})"),
                                 None => model_name_base,
                             };
+                            let model_notice = self.models.current_notice();
                             let hero_cta = crate::views::announcements::promo_cta(
                                 &self.active_announcements,
                                 &self.hidden_announcement_ids,
@@ -4529,6 +4442,7 @@ impl AppView {
                                 announcement: hero_announcement,
                                 tip,
                                 model_name: &model_name,
+                                model_notice: model_notice.as_ref(),
                                 flags: &flags_vec,
                                 selected: self.welcome_menu_index,
                                 team_name: self.team_name.as_deref(),
@@ -4702,11 +4616,13 @@ impl AppView {
                                 panel.render(full_area, f.buffer_mut());
                             }
                             let has_cloud_modal = false;
-                            let cursor = if has_cloud_modal || self.tutorial.is_some() {
-                                None
-                            } else {
-                                result.cursor_pos
-                            };
+                            let has_remote_modal = false;
+                            let cursor =
+                                if has_cloud_modal || has_remote_modal || self.tutorial.is_some() {
+                                    None
+                                } else {
+                                    result.cursor_pos
+                                };
                             let on_url = self.welcome_auth_url_rect.as_ref().is_some_and(|r| {
                                 matches!(self.auth_state, AuthState::Authenticating { .. })
                                     && self.last_mouse_pos.is_some_and(|(mx, my)| {
@@ -4814,7 +4730,6 @@ impl AppView {
                                             None
                                         },
                                     },
-                                    &self.bundle_state,
                                     overlay_active,
                                     link_spans,
                                     AppRenderParams {
@@ -4854,17 +4769,20 @@ impl AppView {
                                 }
                                 let (cursor_pos, post_flush) = result;
                                 let has_cloud = false;
+                                let has_remote_modal = false;
                                 if has_cloud
+                                    || has_remote_modal
                                     || self.import_claude_modal.is_some()
                                     || self.tutorial.is_some()
                                 {
                                     link_spans.clear();
                                 }
-                                let cursor = if has_cloud || self.tutorial.is_some() {
-                                    None
-                                } else {
-                                    cursor_pos
-                                };
+                                let cursor =
+                                    if has_cloud || has_remote_modal || self.tutorial.is_some() {
+                                        None
+                                    } else {
+                                        cursor_pos
+                                    };
                                 return (cursor, Self::merge_escapes(notif_escapes, post_flush));
                             }
                         }
@@ -4933,7 +4851,6 @@ impl AppView {
                                             .get(&agent_id)
                                             .map(crate::views::session_title::entry_title)
                                             .unwrap_or_else(|| "(session)".to_string());
-                                        let bundle_state = &self.bundle_state;
                                         let (cursor, post_flush, drawn) =
                                             crate::views::dashboard::render_popup_overlay(
                                                 f.buffer_mut(),
@@ -4952,7 +4869,6 @@ impl AppView {
                                                         None,
                                                         false,
                                                         crate::app::agent_view::BannerSlotParams::none(),
-                                                        bundle_state,
                                                         false,
                                                         link_spans,
                                                         AppRenderParams {
@@ -5148,6 +5064,11 @@ impl AppView {
             || matches!(self.active_view, ActiveView::AgentDashboard
                 if self.dashboard_session_picker.is_some())
             || cloud_modal_open
+            || self.remote_modal_open()
+    }
+    /// The `/remote` modal, behind its backend feature like the field itself.
+    fn remote_modal_open(&self) -> bool {
+        false
     }
     /// Store the resolved per-tip gates and propagate the prompt-relevant tips (undo and plan nudge) to every agent's prompt.
     /// Reused by startup and the settings live-apply path so a runtime toggle reaches existing agents.
@@ -5302,8 +5223,9 @@ impl AppView {
     /// Called at a fixed rate (~30fps) from the event loop.
     /// Produces redraws when there are running entries with animated accents.
     pub fn tick(&mut self) -> bool {
+        self.fps_hud.note_tick();
         let mut needs_redraw = false;
-        needs_redraw |= self.minimal_state.transcript.is_some();
+        needs_redraw |= self.minimal_state.needs_frames();
         needs_redraw |= self.poll_clipboard_focus_tip();
         if matches!(self.active_view, ActiveView::Welcome) {
             self.welcome_tick = self.welcome_tick.wrapping_add(1);
@@ -5660,7 +5582,7 @@ impl AppView {
         if self.pending_action.is_some() {
             return TickDemand::Fast;
         }
-        if self.minimal_state.transcript.is_some() {
+        if self.minimal_state.needs_frames() {
             return TickDemand::Fast;
         }
         if self

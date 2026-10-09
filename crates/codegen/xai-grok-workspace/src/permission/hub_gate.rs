@@ -4,11 +4,14 @@
 //! persisted grants are the TUI's `permission.toml`, shared on purpose so a grant given in either
 //! surface holds in the other.
 
+use std::path::Path;
 use std::sync::LazyLock;
 
 use prometheus::{IntCounterVec, register_int_counter_vec};
 use serde_json::Value;
+use xai_grok_agent::repo::RepoDirChain;
 use xai_grok_paths::AbsPathBuf;
+use xai_grok_sandbox::command::SandboxMode;
 use xai_tool_runtime::{ToolApprovalPolicy, ToolError, ToolErrorKind};
 
 use crate::handle::WorkspaceHandle;
@@ -21,7 +24,7 @@ use crate::permission::hub_permission::{
     prompt_outcome_allows, request_permission_via_hub,
 };
 use crate::permission::prompter::PromptOutcome;
-use crate::permission::state::{CachedStateStore, PermissionState, persist_state};
+use crate::permission::state::{CachedStateStore, PermissionState, StateFileAccess};
 use crate::permission::types::{AccessKind, Decision};
 use crate::session::WorkspaceSession;
 
@@ -34,10 +37,11 @@ static DECISION_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
     .expect("grok_workspace_permission_decision_total must register once")
 });
 
-const DECISIONS: [&str; 7] = [
+const DECISIONS: [&str; 8] = [
     "undecodable",
     "grant_allow",
     "grant_deny",
+    "sandbox_card",
     "no_transport",
     "prompt_allow",
     "prompt_deny",
@@ -63,16 +67,27 @@ pub enum ToolApprovalGate {
     Off,
 }
 
-/// On by construction where the device is the user's own: there is no off switch on the device, only
-/// the tenant's `tool_approval_policy` delivered with the bind. The sandbox guest keeps the opt-in its
-/// plane already uses (`GROK_HITL_PERMISSION_LIVE`).
+/// Which prompt stands between a mutating call and its run. Persisted grants and denies settle
+/// the call ahead of either.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PromptGate {
+    /// The pre-run card: the owner is asked before the tool runs.
+    PreRun,
+    /// A shell call on a folder whose sandbox enforces and whose output the sandbox decodes: the
+    /// sandbox card, raised on a violation after the run, is the prompt.
+    SandboxCard,
+}
+
+/// Pre-release stopgap: the daemon runs every hub tool call unasked (no permission cards) until
+/// sandboxing lands. The sandbox guest keeps the opt-in its plane already uses
+/// (`GROK_HITL_PERMISSION_LIVE`).
 pub fn approval_gate_for(host_kind: WorkspaceHostKind) -> ToolApprovalGate {
     resolve_gate(host_kind, hitl_permission_live_enabled())
 }
 
 fn resolve_gate(host_kind: WorkspaceHostKind, hitl_opt_in: bool) -> ToolApprovalGate {
     let enforced = match host_kind {
-        WorkspaceHostKind::Daemon => true,
+        WorkspaceHostKind::Daemon => false,
         WorkspaceHostKind::Sandbox => hitl_opt_in,
     };
     if enforced {
@@ -110,13 +125,18 @@ impl SessionApproval {
         *self.policy.lock() = policy;
     }
 
-    fn policy(&self) -> ToolApprovalPolicy {
+    pub(crate) fn policy(&self) -> ToolApprovalPolicy {
         *self.policy.lock()
     }
 }
 
 struct FolderGrants {
     cwd: AbsPathBuf,
+    /// The store's key: the served folder when the bound cwd is a repo-less directory under it.
+    /// Grok Desktop binds every conversation to its own scratch directory beneath the folder it
+    /// exposes, and a cwd-keyed store made an "always" answer hold for one chat only. A cwd inside a
+    /// repository keeps the repo-root key, so the CLI's per-project grants are unchanged.
+    grant_dir: AbsPathBuf,
     store: CachedStateStore,
     state: PermissionState,
     /// The owner's "allow all edits" answer: session-scoped by design, never written to disk.
@@ -124,10 +144,13 @@ struct FolderGrants {
 }
 
 impl FolderGrants {
-    async fn load(cwd: AbsPathBuf) -> Self {
-        let (store, state) = CachedStateStore::resolve_and_load(&cwd, None).await;
+    async fn load(cwd: AbsPathBuf, served_root: &Path, access: StateFileAccess) -> Self {
+        let grant_dir = grant_dir_for(&cwd, served_root).await;
+        let (store, state) =
+            CachedStateStore::resolve_and_load_with(&grant_dir, None, access).await;
         FolderGrants {
             cwd,
+            grant_dir,
             store,
             state,
             allow_edits_for_session: false,
@@ -188,8 +211,38 @@ impl FolderGrants {
         if matches!(outcome, PromptOutcome::AllowEditsForSession) {
             self.allow_edits_for_session = true;
         } else if record_prompt_outcome(&mut self.state, access, outcome).is_some() {
-            persist_state(&self.cwd, &self.state, None).await;
+            self.store.persist(&self.grant_dir, &self.state).await;
         }
+    }
+}
+
+/// The served folder when `cwd` lies under it and is inside no repository of its own; otherwise
+/// `cwd`, which the store resolves to its repo root as before. Both paths are compared canonical
+/// (the desktop joins its cwd from the raw home dir; the daemon canonicalizes the root it serves).
+/// The probe walks the filesystem, so it runs on the blocking pool; one that did not finish keeps
+/// the cwd key.
+pub(crate) async fn grant_dir_for(cwd: &AbsPathBuf, served_root: &Path) -> AbsPathBuf {
+    if cwd.as_path() == served_root {
+        return cwd.clone();
+    }
+    let Ok(root) = AbsPathBuf::new(served_root.to_path_buf()) else {
+        return cwd.clone();
+    };
+    let (probe_cwd, probe_root) = (cwd.clone(), root.clone());
+    let under_root_outside_repo = tokio::task::spawn_blocking(move || {
+        let canonical =
+            |path: &Path| dunce::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+        canonical(probe_cwd.as_path()).starts_with(canonical(probe_root.as_path()))
+            && RepoDirChain::resolve(probe_cwd.as_path())
+                .git_root
+                .is_none()
+    })
+    .await
+    .unwrap_or(false);
+    if under_root_outside_repo {
+        root
+    } else {
+        cwd.clone()
     }
 }
 
@@ -200,7 +253,7 @@ fn permission_denied(message: impl Into<String>) -> ToolError {
     ToolError::new(ToolErrorKind::PermissionDenied, message)
 }
 
-/// Settle one hub tool call: `Ok` lets it run, `Err` is the denial the model sees.
+/// Settle one hub tool call under `gate`: `Ok` lets it run, `Err` is the denial the model sees.
 ///
 /// # Errors
 /// The toolset's own decode error when the call cannot be parsed (it could not have run);
@@ -212,28 +265,47 @@ pub(crate) async fn approve_hub_call(
     tool_name: &str,
     call_id: &str,
     args: &Value,
+    gate: PromptGate,
 ) -> Result<(), ToolError> {
     let transport = workspace.hub_server_blocking().await.and_then(|server| {
         ToolServerPermissionTransport::from_session_id(server, session.session_id())
     });
     settle(
         session,
+        workspace.shared.root_cwd(),
         tool_name,
         call_id,
         args,
         transport
             .as_ref()
             .map(|t| t as &dyn PermissionHookTransport),
+        gate,
+        grant_store_access(workspace),
     )
     .await
 }
 
+/// How the session's grant store is read and written now: as the daemon's own file while the
+/// folder's sandbox is on (its mode is not `off`) — the store a sandboxed command may have
+/// planted — as a plain file otherwise, which is the CLI's own behaviour.
+pub(crate) fn grant_store_access(workspace: &WorkspaceHandle) -> StateFileAccess {
+    match workspace.shared.sandbox() {
+        Some(sandbox) if sandbox.mode() != SandboxMode::Off => StateFileAccess::DaemonOwned {
+            grok_home: xai_grok_config::grok_home(),
+        },
+        _ => StateFileAccess::Plain,
+    }
+}
+
 async fn settle(
     session: &WorkspaceSession,
+    served_root: &Path,
     tool_name: &str,
     call_id: &str,
     args: &Value,
     transport: Option<&dyn PermissionHookTransport>,
+    gate: PromptGate,
+    store_access: StateFileAccess,
 ) -> Result<(), ToolError> {
     let policy = session.approval.policy();
     // A client's auto-approve is unattended mode; only a tenant that allows unattended hosts may grant it.
@@ -254,9 +326,16 @@ async fn settle(
     let mut folder = match policy {
         ToolApprovalPolicy::AlwaysPrompt => None,
         ToolApprovalPolicy::GrantsAllowed | ToolApprovalPolicy::UnattendedAllowed => {
-            if slot.is_none() {
+            // A store opened under the other access is opened again: a folder's sandbox that
+            // came on since must not keep reading its grants as a plain file
+            if slot
+                .as_ref()
+                .is_none_or(|folder| *folder.store.access() != store_access)
+            {
                 match AbsPathBuf::new(session.cwd().to_path_buf()) {
-                    Ok(cwd) => *slot = Some(FolderGrants::load(cwd).await),
+                    Ok(cwd) => {
+                        *slot = Some(FolderGrants::load(cwd, served_root, store_access).await);
+                    }
                     Err(e) => {
                         tracing::warn!(error = %e, "session cwd has no grant store; every mutating call prompts")
                     }
@@ -277,6 +356,13 @@ async fn settle(
             }
             None => {}
         }
+    }
+    // SECURITY: only the prompt is the sandbox card's; a deny row above refused the call already,
+    // and `always_prompt` keeps the pre-run prompt (its ceiling records no answer the card could
+    // stand in for)
+    if gate == PromptGate::SandboxCard && policy != ToolApprovalPolicy::AlwaysPrompt {
+        count("sandbox_card");
+        return Ok(());
     }
 
     let Some(transport) = transport else {

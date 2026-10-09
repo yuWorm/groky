@@ -20,7 +20,7 @@ pub struct TruncationConfig {
 }
 
 /// Which files `read_file` returns whole under the token cap; a bit that is off makes its class a regular file.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 pub struct WholeReadPolicy {
     pub skill_markdown: bool,
     pub instruction_files: bool,

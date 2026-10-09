@@ -30,7 +30,7 @@ impl FilenamePager {
             "supply PAGER_BINARY; implicit builds are forbidden"
         );
         let binary = pager_binary().expect("supplied pager binary");
-        let rg = std::fs::canonicalize(
+        let rg = dunce::canonicalize(
             std::env::var_os("RG_BIN_PATH").expect("supply real rg via RG_BIN_PATH"),
         )
         .expect("real rg fixture exists");

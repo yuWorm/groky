@@ -6,7 +6,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
-use xai_grok_hooks::discovery::HookSource;
+pub use xai_grok_hooks::discovery::HookSourceConfig;
 use xai_grok_tools::registry::types::{SessionContext, ToolRegistryBuilder, ToolServerConfig};
 use xai_tool_runtime::ToolApprovalPolicy;
 /// Default capacity for the workspace event broadcast channel.
@@ -795,6 +795,8 @@ pub struct BindMcpConfig {
     /// Server names designated first-party app endpoints — see
     /// [`Self::with_first_party_servers`].
     first_party: std::sync::Arc<std::collections::HashSet<String>>,
+    /// The call gate for each server name, set with [`Self::with_call_gate`].
+    call_gates: Arc<crate::mcp::McpCallGates>,
 }
 impl BindMcpConfig {
     pub const DEFAULT_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(30);
@@ -814,6 +816,7 @@ impl BindMcpConfig {
             servers: servers.into(),
             discovery_timeout: Self::DEFAULT_DISCOVERY_TIMEOUT,
             first_party: std::sync::Arc::new(std::collections::HashSet::new()),
+            call_gates: Arc::default(),
         }
     }
     pub fn with_discovery_timeout(mut self, timeout: Duration) -> Self {
@@ -829,6 +832,19 @@ impl BindMcpConfig {
     }
     pub fn first_party_servers(&self) -> &std::collections::HashSet<String> {
         &self.first_party
+    }
+    /// `gate` checks every tool call to the server named `server`, a host's own built-in server.
+    /// A server that started before this call keeps the gate it started with.
+    pub fn with_call_gate(
+        mut self,
+        server: impl Into<String>,
+        gate: Arc<dyn crate::mcp::McpCallGate>,
+    ) -> Self {
+        Arc::make_mut(&mut self.call_gates).insert(server.into(), gate);
+        self
+    }
+    pub fn call_gates(&self) -> &crate::mcp::McpCallGates {
+        &self.call_gates
     }
     pub fn servers(&self) -> &[agent_client_protocol::McpServer] {
         &self.servers
@@ -905,6 +921,9 @@ pub struct WorkspaceConfig {
     pub tool_approval: ToolApprovalGate,
     /// Which host runs this server; decides whether the root's `FsChanged` producer is lit.
     pub host_kind: crate::host_kind::WorkspaceHostKind,
+    /// The folder's per-command shell sandbox; `None` on hosts that do not sandbox commands (the
+    /// CLI, the remote sandbox server). The session factory must carry its launch hook.
+    pub sandbox: Option<Arc<crate::sandbox::WorkspaceSandbox>>,
 }
 /// Metadata a tool server announces so hub consumers can identify and route to it.
 /// Re-export of the protocol crate's single catalog of well-known registration-metadata keys; every field is optional and independently sourced.
@@ -967,6 +986,7 @@ impl WorkspaceConfig {
             tool_approval: ToolApprovalGate::Off,
             status_config,
             host_kind: Default::default(),
+            sandbox: None,
         }
     }
 }
@@ -1026,23 +1046,6 @@ impl std::fmt::Debug for AgentSessionConfig {
             .field("extra_env", &self.extra_env)
             .field("parent_session_id", &self.parent_session_id)
             .finish()
-    }
-}
-/// A single hook source: either a JSON settings file or a directory of `*.json` hook files.
-/// Maps 1:1 to [`xai_grok_hooks::discovery::HookSource`] but uses owned `PathBuf` so the config struct is `'static`.
-#[derive(Debug, Clone)]
-pub enum HookSourceConfig {
-    /// A single JSON settings file (e.g. `~/.claude/settings.json`).
-    SettingsFile(PathBuf),
-    /// A directory of `*.json` hook files (e.g. `~/.grok/hooks/`).
-    Directory(PathBuf),
-}
-impl HookSourceConfig {
-    pub fn as_hook_source(&self) -> HookSource<'_> {
-        match self {
-            Self::SettingsFile(path) => HookSource::SettingsFile(path),
-            Self::Directory(path) => HookSource::Directory(path),
-        }
     }
 }
 /// Filesystem isolation strategy for a forked session.

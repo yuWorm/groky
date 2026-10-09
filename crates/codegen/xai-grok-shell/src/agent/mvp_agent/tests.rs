@@ -1,6 +1,13 @@
+use super::system_prompt::{
+    RequestedSystemPrompt, read_session_or_init_meta_str, requested_system_prompt,
+};
 use super::test_hooks::{AttachPause, with_pause_at};
 use super::*;
+use crate::agent::config::TraceUploadEndpoints;
+use crate::agent::config::{EndpointsConfig, ModelEntry};
+use crate::agent::handlers::model_switch::SwitchContextWindow;
 use crate::extensions::code_nav::CodeNavEligibility;
+use std::num::NonZeroU64;
 /// Build an unsigned JWT with a `tier` claim (header.payload.sig base64url).
 fn jwt_with_tier(tier: u64) -> String {
     use base64::Engine;
@@ -47,28 +54,9 @@ fn auth_with_mode(mode: xai_grok_login::AuthMode, key: &str) -> xai_grok_login::
     xai_grok_login::GrokAuth {
         key: key.into(),
         auth_mode: mode,
-        create_time: chrono::Utc::now(),
         user_id: "u".into(),
-        email: None,
-        first_name: None,
-        last_name: None,
-        profile_image_asset_id: None,
-        principal_type: None,
-        principal_id: None,
-        team_id: None,
-        team_name: None,
-        team_role: None,
-        organization_id: None,
-        organization_name: None,
-        organization_role: None,
-        user_blocked_reason: None,
-        team_blocked_reasons: vec![],
         coding_data_retention_opt_out: false,
-        has_grok_code_access: None,
-        refresh_token: None,
-        expires_at: None,
-        oidc_issuer: None,
-        oidc_client_id: None,
+        ..xai_grok_login::GrokAuth::default()
     }
 }
 #[test]
@@ -928,9 +916,16 @@ fn parse_session_plugin_dirs_filters_and_dedupes() {
             42,                             // not a string, skipped
         ]
     });
-    assert_eq!(parse_session_plugin_dirs(meta.as_object()), vec![dir]);
-    assert!(parse_session_plugin_dirs(None).is_empty());
-    assert!(parse_session_plugin_dirs(serde_json::json!({}).as_object()).is_empty());
+    assert_eq!(
+        &[dir],
+        parse_session_plugin_dirs(meta.as_object()).as_paths()
+    );
+    assert!(parse_session_plugin_dirs(None).as_paths().is_empty());
+    assert!(
+        parse_session_plugin_dirs(serde_json::json!({}).as_object())
+            .as_paths()
+            .is_empty()
+    );
 }
 #[test]
 fn read_session_or_init_meta_str_returns_none_when_absent() {
@@ -1012,6 +1007,40 @@ fn system_prompt_override_from_meta_prefers_session_and_rejects_empty() {
         None
     );
     assert_eq!(system_prompt_override_from_meta(None, None), None);
+}
+#[test]
+fn override_wins_over_rules() {
+    let cases = [
+        (
+            serde_json::json!({ "systemPromptOverride": "you are terse", "rules": "keep the marker" }),
+            Some(RequestedSystemPrompt::Override("you are terse")),
+        ),
+        (
+            serde_json::json!({ "systemPromptOverride": "you are terse" }),
+            Some(RequestedSystemPrompt::Override("you are terse")),
+        ),
+        (
+            serde_json::json!({ "rules": "keep the marker" }),
+            Some(RequestedSystemPrompt::Rules("keep the marker")),
+        ),
+        (serde_json::json!({}), None),
+    ];
+    for (init, expected) in cases {
+        assert_eq!(expected, requested_system_prompt(None, init.as_object()));
+    }
+}
+#[test]
+fn blank_override_is_no_override() {
+    let cases = [
+        (
+            serde_json::json!({ "systemPromptOverride": "  ", "rules": "keep the marker" }),
+            Some(RequestedSystemPrompt::Rules("keep the marker")),
+        ),
+        (serde_json::json!({ "systemPromptOverride": "" }), None),
+    ];
+    for (init, expected) in cases {
+        assert_eq!(expected, requested_system_prompt(None, init.as_object()));
+    }
 }
 #[test]
 fn enqueue_replace_system_prompt_override_sends_when_present() {
@@ -1178,7 +1207,7 @@ fn file_toolset_override_invalid_config_returns_error() {
     assert!(err.unwrap_err().contains("unknown"));
 }
 /// Requires a tokio runtime for SessionSignalsHandle::new().
-fn make_test_handle(
+pub(super) fn make_test_handle(
     model: &str,
     yolo: bool,
     client_id: Option<&str>,
@@ -1195,6 +1224,7 @@ fn make_test_handle(
         hunk_cancel,
     );
     crate::session::SessionHandle {
+        context_window_selection: Default::default(),
         cmd_tx,
         persistence_tx,
         registry_write_order: Default::default(),
@@ -1219,8 +1249,8 @@ fn make_test_handle(
         gateway_enabled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
         emit_local_background_tasks: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
         client_caps: crate::session::notifications::SessionClientCaps::new(false, true),
-        mcp_servers: vec![],
-        initial_client_mcp_servers: vec![],
+        mcp_servers: Default::default(),
+        initial_client_mcp_servers: Default::default(),
         display_cwd: None,
         feedback_manager: std::sync::Arc::new(
             crate::session::feedback_manager::FeedbackManager::local_only("test"),
@@ -1680,6 +1710,103 @@ async fn load_effort_precedence_prefers_meta_hint_over_persisted() {
     assert_eq!(
         restore_effort_via_load(None, Some(ReasoningEffort::Low)).await,
         Some(ReasoningEffort::Low),
+    );
+}
+#[tokio::test]
+async fn restore_applies_the_saved_context_window_selection() {
+    let agent = build_minimal_agent_for_tests();
+    let mut entry = ModelEntry::fallback("window-model", &EndpointsConfig::default());
+    entry.info.context_window = NonZeroU64::new(256_000).unwrap();
+    entry.info.context_windows = vec![
+        NonZeroU64::new(256_000).unwrap(),
+        NonZeroU64::new(500_000).unwrap(),
+    ];
+    agent
+        .models_manager
+        .insert_test_entry("window-model", entry);
+    agent.models_manager.settle_first_catalog_for_tests(true);
+    let sid = acp::SessionId::new("restore-window-sess");
+    let (handle, _cmd_tx, mut cmd_rx) = make_live_session_handle(&sid, None);
+    let (switch_tx, switch_rx) = tokio::sync::oneshot::channel();
+    tokio::spawn(async move {
+        while let Some(cmd) = cmd_rx.recv().await {
+            if let crate::session::SessionCommand::SetSessionModel {
+                switch,
+                responds_to,
+            } = cmd
+            {
+                let _ = switch_tx.send((
+                    switch.context_window_selection,
+                    switch
+                        .supported_context_windows
+                        .contains(&NonZeroU64::new(500_000).unwrap()),
+                ));
+                let _ = responds_to.send(Ok(acp::ModelId::new(switch.sampling_config.model)));
+                break;
+            }
+        }
+    });
+    agent.insert_resident(&sid, handle);
+    let info = crate::session::info::Info {
+        id: sid.clone(),
+        cwd: "/tmp".to_string(),
+    };
+    let mut summary =
+        crate::session::persistence::Summary::new(&info, acp::ModelId::new("window-model"))
+            .unwrap();
+    summary.context_window = NonZeroU64::new(500_000);
+    agent.restore_persisted_model(&sid, &summary, None).await;
+    assert_eq!(
+        (SwitchContextWindow::Set(NonZeroU64::new(500_000)), true),
+        switch_rx.await.expect("restore switches the model")
+    );
+}
+#[tokio::test]
+async fn restore_keeps_the_saved_context_window_selection_without_a_catalog() {
+    let agent = build_minimal_agent_for_tests();
+    let mut entry = ModelEntry::fallback("bundled-model", &EndpointsConfig::default());
+    entry.info.context_window = NonZeroU64::new(256_000).unwrap();
+    agent
+        .models_manager
+        .insert_test_entry("bundled-model", entry);
+    agent.models_manager.settle_first_catalog_for_tests(false);
+    let sid = acp::SessionId::new("restore-no-catalog-sess");
+    let (handle, _cmd_tx, mut cmd_rx) = make_live_session_handle(&sid, None);
+    let selection = handle.context_window_selection.clone();
+    let (switch_tx, switch_rx) = tokio::sync::oneshot::channel();
+    tokio::spawn(async move {
+        while let Some(cmd) = cmd_rx.recv().await {
+            if let crate::session::SessionCommand::SetSessionModel {
+                switch,
+                responds_to,
+            } = cmd
+            {
+                let _ = switch_tx.send((
+                    switch.context_window_selection,
+                    switch.sampling_config.context_window,
+                ));
+                let _ = responds_to.send(Ok(acp::ModelId::new(switch.sampling_config.model)));
+                break;
+            }
+        }
+    });
+    agent.insert_resident(&sid, handle);
+    let info = crate::session::info::Info {
+        id: sid.clone(),
+        cwd: "/tmp".to_string(),
+    };
+    let mut summary =
+        crate::session::persistence::Summary::new(&info, acp::ModelId::new("bundled-model"))
+            .unwrap();
+    summary.context_window = NonZeroU64::new(500_000);
+    agent.restore_persisted_model(&sid, &summary, None).await;
+    assert_eq!(
+        (SwitchContextWindow::Preserve, 256_000),
+        switch_rx.await.expect("restore switches the model")
+    );
+    assert_eq!(
+        500_000,
+        selection.load(std::sync::atomic::Ordering::Relaxed)
     );
 }
 /// A session persisted under a routing *slug* (not the catalog map key) must still get reasoning modes and a selected model.
@@ -3056,9 +3183,9 @@ fn write_plugin_manifest(dir: &std::path::Path, name: &str) {
     std::fs::write(dir.join("plugin.json"), format!(r#"{{"name": "{name}"}}"#)).unwrap();
 }
 /// Kill-switch ordering through the production session-less `x.ai/plugins/reload` path (no resident
-/// session, so the rebuild targets the launch dir). `resolve_effective_plugins_config` consults the
-/// folder-trust gate, whose cold-key backstop resolves WITHOUT remote settings and records a durable
-/// verdict; if the disk read ran before the real-remote resolve, a cold launch dir under an org
+/// session, so the rebuild targets the launch dir). The folder-trust gate's cold-key backstop
+/// resolves WITHOUT remote settings and records a durable verdict; if it ran before the real-remote
+/// resolve, a cold launch dir under an org
 /// kill-switch (`folder_trust_enabled = Some(false)`) would be stamped with a kill-switch-blind deny
 /// that the store-only reconcile can never lift. Mirrors
 /// `kill_switched_cold_cwd_stays_allowed_through_plugins_config_read` for the shared rebuild.
@@ -4209,6 +4336,64 @@ async fn diagnostic_upload_skipped_without_credentials() {
         0,
         "missing credentials must fail closed for diagnostics uploads"
     );
+}
+/// The coding-data opt-out governs sharing with xAI, so traces still go to a deployment's own bucket.
+/// Everything else the opt-out gates stays closed.
+#[tokio::test]
+async fn opted_out_user_uploads_traces_only_to_own_bucket() {
+    let agent = build_agent_with_auth(xai_grok_login::GrokAuth {
+        coding_data_retention_opt_out: true,
+        ..xai_grok_login::GrokAuth::test_default()
+    });
+    enable_trace_upload_config(&agent);
+    agent.cfg.borrow_mut().remote_settings = Some(crate::util::config::RemoteSettings::default());
+    assert!(
+        agent.trace_upload_config_snapshot().is_none(),
+        "precondition: no own bucket, so the opt-out blocks uploads"
+    );
+    agent.cfg.borrow_mut().endpoints.trace_upload_bucket = Some("s3://acme-traces".into());
+    let is_own_bucket = |method: Option<crate::session::repo_changes::UploadMethod>| {
+        matches!(
+            method,
+            Some(crate::session::repo_changes::UploadMethod::S3 { bucket, .. }) if bucket == "acme-traces"
+        )
+    };
+    assert!(is_own_bucket(agent.trace_upload_config_snapshot()));
+    assert!(is_own_bucket(agent.trace_upload_config().await));
+    assert!(
+        agent.is_data_collection_disabled(),
+        "heap profiles, workspace snapshots, and diagnostics still see the opt-out"
+    );
+}
+#[tokio::test]
+async fn zdr_team_uploads_no_traces_to_own_bucket() {
+    let agent = build_agent_with_auth(xai_grok_login::GrokAuth {
+        team_blocked_reasons: vec!["BLOCKED_REASON_NO_LOGS".into()],
+        ..xai_grok_login::GrokAuth::test_default()
+    });
+    enable_trace_upload_config(&agent);
+    agent.cfg.borrow_mut().endpoints.trace_upload_bucket = Some("s3://acme-traces".into());
+    assert!(agent.trace_upload_config_snapshot().is_none());
+}
+/// Auth diagnostics always go to the proxy, so a deployment's own bucket must not open them for an opted-out user.
+#[tokio::test]
+async fn diagnostic_upload_skipped_for_opted_out_user_with_own_bucket() {
+    let (stub_url, count) = spawn_counting_storage_stub().await;
+    let agent = build_agent_with_auth(xai_grok_login::GrokAuth {
+        coding_data_retention_opt_out: true,
+        ..xai_grok_login::GrokAuth::test_default()
+    });
+    enable_trace_upload_config(&agent);
+    {
+        let mut cfg = agent.cfg.borrow_mut();
+        cfg.endpoints.trace_upload_url = Some(stub_url);
+        cfg.endpoints.trace_upload_bucket = Some("s3://acme-traces".into());
+    }
+    let uploader = agent
+        .diagnostic_upload_config()
+        .expect("uploader is wired whenever trace upload config is on");
+    uploader(b"log".to_vec(), "tok".into(), "user-id-1".into()).await;
+    assert_eq!(0, count.load(std::sync::atomic::Ordering::SeqCst));
 }
 /// The diagnostics uploader is wired once (at agent construction), so it must re-check the live trace-upload mirror at invocation time.
 /// A mid-session config-level kill switch stops diagnostics uploads too.
@@ -6561,6 +6746,30 @@ fn disconnect_unloads_idle_session_without_finalize() {
         );
     });
 }
+#[test]
+fn evict_sessions_refuses_the_next_prompt() {
+    use acp::Agent as _;
+    run_local_for_bridge_test(|| async {
+        let agent = build_minimal_agent_for_tests();
+        let sid = acp::SessionId::new("sess-evict-prompt");
+        let (handle, _cmd_tx, cmd_rx) = make_live_session_handle(&sid, None);
+        agent.insert_resident(&sid, handle);
+        drop(spawn_fake_actor(cmd_rx, false));
+        drive_disconnect(&agent, &sid).await;
+        let err = agent
+            .prompt(acp::PromptRequest::new(
+                sid,
+                vec![acp::ContentBlock::from("next")],
+            ))
+            .await
+            .expect_err("an evicted session must refuse the next prompt");
+        assert_eq!(acp::Error::invalid_params().code, err.code);
+        assert_eq!(
+            Some("unknown session id"),
+            err.data.as_ref().and_then(|data| data.as_str())
+        );
+    });
+}
 /// The `IsBusy` keep-resident path. A between-turns session (`current_prompt_id = None`) whose actor answers `IsBusy = true` must be kept resident. True here means inputs are queued at the turn boundary.
 /// It must NOT be unloaded and must receive no `Shutdown`. This exercises the async round-trip that the sync fast-path tests skip.
 #[test]
@@ -7134,7 +7343,7 @@ fn gated_reconnect_recheck_lifts_gate_clearing_paywall_flash() {
     });
 }
 /// Agent with pre-loaded auth, a gateway receiver (to assert emitted notifications), and the proxy URL pointed at a mock `/v1/settings`.
-fn build_agent_with_auth_and_proxy(
+pub(super) fn build_agent_with_auth_and_proxy(
     auth: xai_grok_login::GrokAuth,
     proxy_url: String,
     mode: crate::agent::config::AgentMode,
@@ -7157,6 +7366,234 @@ fn build_agent_with_auth_and_proxy(
     cfg.endpoints.cli_chat_proxy_base_url = Some(proxy_url);
     let agent = MvpAgent::new(gateway, &cfg, auth_manager, None, None).expect("valid test config");
     (agent, rx)
+}
+/// The manager's proxy also points at the mock (the `/user` fetch uses it) and the credential is on disk. The `TempDir` must outlive the agent or `auth.json` writes fail.
+async fn build_hydration_agent(
+    proxy_url: &str,
+    auth: xai_grok_login::GrokAuth,
+) -> (MvpAgent, tempfile::TempDir) {
+    use crate::agent::config::{AgentMode, Config as AgentConfig};
+    use xai_grok_login::{AuthManager, GrokComConfig};
+    let temp_dir = tempfile::tempdir().unwrap();
+    let auth_manager = std::sync::Arc::new(
+        AuthManager::new(temp_dir.path(), GrokComConfig::default()).with_proxy_base_url(proxy_url),
+    );
+    auth_manager.save_without_enrichment(auth).await.unwrap();
+    let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut cfg = AgentConfig {
+        mode: AgentMode::Leader,
+        ..Default::default()
+    };
+    cfg.endpoints.cli_chat_proxy_base_url = Some(proxy_url.to_owned());
+    let agent = MvpAgent::new(GatewaySender::new(tx), &cfg, auth_manager, None, None)
+        .expect("valid test config");
+    (agent, temp_dir)
+}
+const USER_A: &str = "a@acme.test";
+const USER_B: &str = "b@acme.test";
+/// A nameless Team principal: the claim lands at login while `team_name` waits on `/user`.
+fn team_auth() -> xai_grok_login::GrokAuth {
+    xai_grok_login::GrokAuth {
+        oidc_issuer: Some(xai_grok_login::XAI_OAUTH2_ISSUER.to_string()),
+        email: Some(USER_A.into()),
+        principal_type: Some(xai_grok_login::model::TEAM_PRINCIPAL_TYPE.into()),
+        team_id: Some("team-a".into()),
+        ..xai_grok_login::GrokAuth::test_default()
+    }
+}
+async fn hydrate(agent: &MvpAgent, email: &str) -> Option<bool> {
+    let req = acp::ExtRequest::new(
+        "x.ai/auth/hydrate_team_capability",
+        serde_json::value::to_raw_value(&serde_json::json!({ "email": email, "teamId": "team-a" }))
+            .unwrap()
+            .into(),
+    );
+    let resp = crate::extensions::auth::handle(agent, &req).await.unwrap();
+    let body: serde_json::Value = serde_json::from_str(resp.0.get()).unwrap();
+    assert!(
+        body.get("canAdministerTeam").is_some() && body.get("codingDataRetentionOptOut").is_none(),
+        "{body}"
+    );
+    body.get("canAdministerTeam").and_then(|v| v.as_bool())
+}
+/// A `/user` answer parked past a Settings opt-out still carries the opted-in value; only the capability may land, and only in memory.
+#[tokio::test]
+async fn hydration_delayed_past_an_opt_out_keeps_the_opt_out() {
+    let server = xai_grok_test_support::MockInferenceServer::start()
+        .await
+        .unwrap();
+    server.set_user_can_administer_team(xai_grok_test_support::MockCanAdministerTeam::Denied);
+    server.set_user_coding_data_retention_opt_out(Some(false));
+    server.hold_user_info();
+    let (agent, _home) = build_hydration_agent(
+        &server.url(),
+        xai_grok_login::GrokAuth {
+            coding_data_retention_opt_out: false,
+            ..team_auth()
+        },
+    )
+    .await;
+    let opt_out_then_release = async {
+        server.user_info_arrived(1).await;
+        let mut opted_out = agent.auth_manager.current().unwrap();
+        opted_out.coding_data_retention_opt_out = true;
+        agent
+            .auth_manager
+            .save_without_enrichment(opted_out)
+            .await
+            .unwrap();
+        server.release_user_info();
+    };
+    let (capability, ()) = tokio::join!(hydrate(&agent, USER_A), opt_out_then_release);
+    assert_eq!(capability, Some(false));
+    let live = agent.auth_manager.current().unwrap();
+    assert_eq!(live.can_administer_team, Some(false));
+    assert!(live.coding_data_retention_opt_out);
+    let disk = xai_grok_login::storage::read_auth_json(agent.auth_manager.auth_json_path())
+        .unwrap()
+        .into_values()
+        .next()
+        .unwrap();
+    assert_eq!(disk.can_administer_team, None);
+    assert!(disk.coding_data_retention_opt_out);
+}
+/// An answer for account A never reaches account B: not a GET parked past the switch, not a request still naming A, and not B's cached value.
+#[tokio::test]
+async fn hydration_is_bound_to_the_account_that_asked() {
+    let server = xai_grok_test_support::MockInferenceServer::start()
+        .await
+        .unwrap();
+    server.set_user_can_administer_team(xai_grok_test_support::MockCanAdministerTeam::Denied);
+    server.hold_user_info();
+    let (agent, _home) = build_hydration_agent(&server.url(), team_auth()).await;
+    let switch_then_release = async {
+        server.user_info_arrived(1).await;
+        agent.auth_manager.hot_swap(xai_grok_login::GrokAuth {
+            key: "key-b".into(),
+            email: Some(USER_B.into()),
+            ..team_auth()
+        });
+        server.release_user_info();
+    };
+    let (late_answer, ()) = tokio::join!(hydrate(&agent, USER_A), switch_then_release);
+    assert_eq!(late_answer, None);
+    assert_eq!(
+        agent.auth_manager.current().unwrap().can_administer_team,
+        None
+    );
+    assert_eq!(hydrate(&agent, USER_A).await, None);
+    assert_eq!(server.request_count_for("/v1/user"), 1);
+    assert_eq!(hydrate(&agent, USER_B).await, Some(false));
+    assert_eq!(hydrate(&agent, USER_A).await, None);
+    assert_eq!(hydrate(&agent, USER_B).await, Some(false));
+    assert_eq!(server.request_count_for("/v1/user"), 2);
+}
+/// A token refresh mid-GET rotates the bearer without changing who asked, so the answer lands; one its enrichment already resolved wins and is what the caller hears; a User principal on the same team is another account.
+#[tokio::test]
+async fn hydration_merges_only_into_the_same_unresolved_principal() {
+    let rotated = || xai_grok_login::GrokAuth {
+        key: "key-rotated".into(),
+        ..team_auth()
+    };
+    for (swapped_in, answer, live_after) in [
+        (rotated(), Some(false), Some(false)),
+        (
+            xai_grok_login::GrokAuth {
+                can_administer_team: Some(true),
+                ..rotated()
+            },
+            Some(true),
+            Some(true),
+        ),
+        (
+            xai_grok_login::GrokAuth {
+                principal_type: Some("User".into()),
+                ..rotated()
+            },
+            None,
+            None,
+        ),
+    ] {
+        let server = xai_grok_test_support::MockInferenceServer::start()
+            .await
+            .unwrap();
+        server.set_user_can_administer_team(xai_grok_test_support::MockCanAdministerTeam::Denied);
+        server.hold_user_info();
+        let (agent, _home) = build_hydration_agent(&server.url(), team_auth()).await;
+        let swap_then_release = async {
+            server.user_info_arrived(1).await;
+            agent.auth_manager.hot_swap(swapped_in);
+            server.release_user_info();
+        };
+        let (capability, ()) = tokio::join!(hydrate(&agent, USER_A), swap_then_release);
+        assert_eq!(capability, answer);
+        assert_eq!(
+            agent.auth_manager.current().unwrap().can_administer_team,
+            live_after
+        );
+    }
+}
+/// Two pagers ask while the cache is unknown; the second answer finds it resolved and must still tell its caller.
+#[tokio::test]
+async fn concurrent_hydrations_both_hear_the_resolved_capability() {
+    let server = xai_grok_test_support::MockInferenceServer::start()
+        .await
+        .unwrap();
+    server.set_user_can_administer_team(xai_grok_test_support::MockCanAdministerTeam::Denied);
+    server.hold_user_info();
+    let (agent, _home) = build_hydration_agent(&server.url(), team_auth()).await;
+    let release = async {
+        server.user_info_arrived(2).await;
+        server.release_user_info();
+    };
+    let (a, b, ()) = tokio::join!(hydrate(&agent, USER_A), hydrate(&agent, USER_A), release);
+    assert_eq!((a, b), (Some(false), Some(false)));
+}
+/// A fetch that fails or answers no capability, null or omitted, leaves the credential exactly as it was.
+#[tokio::test]
+async fn unresolved_or_failed_hydration_changes_nothing() {
+    let opted_out = || xai_grok_login::GrokAuth {
+        coding_data_retention_opt_out: true,
+        ..team_auth()
+    };
+    let untouched = |agent: &MvpAgent| {
+        let live = agent.auth_manager.current().unwrap();
+        (live.can_administer_team, live.coding_data_retention_opt_out)
+    };
+    let server = xai_grok_test_support::MockInferenceServer::start()
+        .await
+        .unwrap();
+    server.set_user_can_administer_team(xai_grok_test_support::MockCanAdministerTeam::Unresolved);
+    server.set_user_coding_data_retention_opt_out(Some(false));
+    let (agent, _home) = build_hydration_agent(&server.url(), opted_out()).await;
+    assert_eq!(hydrate(&agent, USER_A).await, None);
+    assert_eq!(untouched(&agent), (None, true));
+    assert_eq!(server.request_count_for("/v1/user"), 1);
+    server.set_user_can_administer_team(xai_grok_test_support::MockCanAdministerTeam::Omitted);
+    assert_eq!(hydrate(&agent, USER_A).await, None);
+    assert_eq!(untouched(&agent), (None, true));
+    assert_eq!(server.request_count_for("/v1/user"), 2);
+    let (agent, _home) = build_hydration_agent("http://127.0.0.1:1/v1", opted_out()).await;
+    assert_eq!(hydrate(&agent, USER_A).await, None);
+    assert_eq!(untouched(&agent), (None, true));
+}
+/// `/user` never resolves the capability for a User principal, so a personal account is not fetched even though its credential carries a `team_id`.
+#[tokio::test]
+async fn personal_account_does_not_fetch_the_team_capability() {
+    let server = xai_grok_test_support::MockInferenceServer::start()
+        .await
+        .unwrap();
+    server.set_user_can_administer_team(xai_grok_test_support::MockCanAdministerTeam::Denied);
+    let (agent, _home) = build_hydration_agent(
+        &server.url(),
+        xai_grok_login::GrokAuth {
+            principal_type: Some("User".into()),
+            ..team_auth()
+        },
+    )
+    .await;
+    assert_eq!(hydrate(&agent, USER_A).await, None);
+    assert_eq!(server.request_count_for("/v1/user"), 0);
 }
 /// Drain the gateway, returning `true` if any `x.ai/settings/update` notification was emitted (and acking each so the sender doesn't warn).
 fn drained_settings_update(

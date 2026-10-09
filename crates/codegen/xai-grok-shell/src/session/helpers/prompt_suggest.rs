@@ -208,7 +208,7 @@ pub(crate) fn suggest_prompt_user_message(transcript: &str, cwd: &str) -> String
 /// Returns `None` when there is nothing to show. Matches the eval: empty or a
 /// silence token is NONE. Other text is shown as the first line.
 pub(crate) fn sanitize_suggestion(raw: &str) -> Option<String> {
-    let line = raw.trim().lines().next()?.trim();
+    let line = raw.trim().lines().next()?.trim().replace("<|eos|>", "");
     let line = line
         .trim_start_matches(['"', '\'', '`', '“', '‘'])
         .trim_end_matches(['"', '\'', '`', '”', '’'])
@@ -406,6 +406,14 @@ mod tests {
         for s in ["NONE", "none", "n/a", "no suggestion", "(silence)", ""] {
             assert_eq!(sanitize_suggestion(s), None, "should reject {s:?}");
         }
+    }
+
+    #[test]
+    fn sanitize_strips_eos_token() {
+        assert_eq!(
+            sanitize_suggestion("\"run the tests\"<|eos|>").as_deref(),
+            Some("run the tests")
+        );
     }
 
     #[test]

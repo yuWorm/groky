@@ -604,6 +604,7 @@ It has multiple lines."#;
             when_to_use: None,
             has_user_specified_description: true,
             paths: None,
+            origin: None,
             enabled: true,
             body: Some("---\n\nParagraph after a markdown HR.".to_string()),
         };
@@ -638,6 +639,7 @@ It has multiple lines."#;
             when_to_use: None,
             has_user_specified_description: true,
             paths: None,
+            origin: None,
             enabled: true,
             body: None,
         };
@@ -673,6 +675,7 @@ It has multiple lines."#;
             when_to_use: None,
             has_user_specified_description: false,
             paths: None,
+            origin: None,
             enabled: true,
             body: None,
         };
@@ -703,6 +706,7 @@ It has multiple lines."#;
             when_to_use: None,
             has_user_specified_description: false,
             paths: None,
+            origin: None,
             enabled: true,
             body: None,
         };
@@ -736,6 +740,7 @@ It has multiple lines."#;
             when_to_use: None,
             has_user_specified_description: false,
             paths: None,
+            origin: None,
             enabled: true,
             body: None,
         };
@@ -775,6 +780,7 @@ It has multiple lines."#;
             when_to_use: None,
             has_user_specified_description: false,
             paths: None,
+            origin: None,
             enabled: true,
             body: None,
         };

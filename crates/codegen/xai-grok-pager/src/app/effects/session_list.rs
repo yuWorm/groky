@@ -18,7 +18,7 @@ use xai_grok_tools::implementations::skills::skill::extract_skill_display_text;
 pub(super) enum LocalPresence {
     /// `remote` rows found on disk become `local`; everything else keeps the shell's label.
     Relabel,
-    /// Only rows found on disk survive, labelled `local`. Conversation and foreign rows never qualify.
+    /// Rows needing local storage must exist on disk; daemon rows stay available. Conversation and foreign rows never qualify.
     Require,
 }
 impl LocalPresence {
@@ -287,8 +287,12 @@ fn parse_session_picker_entries_with(
         }
         LocalPresence::Require => {
             parsed.retain(|e| e.source != "conversation" && !is_foreign_picker_source(&e.source));
-            if !parsed.is_empty() {
-                let candidate_ids: Vec<&str> = parsed.iter().map(|e| e.id.as_str()).collect();
+            let candidate_ids: Vec<&str> = parsed
+                .iter()
+                .filter(|e| !crate::app::is_daemon_session_row(&e.source))
+                .map(|e| e.id.as_str())
+                .collect();
+            if !candidate_ids.is_empty() {
                 let local_ids = match resolve_local(&candidate_ids) {
                     Ok(local_ids) => local_ids,
                     Err(error) => {
@@ -296,6 +300,9 @@ fn parse_session_picker_entries_with(
                     }
                 };
                 parsed.retain_mut(|e| {
+                    if crate::app::is_daemon_session_row(&e.source) {
+                        return true;
+                    }
                     if !local_ids.contains(&e.id) {
                         return false;
                     }

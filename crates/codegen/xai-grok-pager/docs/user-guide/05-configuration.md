@@ -79,8 +79,7 @@ group_tool_verbs = true                # fold runs of read/search/list tool call
                                        # — and finished thoughts among them — into one row (default: true)
 collapsed_edit_blocks = false          # show edits as one-line +N/-M diffstat summaries and merge
                                        # back-to-back same-file edits into one row, expand for the
-                                       # diffs (default: false; pager.toml [scrollback.blocks.edit]
-                                       # expanded_by_default/line_summary override its fold shape)
+                                       # diffs (default: false)
 page_flip_on_send = true               # pin a just-sent prompt at the top of the viewport so the
                                        # response starts on a fresh page (default: true); set false
                                        # so sending never moves the scroll position
@@ -747,8 +746,8 @@ dim_accent = 0.5                      # dimming factor for collapsed accents (0.
 [scrollback.blocks.edit]
 indent = true                         # indent diff content
 vpad = false                          # vertical padding
-# expanded_by_default = true          # unset: follows [ui] collapsed_edit_blocks in config.toml
-                                      # (flag on = collapsed one-liner); uncomment to pin either shape
+# expanded_by_default = true          # Unset follows Collapsed edit blocks. When that setting is on,
+                                      # edits start collapsed even if this line is true.
 dual_line_numbers = false             # two-column line numbers (old + new)
 # line_summary = false                # show +N/-M in the collapsed header; unset follows the same flag
 hunk_separator = "…"                  # separator between diff hunks (default: "…")

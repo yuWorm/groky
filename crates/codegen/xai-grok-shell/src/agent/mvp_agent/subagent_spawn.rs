@@ -6,6 +6,7 @@
 //! - `start_subagent_coordinator`: takes the event receiver and presentation state and starts the coordinator via `spawn_subagent_coordinator`.
 //! - `build_subagent_validation_context` and `try_build_subagent_spawn_context`: snapshot config and the parent handle for the child.
 use super::*;
+use crate::agent::config::TraceUploadEndpoints;
 use crate::session::repo_changes::UploadMethod;
 impl MvpAgent {
     /// Starts the shared coordinator actor; idempotent.
@@ -385,7 +386,7 @@ impl MvpAgent {
                 .and_then(|h| h.allowed_subagent_types.clone()),
             parent_mcp_configs: parent_handle
                 .as_ref()
-                .map(|h| h.mcp_servers.clone())
+                .map(|h| crate::session::agent_mcp::mcp_servers_for_fork(&h.mcp_servers))
                 .unwrap_or_default(),
             managed_mcp_state: self.managed_mcp_cache.clone(),
             parent_mcp_pool: None,

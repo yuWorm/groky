@@ -100,7 +100,6 @@ impl AgentView {
         scratch: &mut ScratchBuffer,
         pending_hint: Option<PendingHint>,
         theme: &Theme,
-        bundle_state: &crate::app::bundle::BundleState,
         overlay: Option<InheritedOverlay<'_>>,
     ) -> (
         Option<(u16, u16)>,
@@ -327,7 +326,6 @@ impl AgentView {
                 pending_hint,
                 false,
                 crate::app::agent_view::BannerSlotParams::none(),
-                bundle_state,
                 overlay.is_some(),
                 &mut Vec::new(),
                 AppRenderParams {

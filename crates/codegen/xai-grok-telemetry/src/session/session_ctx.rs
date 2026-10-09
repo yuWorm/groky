@@ -241,8 +241,9 @@ pub async fn drain_at_process_exit() {
 }
 
 /// Wait (up to `timeout`) for in-flight event posts to finish.
+/// Returns whether every registered post finished. A timeout leaves posts in flight.
 /// Meant for commands that exit as soon as their work is done; the agent runs long enough that its events land on their own.
-pub async fn drain_pending(timeout: std::time::Duration) {
+pub async fn drain_pending(timeout: std::time::Duration) -> bool {
     let drain_span = crate::region::Region::from_span(tracing::info_span!(
         "teardown.telemetry_drain",
         pending = PENDING_EVENTS.load(Ordering::Acquire) as i64,
@@ -263,6 +264,7 @@ pub async fn drain_pending(timeout: std::time::Duration) {
     drain_span
         .span()
         .record("elapsed_ms", started.elapsed().as_millis() as i64);
+    PENDING_EVENTS.load(Ordering::Acquire) == 0
 }
 
 type CtxSnapshot = Option<(String, Option<u32>)>;
@@ -381,6 +383,7 @@ mod tests {
                     source_bytes: 42,
                     snapshot_bytes: 64,
                     duration_ms: 1,
+                    model_id: "grok-4.6".to_owned(),
                 },
             );
             assert_eq!("grok-shell-mcp_file_input_completed", name);
@@ -470,7 +473,10 @@ mod tests {
 
         let started = std::time::Instant::now();
         let budget = std::time::Duration::from_secs(5);
-        drain_pending(budget).await;
+        assert!(
+            drain_pending(budget).await,
+            "drain must observe the post finish, not time out"
+        );
         assert!(
             started.elapsed() < budget,
             "drain must observe the post finish, not time out"

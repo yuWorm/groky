@@ -171,7 +171,7 @@ impl PeekPanelState {
     }
 }
 
-/// Returns `None` when the row's owning agent (or subagent) no longer exists, signalling the caller
+/// Returns `None` when the row's owning agent no longer exists, signalling the caller
 /// to close the peek.
 pub fn compute_peek_fields(
     row: &DashboardRowId,
@@ -289,34 +289,6 @@ pub fn compute_peek_fields(
                 reject_option,
             })
         }
-        DashboardRowId::Subagent {
-            parent,
-            child_session_id,
-        } => {
-            let parent_agent = agents.get(parent)?;
-            let info = parent_agent.subagent_sessions.get(child_session_id)?;
-            let label = {
-                let (l, _) = crate::app::subagent::format_subagent_label(info);
-                sanitize_display_text(&l).into_owned()
-            };
-            let child = parent_agent.subagent_view(child_session_id);
-            let response_type = child
-                .map(extract_last_response_type)
-                .unwrap_or_else(|| "Subagent".to_string());
-            let last_user_message = child.and_then(extract_last_user_message);
-            let time_ago = crate::util::format_time_ago(info.attempt.last_progress_at.elapsed());
-            Some(PeekFields {
-                label,
-                time_ago,
-                response_type,
-                last_user_message,
-                // Subagents are driven by their parent; no direct permission prompts appear here
-                question: None,
-                options: Vec::new(),
-                request_id: None,
-                reject_option: None,
-            })
-        }
         // Roster-only rows are not locally hosted; there is no local `AgentView` to peek into
         DashboardRowId::Roster { .. } | DashboardRowId::Workspace { .. } => None,
     }
@@ -332,8 +304,7 @@ pub struct PeekModeBadge {
 }
 
 /// The peeked row's current config-badge state. Sourced live (not via [`PeekFields`]) so it always
-/// reflects a `/model` switch or a Shift+Tab mode change. Always-approve and auto follow the parent
-/// (subagents run under the parent's permission mode) and subagents have no plan mode of their own.
+/// reflects a `/model` switch or a Shift+Tab mode change.
 pub fn peek_model_and_mode(
     row: &DashboardRowId,
     agents: &indexmap::IndexMap<crate::app::agent::AgentId, AgentView>,
@@ -352,24 +323,6 @@ pub fn peek_model_and_mode(
                 auto: agent.session.is_auto(),
                 mode_label: agent.prompt_row_mode_label(),
             },
-            None => default(),
-        },
-        DashboardRowId::Subagent {
-            parent,
-            child_session_id,
-        } => match agents.get(parent) {
-            Some(parent_agent) => {
-                let model = parent_agent
-                    .subagent_view(child_session_id)
-                    .and_then(|c| c.session.models.current_model_name())
-                    .or_else(|| parent_agent.session.models.current_model_name());
-                PeekModeBadge {
-                    model,
-                    yolo: parent_agent.session.yolo_mode,
-                    auto: parent_agent.session.is_auto(),
-                    mode_label: None,
-                }
-            }
             None => default(),
         },
         DashboardRowId::Roster { .. } | DashboardRowId::Workspace { .. } => default(),
@@ -1174,16 +1127,16 @@ mod tests {
         planp.auto_approve = false;
         let plan_auto_bottom = badge_row(&planp, 6);
         assert!(
-            plan_auto_bottom.contains("Grok 4 Fast · plan · auto"),
-            "plan must not hide auto: {plan_auto_bottom:?}",
+            plan_auto_bottom.contains("Grok 4 Fast · plan · auto-review"),
+            "plan must not hide auto-review: {plan_auto_bottom:?}",
         );
 
         planp.mode_label = None;
         planp.auto_approve = true;
         let yolo_bottom = badge_row(&planp, 6);
         assert!(
-            yolo_bottom.contains("always-approve") && !yolo_bottom.contains("auto"),
-            "always-approve wins over auto: {yolo_bottom:?}",
+            yolo_bottom.contains("always-approve") && !yolo_bottom.contains("auto-review"),
+            "always-approve wins over auto-review: {yolo_bottom:?}",
         );
     }
 

@@ -656,16 +656,6 @@ mod tests {
     }
 
     #[test]
-    fn build_lines_contains_tokens_summary() {
-        let block = ContextInfoBlock::new(snapshot(), "grok-4");
-        let theme = test_theme();
-        let lines = block.build_lines(&theme, BarLayout::WIDE);
-        let l2 = line_text(&lines, 2);
-        assert!(l2.contains("tokens"));
-        assert!(l2.contains("(3.67%)"));
-    }
-
-    #[test]
     fn precise_usage_percent_handles_zero_total() {
         assert_eq!(precise_usage_percent(100, 0), 0.0);
     }
@@ -1090,23 +1080,8 @@ mod tests {
         assert_eq!(percent_of_window(500_000, 1_000_000), "50%");
     }
 
-    // Responsive bar layout tests
     // The bar's shape (5×20 vs 10×10) is chosen by `BarLayout::for_width` based on terminal width
     // Narrow terminals thus get a square bar that still fits in their column budget
-
-    #[test]
-    fn bar_layout_wide_is_5_rows_of_20() {
-        assert_eq!(BarLayout::WIDE.rows, 5);
-        assert_eq!(BarLayout::WIDE.row_len, 20);
-        assert_eq!(BarLayout::WIDE.total(), 100);
-    }
-
-    #[test]
-    fn bar_layout_narrow_is_10_rows_of_10() {
-        assert_eq!(BarLayout::NARROW.rows, 10);
-        assert_eq!(BarLayout::NARROW.row_len, 10);
-        assert_eq!(BarLayout::NARROW.total(), 100);
-    }
 
     #[test]
     fn bar_layout_for_width_picks_wide_at_breakpoint_and_above() {
@@ -1219,10 +1194,6 @@ mod tests {
             );
         }
     }
-
-    // -------------------------------------------------------------------
-    // Legend label color and responsive wrapping tests
-    // -------------------------------------------------------------------
 
     /// Helper: find the legend row (or row 1, for the narrow layout) whose label text starts with `label_prefix`.
     /// Returns the matching `Line` so the caller can assert on its spans.

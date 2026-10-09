@@ -21,6 +21,7 @@ mod auto_gc;
 #[cfg(target_os = "linux")]
 pub mod btrfs;
 mod copy;
+mod data_dirs;
 #[cfg(feature = "metadata")]
 pub mod db;
 #[cfg(feature = "metadata")]
@@ -47,6 +48,8 @@ pub use api::cleanup_orphaned_btrfs_snapshots;
 pub use api::cleanup_orphaned_overlay_snapshots;
 #[cfg(feature = "metadata")]
 pub use api::gc::{GcOptions, GcReport, KeptWorktree, gc_worktrees, gc_worktrees_with_delegate};
+#[cfg(feature = "metadata")]
+pub use api::remove_worktree_in;
 pub use api::{
     BtrfsDelegate, BtrfsMode, CleanupReport, CopyReport, CreationMode, DelegateSnapshotResult,
     DirtyFilesReport, ENOSPC_OS_MESSAGE, IgnoredFilesMode, OUT_OF_DISK_CONTEXT, RemoveReport,
@@ -81,6 +84,8 @@ pub use metrics::{
     DisposeMethod, grove_wt_create_count, grove_wt_create_last_duration_ns, record_grove_wt_create,
     record_grove_wt_dispose,
 };
+#[cfg(feature = "metadata")]
+pub use nfs::candidate_data_dirs;
 pub use nfs::{
     CAP_CANCEL_WORKTREE_CREATE, CAP_FORK_FROM_BACKING, CleanArtifactsReply, DetachReply,
     GroveHardFail, NfsAdopted, NfsCreateDecision, NfsStatusView, NfsWorktreeClient,

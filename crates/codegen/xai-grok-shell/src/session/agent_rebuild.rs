@@ -326,7 +326,6 @@ impl AgentRebuildSpec {
         .with_fs(fs_backend.clone())
         .with_mcp_file_input_preparation()
         .with_subagents_enabled(*subagents_enabled)
-        .with_child_nested_subagents_allowed(1 < *subagents_max_depth)
         .with_subagent_toggle(subagent_toggle.clone())
         .with_background_workflows_enabled(*background_workflows_enabled)
         .with_task_model_slugs(presentation.model_slugs.clone())
