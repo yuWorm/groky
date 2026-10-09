@@ -1,5 +1,40 @@
 [
   {
+    "category": "features",
+    "description": "**`/context-window`** sets a session window from the model's menu. groky `/window` still works.",
+    "breaking_change": false
+  },
+  {
+    "category": "features",
+    "description": "**Claude settings import** on Welcome (Ctrl+I; Shift+I dismisses).",
+    "breaking_change": false
+  },
+  {
+    "category": "features",
+    "description": "**Per-model notice** banner sits above the prompt when the catalog has one.",
+    "breaking_change": false
+  },
+  {
+    "category": "features",
+    "description": "**Ask mode** paints the composer flag and border green.",
+    "breaking_change": false
+  },
+  {
+    "category": "features",
+    "description": "**Sandbox** holds network requests and asks before allowing egress.",
+    "breaking_change": false
+  },
+  {
+    "category": "features",
+    "description": "**`max_request_bytes`** on a custom model or provider caps the request body so image-heavy sessions stay under the host limit.",
+    "breaking_change": false
+  },
+  {
+    "category": "features",
+    "description": "**Subagent model inheritance** is a Settings row with layered overrides.",
+    "breaking_change": false
+  },
+  {
     "category": "fixes",
     "description": "**`/window`** can set a gear during its own slash turn instead of failing with a running-turn error.",
     "breaking_change": false

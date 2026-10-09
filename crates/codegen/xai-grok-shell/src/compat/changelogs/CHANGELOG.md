@@ -1,5 +1,17 @@
 # Unreleased
 
+# 0.1.21 — 2026-10-09
+
+## Features
+
+- **`/context-window`** sets a session window from the model's menu (`/context-window 256k`). groky `/window` still works.
+- **Claude settings import** on Welcome (Ctrl+I; Shift+I dismisses).
+- **Per-model notice** banner sits above the prompt when the catalog has one.
+- **Ask mode** paints the composer flag and border green.
+- **Sandbox** holds network requests and asks before allowing egress.
+- **`max_request_bytes`** on a custom model or provider caps the request body so image-heavy sessions stay under the host limit.
+- **Subagent model inheritance** is a Settings row with layered overrides.
+
 # 0.1.20 — 2026-09-24
 
 ## Bug Fixes
