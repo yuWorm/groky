@@ -482,7 +482,7 @@ impl SessionActor {
             && memo.model_id == model_id
             && memo.facts.byok != ModelByok::Unknown
         {
-            return (memo.facts, memo.provider.clone());
+            return (memo.facts.clone(), memo.provider.clone());
         }
         let (fresh, provider) =
             crate::agent::config::resolve_model_auth_facts_and_provider(model_id);
@@ -490,13 +490,13 @@ impl SessionActor {
             if let Some(memo) = self.model_auth_memo.borrow().as_ref()
                 && memo.model_id == model_id
             {
-                return (memo.facts, memo.provider.clone());
+                return (memo.facts.clone(), memo.provider.clone());
             }
             return (fresh, provider);
         }
         *self.model_auth_memo.borrow_mut() = Some(ModelAuthMemo {
             model_id: model_id.to_string(),
-            facts: fresh,
+            facts: fresh.clone(),
             provider: provider.clone(),
         });
         (fresh, provider)
@@ -654,43 +654,43 @@ impl SessionActor {
             }
         }
 
-        let cfg = self
-            .chat_state_handle
-            .get_sampling_config()
-            .await
-            .unwrap_or_else(|| xai_grok_sampling_types::SamplingConfig {
-                base_url: String::new(),
-                mtls_cert_dir: None,
-                model: String::new(),
-                max_completion_tokens: None,
-                temperature: None,
-                top_p: None,
-                max_retries: None,
-                rate_limit_retry_threshold: None,
-                api_backend: Default::default(),
-                extra_headers: Default::default(),
-                conversation_group_id: None,
-                query_params: Default::default(),
-                env_http_headers: Default::default(),
-                context_window: std::num::NonZeroU64::new(256_000).unwrap(),
-                max_request_bytes: None,
-                reasoning_effort: None,
-                reasoning_summary: None,
-                stream_tool_calls: None,
-            });
-        let creds = self.chat_state_handle.get_credentials().await;
-        let model_facts = self.model_auth_facts(cfg.model.as_str());
+        // Enqueue both reads before yielding so a model switch cannot split the
+        // endpoint/credential snapshot from its catalog identity on this actor.
+        let catalog_model_id = self.catalog_model_id.borrow().clone();
+        let (cfg, creds) = tokio::join!(
+            self.chat_state_handle.get_sampling_config(),
+            self.chat_state_handle.get_credentials(),
+        );
+        let cfg = cfg.unwrap_or_else(|| xai_grok_sampling_types::SamplingConfig {
+            base_url: String::new(),
+            mtls_cert_dir: None,
+            model: String::new(),
+            max_completion_tokens: None,
+            temperature: None,
+            top_p: None,
+            max_retries: None,
+            rate_limit_retry_threshold: None,
+            api_backend: Default::default(),
+            extra_headers: Default::default(),
+            conversation_group_id: None,
+            query_params: Default::default(),
+            env_http_headers: Default::default(),
+            context_window: std::num::NonZeroU64::new(256_000).unwrap(),
+            max_request_bytes: None,
+            reasoning_effort: None,
+            reasoning_summary: None,
+            stream_tool_calls: None,
+        });
+        let model_facts = self.model_auth_facts(catalog_model_id.0.as_ref());
         // Gate on the stable session classifier, not `creds.auth_type`; see `crate::agent::auth_method::session_token_auth_gate`
         // `cfg.base_url` keeps an `Unknown` BYOK status refreshable against first-party xAI hosts
         // That avoids leaking the session token to a third-party endpoint
         let auth_method = self.auth_method_id.load();
         let gate =
             SessionTokenAuthGate::new(auth_method.as_deref(), model_facts.byok, &cfg.base_url);
-        // Vendor URLs (Codex, OpenRouter, …) own their bearer in
-        // vendor-auth.json. Never substitute the xAI session JWT — that 401s
-        // ChatGPT and the pager then prompts `/login`.
-        let vendor_id =
-            crate::compat::vendor_id_for_url_and_scheme(&cfg.base_url, model_facts.auth_scheme);
+        // Refresh only the selected catalog provider. A URL may belong to several
+        // accounts, and explicit per-model credentials must never be overwritten.
+        let vendor_id = model_facts.vendor_id;
         let use_bearer_resolver = vendor_id.is_none() && gate.active();
         self.log_auth_gate_unknown("reconstruct_full_config", gate, &cfg.base_url);
         // Refresh the session token before the sampler reads it; gated to sessions that use it.
@@ -700,7 +700,7 @@ impl SessionActor {
         // Session path: only seed a wire-valid AT
         // Hard-expired keys must not land in default headers when the resolver has nothing to stamp
         let api_key = if let Some(id) = vendor_id.as_deref() {
-            crate::compat::live_vendor_key_for_id(id).or(creds.api_key)
+            crate::compat::live_vendor_key_for_id(id)
         } else if use_bearer_resolver {
             // `use_bearer_resolver` means the endpoint is a first-party xAI URL.
             // A session from another authority must not seed the default headers either.
@@ -1402,17 +1402,17 @@ impl SessionActor {
 
         // Auth-401 recovery only applies to refreshable session-token auth (the stable gate, not `creds.auth_type`).
         // A static api-key isn't refreshable, so retrying re-sends the same rejected bearer and 401-loops the turn See `crate::agent::auth_method::session_token_auth_gate`.
-        // One sampling-config snapshot drives every arm-4 decision, so the provider resolution and the gate can't disagree mid-model-switch.
-        let (failed_model_id, failed_base_url) = self
+        let failed_base_url = self
             .chat_state_handle
             .get_sampling_config()
             .await
-            .map(|c| (c.model, c.base_url))
+            .map(|c| c.base_url)
             .unwrap_or_default();
+        let failed_model_id = self.catalog_model_id.borrow().clone();
         let is_auth_401 =
             matches!(error.kind, SamplingErrorKind::Auth) || error.status_code == Some(401);
         if is_auth_401
-            && let Some(provider_id) = crate::compat::vendor_id_for_base_url(&failed_base_url)
+            && let Some(provider_id) = self.model_auth_facts(failed_model_id.0.as_ref()).vendor_id
         {
             return self
                 .surface_vendor_auth_failure(&provider_id, &error.message, error.status_code)
@@ -1422,13 +1422,13 @@ impl SessionActor {
         // Provider-backed models recover via arm 4c below
         // The provider is resolved before the eligibility check so its warnings stay quiet for a 401 that 4c handles
         let auth_provider = if is_auth_401 {
-            self.model_auth_provider(&failed_model_id)
+            self.model_auth_provider(failed_model_id.0.as_ref())
         } else {
             None
         };
 
         let auth_recovery_eligible = matches!(error.kind, SamplingErrorKind::Auth) && {
-            let gate = self.auth_gate(&failed_model_id, &failed_base_url);
+            let gate = self.auth_gate(failed_model_id.0.as_ref(), &failed_base_url);
             let eligible = gate.active();
             // Log the Unknown-BYOK decision (eligible or not) so a session still 401ing shows whether refresh fired
             self.log_auth_gate_unknown("handle_sampling_failure", gate, &failed_base_url);
@@ -1739,11 +1739,7 @@ impl SessionActor {
             .context_window_selection
             .store(0, std::sync::atomic::Ordering::Relaxed);
 
-        // The summary and clients key models by catalog id, not by the routing slug `cfg.model` may hold
-        let model_id = self
-            .models_manager
-            .catalog_key(&cfg.model)
-            .unwrap_or_else(|| acp::ModelId::new(cfg.model.clone()));
+        let model_id = self.catalog_model_id.borrow().clone();
         let agent_name = self.agent.borrow().definition().name.clone();
         let _ = self
             .notifications
@@ -2098,14 +2094,15 @@ impl SessionActor {
             let creds = self.chat_state_handle.get_credentials().await;
             // Gate on the stable classifier, not `creds.auth_type`; this also heals a transient `ApiKey` flip by writing the refreshed token into `creds.api_key` below
             // See `crate::agent::auth_method::session_token_auth_gate`
-            let (model_id, base_url) = self
+            let base_url = self
                 .chat_state_handle
                 .get_sampling_config()
                 .await
-                .map(|c| (c.model, c.base_url))
+                .map(|c| c.base_url)
                 .unwrap_or_default();
+            let model_id = self.catalog_model_id.borrow().clone();
             // Same condition as the seed guard above, so without this the re-seed puts the key back.
-            if self.auth_gate(&model_id, &base_url).active()
+            if self.auth_gate(model_id.0.as_ref(), &base_url).active()
                 && ActiveAuthBackend::default().is_xai_authority()
             {
                 match am.get_valid_token().await {
@@ -2132,7 +2129,7 @@ impl SessionActor {
                         tracing::warn!(
                             error = %e,
                             hard_expired,
-                            model = %model_id,
+                            model = %model_id.0,
                             "auth: preflight get_valid_token failed"
                         );
                         xai_grok_telemetry::unified_log::warn(
@@ -2141,7 +2138,7 @@ impl SessionActor {
                             Some(serde_json::json!({
                                 "error": format!("{e}"),
                                 "hard_expired": hard_expired,
-                                "model": model_id,
+                                "model": model_id.0.as_ref(),
                             })),
                         );
                         return;
@@ -2163,19 +2160,14 @@ impl SessionActor {
 
         let creds = self.chat_state_handle.get_credentials().await;
         let current_key = creds.api_key;
-        let current_model_id = self
-            .chat_state_handle
-            .get_sampling_config()
-            .await
-            .map(|c| c.model)
-            .unwrap_or_default();
+        let current_model_id = self.catalog_model_id.borrow().clone();
 
         // Provider-backed models mint and refresh here so `resolve_credentials` stays cache-only
-        if let Some(provider) = self.model_auth_provider(&current_model_id) {
+        if let Some(provider) = self.model_auth_provider(current_model_id.0.as_ref()) {
             self.refresh_provider_token_pre_turn(
                 &provider,
                 current_key.as_deref(),
-                &current_model_id,
+                current_model_id.0.as_ref(),
             )
             .await;
             // Provider models carry no session JWT, so skip the JWT refresh below.
@@ -2188,13 +2180,13 @@ impl SessionActor {
             if let Some(exp) = parse_jwt_expiration(key) {
                 let remaining_secs = (exp - chrono::Utc::now()).num_seconds();
                 tracing::debug!(
-                    model = %current_model_id,
+                    model = %current_model_id.0,
                     remaining_secs,
                     "JWT token valid, no refresh needed"
                 );
             } else {
                 tracing::debug!(
-                    model = %current_model_id,
+                    model = %current_model_id.0,
                     key_len = key.len(),
                     "Token is not a JWT, expiry-based refresh not applicable"
                 );
@@ -2206,18 +2198,18 @@ impl SessionActor {
         let remaining_secs =
             parse_jwt_expiration(key).map_or(0, |exp| (exp - chrono::Utc::now()).num_seconds());
         tracing::info!(
-            model = %current_model_id,
+            model = %current_model_id.0,
             remaining_secs,
             "JWT near expiry, refreshing from config.toml"
         );
 
-        let Some(new_key) = self.reload_api_key_from_config(&current_model_id) else {
+        let Some(new_key) = self.reload_api_key_from_config(current_model_id.0.as_ref()) else {
             return; // specific failure already logged
         };
 
         if key == &new_key {
             tracing::warn!(
-                model = %current_model_id,
+                model = %current_model_id.0,
                 "Config.toml returned same token (not yet rotated by external process?)"
             );
             return;
@@ -2226,7 +2218,7 @@ impl SessionActor {
         let new_remaining_secs = parse_jwt_expiration(&new_key)
             .map_or(0, |exp| (exp - chrono::Utc::now()).num_seconds());
         tracing::info!(
-            model = %current_model_id,
+            model = %current_model_id.0,
             new_remaining_secs,
             key_len = new_key.len(),
             "Refreshed API token from config.toml"
@@ -2246,11 +2238,7 @@ impl SessionActor {
             .map_err(|e| tracing::warn!(error = %e, "Failed to parse reloaded config.toml"))
             .ok()?;
 
-        let config_model = config
-            .config_models
-            .iter()
-            .find(|(k, v)| v.model.as_deref().unwrap_or(k.as_str()) == current_model_id)
-            .map(|(_, v)| v);
+        let config_model = config.config_models.get(current_model_id);
 
         let Some(model) = config_model else {
             tracing::warn!(

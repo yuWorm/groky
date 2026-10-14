@@ -42,7 +42,7 @@ pub(crate) async fn apply(
     tracing::debug!("session_session_model::mvp_agent: {:?}", &args);
     let acp::SetSessionModelRequest {
         session_id,
-        model_id,
+        model_id: requested_model_id,
         ..
     } = args;
     let handle = agent
@@ -51,7 +51,7 @@ pub(crate) async fn apply(
         .ok_or_else(|| acp::Error::invalid_params().data("unknown session id"))?;
     let _config_guard = agent.config_mutation_lock(&session_id).lock_owned().await;
     let handle = agent.resident_handle(&session_id).unwrap_or(handle);
-    let model = agent.resolve_model_id(&model_id)?;
+    let (model_id, model) = agent.resolve_model_selection(&requested_model_id)?;
     let use_concise = model.info().use_concise;
     let session_default = handle
         .session_default_agent_profile
@@ -163,6 +163,7 @@ pub(crate) async fn apply(
         agent.prepare_sampling_config_for_model(&model, handle.origin_client.clone());
     agent.models_manager.apply_supported_effort(
         &mut model_sampling,
+        &model_id,
         effective_effort,
         &session_id,
         EffortTarget::ModelSwitch,
@@ -176,7 +177,7 @@ pub(crate) async fn apply(
         (
             crate::util::config::resolve_auto_compact_threshold_percent(
                 &cfg,
-                model_sampling.model.as_str(),
+                model_id.0.as_ref(),
                 Some(model.info()),
             ),
             crate::util::config::resolve_system_prompt_label(
@@ -240,6 +241,7 @@ pub(crate) async fn apply(
     let (tx, rx) = oneshot::channel();
     let _ = handle.cmd_tx.send(SessionCommand::SetSessionModel {
         switch: SessionModelSwitch {
+            model_id: model_id.clone(),
             sampling_config: model_sampling,
             use_concise,
             is_family_switch,

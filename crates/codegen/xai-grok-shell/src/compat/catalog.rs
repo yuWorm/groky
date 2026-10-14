@@ -270,32 +270,16 @@ pub fn provider_by_id(id: &str) -> Option<&'static ProviderSpec> {
     PROVIDERS.iter().find(|p| p.id == id)
 }
 
-fn url_matches_provider(base_url: &str, provider: &ProviderSpec) -> bool {
+pub(crate) fn url_matches_provider(base_url: &str, provider: &ProviderSpec) -> bool {
     let url = base_url.trim().trim_end_matches('/');
     if url.is_empty() {
         return false;
     }
     let base = provider.base_url.trim_end_matches('/');
-    url == base || url.starts_with(&format!("{base}/"))
-}
-
-/// All builtin vendors that own this sampling URL (Claude Pro shares Anthropic's host).
-pub(crate) fn provider_ids_for_base_url(base_url: &str) -> Vec<&'static str> {
-    PROVIDERS
-        .iter()
-        .filter(|provider| url_matches_provider(base_url, provider))
-        .map(|provider| provider.id)
-        .collect()
-}
-
-/// Match a sampling `base_url` to a builtin vendor (prefix, slash-insensitive).
-/// When several providers share a host, prefer one that currently has credentials.
-pub(crate) fn provider_id_for_base_url(base_url: &str) -> Option<&'static str> {
-    let ids = provider_ids_for_base_url(base_url);
-    ids.iter()
-        .copied()
-        .find(|id| store_has_provider(id))
-        .or_else(|| ids.first().copied())
+    url == base
+        || url
+            .strip_prefix(base)
+            .is_some_and(|suffix| suffix.starts_with('/'))
 }
 
 pub fn provider_display_name(id: &str) -> String {
@@ -625,34 +609,11 @@ mod tests {
     use super::merge_vendor_catalog;
     use super::model_entry;
     use super::provider_by_id;
-    use super::provider_id_for_base_url;
     use super::unlock_override::{Unlock, with};
     use indexmap::IndexMap;
     use xai_grok_sampling_types::{
         ApiBackend, ReasoningEffort, ReasoningEffortOption, effort_label,
     };
-
-    #[test]
-    fn provider_id_for_base_url_matches_codex_and_openai() {
-        assert_eq!(
-            provider_id_for_base_url("https://chatgpt.com/backend-api/codex"),
-            Some("openai-codex")
-        );
-        assert_eq!(
-            provider_id_for_base_url("https://chatgpt.com/backend-api/codex/"),
-            Some("openai-codex")
-        );
-        assert_eq!(
-            provider_id_for_base_url("https://chatgpt.com/backend-api/codex/responses"),
-            Some("openai-codex")
-        );
-        assert_eq!(
-            provider_id_for_base_url("https://api.openai.com/v1"),
-            Some("openai")
-        );
-        assert_eq!(provider_id_for_base_url("https://api.x.ai/v1"), None);
-        assert_eq!(provider_id_for_base_url("http://localhost"), None);
-    }
 
     #[test]
     fn empty_unlock_matches_official_list() {

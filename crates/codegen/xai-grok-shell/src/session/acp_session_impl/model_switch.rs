@@ -7,6 +7,7 @@ impl SessionActor {
         switch: crate::session::SessionModelSwitch,
     ) -> Result<acp::ModelId, acp::Error> {
         let crate::session::SessionModelSwitch {
+            model_id,
             mut sampling_config,
             use_concise,
             is_family_switch,
@@ -22,7 +23,6 @@ impl SessionActor {
         {
             sampling_config.conversation_group_id = Some(id);
         }
-        let model_id = acp::ModelId::new(sampling_config.model.clone());
         let supported = |window: &std::num::NonZeroU64| supported_context_windows.contains(window);
         let selection = match context_window_selection {
             crate::session::SwitchContextWindow::Preserve => {
@@ -93,6 +93,11 @@ impl SessionActor {
                 "supports_backend_search": sampling_config.supports_backend_search,
             })),
         );
+        let existing = self.chat_state_handle.get_credentials().await;
+        let session_key = self
+            .auth_manager
+            .as_ref()
+            .and_then(|am| am.current_or_expired().map(|a| a.key));
         self.chat_state_handle
             .update_sampling_config(xai_grok_sampling_types::SamplingConfig {
                 base_url: sampling_config.base_url.clone(),
@@ -116,25 +121,20 @@ impl SessionActor {
                 reasoning_summary: sampling_config.reasoning_summary,
                 stream_tool_calls: Some(sampling_config.stream_tool_calls),
             });
-        let existing = self.chat_state_handle.get_credentials().await;
-        let session_key = self
-            .auth_manager
-            .as_ref()
-            .and_then(|am| am.current_or_expired().map(|a| a.key));
         self.chat_state_handle
             .update_credentials(xai_chat_state::Credentials {
                 api_key: sampling_config.api_key.clone(),
                 auth_type: crate::agent::config::resolve_chat_state_auth_type(
-                    sampling_config.model.as_str(),
+                    model_id.0.as_ref(),
                     session_key.as_deref(),
                     existing.auth_type,
                 ),
                 alpha_test_key: existing.alpha_test_key,
                 client_version: sampling_config.client_version.clone(),
             });
+        self.catalog_model_id.replace(model_id.clone());
         self.invalidate_model_auth_memo();
-        self.signals_handle()
-            .record_model_usage(&sampling_config.model);
+        self.signals_handle().set_primary_model(model_id.0.as_ref());
         if apply_prompt_override && !skip_prompt_rewrite {
             if self.state.lock().await.running_task.is_some() {
                 tracing::warn!(
@@ -261,9 +261,10 @@ impl SessionActor {
         let Some(mut cfg) = self.chat_state_handle.get_sampling_config().await else {
             return Err(acp::Error::internal_error().data("session has no sampling config"));
         };
+        let catalog_model_id = self.catalog_model_id.borrow().clone();
         let catalog_max = crate::agent::config::find_model_by_id(
             &self.models_manager.models(),
-            cfg.model.as_str(),
+            catalog_model_id.0.as_ref(),
         )
         .map(|e| e.info.context_window.get())
         .unwrap_or(cfg.context_window.get())
@@ -290,18 +291,21 @@ impl SessionActor {
         let Some(mut cfg) = self.chat_state_handle.get_sampling_config().await else {
             return Err(acp::Error::internal_error().data("session has no sampling config"));
         };
+        let model_id = self.catalog_model_id.borrow().clone();
         if !self
             .models_manager
-            .model_supports_reasoning_effort(&cfg.model)
+            .model_supports_reasoning_effort(model_id.0.as_ref())
         {
             return Err(acp::Error::invalid_params()
                 .data("the session's current model does not support reasoning effort"));
         }
-        if let Some(routed) = self.models_manager.model_for_effort(&cfg.model, effort) {
+        if let Some(routed) = self
+            .models_manager
+            .model_for_effort(model_id.0.as_ref(), effort)
+        {
             cfg.model = routed;
         }
         cfg.reasoning_effort = Some(effort);
-        let model_id = acp::ModelId::new(cfg.model.clone());
         self.chat_state_handle.update_sampling_config(cfg);
         let agent_name = self.agent.borrow().definition().name.clone();
         let _ = self

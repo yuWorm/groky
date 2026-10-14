@@ -3118,14 +3118,17 @@ pub(crate) fn default_model_entries(endpoints: &EndpointsConfig) -> IndexMap<Str
         .collect()
 }
 /// Resolve a model against the available model map.
-/// Checks the map key (id) first, then falls back to a slug scan.
+/// Checks the catalog key first; a wire slug must identify exactly one entry.
 pub(crate) fn find_model_by_id<'a>(
     models: &'a IndexMap<String, ModelEntry>,
     model_id: &str,
 ) -> Option<&'a ModelEntry> {
-    models
-        .get(model_id)
-        .or_else(|| models.values().find(|m| m.info.has_model_id(model_id)))
+    if let Some(model) = models.get(model_id) {
+        return Some(model);
+    }
+    let mut matches = models.values().filter(|m| m.info.has_model_id(model_id));
+    let model = matches.next()?;
+    matches.next().is_none().then_some(model)
 }
 /// Whether the EFFECTIVE Auto-mode classifier model supports reasoning effort. That is the model actually routed to (`aux_model` when the aux sampler resolved), else the session model the worker falls back to.
 /// A model not found in the catalog resolves `false` (conservative; also covers the Tier-2 synthetic proxy entry). Drives the built-in `low` effort default.
@@ -4416,7 +4419,7 @@ fn resolve_credentials_enforced(
     credentials
 }
 pub use xai_grok_telemetry::config::deployment_id_from_key;
-/// Try to resolve credentials for a model by loading the effective config.
+/// Try to resolve credentials for an exact catalog model by loading the effective config.
 /// Returns `None` (with a warning) if config loading, parsing, or model lookup fails.
 /// `session_key` should only be passed when `auth_type` is `SessionToken`; callers must guard this.
 pub(crate) fn try_resolve_model_credentials(
@@ -4429,8 +4432,9 @@ pub(crate) fn try_resolve_model_credentials(
     let cfg = Config::new_from_toml_cfg(&raw)
         .map_err(|e| tracing::warn!(error = %e, "config parse failed for credential resolution"))
         .ok()?;
-    let models = resolve_model_list(&cfg, None);
-    let entry = find_model_by_id(&models, model_id)?;
+    let mut models = resolve_model_list(&cfg, None);
+    crate::compat::merge_vendor_catalog(&mut models);
+    let entry = models.get(model_id)?;
     let mut credentials = resolve_credentials(entry, session_key);
     enforce_disable_api_key_auth(
         &mut credentials,
@@ -4439,15 +4443,17 @@ pub(crate) fn try_resolve_model_credentials(
     );
     Some(credentials)
 }
-/// Per-model auth facts (BYOK status and auth scheme) from one effective-config load, memoized by the session actor.
-#[derive(Clone, Copy)]
+/// Per-model auth facts from one effective-config load, memoized by catalog identity.
+#[derive(Clone)]
 pub(crate) struct ModelAuthFacts {
     pub byok: ModelByok,
     pub auth_scheme: AuthScheme,
+    /// Vendor credential owner; absent when explicit model credentials take precedence.
+    pub vendor_id: Option<std::sync::Arc<str>>,
 }
-/// Resolve `model_id` to its auth facts and auth-provider reference from one effective-config load. Both ride the same memo (see `SessionActor::model_auth_memo`).
-/// A load/parse failure yields `byok = Unknown`; a model absent from the catalog yields `NotByok`.
-/// An empty `model_id` (no sampling config yet) yields `Unknown`, not `NotByok`, so the gate isn't activated for an unidentified model.
+/// Resolve a catalog model's auth facts and auth-provider reference from one effective-config load. Both ride the same memo (see `SessionActor::model_auth_memo`).
+/// A load/parse failure yields `Unknown`; an absent vendor row retains its namespace owner after logout.
+/// An empty `model_id` yields `Unknown`, so the gate isn't activated for an unidentified model.
 pub(crate) fn resolve_model_auth_facts_and_provider(
     model_id: &str,
 ) -> (ModelAuthFacts, Option<xai_grok_login::AuthProviderRef>) {
@@ -4456,16 +4462,37 @@ pub(crate) fn resolve_model_auth_facts_and_provider(
             ModelAuthFacts {
                 byok: ModelByok::Unknown,
                 auth_scheme: AuthScheme::default(),
+                vendor_id: None,
             },
             None,
         );
     }
     with_resolved_model(model_id, |lookup| {
+        // A selected vendor remains the credential owner after its key is removed,
+        // even though logged-out providers no longer appear in the picker.
+        if let ModelLookup::Loaded(None) = lookup
+            && let Some((id, auth_scheme)) = crate::compat::vendor_auth_for_catalog_id(model_id)
+        {
+            return (
+                ModelAuthFacts {
+                    byok: ModelByok::Byok,
+                    auth_scheme,
+                    vendor_id: Some(std::sync::Arc::from(id)),
+                },
+                None,
+            );
+        }
         let facts = ModelAuthFacts {
             byok: byok_from_lookup(&lookup),
             auth_scheme: match lookup {
                 ModelLookup::Loaded(Some(e)) => e.info().auth_scheme,
                 _ => AuthScheme::default(),
+            },
+            vendor_id: match lookup {
+                ModelLookup::Loaded(Some(e)) => {
+                    crate::compat::vendor_id_for_model(e).map(std::sync::Arc::from)
+                }
+                _ => None,
             },
         };
         let provider = match lookup {
@@ -4502,8 +4529,9 @@ fn with_resolved_model<T>(model_id: &str, f: impl FnOnce(ModelLookup) -> T) -> T
     else {
         return f(ModelLookup::ConfigUnavailable);
     };
-    let models = resolve_model_list(&cfg, None);
-    f(ModelLookup::Loaded(find_model_by_id(&models, model_id)))
+    let mut models = resolve_model_list(&cfg, None);
+    crate::compat::merge_vendor_catalog(&mut models);
+    f(ModelLookup::Loaded(models.get(model_id)))
 }
 /// Resolve a standalone `SamplerConfig` for an auxiliary model slug (image description, session summary, ...).
 /// Resolved through the catalog so a `[model.*]` override redirects it to its own endpoint, credentials, and routing `model`.
@@ -4703,8 +4731,8 @@ pub(crate) fn sampling_config_for_model(
         &credentials.base_url,
     );
     // GROK_COMPAT_HOOK begin
-    if let Some(family) = info.model_family.as_deref() {
-        crate::compat::oauth::inject_request_headers(family, &mut extra_headers);
+    if let Some(provider_id) = crate::compat::vendor_id_for_model(model) {
+        crate::compat::oauth::inject_request_headers(provider_id, &mut extra_headers);
     }
     // GROK_COMPAT_HOOK end
     let api_backend = info.api_backend.clone();

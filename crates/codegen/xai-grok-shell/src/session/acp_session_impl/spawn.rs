@@ -533,7 +533,7 @@ pub(crate) async fn spawn_session_actor(
             (0, Vec::new(), Vec::new())
         };
     drop(history_scan);
-    let primary_model_id = sampling_config.model.clone();
+    let primary_model_id = session_model_id.0.to_string();
     let web_search_config_step = spawn_step!("web_search_config_load");
     let web_search_domains = if disable_web_search {
         None
@@ -1813,6 +1813,7 @@ pub(crate) async fn spawn_session_actor(
         transient_episode_start: std::cell::Cell::new(None),
         auth_method_id,
         model_auth_memo: std::cell::RefCell::new(None),
+        catalog_model_id: std::cell::RefCell::new(session_model_id.clone()),
         attribution_callback,
         auth_manager,
         is_chat_kind,

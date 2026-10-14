@@ -1663,6 +1663,39 @@ fn auth_scheme_defaults_to_bearer_when_not_set_in_config() {
     assert_eq!(info.auth_type, "bearer");
 }
 #[test]
+fn credential_lookup_requires_catalog_identity_for_shared_wire_models() {
+    let mut models = IndexMap::new();
+    for (id, key) in [
+        ("first/shared", "first-key"),
+        ("selected/shared", "selected-key"),
+    ] {
+        models.insert(
+            id.to_owned(),
+            test_model_entry("shared", "https://relay.example/v1", Some(key), None, None),
+        );
+    }
+    assert!(
+        find_model_by_id(&models, "shared").is_none(),
+        "an ambiguous wire slug must not choose another account's credentials"
+    );
+    let selected = find_model_by_id(&models, "selected/shared").unwrap();
+    assert_eq!(
+        resolve_credentials(selected, Some("session-token"))
+            .api_key
+            .as_deref(),
+        Some("selected-key")
+    );
+    models.shift_remove("first/shared");
+    let unique = find_model_by_id(&models, "shared").unwrap();
+    assert_eq!(
+        resolve_credentials(unique, Some("session-token"))
+            .api_key
+            .as_deref(),
+        Some("selected-key")
+    );
+}
+
+#[test]
 fn has_own_credentials_guards_session_vs_external_key() {
     let endpoints = EndpointsConfig::default();
     for (model_id, entry) in default_model_entries(&endpoints) {

@@ -32,19 +32,43 @@ pub use vendor_models::{
 };
 
 use crate::agent::config::ModelEntry;
-use xai_grok_sampler::AuthScheme;
 
-/// Look up a vendor API key for a catalog model (`model_family` = provider id).
-pub fn vendor_key_for_model(model: &ModelEntry) -> Option<String> {
-    let family = model.info.model_family.as_deref()?;
-    if !is_known_vendor(family) {
+/// Credential owner of a catalog model, unless explicit model credentials take precedence.
+pub fn vendor_id_for_model(model: &ModelEntry) -> Option<&str> {
+    if model.own_credential().is_some() || model.auth_provider.is_some() {
         return None;
     }
-    oauth::ensure_fresh(family);
-    VendorAuthStore::default_store()
-        .ok()?
-        .api_key(family)
-        .filter(|k| !k.trim().is_empty())
+    model
+        .info
+        .model_family
+        .as_deref()
+        .filter(|id| is_known_vendor(id))
+}
+
+/// Resolve a catalog namespace even after logout hides its rows from the picker.
+/// Never infer an owner from an endpoint or an unqualified wire model.
+pub(crate) fn vendor_auth_for_catalog_id(
+    model_id: &str,
+) -> Option<(&str, xai_grok_sampler::AuthScheme)> {
+    let (id, model) = model_id.split_once('/')?;
+    if model.is_empty() {
+        return None;
+    }
+    if let Some(provider) = provider_by_id(id) {
+        return Some((id, provider.auth_scheme));
+    }
+    #[cfg(not(test))]
+    if let Ok(store) = custom::CustomProviderStore::default_store()
+        && let Some(provider) = store.get(id)
+    {
+        return Some((id, provider.auth_scheme()));
+    }
+    None
+}
+
+/// Look up the selected model's vendor credential, never another provider on the same URL.
+pub fn vendor_key_for_model(model: &ModelEntry) -> Option<String> {
+    live_vendor_key_for_id(vendor_id_for_model(model)?)
 }
 
 pub fn is_known_vendor(id: &str) -> bool {
@@ -57,40 +81,6 @@ pub fn is_vendor_catalog_model(model: &ModelEntry) -> bool {
         .model_family
         .as_deref()
         .is_some_and(is_known_vendor)
-}
-
-/// Builtin or custom provider whose `base_url` owns this sampling URL.
-pub fn vendor_id_for_base_url(base_url: &str) -> Option<String> {
-    catalog::provider_id_for_base_url(base_url)
-        .map(str::to_owned)
-        .or_else(|| custom::provider_id_for_base_url(base_url))
-}
-
-/// Same host can be API-key Anthropic (`x-api-key`) and Claude Pro OAuth
-/// (Bearer). Pick the slot that matches this request's auth scheme.
-pub fn vendor_id_for_url_and_scheme(base_url: &str, scheme: AuthScheme) -> Option<String> {
-    let ids = catalog::provider_ids_for_base_url(base_url);
-    if ids.is_empty() {
-        return custom::provider_id_for_base_url(base_url);
-    }
-    let store = VendorAuthStore::default_store().ok();
-    let matching: Vec<&'static str> = ids
-        .into_iter()
-        .filter(|id| catalog::provider_by_id(id).is_some_and(|p| p.auth_scheme == scheme))
-        .collect();
-    matching
-        .iter()
-        .copied()
-        .find(|id| store.as_ref().is_some_and(|s| s.has_provider(id)))
-        .or_else(|| matching.first().copied())
-        .map(str::to_owned)
-        .or_else(|| vendor_id_for_base_url(base_url))
-}
-
-/// Refresh-on-read vendor bearer for a live request. `None` if the URL is
-/// not a vendor endpoint or the sidecar has no usable secret.
-pub fn live_vendor_key_for_url(base_url: &str) -> Option<String> {
-    live_vendor_key_for_id(&vendor_id_for_base_url(base_url)?)
 }
 
 pub fn live_vendor_key_for_id(id: &str) -> Option<String> {
@@ -155,10 +145,10 @@ pub fn model_supports_openai_fast(model_id: &str) -> bool {
 /// gate instead; this stays host-only so a Claude row on the same relay URL
 /// does not inherit `service_tier`.
 pub fn url_supports_openai_fast(base_url: &str) -> bool {
-    matches!(
-        vendor_id_for_base_url(base_url).as_deref(),
-        Some("openai") | Some("openai-codex")
-    )
+    OPENAI_FAST_PROVIDERS
+        .iter()
+        .filter_map(|id| provider_by_id(id))
+        .any(|provider| catalog::url_matches_provider(base_url, provider))
 }
 
 /// ACP method id for "a vendor credential is configured" (not grok.com).
@@ -213,48 +203,6 @@ fn vendor_auth_method() -> agent_client_protocol::AuthMethod {
 
 #[cfg(test)]
 mod tests {
-    use super::{vendor_auth_user_message, vendor_id_for_base_url};
-
-    #[test]
-    fn vendor_id_for_codex_url() {
-        assert_eq!(
-            vendor_id_for_base_url("https://chatgpt.com/backend-api/codex").as_deref(),
-            Some("openai-codex")
-        );
-        assert_eq!(vendor_id_for_base_url("https://api.x.ai/v1"), None);
-    }
-
-    #[test]
-    fn anthropic_url_stays_api_key_provider_without_oauth_slot() {
-        assert_eq!(
-            vendor_id_for_base_url("https://api.anthropic.com/v1").as_deref(),
-            Some("anthropic")
-        );
-        assert_eq!(
-            super::vendor_id_for_url_and_scheme(
-                "https://api.anthropic.com/v1",
-                super::AuthScheme::Bearer,
-            )
-            .as_deref(),
-            Some("anthropic-claude")
-        );
-        assert_eq!(
-            super::vendor_id_for_url_and_scheme(
-                "https://api.anthropic.com/v1",
-                super::AuthScheme::XApiKey,
-            )
-            .as_deref(),
-            Some("anthropic")
-        );
-    }
-
-    #[test]
-    fn vendor_auth_message_points_at_provider_login() {
-        let msg = vendor_auth_user_message("openai-codex");
-        assert!(msg.contains("/provider-login openai-codex"), "{msg}");
-        assert!(!msg.contains("/login "), "{msg}");
-    }
-
     #[test]
     fn skip_xai_startup_auto_login_unless_force_login() {
         assert!(super::skip_xai_startup_auto_login(false));

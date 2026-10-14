@@ -97,7 +97,10 @@ impl CatalogSource {
     }
 }
 
-/// Map a model id (catalog key or routing slug) to its catalog key.
+/// Map a catalog key or uniquely owned routing slug to its catalog key.
+///
+/// A wire slug shared by multiple providers has no provider identity, so it must
+/// not select one catalog entry arbitrarily.
 pub(crate) fn resolve_catalog_key(
     models: &IndexMap<String, ModelEntry>,
     id: &acp::ModelId,
@@ -106,11 +109,17 @@ pub(crate) fn resolve_catalog_key(
     if models.contains_key(id_str) {
         return Some(id.clone());
     }
-    models
+    if crate::compat::vendor_auth_for_catalog_id(id_str).is_some() {
+        return None;
+    }
+    let mut matches = models
         .iter()
-        .rev()
-        .find(|(_, entry)| entry.info.has_model_id(id_str))
-        .map(|(key, _)| acp::ModelId::new(key.clone()))
+        .filter(|(_, entry)| entry.info.has_model_id(id_str));
+    let (key, _) = matches.next()?;
+    if matches.next().is_some() {
+        return None;
+    }
+    Some(acp::ModelId::new(key.clone()))
 }
 
 /// How restore should point a loaded session at a model.
@@ -167,13 +176,18 @@ pub(crate) fn selectable_catalog_key_for_persisted(
         return Some(id.clone());
     }
     let id_str = id.0.as_ref();
-    if let Some((key, _)) = models.iter().rev().find(|(key, entry)| {
+    if crate::compat::vendor_auth_for_catalog_id(id_str).is_some() {
+        return None;
+    }
+    let mut matches = models.iter().filter(|(key, entry)| {
         available.contains_key(&acp::ModelId::new((*key).clone()))
             && entry.info.has_model_id(id_str)
-    }) {
-        return Some(acp::ModelId::new(key.clone()));
+    });
+    let (key, _) = matches.next()?;
+    if matches.next().is_some() {
+        return None;
     }
-    resolve_catalog_key(models, id).filter(|key| available.contains_key(key))
+    Some(acp::ModelId::new(key.clone()))
 }
 
 /// Overlay vendor catalog rows onto a stored catalog clone.
@@ -192,9 +206,15 @@ fn visible_entry<'a>(
     visible: &'a IndexMap<String, ModelEntry>,
     id: &str,
 ) -> Option<(&'a String, &'a ModelEntry)> {
-    visible
-        .get_key_value(id)
-        .or_else(|| visible.iter().find(|(_, m)| m.has_model_id(id)))
+    if let Some(entry) = visible.get_key_value(id) {
+        return Some(entry);
+    }
+    if crate::compat::vendor_auth_for_catalog_id(id).is_some() {
+        return None;
+    }
+    let mut matches = visible.iter().filter(|(_, entry)| entry.has_model_id(id));
+    let entry = matches.next()?;
+    matches.next().is_none().then_some(entry)
 }
 
 /// Stable fallback when there is no preference, or the preference is missing from the catalog.

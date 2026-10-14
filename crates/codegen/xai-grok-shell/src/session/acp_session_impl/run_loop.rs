@@ -865,9 +865,12 @@ pub(super) async fn run_session(
                                     new_context_window = ?context_window.map(|cw| cw.get()),
                                     "OVERRIDE_MODEL: changing model name in sampling config"
                                 );
-                                // Update signals so primaryModelId and modelsUsed reflect the override, not the agent default (e.g. "grok-4.5").
-                                // set_primary_model also adds to models_used.
-                                session.signals_handle().set_primary_model(&model_name);
+                                // The override changes only the wire slug. Keep signal metadata
+                                // tied to the selected catalog model and its credentials.
+                                let catalog_model_id = session.catalog_model_id.borrow().0.to_string();
+                                session
+                                    .signals_handle()
+                                    .set_primary_model(catalog_model_id);
                                 cfg.model = model_name.clone();
                                 cfg.extra_headers.extend(extra_headers);
                                 if let Some(cw) = context_window
@@ -877,23 +880,12 @@ pub(super) async fn run_session(
                                 }
                                 session.chat_state_handle.update_sampling_config(cfg);
 
-                                let existing = session.chat_state_handle.get_credentials().await;
-                                if let Some(r) = crate::agent::config::try_resolve_model_credentials(model_name.as_str(), existing.api_key.as_deref()) {
-                                    session.chat_state_handle.update_credentials(xai_chat_state::Credentials {
-                                        api_key: r.api_key,
-                                        auth_type: r.auth_type,
-                                        alpha_test_key: existing.alpha_test_key,
-                                        client_version: existing.client_version,
-                                    });
-                                }
-                                // Credentials changed under a possibly-unchanged model id.
-                                session.invalidate_model_auth_memo();
                             }
                         }
                         SessionCommand::GetCurrentModel { responds_to } => {
                             let current = session.chat_state_handle.get_sampling_config().await
                                 .map(|c| crate::session::CurrentModel {
-                                    id: c.model,
+                                    id: session.catalog_model_id.borrow().0.to_string(),
                                     reasoning_effort: c.reasoning_effort,
                                 })
                                 .unwrap_or_default();

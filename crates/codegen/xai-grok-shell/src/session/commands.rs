@@ -352,6 +352,8 @@ impl From<SkillUpdateKind> for AdvertiseTrigger {
     }
 }
 pub struct SessionModelSwitch {
+    /// Exact catalog selection. This is never the model slug sent on the wire.
+    pub model_id: acp::ModelId,
     pub sampling_config: xai_grok_sampler::SamplerConfig,
     pub use_concise: bool,
     /// The two models declare differing `model_family`s, so a lossy compaction runs at switch end.

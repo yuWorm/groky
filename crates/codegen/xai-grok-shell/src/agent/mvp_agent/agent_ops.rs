@@ -2033,11 +2033,11 @@ impl MvpAgent {
                 .await;
         }
     }
-    /// Pure id-to-entry resolver (the `allowed_models` gate lives in `set_session_model`).
-    pub(crate) fn resolve_model_id(
+    /// Resolve a requested catalog key or unique wire slug to its exact catalog selection.
+    pub(crate) fn resolve_model_selection(
         &self,
         requested: &acp::ModelId,
-    ) -> Result<ModelEntry, acp::Error> {
+    ) -> Result<(acp::ModelId, ModelEntry), acp::Error> {
         let requested_str = requested.0.as_ref();
         let models = self.models_manager.models();
         let Some(catalog_key) = resolve_catalog_key(&models, requested) else {
@@ -2062,7 +2062,15 @@ impl MvpAgent {
             requested_str,
             entry.info.model
         );
-        Ok(entry.clone())
+        Ok((catalog_key, entry.clone()))
+    }
+    /// Pure id-to-entry resolver (the `allowed_models` gate lives in `set_session_model`).
+    pub(crate) fn resolve_model_id(
+        &self,
+        requested: &acp::ModelId,
+    ) -> Result<ModelEntry, acp::Error> {
+        self.resolve_model_selection(requested)
+            .map(|(_, entry)| entry)
     }
     pub(crate) fn prepare_sampling_config_for_model(
         &self,
@@ -4478,9 +4486,9 @@ impl MvpAgent {
             .model
         {
             xai_grok_agent::config::ModelOverride::Override(id) => {
-                let mid = acp::ModelId::new(Arc::from(id.as_str()));
-                match self.resolve_model_id(&mid) {
-                    Ok(entry) => Some((mid, entry)),
+                let requested = acp::ModelId::new(Arc::from(id.as_str()));
+                match self.resolve_model_selection(&requested) {
+                    Ok(selection) => Some(selection),
                     Err(_) => {
                         tracing::warn!(
                             agent = %agent_definition.name,
@@ -4537,13 +4545,11 @@ impl MvpAgent {
                 ),
             )
         };
-        self.models_manager
-            .apply_supported_effort(
-                &mut sampling_config,
-                initial_reasoning_effort,
-                &session_info.id,
-                EffortTarget::NewSession,
-            );
+        self.models_manager.apply_supported_effort(&mut sampling_config,
+        &session_model_id,
+        initial_reasoning_effort,
+        &session_info.id,
+        EffortTarget::NewSession,);
         sampling_config.conversation_group_id = Some(
             crate::sampling::derive_conversation_group_id(session_info.id.0.as_ref()),
         );
@@ -4641,25 +4647,24 @@ impl MvpAgent {
             let cfg = self.cfg.borrow();
             resolve_inference_idle_timeout_secs(
                 &models,
-                &sampling_config.model,
+                session_model_id.0.as_ref(),
                 cfg.remote_settings.as_ref(),
             )
         };
         let subagent_rate_limit_max_attempts = {
             let models = self.models_manager.models();
             let per_model = crate::agent::config::find_model_by_id(
-                    &models,
-                    &sampling_config.model,
-                )
-                .and_then(|entry| entry.info.subagent_rate_limit_max_attempts);
+                &models,
+                session_model_id.0.as_ref(),
+            )
+            .and_then(|entry| entry.info.subagent_rate_limit_max_attempts);
             self.resolved_subagent_rate_limit_max_attempts(per_model)
         };
-        let model_max_retries = self
-            .models_manager
-            .models()
-            .values()
-            .find(|entry| entry.info.has_model_id(&sampling_config.model))
-            .and_then(|entry| entry.info.max_retries);
+        let model_max_retries = crate::agent::config::find_model_by_id(
+            &self.models_manager.models(),
+            session_model_id.0.as_ref(),
+        )
+        .and_then(|entry| entry.info.max_retries);
         let origin_client = self.origin_client_info_from_meta(init.meta.as_ref());
         let web_search_sampling_config = self.prepare_web_search_sampling_config();
         let image_gen_config = self.prepare_image_gen_config();
@@ -4762,7 +4767,7 @@ impl MvpAgent {
             let credentials = xai_chat_state::Credentials {
                 api_key: sampling_config.api_key.clone(),
                 auth_type: crate::agent::config::resolve_chat_state_auth_type(
-                    sampling_config.model.as_str(),
+                    session_model_id.0.as_ref(),
                     session_key.as_deref(),
                     self.auth_type(),
                 ),

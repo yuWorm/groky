@@ -99,6 +99,7 @@ pub(super) async fn make_replay_send_update_fixture() -> ReplaySendUpdateFixture
         },
         auth_method_id: test_auth_method_id("test-auth"),
         model_auth_memo: std::cell::RefCell::new(None),
+        catalog_model_id: std::cell::RefCell::new(acp::ModelId::new("test-model")),
         attribution_callback: None,
         auth_manager: None,
         is_chat_kind: false,
@@ -546,6 +547,9 @@ async fn server_overflow_clears_a_larger_context_window_selection() {
                     &crate::agent::config::EndpointsConfig::default(),
                 ),
             );
+            actor
+                .catalog_model_id
+                .replace(acp::ModelId::new("catalog-key"));
             let cfg = selected_window_config(&actor, 500_000);
             actor.context_window_after_overflow(&cfg, std::num::NonZeroU64::new(256_000).unwrap());
             assert_eq!(
@@ -621,6 +625,7 @@ async fn preserve_switch_applies_the_live_selection_while_supported() {
                 }
                 actor
                     .handle_set_session_model(crate::session::SessionModelSwitch {
+                        model_id: acp::ModelId::new("test-model"),
                         sampling_config: xai_grok_sampler::SamplerConfig {
                             model: "test-model".to_owned(),
                             context_window: 256_000,

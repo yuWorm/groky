@@ -759,6 +759,9 @@ pub(crate) struct SessionActor {
     /// Because a config edit can turn the selected model into a per-model BYOK model without changing its id, keying on the id alone is insufficient.
     /// Each model/credential chokepoint must clear this memo (`replace(None)`).
     pub(crate) model_auth_memo: std::cell::RefCell<Option<ModelAuthMemo>>,
+    /// Exact selected catalog model identity, kept apart from the wire model slug in chat state.
+    /// This remains provider-specific when catalog entries share an endpoint and wire model.
+    pub(crate) catalog_model_id: std::cell::RefCell<acp::ModelId>,
     /// The event fires at each of the six `OaiCompatClient` 401 arms in `xai-grok-sampler`.
     /// Threaded into every `SamplerConfig` reconstructed by `reconstruct_full_config`.
     /// `None` when the session was spawned without an `AuthManager` (BYOK direct mode, test fixtures).
@@ -1202,16 +1205,13 @@ impl SessionActor {
     ) {
         self.events.emit_turn_ended(outcome, category, context);
     }
-    /// Current model ID for OTLP span attributes.
-    /// Reads from chat_state_handle so it always reflects the latest model override; no stale cached field.
-    /// Returns "unknown" if no sampling config is set.
+    /// Current selected catalog model ID for OTLP span attributes and persisted metadata.
+    ///
+    /// This intentionally differs from the wire slug in `SamplingConfig`: multiple
+    /// providers can send the same slug, and an `OverrideModelName` does not alter
+    /// the selected model's credentials.
     async fn current_model_id(&self) -> String {
-        self.chat_state_handle
-            .get_sampling_config()
-            .await
-            .map(|c| c.model)
-            .filter(|m| !m.is_empty())
-            .unwrap_or_else(|| "unknown".to_string())
+        self.catalog_model_id.borrow().0.to_string()
     }
     fn session_id_string(&self) -> String {
         self.session_info.id.0.to_string()

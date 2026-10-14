@@ -8,9 +8,12 @@ use crate::agent::remote_config::ModelsManager;
 use crate::sampling::EffortTarget;
 
 impl ModelsManager {
+    /// Apply a requested effort while retaining the selected catalog model as the
+    /// lookup identity. `sampling.model` may be a provider-shared wire slug.
     pub(crate) fn apply_supported_effort(
         &self,
         sampling: &mut SamplerConfig,
+        catalog_model_id: &acp::ModelId,
         effort: Option<ReasoningEffort>,
         session_id: &acp::SessionId,
         target: EffortTarget,
@@ -18,12 +21,12 @@ impl ModelsManager {
         let Some(effort) = effort else {
             return;
         };
-        if !self.model_supports_reasoning_effort(&sampling.model) {
+        if !self.model_supports_reasoning_effort(catalog_model_id.0.as_ref()) {
             // SummaryClient stays quiet; the spawn or switch that carried this effort already warned that the model does not support it
             if matches!(target, EffortTarget::NewSession | EffortTarget::ModelSwitch) {
                 tracing::warn!(
                     session_id = %session_id.0,
-                    model = %sampling.model,
+                    model = %catalog_model_id.0,
                     effort = %effort,
                     "reasoning_effort: model does not support effort; ignoring it"
                 );
@@ -32,11 +35,10 @@ impl ModelsManager {
         }
         // Some models are a different model id at each effort, so swap in the id this effort asks for.
         // Do this before the log, or the log records an id we are not sending.
-        if let Some(routed) = self.model_for_effort(&sampling.model, effort) {
+        if let Some(routed) = self.model_for_effort(catalog_model_id.0.as_ref(), effort) {
             sampling.model = routed;
         }
-        // Same fields at every target; only the level differs
-        // tracing bakes the level into a static callsite, so match a const level per arm
+        // Same fields at every target; tracing bakes the level into a static callsite.
         macro_rules! log_applied {
             ($level:expr) => {
                 tracing::event!(

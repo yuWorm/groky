@@ -120,14 +120,11 @@ pub struct AgentPipes {
 }
 
 /// Stand up `MvpAgent` plus its ACP connection and IO tasks on the current `LocalSet`.
-/// `remote` is installed before `MvpAgent::new` so tests can seed `RemoteSettings`
-/// (including a grove kill) before the first worktree RPC.
-fn spawn_agent_local(remote: Option<xai_grok_shell::util::config::RemoteSettings>) -> AgentPipes {
+/// The supplied config is installed before startup so the catalog and live credential lookups agree.
+fn spawn_agent_local(agent_config: AgentConfig) -> AgentPipes {
     let (c2a_a, c2a_b) = tokio::io::duplex(DUPLEX_BUFFER_BYTES);
     let (a2c_a, a2c_b) = tokio::io::duplex(DUPLEX_BUFFER_BYTES);
 
-    let mut agent_config = AgentConfig::default();
-    agent_config.remote_settings = remote;
     let auth_manager = Arc::new(agent_config.create_auth_manager());
     let (gw_tx, gw_rx) = tokio::sync::mpsc::unbounded_channel();
     let agent = MvpAgent::new(
@@ -178,7 +175,22 @@ pub async fn connect_and_auth_with_remote<C>(
 where
     C: acp::Client + 'static,
 {
-    let pipes = spawn_agent_local(remote);
+    let mut config = AgentConfig::default();
+    config.remote_settings = remote;
+    connect_and_auth_with_config(client, client_type, config).await
+}
+
+/// [`connect_and_auth`] with the same resolved configuration a normal CLI startup loads.
+#[allow(dead_code)]
+pub async fn connect_and_auth_with_config<C>(
+    client: C,
+    client_type: &str,
+    config: AgentConfig,
+) -> (acp::ClientSideConnection, acp::InitializeResponse)
+where
+    C: acp::Client + 'static,
+{
+    let pipes = spawn_agent_local(config);
     connect_client(client, client_type, pipes).await
 }
 

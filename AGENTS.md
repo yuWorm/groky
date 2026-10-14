@@ -24,4 +24,6 @@ Voice: `**Lead** rest.` Lead is the noun the user already knows (`/default`, `Re
 
 ### Unreleased
 
-Next groky version after `v0.1.21`. Empty until a user-visible change lands.
+Next groky version after `v0.1.21`.
+
+- **Providers** keep credentials tied to the selected account when providers share an endpoint or model, including model switches and resumed sessions. Missing credentials no longer reuse an old key or another provider's key.

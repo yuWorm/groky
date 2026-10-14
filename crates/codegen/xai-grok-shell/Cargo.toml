@@ -267,6 +267,10 @@ harness = false
 # is the package wildcard). Process-isolated suites stay as implicit
 # `tests/*.rs` binaries.
 [[test]]
+name = "custom_provider_credential_isolation"
+required-features = ["test-support"]
+
+[[test]]
 name = "test_startup_prefetch_fallback"
 required-features = ["test-support"]
 

@@ -80,7 +80,7 @@ impl MvpAgent {
         let client = self.session_registry_client();
         let register = client
             .is_some()
-            .then(|| self.session_registration(turn_number, prompt));
+            .then(|| self.session_registration(turn_number, prompt, &handle.model_id));
         RegistryTurnEndArgs {
             client,
             session_id: session_id.to_string(),
@@ -99,13 +99,14 @@ impl MvpAgent {
         &self,
         turn_number: u64,
         prompt: &[acp::ContentBlock],
+        model_id: &acp::ModelId,
     ) -> SessionRegistration {
         let suppress = self
             .auth_manager
             .current_or_expired()
             .is_some_and(|a| a.is_zdr_team());
         SessionRegistration {
-            model_id: self.models_manager.current_model_id().0.to_string(),
+            model_id: model_id.0.to_string(),
             hostname: gethostname::gethostname().to_string_lossy().to_string(),
             device_id: if suppress { None } else { Some(agent_id()) },
             first_prompt: if suppress || turn_number != 0 {

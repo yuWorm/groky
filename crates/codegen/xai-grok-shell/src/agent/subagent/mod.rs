@@ -742,7 +742,7 @@ fn session_bearer_resolver(
         )
     })
 }
-/// [`session_bearer_resolver`] for an inherited config, where only the model string is known: BYOK comes from the catalog memo.
+/// [`session_bearer_resolver`] for an inherited config, keyed by the selected catalog model.
 fn inherited_bearer_resolver(
     ctx: &SubagentSpawnContext,
     model: &str,
@@ -753,10 +753,12 @@ fn inherited_bearer_resolver(
         .byok;
     session_bearer_resolver(ctx, byok, base_url)
 }
-fn parent_catalog_model_id(ctx: &SubagentSpawnContext, routing_model: &str) -> acp::ModelId {
+/// Capability fallback for legacy aliases whose catalog row has disappeared.
+/// The unique wire-model fallback must never select a credential owner.
+fn parent_capability_model_id(ctx: &SubagentSpawnContext, wire_model: &str) -> acp::ModelId {
     let models = ctx.models_manager.models();
     resolve_catalog_key(&models, &ctx.model_id)
-        .or_else(|| resolve_catalog_key(&models, &acp::ModelId::new(routing_model)))
+        .or_else(|| resolve_catalog_key(&models, &acp::ModelId::new(wire_model)))
         .unwrap_or_else(|| ctx.model_id.clone())
 }
 /// Read the parent session's actual current sampling config. Prefers the live state from `ChatStateHandle` (authoritative). Falls back to the baseline on `SubagentSpawnContext` if the actor is unavailable.
@@ -774,15 +776,16 @@ async fn read_parent_sampling_config(
                 creds.alpha_test_key.as_deref(),
                 &cfg.base_url,
             );
-            let auth_scheme = crate::agent::config::try_resolve_model_credentials(&cfg.model, None)
-                .map(|r| r.auth_scheme)
-                .unwrap_or_default();
+            let capability_model_id = parent_capability_model_id(ctx, &cfg.model);
+            let auth_facts = crate::agent::config::resolve_model_auth_facts_and_provider(
+                ctx.model_id.0.as_ref(),
+            )
+            .0;
             let inherited_base_url = cfg.base_url.clone();
             let strip_guard = ctx.would_strip_fallback_key(creds.api_key.as_deref());
-            let catalog_model_id = parent_catalog_model_id(ctx, &cfg.model);
             let supports_backend_search = ctx
                 .models_manager
-                .model_supports_backend_search(catalog_model_id.0.as_ref());
+                .model_supports_backend_search(capability_model_id.0.as_ref());
             let extra_response_includes = crate::agent::config::response_include_extensions(
                 supports_backend_search,
                 &cfg.api_backend,
@@ -797,7 +800,7 @@ async fn read_parent_sampling_config(
                 temperature: cfg.temperature,
                 top_p: cfg.top_p,
                 api_backend: cfg.api_backend,
-                auth_scheme,
+                auth_scheme: auth_facts.auth_scheme,
                 request_compression: crate::util::config::request_compression_for_url(
                     &inherited_base_url,
                 ),
@@ -824,15 +827,15 @@ async fn read_parent_sampling_config(
                 bearer_resolver: if strip_guard {
                     None
                 } else {
-                    inherited_bearer_resolver(ctx, &cfg.model, &inherited_base_url)
+                    session_bearer_resolver(ctx, auth_facts.byok, &inherited_base_url)
                 },
                 supports_backend_search,
                 compactions_remaining: ctx
                     .models_manager
-                    .model_compactions_remaining(catalog_model_id.0.as_ref()),
+                    .model_compactions_remaining(capability_model_id.0.as_ref()),
                 compaction_at_tokens: ctx
                     .models_manager
-                    .model_compaction_at_tokens(catalog_model_id.0.as_ref()),
+                    .model_compaction_at_tokens(capability_model_id.0.as_ref()),
                 doom_loop_recovery: ctx.sampling_config.doom_loop_recovery,
                 header_injector: ctx.sampling_config.header_injector.clone(),
             };
@@ -869,15 +872,15 @@ async fn read_parent_sampling_config(
         })),
     );
     let mut fallback = ctx.sampling_config.clone();
+    let capability_model_id = parent_capability_model_id(ctx, &fallback.model);
     fallback.bearer_resolver = if ctx.would_strip_fallback_key(fallback.api_key.as_deref()) {
         None
     } else {
-        inherited_bearer_resolver(ctx, &fallback.model, &fallback.base_url)
+        inherited_bearer_resolver(ctx, ctx.model_id.0.as_ref(), &fallback.base_url)
     };
-    let catalog_model_id = parent_catalog_model_id(ctx, &fallback.model);
     fallback.supports_backend_search = ctx
         .models_manager
-        .model_supports_backend_search(catalog_model_id.0.as_ref());
+        .model_supports_backend_search(capability_model_id.0.as_ref());
     fallback.extra_response_includes = crate::agent::config::response_include_extensions(
         fallback.supports_backend_search,
         &fallback.api_backend,
@@ -885,10 +888,10 @@ async fn read_parent_sampling_config(
     );
     fallback.compactions_remaining = ctx
         .models_manager
-        .model_compactions_remaining(catalog_model_id.0.as_ref());
+        .model_compactions_remaining(capability_model_id.0.as_ref());
     fallback.compaction_at_tokens = ctx
         .models_manager
-        .model_compaction_at_tokens(catalog_model_id.0.as_ref());
+        .model_compaction_at_tokens(capability_model_id.0.as_ref());
     (fallback, ctx.model_id.clone())
 }
 /// `AuthType` for a subagent: BYOK gets `ApiKey` (don't overwrite the BYOK key).
@@ -910,7 +913,13 @@ fn resolve_model_override_to_config(
     model_id: &str,
     ctx: &SubagentSpawnContext,
 ) -> Option<(xai_grok_sampler::SamplerConfig, acp::ModelId)> {
-    let entry = crate::agent::config::find_model_by_id(&ctx.available_models, model_id).cloned()?;
+    let requested_model_id = acp::ModelId::new(model_id);
+    let canonical_model_id = resolve_catalog_key(&ctx.available_models, &requested_model_id)?;
+    let entry = ctx
+        .available_models
+        .get(canonical_model_id.0.as_ref())
+        .cloned()
+        .expect("resolve_catalog_key returns a key present in available_models");
     if !entry.info.user_selectable {
         let user_picker_only = ctx
             .agent_config
@@ -920,11 +929,6 @@ fn resolve_model_override_to_config(
             return None;
         }
     }
-    let canonical_model_id = if ctx.available_models.contains_key(model_id) {
-        acp::ModelId::new(model_id)
-    } else {
-        acp::ModelId::new(entry.info().model.clone())
-    };
     let session_key = ctx.auth.as_ref().map(|a| a.key.as_str());
     let has_session_key = session_key.is_some();
     let mut credentials = resolve_credentials(&entry, session_key);

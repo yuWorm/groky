@@ -290,7 +290,7 @@ async fn sampler_401_recovery_returns_refresh_and_retry() {
 /// retries with a grok.com JWT against chatgpt.com, 401s again, and the
 /// pager prompts `/login` — which cannot fix `vendor-auth.json`.
 #[tokio::test(flavor = "current_thread")]
-async fn sampler_401_on_codex_url_skips_xai_session_refresh() {
+async fn sampler_401_on_codex_model_skips_xai_session_refresh() {
     let local = tokio::task::LocalSet::new();
     local
         .run_until(async {
@@ -304,6 +304,9 @@ async fn sampler_401_on_codex_url_skips_xai_session_refresh() {
             let mut cfg = actor.chat_state_handle.get_sampling_config().await.unwrap();
             cfg.base_url = "https://chatgpt.com/backend-api/codex".into();
             cfg.model = "gpt-5.6-luna".into();
+            actor
+                .catalog_model_id
+                .replace(acp::ModelId::new("openai-codex/gpt-5.6-luna"));
             actor.chat_state_handle.update_sampling_config(cfg);
 
             let result = actor
@@ -1449,6 +1452,7 @@ async fn model_auth_memo_serves_cached_status_and_keys_on_model() {
                     facts: ModelAuthFacts {
                         byok: ModelByok::Byok,
                         auth_scheme: Default::default(),
+                        vendor_id: None,
                     },
                     provider: None,
                 }));
@@ -1492,6 +1496,7 @@ async fn reconstruct_full_config_no_bearer_resolver_for_byok_model_on_session_me
                     facts: ModelAuthFacts {
                         byok: ModelByok::Byok,
                         auth_scheme: Default::default(),
+                        vendor_id: None,
                     },
                     provider: None,
                 }));
@@ -1581,6 +1586,7 @@ async fn set_session_model_invalidates_byok_memo_for_same_model_id() {
                     facts: ModelAuthFacts {
                         byok: ModelByok::NotByok,
                         auth_scheme: Default::default(),
+                        vendor_id: None,
                     },
                     provider: None,
                 }));
@@ -1636,6 +1642,7 @@ async fn seed_provider_memo(actor: &Arc<SessionActor>, provider: xai_grok_login:
             facts: crate::agent::config::ModelAuthFacts {
                 byok: crate::agent::auth_method::ModelByok::Byok,
                 auth_scheme: Default::default(),
+                vendor_id: None,
             },
             provider: Some(provider),
         }));
@@ -1694,6 +1701,7 @@ fn config_only_model_switch(
     sampling_config: xai_grok_sampler::SamplerConfig,
 ) -> crate::session::SessionModelSwitch {
     crate::session::SessionModelSwitch {
+        model_id: acp::ModelId::new(sampling_config.model.clone()),
         sampling_config,
         use_concise: false,
         is_family_switch: false,

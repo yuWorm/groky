@@ -1407,6 +1407,7 @@ async fn apply_supported_effort_assigns_only_when_supported() {
     supported_cfg.reasoning_effort = None;
     agent.models_manager.apply_supported_effort(
         &mut supported_cfg,
+        &acp::ModelId::new("effort-model"),
         Some(ReasoningEffort::High),
         &sid,
         EffortTarget::NewSession,
@@ -1416,6 +1417,7 @@ async fn apply_supported_effort_assigns_only_when_supported() {
     plain_cfg.reasoning_effort = None;
     agent.models_manager.apply_supported_effort(
         &mut plain_cfg,
+        &acp::ModelId::new("plain-model"),
         Some(ReasoningEffort::High),
         &sid,
         EffortTarget::NewSession,
@@ -1425,6 +1427,7 @@ async fn apply_supported_effort_assigns_only_when_supported() {
     none_cfg.reasoning_effort = Some(ReasoningEffort::Low);
     agent.models_manager.apply_supported_effort(
         &mut none_cfg,
+        &acp::ModelId::new("effort-model"),
         None,
         &sid,
         EffortTarget::NewSession,
@@ -1477,6 +1480,7 @@ async fn an_effort_that_names_its_own_model_switches_the_id() {
     assert_eq!(cfg.model, "routed-high");
     agent.models_manager.apply_supported_effort(
         &mut cfg,
+        &acp::ModelId::new("routed-high"),
         Some(ReasoningEffort::Low),
         &sid,
         EffortTarget::ModelSwitch,
@@ -1486,6 +1490,7 @@ async fn an_effort_that_names_its_own_model_switches_the_id() {
     let mut plain_cfg = agent.prepare_sampling_config_for_model(&plain, None);
     agent.models_manager.apply_supported_effort(
         &mut plain_cfg,
+        &acp::ModelId::new("plain-model"),
         Some(ReasoningEffort::Low),
         &sid,
         EffortTarget::ModelSwitch,
@@ -1607,6 +1612,7 @@ async fn new_session_meta_effort_seeds_spawn_for_supported_model_and_drops_for_u
     let mut supported_cfg = agent.prepare_sampling_config_for_model(&supported, None);
     agent.models_manager.apply_supported_effort(
         &mut supported_cfg,
+        &acp::ModelId::new("effort-model"),
         spawn_effort,
         &sid,
         EffortTarget::NewSession,
@@ -1615,6 +1621,7 @@ async fn new_session_meta_effort_seeds_spawn_for_supported_model_and_drops_for_u
     let mut plain_cfg = agent.prepare_sampling_config_for_model(&plain, None);
     agent.models_manager.apply_supported_effort(
         &mut plain_cfg,
+        &acp::ModelId::new("plain-model"),
         spawn_effort,
         &sid,
         EffortTarget::NewSession,
@@ -1653,6 +1660,7 @@ async fn new_session_without_meta_keeps_current_effort_over_catalog_default() {
     assert_eq!(cfg.reasoning_effort, Some(ReasoningEffort::High));
     agent.models_manager.apply_supported_effort(
         &mut cfg,
+        &acp::ModelId::new("effort-model"),
         spawn_effort,
         &acp::SessionId::new("new-session-current-effort"),
         EffortTarget::NewSession,
@@ -1684,7 +1692,7 @@ async fn restore_effort_via_load(
                 responds_to,
             } = cmd
             {
-                let _ = responds_to.send(Ok(acp::ModelId::new(switch.sampling_config.model)));
+                let _ = responds_to.send(Ok(switch.model_id));
             }
         }
     });
@@ -1741,7 +1749,7 @@ async fn restore_applies_the_saved_context_window_selection() {
                         .supported_context_windows
                         .contains(&NonZeroU64::new(500_000).unwrap()),
                 ));
-                let _ = responds_to.send(Ok(acp::ModelId::new(switch.sampling_config.model)));
+                let _ = responds_to.send(Ok(switch.model_id));
                 break;
             }
         }
@@ -1785,7 +1793,7 @@ async fn restore_keeps_the_saved_context_window_selection_without_a_catalog() {
                     switch.context_window_selection,
                     switch.sampling_config.context_window,
                 ));
-                let _ = responds_to.send(Ok(acp::ModelId::new(switch.sampling_config.model)));
+                let _ = responds_to.send(Ok(switch.model_id));
                 break;
             }
         }

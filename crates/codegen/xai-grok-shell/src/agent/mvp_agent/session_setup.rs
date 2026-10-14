@@ -533,19 +533,16 @@ impl MvpAgent {
         let build_custom_model_id: Option<String> = campaign_nudge
             .map(|c| c.value)
             .or_else(|| build_custom_model_id.map(str::to_owned));
-        let resolved_custom_model = build_custom_model_id
-            .as_deref()
-            .and_then(|custom_model| match self
-                .resolve_model_id(&acp::ModelId::new(custom_model))
-            {
-                Ok(model) if model.info.user_selectable => {
+        let resolved_custom_model = build_custom_model_id.as_deref().and_then(|custom_model| {
+            match self.resolve_model_selection(&acp::ModelId::new(custom_model)) {
+                Ok((catalog_model_id, model)) if model.info.user_selectable => {
                     model_agent_type = Some(model.info().agent_type.clone());
                     let origin_client = self
                         .origin_client_info_from_meta(arguments.meta.as_ref());
                     session_sampling_override = Some(
                         self.prepare_sampling_config_for_model(&model, origin_client),
                     );
-                    Some(custom_model)
+                    Some(catalog_model_id)
                 }
                 Ok(_) => {
                     tracing::warn!(
@@ -565,7 +562,8 @@ impl MvpAgent {
                     );
                     None
                 }
-            });
+            }
+        });
         if model_agent_type.is_none()
             && custom_model_id.is_none()
             && let Ok(default_model) =
@@ -587,8 +585,17 @@ impl MvpAgent {
                 origin_client.clone(),
             )
         });
+        let model_id = match &session_initial_model {
+            Some(chat_model) => acp::ModelId::new(chat_model.clone()),
+            None => resolved_custom_model
+                .clone()
+                .unwrap_or_else(|| self.models_manager.current_model_id()),
+        };
+        let session_model_id = model_id.clone();
         let effort_route = split_new_session_effort(
-            resolved_custom_model,
+            resolved_custom_model
+                .as_ref()
+                .map(|model_id| model_id.0.as_ref()),
             resolve_new_session_effort_hint(
                 parse_reasoning_effort_meta(arguments.meta.as_ref()),
                 self.models_manager.current_reasoning_effort(),
@@ -600,6 +607,7 @@ impl MvpAgent {
         };
         self.models_manager.apply_supported_effort(
             &mut session_sampling,
+            &session_model_id,
             spawn_effort.or_else(|| self.models_manager.current_reasoning_effort()),
             &session_id,
             EffortTarget::SummaryClient,
@@ -610,13 +618,6 @@ impl MvpAgent {
         spawn_sampler_transport_prewarm(&session_sampling.base_url);
         let (summary_client, summary_model) = self.build_summary_client(&session_sampling)?;
         let relay_sync = self.start_relay_sync(&session_id, &session_info);
-        let model_id = match &session_initial_model {
-            Some(chat_model) => acp::ModelId::new(chat_model.clone()),
-            None => resolved_custom_model
-                .map(acp::ModelId::new)
-                .unwrap_or_else(|| self.models_manager.current_model_id()),
-        };
-        let session_model_id = model_id.clone();
         self.report_setup_phase(SessionSetupPhase::PersistenceInit);
         let (persistence, root_identity) = if is_chat_kind {
             (crate::session::persistence::PersistenceHandle::noop(), None)
@@ -768,7 +769,7 @@ impl MvpAgent {
                 xai_grok_telemetry::session_ctx::log_event_dual(product_analytics, ev);
             });
         }
-        if let Some(model_id) = resolved_custom_model {
+        if let Some(model_id) = resolved_custom_model.as_ref() {
             self.report_setup_phase(SessionSetupPhase::ModelSwitch);
             let switch_effort = match effort_route {
                 NewSessionEffort::Switch(effort) => Some(effort),
@@ -777,7 +778,7 @@ impl MvpAgent {
             let switched = crate::timed!(log: "new_session: set_session_model", {
                 crate::agent::handlers::model_switch::apply(
                     self,
-                    acp::SetSessionModelRequest::new(session_id.clone(), acp::ModelId::new(model_id)),
+                    acp::SetSessionModelRequest::new(session_id.clone(), model_id.clone()),
                     crate::agent::handlers::model_switch::SwitchEffort::Set(switch_effort),
                     crate::agent::handlers::model_switch::SwitchContextWindow::Preserve,
                     crate::agent::handlers::model_switch::ConfigNotice::Skip,
@@ -1010,12 +1011,12 @@ impl MvpAgent {
         }
         let initial_reasoning_effort = parse_reasoning_effort_meta(request_meta.as_ref());
         let origin_client = self.origin_client_info_from_meta(request_meta.as_ref());
-        let mut load_session_sampling = self.resolve_sampling_config_for_model(
-            &self.models_manager.current_model_id(),
-            origin_client.clone(),
-        );
+        let summary_model_id = self.models_manager.current_model_id();
+        let mut load_session_sampling =
+            self.resolve_sampling_config_for_model(&summary_model_id, origin_client.clone());
         self.models_manager.apply_supported_effort(
             &mut load_session_sampling,
+            &summary_model_id,
             initial_reasoning_effort,
             &session_id,
             EffortTarget::SummaryClient,

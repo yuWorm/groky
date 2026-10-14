@@ -877,6 +877,7 @@ pub(crate) async fn run_shell_child(
         match raw.parse::<ReasoningEffort>() {
             Ok(eff) => ctx.models_manager.apply_supported_effort(
                 &mut effective_sampling_config,
+                &effective_model_id,
                 Some(eff),
                 &acp::SessionId::new(request.id.clone()),
                 crate::sampling::EffortTarget::NewSession,

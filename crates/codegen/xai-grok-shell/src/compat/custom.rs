@@ -177,27 +177,6 @@ pub fn display_name(id: &str) -> Option<String> {
         .and_then(|s| s.get(id).map(|p| p.name.clone()))
 }
 
-/// Match a sampling `base_url` to a user-defined provider.
-pub(crate) fn provider_id_for_base_url(base_url: &str) -> Option<String> {
-    #[cfg(test)]
-    {
-        let _ = base_url;
-        return None;
-    }
-    #[cfg(not(test))]
-    {
-        let url = normalize_base_url(base_url);
-        if url.is_empty() {
-            return None;
-        }
-        let store = CustomProviderStore::default_store().ok()?;
-        store.list().find_map(|provider| {
-            let base = normalize_base_url(&provider.base_url);
-            (url == base || url.starts_with(&format!("{base}/"))).then(|| provider.id.clone())
-        })
-    }
-}
-
 pub struct CustomProviderStore {
     path: PathBuf,
     data: FileShape,

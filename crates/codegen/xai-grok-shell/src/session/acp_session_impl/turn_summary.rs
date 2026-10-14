@@ -66,6 +66,7 @@ impl SessionActor {
 
         self.refresh_token_if_expired().await;
         let session_config = self.reconstruct_full_config().await;
+        let mut catalog_model_id = self.catalog_model_id.borrow().clone();
         // Resolve the helper's own endpoint and credentials; the session endpoint may not serve it.
         let aux_config = if self.models_manager.model_in_catalog(&settings.model) {
             self.resolve_aux_sampler_config(&settings.model).await
@@ -74,6 +75,7 @@ impl SessionActor {
         };
         let mut config = match aux_config {
             Some(mut cfg) => {
+                catalog_model_id = acp::ModelId::new(settings.model.clone());
                 crate::agent::config::stamp_session_local_sampler_fields(
                     &mut cfg,
                     &session_config,
@@ -84,12 +86,13 @@ impl SessionActor {
             }
             None => session_config,
         };
-        if self
-            .models_manager
-            .model_supports_reasoning_effort_value(&config.model, settings.reasoning_effort)
-        {
+        if self.models_manager.model_supports_reasoning_effort_value(
+            catalog_model_id.0.as_ref(),
+            settings.reasoning_effort,
+        ) {
             self.models_manager.apply_supported_effort(
                 &mut config,
+                &catalog_model_id,
                 Some(settings.reasoning_effort),
                 &self.session_info.id,
                 crate::sampling::EffortTarget::SummaryClient,

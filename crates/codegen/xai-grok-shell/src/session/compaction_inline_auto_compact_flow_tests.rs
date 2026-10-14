@@ -87,6 +87,7 @@ async fn create_test_actor(
         },
         auth_method_id: test_auth_method_id("test-auth"),
         model_auth_memo: std::cell::RefCell::new(None),
+        catalog_model_id: std::cell::RefCell::new(acp::ModelId::new("test")),
         attribution_callback: None,
         auth_manager: None,
         is_chat_kind: false,
@@ -909,6 +910,7 @@ async fn family_switch_sanitizes_without_compacting() {
                 .expect("mock inference server");
             actor
                 .handle_set_session_model(crate::session::SessionModelSwitch {
+                    model_id: acp::ModelId::new("new-model"),
                     sampling_config: switch_target_config("new-model", server.url()),
                     use_concise: false,
                     is_family_switch: true,

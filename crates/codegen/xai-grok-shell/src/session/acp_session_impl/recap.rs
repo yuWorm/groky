@@ -523,19 +523,22 @@ impl SessionActor {
     > {
         self.refresh_token_if_expired().await;
         let mut config = self.reconstruct_full_config().await;
+        let mut catalog_model_id = self.catalog_model_id.borrow().clone();
         if self.models_manager.model_shares_route(
             &settings.model,
             &config.base_url,
             &config.api_backend,
         ) {
             config.model = settings.model.clone();
+            catalog_model_id = acp::ModelId::new(settings.model.clone());
         }
-        if self
-            .models_manager
-            .model_supports_reasoning_effort_value(&config.model, settings.reasoning_effort)
-        {
+        if self.models_manager.model_supports_reasoning_effort_value(
+            catalog_model_id.0.as_ref(),
+            settings.reasoning_effort,
+        ) {
             self.models_manager.apply_supported_effort(
                 &mut config,
+                &catalog_model_id,
                 Some(settings.reasoning_effort),
                 &self.session_info.id,
                 crate::sampling::EffortTarget::SummaryClient,
@@ -748,6 +751,11 @@ impl SessionActor {
 
         self.refresh_token_if_expired().await;
         let mut sampling_config = self.reconstruct_full_config().await;
+        let catalog_model_id = if sampling_config.model == model {
+            self.catalog_model_id.borrow().clone()
+        } else {
+            acp::ModelId::new(model.clone())
+        };
         sampling_config.model = model.clone();
         sampling_config.reasoning_effort = None;
         let supports_reasoning = self.models_manager.model_supports_reasoning_effort(&model);
@@ -766,6 +774,7 @@ impl SessionActor {
         );
         self.models_manager.apply_supported_effort(
             &mut sampling_config,
+            &catalog_model_id,
             suggest_reasoning.effort,
             &self.session_info.id,
             crate::sampling::EffortTarget::SummaryClient,

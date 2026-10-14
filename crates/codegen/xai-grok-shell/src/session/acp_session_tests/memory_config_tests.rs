@@ -153,6 +153,7 @@ pub(super) async fn create_test_actor_with_memory(
         },
         auth_method_id: test_auth_method_id("test-auth"),
         model_auth_memo: std::cell::RefCell::new(None),
+        catalog_model_id: std::cell::RefCell::new(acp::ModelId::new("test")),
         attribution_callback: None,
         auth_manager: None,
         is_chat_kind: false,

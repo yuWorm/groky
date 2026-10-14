@@ -2079,17 +2079,58 @@ fn resolve_catalog_key_prefers_exact_key_match() {
     assert_eq!(key.0.as_ref(), "grok-4.5");
 }
 #[test]
-fn resolve_catalog_key_last_slug_match_wins() {
+fn resolve_catalog_key_rejects_ambiguous_routing_slug() {
     let mut models = IndexMap::new();
     models.insert(
-        "default-grok-build".to_string(),
-        make_model_entry("grok-4.5"),
+        "claudeuy/gpt-5.6-sol".to_string(),
+        make_model_entry("gpt-5.6-sol"),
     );
-    models.insert("user-grok-build".to_string(), make_model_entry("grok-4.5"));
-    let persisted = acp::ModelId::new("grok-4.5");
-    let key = resolve_catalog_key(&models, &persisted).expect("slug must resolve");
-    assert_eq!(key.0.as_ref(), "user-grok-build");
+    models.insert(
+        "claudeuyplan/gpt-5.6-sol".to_string(),
+        make_model_entry("gpt-5.6-sol"),
+    );
+    let persisted = acp::ModelId::new("gpt-5.6-sol");
+    assert!(
+        resolve_catalog_key(&models, &persisted).is_none(),
+        "a shared wire slug must not choose a provider"
+    );
 }
+#[test]
+fn missing_vendor_catalog_id_does_not_resolve_to_another_providers_wire_name() {
+    let models = IndexMap::from([(
+        "openrouter/openai/gpt-5.6".to_string(),
+        make_model_entry("openai/gpt-5.6"),
+    )]);
+    let persisted = acp::ModelId::new("openai/gpt-5.6");
+    let available = test_available_keys(&["openrouter/openai/gpt-5.6"]);
+    assert!(resolve_catalog_key(&models, &persisted).is_none());
+    assert_eq!(
+        resolve_restore_model(&persisted, &models, &available),
+        RestoreModelDecision::Unavailable(persisted)
+    );
+}
+
+#[test]
+fn default_model_does_not_choose_a_provider_from_a_shared_wire_name() {
+    let bundled = crate::models::default_model();
+    let catalog = IndexMap::from([
+        (
+            "a/shared-model".to_string(),
+            make_model_entry("shared-model"),
+        ),
+        (
+            "b/shared-model".to_string(),
+            make_model_entry("shared-model"),
+        ),
+        (bundled.to_string(), make_model_entry(bundled)),
+    ]);
+    let mut cfg = config::Config::default();
+    cfg.models.default = Some("shared-model".to_string());
+    let (key, _, source) = resolve_default_model(&cfg, &catalog, true);
+    assert_eq!(key, bundled);
+    assert_eq!(source, config::ConfigSource::Default);
+}
+
 #[test]
 fn selectable_catalog_key_for_persisted_none_when_resolved_not_available() {
     let mut models = IndexMap::new();
@@ -2218,6 +2259,44 @@ fn restore_does_not_auto_switch_vanished_model_to_newest() {
         resolve_restore_model(&persisted, &models, &available),
         RestoreModelDecision::Unavailable(persisted),
         "must not silently upgrade a vanished session model to grok-4.7"
+    );
+}
+#[test]
+fn restore_blocks_ambiguous_legacy_routing_slug() {
+    let mut models = IndexMap::new();
+    models.insert(
+        "claudeuy/gpt-5.6-sol".to_string(),
+        make_model_entry("gpt-5.6-sol"),
+    );
+    models.insert(
+        "claudeuyplan/gpt-5.6-sol".to_string(),
+        make_model_entry("gpt-5.6-sol"),
+    );
+    let available = test_available_keys(&["claudeuy/gpt-5.6-sol", "claudeuyplan/gpt-5.6-sol"]);
+    let persisted = acp::ModelId::new("gpt-5.6-sol");
+    assert_eq!(
+        resolve_restore_model(&persisted, &models, &available),
+        RestoreModelDecision::Unavailable(persisted),
+        "an ambiguous legacy wire slug must remain blocked until the user selects a catalog model"
+    );
+}
+#[test]
+fn restore_keeps_exact_catalog_id_when_wire_slug_is_shared() {
+    let mut models = IndexMap::new();
+    models.insert(
+        "claudeuy/gpt-5.6-sol".to_string(),
+        make_model_entry("gpt-5.6-sol"),
+    );
+    models.insert(
+        "claudeuyplan/gpt-5.6-sol".to_string(),
+        make_model_entry("gpt-5.6-sol"),
+    );
+    let available = test_available_keys(&["claudeuy/gpt-5.6-sol", "claudeuyplan/gpt-5.6-sol"]);
+    let persisted = acp::ModelId::new("claudeuyplan/gpt-5.6-sol");
+    assert_eq!(
+        resolve_restore_model(&persisted, &models, &available),
+        RestoreModelDecision::Use(persisted),
+        "a catalog ID persisted by a switch must retain its provider on resume"
     );
 }
 

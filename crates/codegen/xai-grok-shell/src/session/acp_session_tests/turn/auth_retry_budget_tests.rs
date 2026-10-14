@@ -233,6 +233,7 @@ async fn session_token_actor(
     cfg.base_url = server.url();
     cfg.api_backend = xai_grok_sampling_types::ApiBackend::Responses;
     cfg.model = "test".to_string();
+    actor.catalog_model_id.replace(acp::ModelId::new("test"));
     actor.chat_state_handle.update_sampling_config(cfg);
     let mut creds = actor.chat_state_handle.get_credentials().await;
     creds.api_key = None;
@@ -247,6 +248,7 @@ async fn session_token_actor(
             facts: crate::agent::config::ModelAuthFacts {
                 byok: crate::agent::auth_method::ModelByok::NotByok,
                 auth_scheme: Default::default(),
+                vendor_id: None,
             },
             provider: None,
         }));
