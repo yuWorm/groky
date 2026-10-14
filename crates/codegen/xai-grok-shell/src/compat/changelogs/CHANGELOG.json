@@ -5,6 +5,16 @@
     "breaking_change": false
   },
   {
+    "category": "fixes",
+    "description": "**Providers** keep credentials tied to the selected account when providers share an endpoint or model, including model switches and resumed sessions. Missing credentials no longer reuse an old key or another provider's key.",
+    "breaking_change": false
+  },
+  {
+    "category": "fixes",
+    "description": "**Messages providers** accept base URLs without `/v1`, including GLM's Anthropic-compatible endpoint, instead of sending requests to the wrong path and retrying empty responses. Existing `/v1` URLs keep working.",
+    "breaking_change": false
+  },
+  {
     "category": "features",
     "description": "**`/context-window`** sets a session window from the model's menu. groky `/window` still works.",
     "breaking_change": false

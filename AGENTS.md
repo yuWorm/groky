@@ -24,7 +24,4 @@ Voice: `**Lead** rest.` Lead is the noun the user already knows (`/default`, `Re
 
 ### Unreleased
 
-Next groky version after `v0.1.21`.
-
-- **Providers** keep credentials tied to the selected account when providers share an endpoint or model, including model switches and resumed sessions. Missing credentials no longer reuse an old key or another provider's key.
-- **Messages providers** accept base URLs without `/v1`, including GLM's Anthropic-compatible endpoint, instead of sending requests to the wrong path and retrying empty responses. Existing `/v1` URLs keep working.
+Next groky version after `v0.1.22`.

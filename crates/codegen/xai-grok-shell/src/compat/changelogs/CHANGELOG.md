@@ -1,8 +1,13 @@
-# Unreleased
+# 0.1.22 — 2026-10-15
 
 ## Features
 
 - **ChatGPT Codex models** refresh from the signed-in account with a five-minute account-scoped cache and bundled fallback.
+
+## Bug Fixes
+
+- **Providers** keep credentials tied to the selected account when providers share an endpoint or model, including model switches and resumed sessions. Missing credentials no longer reuse an old key or another provider's key.
+- **Messages providers** accept base URLs without `/v1`, including GLM's Anthropic-compatible endpoint, instead of sending requests to the wrong path and retrying empty responses. Existing `/v1` URLs keep working.
 
 # 0.1.21 — 2026-10-09
 
