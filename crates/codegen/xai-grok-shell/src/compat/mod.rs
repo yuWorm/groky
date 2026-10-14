@@ -27,7 +27,8 @@ pub use self_update::{
     set_product_version, updates_allowed as groky_updates_allowed,
 };
 pub use vendor_models::{
-    refresh as refresh_vendor_models, refresh_unlocked as refresh_unlocked_vendor_models,
+    refresh as refresh_vendor_models, refresh_stale_unlocked as refresh_stale_vendor_models,
+    refresh_unlocked as refresh_unlocked_vendor_models,
 };
 
 use crate::agent::config::ModelEntry;

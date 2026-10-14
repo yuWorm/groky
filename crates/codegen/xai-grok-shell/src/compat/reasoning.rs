@@ -233,9 +233,26 @@ pub fn apply_to_model_info(info: &mut ModelInfo, api_model: &str) {
 /// (not first-party Grok).
 pub(crate) fn apply_overlay_to_vendor_entries(models: &mut IndexMap<String, ModelEntry>) {
     for entry in models.values_mut() {
-        if crate::compat::is_vendor_catalog_model(entry) {
-            let api_model = entry.info.model.clone();
-            apply_to_model_info(&mut entry.info, &api_model);
+        if !crate::compat::is_vendor_catalog_model(entry) {
+            continue;
+        }
+        let api_model = entry.info.model.clone();
+        let codex_menu = (entry.info.model_family.as_deref() == Some("openai-codex")
+            && !entry.info.reasoning_efforts.is_empty())
+        .then(|| {
+            (
+                entry.info.reasoning_efforts.clone(),
+                entry.info.reasoning_effort,
+                entry.info.reasoning_effort_server_default,
+                entry.info.supports_reasoning_effort,
+            )
+        });
+        apply_to_model_info(&mut entry.info, &api_model);
+        if let Some((options, default, server_default, supported)) = codex_menu {
+            entry.info.reasoning_efforts = options;
+            entry.info.reasoning_effort = default;
+            entry.info.reasoning_effort_server_default = server_default;
+            entry.info.supports_reasoning_effort = supported;
         }
     }
 }

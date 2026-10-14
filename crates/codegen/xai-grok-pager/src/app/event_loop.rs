@@ -1695,6 +1695,9 @@ pub(crate) async fn run(
     let mut dashboard_poll_at: Option<Instant> = Some(Instant::now());
     const RECAP_POLL_INTERVAL: Duration = Duration::from_secs(20);
     let mut recap_poll_at: Option<Instant> = Some(Instant::now() + RECAP_POLL_INTERVAL);
+    const VENDOR_CATALOG_POLL_INTERVAL: Duration = Duration::from_secs(60);
+    let mut vendor_catalog_poll_at: Option<Instant> =
+        Some(Instant::now() + VENDOR_CATALOG_POLL_INTERVAL);
     let mut presenter = Presenter::new();
     let mut suspend_retry_after: Option<Instant> = None;
     let mut suspend_wait_reports = SuspendWaitReports::default();
@@ -1717,6 +1720,10 @@ pub(crate) async fn run(
         if !app.has_access() {
             gate_poll_at = Some(Instant::now() + GATE_POLL_INTERVAL);
         }
+    }
+    let vendor_refresh = vec![super::actions::Effect::RefreshStaleVendorModels];
+    if process_effects(vendor_refresh, &mut tasks, &mut app, &progress_tx) {
+        return Ok(finish_run(&mut app));
     }
     if !post_render_effects.is_empty()
         && process_effects(post_render_effects, &mut tasks, &mut app, &progress_tx)
@@ -2102,6 +2109,12 @@ pub(crate) async fn run(
         };
         let recap_poll = async {
             match recap_poll_at {
+                Some(at) => sleep_until(at).await,
+                None => std::future::pending().await,
+            }
+        };
+        let vendor_catalog_poll = async {
+            match vendor_catalog_poll_at {
                 Some(at) => sleep_until(at).await,
                 None => std::future::pending().await,
             }
@@ -2556,6 +2569,14 @@ pub(crate) async fn run(
                 }
                 // Always re-arm: a cheap no-op fire while focused / not-yet-eligible.
                 recap_poll_at = Some(Instant::now() + RECAP_POLL_INTERVAL);
+            }
+
+            _ = vendor_catalog_poll => {
+                let effects = vec![Effect::RefreshStaleVendorModels];
+                if process_effects(effects, &mut tasks, &mut app, &progress_tx) {
+                    break;
+                }
+                vendor_catalog_poll_at = Some(Instant::now() + VENDOR_CATALOG_POLL_INTERVAL);
             }
 
             _ = load_barrier_tick => {}

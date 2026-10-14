@@ -1861,6 +1861,8 @@ pub enum Effect {
     },
     /// GET https://models.dev/api.json and persist the compact overlay.
     SyncModelsDev,
+    /// Refresh the ChatGPT Codex account catalog when its five-minute cache is stale.
+    RefreshStaleVendorModels,
     /// Send AuthenticateRequest to the agent.
     Authenticate {
         request_seq: u64,
@@ -2496,6 +2498,10 @@ pub enum TaskResult {
         count: usize,
         vendor_count: usize,
         error: Option<String>,
+    },
+    /// Startup or periodic refresh of the stale ChatGPT Codex account catalog finished.
+    StaleVendorModelsRefreshed {
+        count: usize,
     },
     /// Session lifecycle result paired with the memory mode pinned by the
     /// actor that produced it. The wrapper lets all lifecycle variants share

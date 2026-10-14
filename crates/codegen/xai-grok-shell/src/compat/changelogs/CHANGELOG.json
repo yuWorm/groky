@@ -1,6 +1,11 @@
 [
   {
     "category": "features",
+    "description": "**ChatGPT Codex models** refresh from the signed-in account with a five-minute account-scoped cache and bundled fallback.",
+    "breaking_change": false
+  },
+  {
+    "category": "features",
     "description": "**`/context-window`** sets a session window from the model's menu. groky `/window` still works.",
     "breaking_change": false
   },

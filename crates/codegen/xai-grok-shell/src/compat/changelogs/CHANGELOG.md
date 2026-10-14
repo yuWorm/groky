@@ -1,5 +1,9 @@
 # Unreleased
 
+## Features
+
+- **ChatGPT Codex models** refresh from the signed-in account with a five-minute account-scoped cache and bundled fallback.
+
 # 0.1.21 — 2026-10-09
 
 ## Features

@@ -318,6 +318,12 @@ pub(crate) fn execute(
                 }
             });
         }
+        Effect::RefreshStaleVendorModels => {
+            tasks.spawn(async move {
+                let count = xai_grok_shell::compat::refresh_stale_vendor_models().await;
+                TaskResult::StaleVendorModelsRefreshed { count }
+            });
+        }
         Effect::Logout => {
             let tx = acp_tx.clone();
             tasks

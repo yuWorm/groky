@@ -278,6 +278,20 @@ pub(super) fn handle_models_dev_synced(
     vec![]
 }
 
+pub(super) fn handle_stale_vendor_models_refreshed(app: &mut AppView, count: usize) -> Vec<Effect> {
+    if count == 0 {
+        return vec![];
+    }
+    for provider_id in xai_grok_shell::compat::unlocked_provider_ids() {
+        inject_provider_models(app, &provider_id);
+    }
+    patch_model_state_reasoning(&mut app.models);
+    for agent in app.agents.values_mut() {
+        patch_model_state_reasoning(&mut agent.session.models);
+    }
+    vec![]
+}
+
 fn inject_provider_models(app: &mut AppView, provider_id: &str) {
     let extras = xai_grok_shell::compat::acp_models_for_provider(provider_id);
     let prefix = format!("{provider_id}/");

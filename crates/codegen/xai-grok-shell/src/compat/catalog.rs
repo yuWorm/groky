@@ -8,7 +8,7 @@ use crate::agent::config::{EnvKeys, ModelEntry, ModelInfo};
 #[cfg(not(test))]
 use crate::compat::auth_store::VendorAuthStore;
 use xai_grok_sampler::AuthScheme;
-use xai_grok_sampling_types::ApiBackend;
+use xai_grok_sampling_types::{ApiBackend, ReasoningEffortOption};
 
 #[derive(Clone, Debug)]
 pub struct ProviderSpec {
@@ -433,8 +433,10 @@ fn extra_headers(provider: &ProviderSpec) -> indexmap::IndexMap<String, String> 
 struct ResolvedModel {
     api_model: String,
     name: String,
+    description: Option<String>,
     context_window: u64,
     supports_reasoning_effort: bool,
+    reasoning_efforts: Vec<ReasoningEffortOption>,
 }
 
 fn static_models(provider: &ProviderSpec) -> Vec<ResolvedModel> {
@@ -444,8 +446,10 @@ fn static_models(provider: &ProviderSpec) -> Vec<ResolvedModel> {
         .map(|spec| ResolvedModel {
             api_model: spec.api_model.to_owned(),
             name: spec.name.to_owned(),
+            description: None,
             context_window: spec.context_window,
             supports_reasoning_effort: spec.supports_reasoning_effort,
+            reasoning_efforts: Vec::new(),
         })
         .collect()
 }
@@ -455,13 +459,15 @@ fn from_cached(models: Vec<crate::compat::vendor_models::CachedModel>) -> Vec<Re
     models
         .into_iter()
         .map(|model| {
-            let supports_reasoning_effort =
-                crate::compat::reasoning::model_supports(&model.api_model);
+            let supports_reasoning_effort = !model.reasoning_efforts.is_empty()
+                || crate::compat::reasoning::model_supports(&model.api_model);
             ResolvedModel {
                 api_model: model.api_model,
                 name: model.name,
+                description: model.description,
                 context_window: model.context_window,
                 supports_reasoning_effort,
+                reasoning_efforts: model.reasoning_efforts,
             }
         })
         .collect()
@@ -497,6 +503,7 @@ fn model_entry(provider: &ProviderSpec, spec: &ResolvedModel) -> (String, ModelE
         provider.name,
         &spec.name,
     ));
+    info.description.clone_from(&spec.description);
     info.api_backend = provider.api_backend.clone();
     info.auth_scheme = provider.auth_scheme;
     info.extra_headers = extra_headers(provider);
@@ -505,6 +512,15 @@ fn model_entry(provider: &ProviderSpec, spec: &ResolvedModel) -> (String, ModelE
     info.supports_reasoning_effort = spec.supports_reasoning_effort;
     info.user_selectable = true;
     crate::compat::reasoning::apply_to_model_info(&mut info, &spec.api_model);
+    if !spec.reasoning_efforts.is_empty() {
+        info.reasoning_efforts.clone_from(&spec.reasoning_efforts);
+        info.reasoning_effort = spec
+            .reasoning_efforts
+            .iter()
+            .find(|option| option.default)
+            .map(|option| option.value);
+        info.reasoning_effort_server_default = info.reasoning_effort.is_none();
+    }
     let entry = ModelEntry {
         info,
         mtls_cert_dir: None,
@@ -605,11 +621,16 @@ mod unlock_override {
 
 #[cfg(test)]
 mod tests {
+    use super::ResolvedModel;
     use super::merge_vendor_catalog;
+    use super::model_entry;
+    use super::provider_by_id;
     use super::provider_id_for_base_url;
     use super::unlock_override::{Unlock, with};
     use indexmap::IndexMap;
-    use xai_grok_sampling_types::ApiBackend;
+    use xai_grok_sampling_types::{
+        ApiBackend, ReasoningEffort, ReasoningEffortOption, effort_label,
+    };
 
     #[test]
     fn provider_id_for_base_url_matches_codex_and_openai() {
@@ -792,6 +813,50 @@ mod tests {
                 assert!(!resolved.contains_key("openai/gpt-4o"));
             },
         );
+    }
+
+    #[test]
+    fn codex_catalog_metadata_populates_model_entry() {
+        let provider = provider_by_id("openai-codex").unwrap();
+        let reasoning_efforts = vec![
+            ReasoningEffortOption {
+                id: "low".into(),
+                value: ReasoningEffort::Low,
+                label: effort_label(ReasoningEffort::Low),
+                description: Some("Fast".into()),
+                default: false,
+            },
+            ReasoningEffortOption {
+                id: "high".into(),
+                value: ReasoningEffort::High,
+                label: effort_label(ReasoningEffort::High),
+                description: Some("Deep".into()),
+                default: true,
+            },
+        ];
+        let (_, entry) = model_entry(
+            provider,
+            &ResolvedModel {
+                api_model: "gpt-next".into(),
+                name: "GPT Next".into(),
+                description: Some("Account catalog model".into()),
+                context_window: 1_000_000,
+                supports_reasoning_effort: true,
+                reasoning_efforts,
+            },
+        );
+
+        assert_eq!(
+            entry.info.name.as_deref(),
+            Some("OpenAI Codex (ChatGPT) · GPT Next")
+        );
+        assert_eq!(
+            entry.info.description.as_deref(),
+            Some("Account catalog model")
+        );
+        assert_eq!(entry.info.context_window.get(), 1_000_000);
+        assert_eq!(entry.info.reasoning_effort, Some(ReasoningEffort::High));
+        assert_eq!(entry.info.reasoning_efforts.len(), 2);
     }
 }
 

@@ -23,8 +23,8 @@ pub async fn probe_api_key(provider_id: &str, api_key: &str) -> Result<(), Vendo
         return Err(VendorLoginError::EmptyKey);
     }
 
-    // ChatGPT Codex has no public `/models` listing; OAuth already proved the
-    // token, and a PAT is accepted without a probe.
+    // Codex model discovery is account-scoped. OAuth proves the account and
+    // refreshes its product catalog; a manually supplied PAT is accepted here.
     if provider.id == "openai-codex" {
         return Ok(());
     }

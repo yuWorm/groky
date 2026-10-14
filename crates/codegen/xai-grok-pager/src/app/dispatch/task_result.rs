@@ -2373,6 +2373,9 @@ pub(super) fn dispatch_task_result(result: TaskResult, app: &mut AppView) -> Vec
             vendor_count,
             error,
         } => super::vendor::handle_models_dev_synced(app, count, vendor_count, error),
+        TaskResult::StaleVendorModelsRefreshed { count } => {
+            super::vendor::handle_stale_vendor_models_refreshed(app, count)
+        }
         TaskResult::FeatureOverridePersisted { feature, result } => {
             settings::handle_feature_override_persisted(app, feature, result)
         }
