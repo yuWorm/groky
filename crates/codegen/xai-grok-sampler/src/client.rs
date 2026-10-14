@@ -441,10 +441,18 @@ impl EndpointTemplate {
 
     fn url_for_path(&self, path: &str) -> String {
         let path = path.trim_start_matches('/');
-        match self {
-            Self::Plain(base) => format!("{base}/{path}"),
-            Self::WithQuery { prefix, suffix } => format!("{prefix}/{path}{suffix}"),
-        }
+        let (base, suffix) = match self {
+            Self::Plain(base) => (base.as_str(), ""),
+            Self::WithQuery { prefix, suffix } => (prefix.as_str(), suffix.as_str()),
+        };
+        // GROK_COMPAT_HOOK: Anthropic SDK base URLs omit /v1; existing
+        // groky providers include it. Both must reach /v1/messages.
+        let path = if path == "messages" && !base.ends_with("/v1") {
+            "v1/messages"
+        } else {
+            path
+        };
+        format!("{base}/{path}{suffix}")
     }
 }
 

@@ -79,6 +79,12 @@ Grok supports three API backends. Set `api_backend` in your `[model.*]` config t
 
 When you omit `api_backend`, Grok uses `chat_completions`.
 
+For `messages`, groky accepts Anthropic SDK-style base URLs such as
+`https://api.anthropic.com` or `https://open.bigmodel.cn/api/anthropic` and
+appends `/v1/messages`. A base URL already ending in `/v1` gets only
+`/messages` appended. This applies to both streaming and non-streaming requests;
+query parameters are preserved. Other backends keep their existing URL behavior.
+
 To send provider-specific authentication or version headers -- for example, Anthropic's `x-api-key` -- use the `extra_headers` field described below. Grok sends those headers verbatim with every request to the endpoint.
 
 ---
