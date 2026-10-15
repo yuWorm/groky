@@ -247,6 +247,9 @@ pub(crate) struct SessionSpawnOptions<'a> {
     pub persisted_agent_profile: Option<xai_grok_agent::AgentDefinition>,
     pub model_agent_type: Option<&'a str>,
     pub session_model_id: acp::ModelId,
+    /// Persisted Codex-slot binding for a restored/forked session. `None`
+    /// makes the actor snapshot the current Codex default for a new session.
+    pub vendor_accounts: Option<indexmap::IndexMap<String, String>>,
     /// A `session/new` reasoning-effort hint applied to the spawn sampling; `None` for loads.
     pub initial_reasoning_effort: Option<ReasoningEffort>,
     pub session_yolo_mode: bool,
@@ -392,6 +395,7 @@ pub(crate) fn chat_session_spawn_options<'a>(
         persisted_agent_profile: None,
         model_agent_type,
         session_model_id,
+        vendor_accounts: Some(crate::session::vendor_accounts::snapshot_default_vendor_accounts()),
         initial_reasoning_effort: None,
         session_yolo_mode,
         session_auto_mode: false,

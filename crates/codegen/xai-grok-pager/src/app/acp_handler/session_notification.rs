@@ -1104,6 +1104,19 @@ pub(super) fn handle_session_notification_with_origin(
             ));
             true
         }
+        XaiSessionUpdate::VendorAccountChanged { provider_id, account_id, models } => {
+            let prefix = format!("{provider_id}/");
+            agent.session.models.available.retain(|id, _| !id.0.starts_with(&prefix));
+            agent.session.models.available.extend(
+                models.into_iter().map(|model| (model.model_id.clone(), model)),
+            );
+            if provider_id == "openai-codex"
+                && let Some(manager) = agent.vendor_login.as_mut()
+            {
+                manager.current_codex_account = Some(account_id);
+            }
+            true
+        }
         XaiSessionUpdate::ServedModel { display_name } => {
             agent
                 .session

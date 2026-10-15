@@ -29,6 +29,7 @@ pub use self::persistence::{
 pub use self::result::{Empty, ExtMethodResult};
 pub use self::share::{ShareSessionRequest, ShareSessionResponse};
 pub use self::user_echo::{CLIENT_USER_MESSAGE_ECHO_META, USER_MESSAGE_ECHO_CAPABILITY};
+pub(crate) use self::vendor_accounts::VendorAccountBindings;
 pub use prod_mc_cli_chat_proxy_types::feedback_types::{
     ClientType, FeedbackImage, FeedbackTerminalInfo, MAX_FEEDBACK_IMAGE_BYTES,
     MAX_FEEDBACK_IMAGE_TOTAL_BYTES, MAX_FEEDBACK_IMAGES, RatingType, feedback_image_extension,
@@ -574,6 +575,7 @@ pub(crate) mod slash_commands;
 pub mod usage_file;
 pub use slash_commands::{PAGER_COMMAND_KEYS, builtin_command};
 pub(crate) mod repo_status_prefix;
+pub(crate) mod vendor_accounts;
 pub mod storage;
 pub(crate) mod streaming_capture;
 pub mod summary;

@@ -473,6 +473,12 @@ pub enum SessionCommand {
         switch: SessionModelSwitch,
         responds_to: oneshot::Sender<Result<acp::ModelId, acp::Error>>,
     },
+    /// Bind this session to one provider account.  The actor queues this while a
+    /// turn is active, then applies it only after that whole turn completes.
+    SetVendorAccount {
+        provider_id: String,
+        account_id: String,
+    },
     /// Set only the reasoning effort on the session's live model. Carrying no
     /// model keeps a concurrent `SetSessionModel` from being reverted.
     SetReasoningEffort {

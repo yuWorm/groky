@@ -562,6 +562,7 @@ fn fork_summary(
             .clone()
             .map(acp::ModelId::new)
             .unwrap_or(source.current_model_id),
+        vendor_accounts: source.vendor_accounts,
         parent_session_id: options.parent_session_id.clone(),
         forked_at: Some(chrono::Utc::now()),
         collection_id: None,

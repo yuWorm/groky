@@ -51,7 +51,8 @@ pub(crate) async fn apply(
         .ok_or_else(|| acp::Error::invalid_params().data("unknown session id"))?;
     let _config_guard = agent.config_mutation_lock(&session_id).lock_owned().await;
     let handle = agent.resident_handle(&session_id).unwrap_or(handle);
-    let (model_id, model) = agent.resolve_model_selection(&requested_model_id)?;
+    let (model_id, model) =
+        agent.resolve_model_selection_for_session(&session_id, &requested_model_id)?;
     let use_concise = model.info().use_concise;
     let session_default = handle
         .session_default_agent_profile
@@ -61,7 +62,7 @@ pub(crate) async fn apply(
         resolve_required_agent_type(Some(model.info().agent_type.as_str()), session_default);
     let previous_model_id = handle.model_id.0.clone();
     let is_family_switch = {
-        let models = agent.models_manager.models();
+        let models = agent.models_for_session(&session_id);
         let old_family = config::find_model_by_id(&models, &previous_model_id)
             .and_then(|e| e.info.model_family.as_deref());
         matches!(

@@ -93,10 +93,14 @@ impl MvpAgent {
     pub(super) fn build_summary_client(
         &self,
         primary: &SamplingConfig,
+        vendor_accounts: Option<&indexmap::IndexMap<String, String>>,
     ) -> Result<(OaiCompatClient, String), acp::Error> {
         let slug = self.resolve_session_summary_model();
         let session_key = self.auth_manager.current_or_expired().map(|a| a.key.clone());
-        let models = self.models_manager.models();
+        let models = vendor_accounts.map_or_else(
+            || self.models_manager.models(),
+            |accounts| self.models_for_vendor_account_map(accounts),
+        );
         let endpoints = self.models_manager.endpoints();
         let (disable_api_key_auth, alpha_test_key, client_version) = {
             let cfg = self.cfg.borrow();
@@ -106,7 +110,9 @@ impl MvpAgent {
                 cfg.client_version.clone(),
             )
         };
-        let config = match crate::agent::config::resolve_aux_model_sampling_config(
+        let vendor_id = crate::agent::config::find_model_by_id(&models, &slug)
+            .and_then(crate::compat::vendor_id_for_model);
+        let mut config = match crate::agent::config::resolve_aux_model_sampling_config(
             &slug,
             &models,
             &endpoints,
@@ -130,6 +136,22 @@ impl MvpAgent {
                 fallback
             }
         };
+        if let Some(provider_id) = vendor_id {
+            let empty_vendor_accounts = indexmap::IndexMap::new();
+            let credential =
+                crate::session::vendor_accounts::request_session_vendor_credential(
+                    vendor_accounts.unwrap_or(&empty_vendor_accounts),
+                    provider_id,
+                );
+            config.api_key = credential
+                .as_ref()
+                .and_then(|value| value.request_secret().map(str::to_owned));
+            crate::compat::oauth::inject_request_headers(
+                provider_id,
+                credential.as_ref(),
+                &mut config.extra_headers,
+            );
+        }
         let model = config.model.clone();
         let client = OaiCompatClient::new(config).map_err(map_sampling_err_to_acp)?;
         Ok((client, model))
@@ -2033,6 +2055,54 @@ impl MvpAgent {
                 .await;
         }
     }
+    /// Replace global Codex rows with the selected account's catalog while
+    /// preserving explicit model credentials and routing overrides.
+    fn models_for_vendor_account_map(
+        &self,
+        vendor_accounts: &indexmap::IndexMap<String, String>,
+    ) -> indexmap::IndexMap<String, ModelEntry> {
+        crate::session::vendor_accounts::models_for_vendor_accounts(
+            self.models_manager.models(),
+            vendor_accounts,
+        )
+    }
+
+    pub(crate) fn models_for_vendor_accounts(
+        &self,
+        vendor_accounts: &crate::session::VendorAccountBindings,
+    ) -> indexmap::IndexMap<String, ModelEntry> {
+        self.models_for_vendor_account_map(&vendor_accounts.read())
+    }
+
+    pub(crate) fn models_for_session(
+        &self,
+        session_id: &acp::SessionId,
+    ) -> indexmap::IndexMap<String, ModelEntry> {
+        self.resident_handle(session_id).map_or_else(
+            || self.models_manager.models(),
+            |handle| self.models_for_vendor_accounts(&handle.vendor_accounts),
+        )
+    }
+
+    /// Resolve a model against the account-scoped catalog for this session.
+    pub(crate) fn resolve_model_selection_for_session(
+        &self,
+        session_id: &acp::SessionId,
+        requested: &acp::ModelId,
+    ) -> Result<(acp::ModelId, ModelEntry), acp::Error> {
+        let requested_str = requested.0.as_ref();
+        let models = self.models_for_session(session_id);
+        let Some(catalog_key) = resolve_catalog_key(&models, requested) else {
+            return Err(acp::Error::invalid_params().data("unknown model id"));
+        };
+        Ok((
+            catalog_key.clone(),
+            models
+                .get(catalog_key.0.as_ref())
+                .expect("resolve_catalog_key returns a key present in models")
+                .clone(),
+        ))
+    }
     /// Resolve a requested catalog key or unique wire slug to its exact catalog selection.
     pub(crate) fn resolve_model_selection(
         &self,
@@ -3282,6 +3352,29 @@ impl MvpAgent {
                 origin
             })
     }
+    pub(super) fn available_models_for_session(
+        &self,
+        session_id: Option<&acp::SessionId>,
+    ) -> indexmap::IndexMap<acp::ModelId, acp::ModelInfo> {
+        let Some(session_id) = session_id else {
+            return self.models_manager.available();
+        };
+        let scoped_models = self.models_for_session(session_id);
+        let mut available = self.models_manager.available();
+        available.retain(|model_id, _| scoped_models.contains_key(model_id.0.as_ref()));
+        if let Some(handle) = self.resident_handle(session_id) {
+            let vendor_accounts = handle.vendor_accounts.read();
+            if let Some(account_id) =
+                vendor_accounts.get(crate::session::vendor_accounts::CODEX_PROVIDER_ID)
+            {
+                available.extend(crate::compat::acp_models_for_provider_account(
+                    crate::session::vendor_accounts::CODEX_PROVIDER_ID,
+                    account_id,
+                ));
+            }
+        }
+        available
+    }
     /// When `session_id` is `Some`, looks up the session's per-session model.
     /// Falls back to `current_model_id` (startup default) when no session is found or `session_id` is `None`.
     /// The `None` case covers `initialize`, before any session exists.
@@ -3294,11 +3387,9 @@ impl MvpAgent {
                 .and_then(|sid| self.resident_handle(sid).map(|h| h.model_id.clone())),
             &self.models_manager.current_model_id(),
         );
-        let mut available_models: Vec<acp::ModelInfo> = self
-            .models_manager
-            .available()
-            .values()
-            .cloned()
+        let mut available_models: Vec<_> = self
+            .available_models_for_session(session_id)
+            .into_values()
             .collect();
         self.overlay_session_model_meta(session_id, &model_id, &mut available_models);
         acp::SessionModelState::new(model_id, available_models)
@@ -4172,6 +4263,7 @@ impl MvpAgent {
             persisted_agent_profile,
             model_agent_type,
             session_model_id,
+            vendor_accounts,
             initial_reasoning_effort,
             session_yolo_mode,
             session_auto_mode,
@@ -4929,6 +5021,9 @@ impl MvpAgent {
                     self.managed_mcp_cache.clone(),
                     managed_mcp_proxy_url,
                     session_model_id,
+                    vendor_accounts.map(
+                        crate::session::vendor_accounts::shared_vendor_accounts,
+                    ),
                     session_yolo_mode,
                     session_auto_mode,
                     origin_client.as_ref().map(|o| o.product.clone()),

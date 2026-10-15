@@ -279,6 +279,7 @@ pub(crate) async fn spawn_session_actor(
     managed_mcp_handle: crate::session::managed_mcp::ManagedMcpStateHandle,
     managed_mcp_proxy_base_url: String,
     session_model_id: acp::ModelId,
+    vendor_accounts: Option<crate::session::VendorAccountBindings>,
     session_yolo_mode: bool,
     session_auto_mode: bool,
     session_client_identifier: Option<String>,
@@ -347,6 +348,14 @@ pub(crate) async fn spawn_session_actor(
     }
     let wf_sid: String = session_info.id.0.to_string();
     let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
+    let vendor_accounts = vendor_accounts.unwrap_or_else(|| {
+        crate::session::vendor_accounts::shared_vendor_accounts(
+            crate::session::vendor_accounts::snapshot_default_vendor_accounts(),
+        )
+    });
+    let _ = persistence.tx.send(PersistenceMsg::VendorAccounts(
+        vendor_accounts.read().clone(),
+    ));
     let mut mcp_servers = mcp_servers;
     if !startup_hints.is_subagent {
         crate::session::agent_mcp::apply_agent_mcp_overlay(
@@ -663,6 +672,7 @@ pub(crate) async fn spawn_session_actor(
         pending_inputs: VecDeque::new(),
         edit_holds: HashMap::new(),
         pending_notifications: Vec::new(),
+        pending_vendor_account_changes: Default::default(),
         notifications_suppressed: false,
         rewindable: false,
         front_message_committed: false,
@@ -1814,6 +1824,7 @@ pub(crate) async fn spawn_session_actor(
         auth_method_id,
         model_auth_memo: std::cell::RefCell::new(None),
         catalog_model_id: std::cell::RefCell::new(session_model_id.clone()),
+        vendor_accounts: vendor_accounts.clone(),
         attribution_callback,
         auth_manager,
         is_chat_kind,
@@ -2442,6 +2453,7 @@ pub(crate) async fn spawn_session_actor(
         current_prompt_id,
         registry_write_order: Default::default(),
         pending_interactions,
+        vendor_accounts,
         active_work: active_work.clone(),
         info: session_info,
         max_turns,
@@ -2611,6 +2623,7 @@ pub(crate) async fn spawn_session_on_thread(
     managed_mcp_handle: crate::session::managed_mcp::ManagedMcpStateHandle,
     managed_mcp_proxy_base_url: String,
     session_model_id: acp::ModelId,
+    vendor_accounts: Option<crate::session::VendorAccountBindings>,
     session_yolo_mode: bool,
     session_auto_mode: bool,
     session_client_identifier: Option<String>,
@@ -2827,6 +2840,7 @@ pub(crate) async fn spawn_session_on_thread(
                     managed_mcp_handle,
                     managed_mcp_proxy_base_url,
                     session_model_id,
+                    vendor_accounts,
                     session_yolo_mode,
                     session_auto_mode,
                     session_client_identifier,

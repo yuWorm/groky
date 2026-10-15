@@ -840,6 +840,11 @@ pub(super) async fn run_session(
                             let updated_model_id = session.handle_set_session_model(switch).await;
                             let _ = responds_to.send(updated_model_id);
                         }
+                        SessionCommand::SetVendorAccount { provider_id, account_id } => {
+                            session
+                                .set_vendor_account_at_turn_boundary(provider_id, account_id)
+                                .await;
+                        }
                         SessionCommand::SetReasoningEffort { effort, responds_to } => {
                             let updated_model_id = session.handle_set_reasoning_effort(effort).await;
                             let _ = responds_to.send(updated_model_id);
@@ -2364,6 +2369,7 @@ pub(super) async fn run_session(
                         }
                         continue;
                     }
+                    session.apply_pending_vendor_account_changes().await;
                     if let Some(source_prompt_index) = v2_capture_source_prompt_index {
                         session
                             .enqueue_v2_turn_capture(source_prompt_index)

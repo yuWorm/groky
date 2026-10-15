@@ -57,6 +57,9 @@ pub struct SessionHandle {
     pub current_prompt_id: std::sync::Arc<std::sync::Mutex<Option<String>>>,
     /// Shared `Arc` with the actor (insert on issue, remove on resolve); never persisted.
     pub pending_interactions: crate::session::pending_interaction::PendingInteractions,
+    /// Codex account selection effective for this session. The actor updates
+    /// it only between turns; consumers must not consult the Codex default.
+    pub(crate) vendor_accounts: crate::session::VendorAccountBindings,
     pub(crate) active_work: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     pub info: crate::session::info::Info,
     /// `None` means unlimited.

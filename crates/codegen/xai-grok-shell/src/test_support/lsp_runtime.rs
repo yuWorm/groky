@@ -81,6 +81,9 @@ pub(crate) fn ctx_with_toggle(toggle: HashMap<String, bool>) -> SubagentSpawnCon
         tool_params_json: Default::default(),
         plugin_registry: None,
         models_manager: Default::default(),
+        vendor_accounts: crate::session::vendor_accounts::shared_vendor_accounts(
+            Default::default(),
+        ),
         file_tool_overrides: None,
         agent_config: None,
         gcs_bucket_url: None,

@@ -99,6 +99,9 @@ fn spawn_ctx(parent_cwd: PathBuf) -> SubagentSpawnContext {
         tool_params_json: Default::default(),
         plugin_registry: None,
         models_manager: Default::default(),
+        vendor_accounts: crate::session::vendor_accounts::shared_vendor_accounts(
+            Default::default(),
+        ),
         file_tool_overrides: None,
         agent_config: None,
         gcs_bucket_url: None,

@@ -458,14 +458,23 @@ fn from_cached(models: Vec<crate::compat::vendor_models::CachedModel>) -> Vec<Re
 }
 
 /// Live cache, then models.dev current generation, then the hardcoded slice.
-fn resolved_models(provider: &ProviderSpec) -> Vec<ResolvedModel> {
+fn resolved_models(provider: &ProviderSpec, account_id: Option<&str>) -> Vec<ResolvedModel> {
     #[cfg(test)]
     {
+        let _ = account_id;
         return static_models(provider);
     }
     #[cfg(not(test))]
     {
-        if let Some(cached) = crate::compat::vendor_models::cached_models(provider.id) {
+        if provider.id == "openai-codex"
+            && account_id.is_none()
+            && !VendorAuthStore::default_store()
+                .ok()
+                .is_some_and(|store| store.default_account_id(provider.id).is_some())
+        {
+            return Vec::new();
+        }
+        if let Some(cached) = crate::compat::vendor_models::cached_models(provider.id, account_id) {
             return from_cached(cached);
         }
         let fallback = crate::compat::vendor_models::models_dev_fallback(provider.id);
@@ -523,7 +532,7 @@ pub fn merge_vendor_catalog(resolved: &mut IndexMap<String, ModelEntry>) {
         if !provider_unlocked(provider) {
             continue;
         }
-        for spec in resolved_models(provider) {
+        for spec in resolved_models(provider, None) {
             let (key, entry) = model_entry(provider, &spec);
             if !resolved.contains_key(&key) {
                 resolved.insert(key, entry);
@@ -541,11 +550,46 @@ pub fn acp_models_for_provider(
         return crate::compat::custom::acp_models_for_custom(provider_id);
     };
     let mut entries = IndexMap::new();
-    for spec in resolved_models(provider) {
+    for spec in resolved_models(provider, None) {
         let (key, entry) = model_entry(provider, &spec);
         entries.insert(key, entry);
     }
     crate::agent::config::to_acp_model_info(&entries)
+}
+
+/// The selected account's catalog, never another account's cached capabilities.
+pub fn models_for_provider_account(
+    provider_id: &str,
+    account_id: &str,
+) -> IndexMap<String, ModelEntry> {
+    let Some(provider) = provider_by_id(provider_id) else {
+        return IndexMap::new();
+    };
+    let has_account = crate::compat::VendorAuthStore::default_store()
+        .ok()
+        .is_some_and(|store| store.account_credential(provider_id, account_id).is_some());
+    if !has_account {
+        return IndexMap::new();
+    }
+    resolved_models(provider, Some(account_id))
+        .iter()
+        .map(|spec| model_entry(provider, spec))
+        .collect()
+}
+
+pub fn acp_models_for_provider_account(
+    provider_id: &str,
+    account_id: &str,
+) -> IndexMap<agent_client_protocol::ModelId, agent_client_protocol::ModelInfo> {
+    let mut models =
+        crate::agent::config::to_acp_model_info(&models_for_provider_account(provider_id, account_id));
+    for model in models.values_mut() {
+        model.meta.get_or_insert_with(Default::default).insert(
+            "grokyAccountId".to_owned(),
+            serde_json::Value::String(account_id.to_owned()),
+        );
+    }
+    models
 }
 
 pub(crate) fn provider_is_unlocked(id: &str) -> bool {

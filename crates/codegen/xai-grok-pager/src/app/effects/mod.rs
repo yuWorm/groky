@@ -204,6 +204,130 @@ pub(crate) fn execute(
                 }
             });
         }
+        Effect::SelectVendorAccount {
+            provider_id,
+            account_id,
+            session_id,
+            update_session_catalog,
+        } => {
+            tasks.spawn(async move {
+                let result = (|| {
+                    let mut store = xai_grok_shell::compat::VendorAuthStore::default_store()?;
+                    store.set_default_account(&provider_id, &account_id)
+                })();
+                TaskResult::VendorAccountSelected {
+                    provider_id,
+                    account_id,
+                    session_id,
+                    update_session_catalog,
+                    error: result.err().map(|error| error.to_string()),
+                }
+            });
+        }
+        Effect::RenameVendorAccount {
+            provider_id,
+            account_id,
+            label,
+        } => {
+            tasks.spawn(async move {
+                let result = (|| {
+                    let mut store = xai_grok_shell::compat::VendorAuthStore::default_store()?;
+                    store.rename_account(&provider_id, &account_id, &label)
+                })();
+                TaskResult::VendorAccountRenamed {
+                    provider_id,
+                    account_id,
+                    error: result.err().map(|error| error.to_string()),
+                }
+            });
+        }
+        Effect::RemoveVendorAccount {
+            provider_id,
+            account_id,
+        } => {
+            tasks.spawn(async move {
+                let result = (|| {
+                    let mut store = xai_grok_shell::compat::VendorAuthStore::default_store()?;
+                    let was_default = store
+                        .default_account_id(&provider_id)
+                        .is_some_and(|id| id == account_id.as_str());
+                    let removed = store.remove_account(&provider_id, &account_id)?;
+                    Ok::<_, std::io::Error>((removed, was_default))
+                })();
+                match result {
+                    Ok((removed, was_default)) => TaskResult::VendorAccountRemoved {
+                        provider_id,
+                        account_id,
+                        removed,
+                        was_default,
+                        error: None,
+                    },
+                    Err(error) => TaskResult::VendorAccountRemoved {
+                        provider_id,
+                        account_id,
+                        removed: false,
+                        was_default: false,
+                        error: Some(error.to_string()),
+                    },
+                }
+            });
+        }
+        Effect::RefreshVendorAccountCatalog {
+            provider_id,
+            account_id,
+            session_id,
+            update_session_catalog,
+        } => {
+            tasks.spawn(async move {
+                match xai_grok_shell::compat::refresh_vendor_models_for_account(
+                    &provider_id,
+                    Some(&account_id),
+                )
+                .await
+                {
+                    Ok(count) => TaskResult::VendorAccountCatalogRefreshed {
+                        provider_id,
+                        account_id,
+                        session_id,
+                        update_session_catalog,
+                        count,
+                        error: None,
+                    },
+                    Err(error) => TaskResult::VendorAccountCatalogRefreshed {
+                        provider_id,
+                        account_id,
+                        session_id,
+                        update_session_catalog,
+                        count: 0,
+                        error: Some(error.to_string()),
+                    },
+                }
+            });
+        }
+        Effect::NotifyVendorAccountChanged {
+            session_id,
+            provider_id,
+            account_id,
+        } => {
+            let tx = acp_tx.clone();
+            tasks.spawn(async move {
+                let params = serde_json::json!({
+                    "session_id": session_id.0.to_string(),
+                    "provider_id": provider_id,
+                    "account_id": account_id,
+                });
+                let notification = acp::ExtNotification::new(
+                    "groky/vendor_account_changed",
+                    serde_json::value::to_raw_value(&params)
+                        .expect("serialize vendor_account_changed params")
+                        .into(),
+                );
+                if let Err(error) = acp_send(notification, &tx).await {
+                    tracing::warn!(%error, "Failed to send vendor_account_changed notification");
+                }
+                TaskResult::CancelComplete
+            });
+        }
         Effect::VendorOAuthStart { provider_id } => {
             tasks.spawn(async move {
                 match xai_grok_shell::compat::oauth::begin(&provider_id).await {

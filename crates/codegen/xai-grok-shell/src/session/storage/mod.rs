@@ -1286,6 +1286,13 @@ pub trait StorageAdapter: Send + Sync {
         reasoning_effort: Option<Option<ReasoningEffort>>,
         context_window: Option<Option<std::num::NonZeroU64>>,
     ) -> io::Result<()>;
+    /// Persist the session's provider-account mapping. This contains slot ids,
+    /// never credentials, and must not resolve a current provider default.
+    async fn set_vendor_accounts(
+        &self,
+        info: &Info,
+        vendor_accounts: indexmap::IndexMap<String, String>,
+    ) -> io::Result<()>;
 
     /// Update the collection ID for telemetry tracing
     async fn update_collection_id(&self, info: &Info, collection_id: &str) -> io::Result<()>;

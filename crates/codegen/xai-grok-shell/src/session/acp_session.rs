@@ -54,6 +54,7 @@ use crate::terminal::TerminalRunRequest;
 use crate::tools::ToolContext;
 use agent_client_protocol as acp;
 use agent_client_protocol::ContentBlock;
+use indexmap::IndexMap;
 use parking_lot::Mutex;
 use serde_json::json;
 use std::collections::{HashMap, VecDeque};
@@ -382,6 +383,9 @@ pub(crate) struct State {
     pub(crate) message_delivery: parent_message::MessageDeliveryState,
     pub(crate) pending_inputs: VecDeque<InputItem>,
     pub(crate) pending_notifications: Vec<PendingNotification>,
+    /// Latest selection per provider received while a turn was active.  Applied
+    /// only after completion, so no tool-loop request changes account mid-turn.
+    pub(crate) pending_vendor_account_changes: IndexMap<String, String>,
     /// Prompt ids under composer edit, stamped (and re-stamped) by `hold_edit`.
     /// Held followers are skipped by combine; a live held front blocks promote.
     pub(crate) edit_holds: HashMap<String, std::time::Instant>,
@@ -762,6 +766,9 @@ pub(crate) struct SessionActor {
     /// Exact selected catalog model identity, kept apart from the wire model slug in chat state.
     /// This remains provider-specific when catalog entries share an endpoint and wire model.
     pub(crate) catalog_model_id: std::cell::RefCell<acp::ModelId>,
+    /// Session-local Codex account selection. New root sessions snapshot the
+    /// Codex default once; children inherit the parent's shared binding.
+    pub(crate) vendor_accounts: crate::session::VendorAccountBindings,
     /// The event fires at each of the six `OaiCompatClient` 401 arms in `xai-grok-sampler`.
     /// Threaded into every `SamplerConfig` reconstructed by `reconstruct_full_config`.
     /// `None` when the session was spawned without an `AuthManager` (BYOK direct mode, test fixtures).

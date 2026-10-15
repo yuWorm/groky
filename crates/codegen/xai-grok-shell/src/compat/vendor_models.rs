@@ -95,6 +95,23 @@ struct CodexCacheScope {
     client_version: String,
 }
 
+impl CodexCacheScope {
+    fn for_identity(identity: &str) -> Option<Self> {
+        let identity = identity.trim();
+        if identity.is_empty() {
+            return None;
+        }
+        Some(Self {
+            identity: blake3::hash(identity.as_bytes()).to_hex().to_string(),
+            client_version: codex_client_version(),
+        })
+    }
+
+    fn cache_key(&self) -> String {
+        format!("{CODEX_PROVIDER_ID}:{}", self.identity)
+    }
+}
+
 struct CodexCatalog {
     models: Vec<CachedModel>,
     etag: Option<String>,
@@ -133,70 +150,55 @@ impl ClaudeFamily {
     }
 }
 
-fn codex_cache_scope() -> Option<CodexCacheScope> {
-    let identity = super::auth_store::VendorAuthStore::default_store()
-        .ok()?
-        .credential(CODEX_PROVIDER_ID)?
-        .account_id
-        .as_deref()?
-        .trim()
-        .to_owned();
-    if identity.is_empty() {
-        return None;
-    }
-    let identity = blake3::hash(identity.as_bytes()).to_hex().to_string();
-    Some(CodexCacheScope {
-        identity,
-        client_version: codex_client_version(),
-    })
+fn codex_cache_scope(account_id: Option<&str>) -> Option<CodexCacheScope> {
+    let store = super::auth_store::VendorAuthStore::default_store().ok()?;
+    let credential = match account_id {
+        Some(id) => store.account_credential(CODEX_PROVIDER_ID, id)?,
+        None => store.credential(CODEX_PROVIDER_ID)?,
+    };
+    CodexCacheScope::for_identity(credential.account_id.as_deref()?)
 }
 
-pub(crate) fn cached_models(provider_id: &str) -> Option<Vec<CachedModel>> {
+pub(crate) fn cached_models(
+    provider_id: &str,
+    account_id: Option<&str>,
+) -> Option<Vec<CachedModel>> {
     #[cfg(test)]
     {
-        let _ = provider_id;
+        let _ = (provider_id, account_id);
         return None;
     }
     #[cfg(not(test))]
     {
         let store = load_store().ok()?;
-        let cached = store.data.providers.get(provider_id)?;
-        if provider_id == CODEX_PROVIDER_ID {
-            let scope = codex_cache_scope()?;
-            if !cached.matches_codex_scope(&scope.identity, &scope.client_version) {
-                return None;
-            }
-        }
+        let cached = if provider_id == CODEX_PROVIDER_ID {
+            let scope = codex_cache_scope(account_id)?;
+            store.codex_catalog(&scope)?
+        } else {
+            store.data.providers.get(provider_id)?
+        };
         (!cached.models.is_empty()).then(|| cached.models.clone())
     }
 }
 
 fn cached_codex_etag(scope: &CodexCacheScope) -> Option<String> {
-    load_store()
-        .ok()?
-        .data
-        .providers
-        .get(CODEX_PROVIDER_ID)?
-        .etag_for_codex_scope(scope)
+    load_store().ok()?.codex_catalog(scope)?.etag_for_codex_scope(scope)
 }
 
 fn touch_codex_cache(scope: &CodexCacheScope) -> Result<usize, VendorLoginError> {
-    let mut store = load_store()?;
-    let Some(count) = store
-        .data
-        .providers
-        .get_mut(CODEX_PROVIDER_ID)
-        .and_then(|cached| cached.touch_codex_scope(scope, now_secs()))
-    else {
-        return Ok(0);
-    };
-    store.save()?;
-    Ok(count)
+    Ok(Store::update(Store::default_path(), |store| {
+        store
+            .data
+            .providers
+            .get_mut(&scope.cache_key())
+            .and_then(|cached| cached.touch_codex_scope(scope, now_secs()))
+            .unwrap_or(0)
+    })?)
 }
 
 fn refresh_needed(provider_id: &str) -> bool {
     let codex_scope = if provider_id == CODEX_PROVIDER_ID {
-        let Some(scope) = codex_cache_scope() else {
+        let Some(scope) = codex_cache_scope(None) else {
             return false;
         };
         Some(scope)
@@ -206,14 +208,13 @@ fn refresh_needed(provider_id: &str) -> bool {
     let Ok(store) = load_store() else {
         return true;
     };
-    let Some(cached) = store.data.providers.get(provider_id) else {
+    let cached = match codex_scope.as_ref() {
+        Some(scope) => store.codex_catalog(scope),
+        None => store.data.providers.get(provider_id),
+    };
+    let Some(cached) = cached else {
         return true;
     };
-    if let Some(scope) = codex_scope
-        && !cached.matches_codex_scope(&scope.identity, &scope.client_version)
-    {
-        return true;
-    }
     !cached.is_fresh_at(now_secs())
 }
 
@@ -226,22 +227,37 @@ pub(crate) fn models_dev_fallback(provider_id: &str) -> Vec<CachedModel> {
 }
 
 pub async fn refresh(provider_id: &str) -> Result<usize, VendorLoginError> {
+    refresh_for_account(provider_id, None).await
+}
+
+/// Refresh exactly one account without changing the provider's default.
+pub async fn refresh_for_account(
+    provider_id: &str,
+    account_id: Option<&str>,
+) -> Result<usize, VendorLoginError> {
     let Some(provider) = super::catalog::provider_by_id(provider_id) else {
         return Ok(0);
     };
-    let key = super::live_vendor_key_for_id(provider.id).unwrap_or_default();
+    let credential = super::oauth::request_credential(provider.id, account_id)?;
+    let key = credential
+        .as_ref()
+        .and_then(super::VendorCredential::request_secret)
+        .unwrap_or_default();
     if provider.requires_auth && key.trim().is_empty() {
         return Ok(0);
     }
-    let extra = listing_headers(provider.id, provider.anthropic_version);
+    let extra = listing_headers(provider.id, provider.anthropic_version, credential.as_ref());
     if provider.id == CODEX_PROVIDER_ID {
-        let Some(scope) = codex_cache_scope() else {
+        let Some(identity) = credential.as_ref().and_then(|c| c.account_id.as_deref()) else {
+            return Ok(0);
+        };
+        let Some(scope) = CodexCacheScope::for_identity(identity) else {
             return Ok(0);
         };
         let cached_etag = cached_codex_etag(&scope);
         let response =
-            fetch_codex_model_list(provider.base_url, &key, &extra, cached_etag.as_deref()).await?;
-        if codex_cache_scope().as_ref() != Some(&scope) {
+            fetch_codex_model_list(provider.base_url, key, &extra, cached_etag.as_deref()).await?;
+        if codex_cache_scope(Some(identity)).as_ref() != Some(&scope) {
             return Ok(0);
         }
         return match response {
@@ -259,7 +275,7 @@ pub async fn refresh(provider_id: &str) -> Result<usize, VendorLoginError> {
 
     let listed = fetch_model_list_with_headers(
         provider.base_url,
-        &key,
+        key,
         provider.auth_scheme,
         provider.anthropic_version,
         &extra,
@@ -315,12 +331,16 @@ pub async fn refresh_stale_unlocked() -> usize {
     }
 }
 
-fn listing_headers(provider_id: &str, anthropic_version: Option<&str>) -> Vec<(String, String)> {
+fn listing_headers(
+    provider_id: &str,
+    anthropic_version: Option<&str>,
+    credential: Option<&super::VendorCredential>,
+) -> Vec<(String, String)> {
     let mut headers = indexmap::IndexMap::new();
     if let Some(version) = anthropic_version {
         headers.insert("anthropic-version".into(), version.to_owned());
     }
-    super::oauth::inject_request_headers(provider_id, &mut headers);
+    super::oauth::inject_request_headers(provider_id, credential, &mut headers);
     headers.into_iter().collect()
 }
 
@@ -810,18 +830,18 @@ fn save_models(
     }
     #[cfg(not(test))]
     {
-        let mut store = load_store()?;
-        store.data.providers.insert(
-            provider_id.to_owned(),
-            CachedProvider {
-                updated_at: now_secs(),
-                identity: scope.map(|scope| scope.identity.clone()),
-                client_version: scope.map(|scope| scope.client_version.clone()),
-                etag,
-                models,
-            },
-        );
-        store.save()
+        Store::update(Store::default_path(), |store| {
+            store.data.providers.insert(
+                scope.map_or_else(|| provider_id.to_owned(), CodexCacheScope::cache_key),
+                CachedProvider {
+                    updated_at: now_secs(),
+                    identity: scope.map(|scope| scope.identity.clone()),
+                    client_version: scope.map(|scope| scope.client_version.clone()),
+                    etag,
+                    models,
+                },
+            );
+        })
     }
 }
 
@@ -847,13 +867,45 @@ impl Store {
     }
 
     fn load_from(path: PathBuf) -> io::Result<Self> {
-        let data = if path.exists() {
+        let mut data: FileShape = if path.exists() {
             let raw = fs::read_to_string(&path)?;
-            serde_json::from_str(&raw).unwrap_or_default()
+            serde_json::from_str(&raw)
+                .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?
         } else {
             FileShape::default()
         };
+        if let Some(legacy) = data.providers.remove(CODEX_PROVIDER_ID)
+            && let Some(identity) = legacy.identity.as_deref()
+        {
+            data.providers
+                .entry(format!("{CODEX_PROVIDER_ID}:{identity}"))
+                .or_insert(legacy);
+        }
         Ok(Self { path, data })
+    }
+
+    fn codex_catalog(&self, scope: &CodexCacheScope) -> Option<&CachedProvider> {
+        self.data
+            .providers
+            .get(&scope.cache_key())
+            .filter(|cached| cached.matches_codex_scope(&scope.identity, &scope.client_version))
+    }
+
+    fn update<T>(path: PathBuf, apply: impl FnOnce(&mut Self) -> T) -> io::Result<T> {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let lock = fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(path.with_extension("lock"))?;
+        fs2::FileExt::lock_exclusive(&lock)?;
+        let mut store = Self::load_from(path)?;
+        let result = apply(&mut store);
+        store.save()?;
+        Ok(result)
     }
 
     fn save(&self) -> io::Result<()> {
@@ -862,13 +914,12 @@ impl Store {
         }
         let json = serde_json::to_string_pretty(&self.data)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-        let tmp = self.path.with_extension("json.tmp");
-        let mut file = fs::File::create(&tmp)?;
+        let parent = self.path.parent().unwrap_or_else(|| std::path::Path::new("."));
+        let mut file = tempfile::NamedTempFile::new_in(parent)?;
         file.write_all(json.as_bytes())?;
         file.write_all(b"\n")?;
-        file.sync_all()?;
-        drop(file);
-        fs::rename(&tmp, &self.path)?;
+        file.as_file().sync_all()?;
+        file.persist(&self.path).map_err(|error| error.error)?;
         Ok(())
     }
 }
@@ -1124,6 +1175,83 @@ mod tests {
         assert!(!cached.is_fresh_at(1_300));
         assert_eq!(cached.touch_codex_scope(&scope, 1_300), Some(0));
         assert!(cached.is_fresh_at(1_300));
+    }
+
+    fn account_catalog(scope: &super::CodexCacheScope, model: &str) -> CachedProvider {
+        CachedProvider {
+            updated_at: 1_000,
+            identity: Some(scope.identity.clone()),
+            client_version: Some(scope.client_version.clone()),
+            etag: Some(format!("etag-{model}")),
+            models: vec![CachedModel {
+                api_model: model.into(),
+                name: model.into(),
+                context_window: 400_000,
+                description: None,
+                reasoning_efforts: Vec::new(),
+            }],
+        }
+    }
+
+    #[test]
+    fn legacy_codex_cache_migrates_without_exposing_it_to_another_account() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("vendor-catalog.json");
+        let scope_a = super::CodexCacheScope::for_identity("account-a").unwrap();
+        let scope_b = super::CodexCacheScope::for_identity("account-b").unwrap();
+        let legacy = serde_json::json!({
+            "providers": {
+                "openai-codex": account_catalog(&scope_a, "gpt-a")
+            }
+        });
+        std::fs::write(&path, serde_json::to_vec(&legacy).unwrap()).unwrap();
+        super::Store::update(path.clone(), |store| {
+            assert!(store.codex_catalog(&scope_b).is_none());
+            store.data.providers.insert(
+                scope_b.cache_key(),
+                account_catalog(&scope_b, "gpt-b"),
+            );
+        }).unwrap();
+
+        let store = super::Store::load_from(path).unwrap();
+        assert_eq!(store.codex_catalog(&scope_a).unwrap().models[0].api_model, "gpt-a");
+        assert_eq!(store.codex_catalog(&scope_b).unwrap().models[0].api_model, "gpt-b");
+        assert_eq!(
+            store.codex_catalog(&scope_a).unwrap().etag.as_deref(),
+            Some("etag-gpt-a"),
+        );
+        let mut changed_version = scope_a;
+        changed_version.client_version.push_str("-changed");
+        assert!(store.codex_catalog(&changed_version).is_none());
+    }
+
+    #[test]
+    fn concurrent_account_catalog_writes_preserve_both_accounts() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("vendor-catalog.json");
+        let barrier = std::sync::Barrier::new(2);
+        let scopes = [
+            super::CodexCacheScope::for_identity("account-a").unwrap(),
+            super::CodexCacheScope::for_identity("account-b").unwrap(),
+        ];
+        std::thread::scope(|threads| {
+            for (scope, model) in scopes.iter().zip(["gpt-a", "gpt-b"]) {
+                let path = path.clone();
+                let barrier = &barrier;
+                threads.spawn(move || {
+                    barrier.wait();
+                    super::Store::update(path, |store| {
+                        store.data.providers.insert(scope.cache_key(), account_catalog(scope, model));
+                    }).unwrap();
+                });
+            }
+        });
+        let store = super::Store::load_from(path).unwrap();
+        for (scope, model) in scopes.iter().zip(["gpt-a", "gpt-b"]) {
+            let cached = store.codex_catalog(scope).unwrap();
+            assert_eq!(cached.models[0].api_model, model);
+            assert_eq!(cached.etag.as_deref(), Some(format!("etag-{model}").as_str()));
+        }
     }
 
     #[test]

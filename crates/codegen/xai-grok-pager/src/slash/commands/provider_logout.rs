@@ -1,4 +1,4 @@
-//! `/provider-logout` — drop a stored third-party API key.
+//! `/provider-logout` — sign out of every stored account for a provider.
 
 use crate::app::actions::Action;
 use crate::slash::command::{AppCtx, ArgItem, CommandExecCtx, CommandResult, SlashCommand};
@@ -15,7 +15,7 @@ impl SlashCommand for ProviderLogoutCommand {
     }
 
     fn description(&self) -> &str {
-        "Remove a third-party provider API key"
+        "Sign out of every stored account for a provider"
     }
 
     fn usage(&self) -> &str {

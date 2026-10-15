@@ -507,6 +507,7 @@ impl MvpAgent {
                     .map(|s| s.to_string())
             });
         let session_info = session_info_for(&session_id, &cwd);
+        let vendor_accounts = crate::session::vendor_accounts::snapshot_default_vendor_accounts();
         spawn_session_sweep(&session_info);
         let mut model_agent_type: Option<String> = None;
         let mut session_sampling_override: Option<SamplingConfig> = None;
@@ -616,7 +617,8 @@ impl MvpAgent {
             crate::sampling::derive_conversation_group_id(session_id.0.as_ref()),
         );
         spawn_sampler_transport_prewarm(&session_sampling.base_url);
-        let (summary_client, summary_model) = self.build_summary_client(&session_sampling)?;
+        let (summary_client, summary_model) =
+            self.build_summary_client(&session_sampling, Some(&vendor_accounts))?;
         let relay_sync = self.start_relay_sync(&session_id, &session_info);
         self.report_setup_phase(SessionSetupPhase::PersistenceInit);
         let (persistence, root_identity) = if is_chat_kind {
@@ -698,6 +700,7 @@ impl MvpAgent {
                     prefetch: None,
                     model_agent_type: model_agent_type.as_deref(),
                     session_model_id,
+                    vendor_accounts: Some(vendor_accounts.clone()),
                     initial_reasoning_effort: spawn_effort,
                     session_yolo_mode,
                     session_auto_mode: session_auto_mode && !session_yolo_mode,
@@ -706,6 +709,7 @@ impl MvpAgent {
                     is_chat_kind: false,
                 }
             };
+            spawn_opts.vendor_accounts = Some(vendor_accounts.clone());
             spawn_opts.prefetch = Some(prefetch);
             let mut spawn_timer = crate::instrumentation_timer!("session.spawn");
             spawn_timer.with_field("session_id", session_id.0.as_ref());
@@ -1011,6 +1015,11 @@ impl MvpAgent {
         }
         let initial_reasoning_effort = parse_reasoning_effort_meta(request_meta.as_ref());
         let origin_client = self.origin_client_info_from_meta(request_meta.as_ref());
+        // Legacy summaries snapshot the current Codex default once. An
+        // explicit empty binding remains empty and cannot fall back.
+        let vendor_accounts =
+            crate::session::persistence::persisted_vendor_accounts(session_id.0.as_ref())
+                .unwrap_or_else(crate::session::vendor_accounts::snapshot_default_vendor_accounts);
         let summary_model_id = self.models_manager.current_model_id();
         let mut load_session_sampling =
             self.resolve_sampling_config_for_model(&summary_model_id, origin_client.clone());
@@ -1024,7 +1033,8 @@ impl MvpAgent {
         load_session_sampling.conversation_group_id = Some(
             crate::sampling::derive_conversation_group_id(session_id.0.as_ref()),
         );
-        let (summary_client, summary_model) = self.build_summary_client(&load_session_sampling)?;
+        let (summary_client, summary_model) =
+            self.build_summary_client(&load_session_sampling, Some(&vendor_accounts))?;
         let relay_sync = self.start_relay_sync(&session_id, &session_info);
         let mut persistence_timer = crate::instrumentation_timer!("session.load");
         persistence_timer.with_field("session_id", session_id.0.as_ref());
@@ -1266,6 +1276,7 @@ impl MvpAgent {
                         persisted_agent_profile: restore_profile,
                         model_agent_type: restore_model_agent_type.as_deref(),
                         session_model_id: summary.current_model_id.clone(),
+                        vendor_accounts: Some(vendor_accounts.clone()),
                         initial_reasoning_effort: None,
                         session_yolo_mode,
                         session_auto_mode: session_auto_mode && !session_yolo_mode,
@@ -1796,8 +1807,8 @@ impl MvpAgent {
         session_id: &acp::SessionId,
         persisted_model: acp::ModelId,
     ) -> acp::ModelId {
-        let models = self.models_manager.models();
-        let available = self.models_manager.available();
+        let models = self.models_for_session(session_id);
+        let available = self.available_models_for_session(Some(session_id));
         self.session_registry.take_unavailable_model(session_id);
         let resolved_catalog_key = resolve_catalog_key(&models, &persisted_model);
         tracing::debug!(

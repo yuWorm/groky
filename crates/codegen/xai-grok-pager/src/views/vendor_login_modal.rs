@@ -31,6 +31,8 @@ const SHORTCUT_ADD: usize = 6;
 const SHORTCUT_SKIP_SYNC: usize = 7;
 const SHORTCUT_TOGGLE_REASONING: usize = 8;
 const SHORTCUT_REFRESH: usize = 9;
+const SHORTCUT_RENAME_ACCOUNT: usize = 10;
+const SHORTCUT_REMOVE_ACCOUNT: usize = 11;
 const ADD_CUSTOM_ID: &str = "__add_custom__";
 const PROTOCOLS: &[&str] = &["chat_completions", "responses", "messages"];
 
@@ -356,6 +358,17 @@ enum VendorLoginStep {
         selected: usize,
         scroll: usize,
     },
+    /// The multi-account manager for ChatGPT Codex subscriptions.
+    CodexAccounts {
+        selected: usize,
+        scroll: usize,
+    },
+    CodexRename {
+        account_id: String,
+    },
+    CodexConfirmRemove {
+        account_id: String,
+    },
     Method {
         provider_id: String,
         provider_name: String,
@@ -392,6 +405,11 @@ pub(crate) struct VendorLoginState {
     custom: Option<CustomDraft>,
     add_model: Option<AddModelDraft>,
     context_edit: Option<LineEditor>,
+    /// Read once when entering or returning to the manager; credentials never enter UI state.
+    codex_accounts: Vec<xai_grok_shell::compat::VendorAccountInfo>,
+    pub(crate) current_codex_account: Option<String>,
+    /// An OAuth add returns here instead of closing the modal.
+    return_to_codex_accounts: bool,
 }
 
 impl VendorLoginState {
@@ -410,12 +428,24 @@ impl VendorLoginState {
             custom: None,
             add_model: None,
             context_edit: None,
+            codex_accounts: Vec::new(),
+            current_codex_account: None,
+            return_to_codex_accounts: false,
         }
     }
 
     pub(crate) fn for_provider(provider_id: String, provider_name: String) -> Self {
         let mut state = Self::picker();
-        state.enter_provider(provider_id, provider_name, false);
+        if provider_id == "openai-codex" {
+            let has_accounts = state.reload_codex_accounts();
+            if has_accounts || state.error.is_some() {
+                state.enter_codex_accounts();
+            } else {
+                state.enter_provider(provider_id, provider_name, false);
+            }
+        } else {
+            state.enter_provider(provider_id, provider_name, false);
+        }
         state
     }
 
@@ -447,6 +477,9 @@ impl VendorLoginState {
                 ..
             } => (provider_id.clone(), provider_name.clone(), *from_picker),
             VendorLoginStep::Pick { .. }
+            | VendorLoginStep::CodexAccounts { .. }
+            | VendorLoginStep::CodexRename { .. }
+            | VendorLoginStep::CodexConfirmRemove { .. }
             | VendorLoginStep::CustomForm
             | VendorLoginStep::CustomModels => return,
         };
@@ -518,6 +551,126 @@ impl VendorLoginState {
         state.enter_custom_edit(&provider_id);
         state
     }
+    fn reload_codex_accounts(&mut self) -> bool {
+        let selected_id = self
+            .selected_codex_account()
+            .map(|account| account.id.clone());
+        match xai_grok_shell::compat::VendorAuthStore::default_store() {
+            Ok(store) => {
+                self.codex_accounts = store.accounts("openai-codex");
+                self.error = None;
+            }
+            Err(error) => {
+                self.codex_accounts.clear();
+                self.error = Some(format!("Could not read Codex accounts: {error}"));
+            }
+        }
+        let selected_index = selected_id
+            .as_deref()
+            .and_then(|id| self.codex_accounts.iter().position(|account| account.id == id));
+        let account_count = self.codex_accounts.len();
+        if let VendorLoginStep::CodexAccounts { selected, scroll } = &mut self.step {
+            if account_count == 0 {
+                *selected = 0;
+                *scroll = 0;
+            } else {
+                *selected = selected_index.unwrap_or(0).min(account_count - 1);
+            }
+        }
+        !self.codex_accounts.is_empty()
+    }
+
+    fn enter_codex_accounts(&mut self) {
+        self.return_to_codex_accounts = false;
+        let selected = self
+            .codex_accounts
+            .iter()
+            .position(|account| account.is_default)
+            .unwrap_or(0);
+        self.step = VendorLoginStep::CodexAccounts {
+            selected,
+            scroll: 0,
+        };
+        self.editor.reset();
+        self.probing = false;
+        self.row_map.clear();
+    }
+    fn selected_codex_account(&self) -> Option<&xai_grok_shell::compat::VendorAccountInfo> {
+        let VendorLoginStep::CodexAccounts { selected, .. } = &self.step else {
+            return None;
+        };
+        self.codex_accounts.get(*selected)
+    }
+
+    fn return_to_codex_accounts(&mut self) {
+        self.reload_codex_accounts();
+        self.enter_codex_accounts();
+    }
+
+    fn begin_codex_add(&mut self) {
+        self.return_to_codex_accounts = true;
+        self.enter_provider(
+            "openai-codex".to_owned(),
+            xai_grok_shell::compat::provider_display_name("openai-codex"),
+            false,
+        );
+    }
+
+    pub(crate) fn complete_codex_oauth(&mut self) -> Vec<String> {
+        self.reload_codex_accounts();
+        let account_ids = self
+            .codex_accounts
+            .iter()
+            .map(|account| account.id.clone())
+            .collect();
+        self.enter_codex_accounts();
+        account_ids
+    }
+
+    pub(crate) fn complete_account_selection(
+        &mut self,
+        account_id: &str,
+        error: Option<String>,
+    ) {
+        self.probing = false;
+        if let Some(error) = error {
+            self.error = Some(error);
+            return;
+        }
+        self.reload_codex_accounts();
+        self.enter_codex_accounts();
+        let selected_index = self
+            .codex_accounts
+            .iter()
+            .position(|account| account.id == account_id);
+        if let VendorLoginStep::CodexAccounts { selected, .. } = &mut self.step
+            && let Some(index) = selected_index
+        {
+            *selected = index;
+        }
+    }
+
+    pub(crate) fn complete_account_rename(
+        &mut self,
+        account_id: &str,
+        error: Option<String>,
+    ) {
+        self.complete_account_selection(account_id, error);
+    }
+
+    pub(crate) fn complete_account_remove(
+        &mut self,
+        error: Option<String>,
+    ) {
+        self.probing = false;
+        if let Some(error) = error {
+            self.error = Some(error);
+            return;
+        }
+        self.reload_codex_accounts();
+        self.enter_codex_accounts();
+    }
+
 
     fn enter_custom_form(&mut self) {
         self.custom = Some(CustomDraft::new());
@@ -600,7 +753,11 @@ impl VendorLoginState {
             } => (provider_id.clone(), provider_name.clone(), *from_picker),
             _ => return,
         };
-        self.enter_provider(provider_id, provider_name, from_picker);
+        if self.return_to_codex_accounts {
+            self.return_to_codex_accounts();
+        } else {
+            self.enter_provider(provider_id, provider_name, from_picker);
+        }
     }
 }
 
@@ -618,6 +775,19 @@ pub(crate) enum VendorLoginOutcome {
     SubmitOAuthCode {
         provider_id: String,
         code: String,
+    },
+    SelectAccount {
+        provider_id: String,
+        account_id: String,
+    },
+    RenameAccount {
+        provider_id: String,
+        account_id: String,
+        label: String,
+    },
+    RemoveAccount {
+        provider_id: String,
+        account_id: String,
     },
     SyncCustom {
         name: String,
@@ -750,6 +920,57 @@ fn step_shortcuts(state: &VendorLoginState) -> Vec<Shortcut<'static>> {
                 id: SHORTCUT_CANCEL,
             },
         ],
+        VendorLoginStep::CodexAccounts { .. } => vec![
+            Shortcut {
+                label: "Enter use",
+                clickable: !state.probing && !state.codex_accounts.is_empty(),
+                id: SHORTCUT_SUBMIT,
+            },
+            Shortcut {
+                label: "a add",
+                clickable: !state.probing,
+                id: SHORTCUT_ADD,
+            },
+            Shortcut {
+                label: "r label",
+                clickable: !state.probing && !state.codex_accounts.is_empty(),
+                id: SHORTCUT_RENAME_ACCOUNT,
+            },
+            Shortcut {
+                label: "d remove",
+                clickable: !state.probing && !state.codex_accounts.is_empty(),
+                id: SHORTCUT_REMOVE_ACCOUNT,
+            },
+            Shortcut {
+                label: "Esc close",
+                clickable: true,
+                id: SHORTCUT_CANCEL,
+            },
+        ],
+        VendorLoginStep::CodexRename { .. } => vec![
+            Shortcut {
+                label: if state.probing { "…" } else { "Enter save" },
+                clickable: !state.probing,
+                id: SHORTCUT_SUBMIT,
+            },
+            Shortcut {
+                label: "Esc back",
+                clickable: true,
+                id: SHORTCUT_CANCEL,
+            },
+        ],
+        VendorLoginStep::CodexConfirmRemove { .. } => vec![
+            Shortcut {
+                label: if state.probing { "…" } else { "Enter remove" },
+                clickable: !state.probing,
+                id: SHORTCUT_SUBMIT,
+            },
+            Shortcut {
+                label: "Esc cancel",
+                clickable: true,
+                id: SHORTCUT_CANCEL,
+            },
+        ],
         VendorLoginStep::CustomModels if state.add_model.is_some() => vec![
             Shortcut {
                 label: "Enter add",
@@ -842,6 +1063,15 @@ pub(crate) fn handle_vendor_login_key(
             state.error = None;
             return VendorLoginOutcome::Changed;
         }
+        if state.return_to_codex_accounts
+            && matches!(
+                &state.step,
+                VendorLoginStep::Key { .. } | VendorLoginStep::Method { .. }
+            )
+        {
+            state.return_to_codex_accounts();
+            return VendorLoginOutcome::Changed;
+        }
         match &state.step {
             VendorLoginStep::Key {
                 from_picker: true, ..
@@ -856,6 +1086,11 @@ pub(crate) fn handle_vendor_login_key(
                 state.back_from_oauth();
                 return VendorLoginOutcome::Changed;
             }
+            VendorLoginStep::CodexRename { .. } | VendorLoginStep::CodexConfirmRemove { .. } => {
+                state.return_to_codex_accounts();
+                return VendorLoginOutcome::Changed;
+            }
+            VendorLoginStep::CodexAccounts { .. } => return VendorLoginOutcome::Close,
             VendorLoginStep::CustomModels => {
                 if let Some(draft) = state.custom.as_mut()
                     && draft.search_focused
@@ -897,6 +1132,12 @@ pub(crate) fn handle_vendor_login_key(
 
     match &state.step {
         VendorLoginStep::Pick { .. } => handle_pick_key(state, key),
+        VendorLoginStep::CodexAccounts { .. } => handle_codex_accounts_key(state, key),
+        VendorLoginStep::CodexRename { .. } => handle_codex_rename_key(state, key),
+        VendorLoginStep::CodexConfirmRemove { .. } if key.code == KeyCode::Enter => {
+            confirm_codex_remove(state)
+        }
+        VendorLoginStep::CodexConfirmRemove { .. } => VendorLoginOutcome::Unchanged,
         VendorLoginStep::Method { .. } => handle_method_key(state, key),
         VendorLoginStep::OAuthWait { .. } => handle_oauth_wait_key(state, key),
         VendorLoginStep::Key { .. } => handle_key_form_key(state, key),
@@ -912,6 +1153,121 @@ fn method_rows(provider_id: &str) -> Vec<(String, String)> {
     }
     rows.push(("api_key".into(), "API key".into()));
     rows
+}
+fn handle_codex_accounts_key(
+    state: &mut VendorLoginState,
+    key: &KeyEvent,
+) -> VendorLoginOutcome {
+    match key.code {
+        KeyCode::Enter => select_codex_account(state),
+        KeyCode::Char('a') | KeyCode::Char('A') => {
+            state.begin_codex_add();
+            VendorLoginOutcome::Changed
+        }
+        KeyCode::Char('r') | KeyCode::Char('R') => begin_codex_rename(state),
+        KeyCode::Char('d') | KeyCode::Char('D') => begin_codex_remove(state),
+        KeyCode::Up | KeyCode::Char('k') => move_codex_account_selection(state, -1),
+        KeyCode::Down | KeyCode::Char('j') => move_codex_account_selection(state, 1),
+        _ => VendorLoginOutcome::Unchanged,
+    }
+}
+
+fn move_codex_account_selection(state: &mut VendorLoginState, delta: isize) -> VendorLoginOutcome {
+    let count = state.codex_accounts.len();
+    let VendorLoginStep::CodexAccounts { selected, scroll } = &mut state.step else {
+        return VendorLoginOutcome::Unchanged;
+    };
+    let next = *selected as isize + delta;
+    if next < 0 || next >= count as isize {
+        return VendorLoginOutcome::Unchanged;
+    }
+    *selected = next as usize;
+    if *selected < *scroll {
+        *scroll = *selected;
+    }
+    VendorLoginOutcome::Changed
+}
+
+fn select_codex_account(state: &mut VendorLoginState) -> VendorLoginOutcome {
+    let Some(account) = state.selected_codex_account() else {
+        state.error = Some("Add a ChatGPT account before selecting one".into());
+        return VendorLoginOutcome::Changed;
+    };
+    let account_id = account.id.clone();
+    state.probing = true;
+    state.error = None;
+    VendorLoginOutcome::SelectAccount {
+        provider_id: "openai-codex".into(),
+        account_id,
+    }
+}
+
+fn begin_codex_rename(state: &mut VendorLoginState) -> VendorLoginOutcome {
+    let Some(account) = state.selected_codex_account() else {
+        return VendorLoginOutcome::Unchanged;
+    };
+    let account_id = account.id.clone();
+    let label = account.label.clone();
+    state.editor.set_text(&label);
+    state.step = VendorLoginStep::CodexRename { account_id };
+    state.error = None;
+    VendorLoginOutcome::Changed
+}
+
+fn begin_codex_remove(state: &mut VendorLoginState) -> VendorLoginOutcome {
+    let Some(account) = state.selected_codex_account() else {
+        return VendorLoginOutcome::Unchanged;
+    };
+    let account_id = account.id.clone();
+    state.step = VendorLoginStep::CodexConfirmRemove { account_id };
+    state.error = None;
+    VendorLoginOutcome::Changed
+}
+
+fn handle_codex_rename_key(
+    state: &mut VendorLoginState,
+    key: &KeyEvent,
+) -> VendorLoginOutcome {
+    if matches!(key.code, KeyCode::Enter) {
+        let VendorLoginStep::CodexRename { account_id } = &state.step else {
+            return VendorLoginOutcome::Unchanged;
+        };
+        let account_id = account_id.clone();
+        let label = state.editor.text().trim().to_owned();
+        if label.is_empty() {
+            state.error = Some("Account label cannot be empty".into());
+            return VendorLoginOutcome::Changed;
+        }
+        state.probing = true;
+        state.error = None;
+        return VendorLoginOutcome::RenameAccount {
+            provider_id: "openai-codex".into(),
+            account_id,
+            label,
+        };
+    }
+    match state.editor.handle_key(key) {
+        LineEditOutcome::Unhandled | LineEditOutcome::HandledNoChange => {
+            VendorLoginOutcome::Unchanged
+        }
+        _ => {
+            state.error = None;
+            VendorLoginOutcome::Changed
+        }
+    }
+}
+
+fn confirm_codex_remove(state: &mut VendorLoginState) -> VendorLoginOutcome {
+    let VendorLoginStep::CodexConfirmRemove { account_id } = &state.step else {
+        return VendorLoginOutcome::Unchanged;
+    };
+    let account_id = account_id.clone();
+    state.probing = true;
+    state.error = None;
+    VendorLoginOutcome::RemoveAccount {
+        provider_id: "openai-codex".into(),
+        account_id,
+    }
 }
 
 fn handle_method_key(state: &mut VendorLoginState, key: &KeyEvent) -> VendorLoginOutcome {
@@ -1017,7 +1373,10 @@ pub(crate) fn handle_vendor_login_paste(
     if state.probing
         || matches!(
             state.step,
-            VendorLoginStep::Pick { .. } | VendorLoginStep::Method { .. }
+            VendorLoginStep::Pick { .. }
+                | VendorLoginStep::CodexAccounts { .. }
+                | VendorLoginStep::CodexConfirmRemove { .. }
+                | VendorLoginStep::Method { .. }
         )
     {
         return VendorLoginOutcome::Unchanged;
@@ -1114,6 +1473,15 @@ pub(crate) fn handle_vendor_login_mouse(
                 state.error = None;
                 return VendorLoginOutcome::Changed;
             }
+            if state.return_to_codex_accounts
+                && matches!(
+                    &state.step,
+                    VendorLoginStep::Key { .. } | VendorLoginStep::Method { .. }
+                )
+            {
+                state.return_to_codex_accounts();
+                return VendorLoginOutcome::Changed;
+            }
             if !state.probing {
                 match &state.step {
                     VendorLoginStep::Key {
@@ -1127,6 +1495,11 @@ pub(crate) fn handle_vendor_login_mouse(
                     }
                     VendorLoginStep::OAuthWait { .. } => {
                         state.back_from_oauth();
+                        return VendorLoginOutcome::Changed;
+                    }
+                    VendorLoginStep::CodexRename { .. }
+                    | VendorLoginStep::CodexConfirmRemove { .. } => {
+                        state.return_to_codex_accounts();
                         return VendorLoginOutcome::Changed;
                     }
                     VendorLoginStep::CustomModels => {
@@ -1160,6 +1533,11 @@ pub(crate) fn handle_vendor_login_mouse(
             }
             return match &state.step {
                 VendorLoginStep::Pick { .. } => confirm_pick(state),
+                VendorLoginStep::CodexAccounts { .. } => select_codex_account(state),
+                VendorLoginStep::CodexRename { .. } => {
+                    handle_codex_rename_key(state, &KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+                }
+                VendorLoginStep::CodexConfirmRemove { .. } => confirm_codex_remove(state),
                 VendorLoginStep::Method { .. } => confirm_method(state),
                 VendorLoginStep::Key { .. } => submit_key(state),
                 VendorLoginStep::OAuthWait { .. } => submit_oauth_code(state),
@@ -1186,7 +1564,14 @@ pub(crate) fn handle_vendor_login_mouse(
             if state.probing {
                 return VendorLoginOutcome::Unchanged;
             }
-            return open_add_model(state);
+            return match &state.step {
+                VendorLoginStep::CodexAccounts { .. } => {
+                    state.begin_codex_add();
+                    VendorLoginOutcome::Changed
+                }
+                VendorLoginStep::CustomModels => open_add_model(state),
+                _ => VendorLoginOutcome::Unchanged,
+            };
         }
         ModalWindowOutcome::ShortcutActivated(SHORTCUT_SKIP_SYNC) => {
             if state.probing {
@@ -1233,6 +1618,12 @@ pub(crate) fn handle_vendor_login_mouse(
             }
             return VendorLoginOutcome::Unchanged;
         }
+        ModalWindowOutcome::ShortcutActivated(SHORTCUT_RENAME_ACCOUNT) => {
+            return begin_codex_rename(state);
+        }
+        ModalWindowOutcome::ShortcutActivated(SHORTCUT_REMOVE_ACCOUNT) => {
+            return begin_codex_remove(state);
+        }
         ModalWindowOutcome::Handled => return VendorLoginOutcome::Changed,
         _ => {}
     }
@@ -1272,6 +1663,12 @@ pub(crate) fn handle_vendor_login_mouse(
                     *selected = idx;
                 }
                 return confirm_method(state);
+            }
+            if matches!(state.step, VendorLoginStep::CodexAccounts { .. }) {
+                if let VendorLoginStep::CodexAccounts { selected, .. } = &mut state.step {
+                    *selected = idx;
+                }
+                return select_codex_account(state);
             }
             if matches!(state.step, VendorLoginStep::CustomModels) {
                 if let Some(draft) = state.custom.as_mut() {
@@ -1313,6 +1710,40 @@ pub(crate) fn handle_vendor_login_mouse(
             }
         }
         return VendorLoginOutcome::Unchanged;
+    }
+    let count = state.codex_accounts.len();
+    if let VendorLoginStep::CodexAccounts { selected, scroll } = &mut state.step {
+        return match kind {
+            MouseEventKind::Moved if in_content => {
+                if let Some(&(_, idx)) = state.row_map.iter().find(|(y, _)| *y == row)
+                    && *selected != idx
+                {
+                    *selected = idx;
+                    return VendorLoginOutcome::Changed;
+                }
+                VendorLoginOutcome::Unchanged
+            }
+            MouseEventKind::ScrollUp if in_content => {
+                if *selected > 0 {
+                    *selected -= 1;
+                    if *selected < *scroll {
+                        *scroll = *selected;
+                    }
+                    VendorLoginOutcome::Changed
+                } else {
+                    VendorLoginOutcome::Unchanged
+                }
+            }
+            MouseEventKind::ScrollDown if in_content => {
+                if *selected + 1 < count {
+                    *selected += 1;
+                    VendorLoginOutcome::Changed
+                } else {
+                    VendorLoginOutcome::Unchanged
+                }
+            }
+            _ => VendorLoginOutcome::Unchanged,
+        };
     }
 
     if matches!(state.step, VendorLoginStep::CustomModels) {
@@ -1971,6 +2402,9 @@ fn title_for(state: &VendorLoginState) -> String {
     }
     match &state.step {
         VendorLoginStep::Pick { .. } => "Sign in · Providers".into(),
+        VendorLoginStep::CodexAccounts { .. } => "ChatGPT Codex accounts".into(),
+        VendorLoginStep::CodexRename { .. } => "Label ChatGPT account".into(),
+        VendorLoginStep::CodexConfirmRemove { .. } => "Remove ChatGPT account?".into(),
         VendorLoginStep::CustomForm => {
             if state.custom.as_ref().is_some_and(|d| d.id.is_some()) {
                 "Edit custom provider".into()
@@ -2015,6 +2449,15 @@ pub(crate) fn render_vendor_login_modal(
     state.content_area = Some(areas.content);
     match &state.step {
         VendorLoginStep::Pick { .. } => render_pick_list(buf, areas.content, state, &theme),
+        VendorLoginStep::CodexAccounts { .. } => {
+            render_codex_accounts(buf, areas.content, state, &theme)
+        }
+        VendorLoginStep::CodexRename { .. } => {
+            render_codex_rename(buf, areas.content, state, &theme)
+        }
+        VendorLoginStep::CodexConfirmRemove { .. } => {
+            render_codex_remove_confirm(buf, areas.content, state, &theme)
+        }
         VendorLoginStep::Method { .. } => render_method_list(buf, areas.content, state, &theme),
         VendorLoginStep::Key { .. } => render_key_form(buf, areas.content, state, &theme),
         VendorLoginStep::OAuthWait { .. } => render_oauth_wait(buf, areas.content, state, &theme),
@@ -2677,6 +3120,271 @@ fn render_custom_models(buf: &mut Buffer, area: Rect, state: &mut VendorLoginSta
             let text = truncate_str(&hint, area.width as usize);
             let tw = text.width() as u16;
             buf.set_span(area.x, status_y, &Span::styled(text, style), tw);
+        }
+    }
+}
+
+fn render_codex_accounts(
+    buf: &mut Buffer,
+    area: Rect,
+    state: &mut VendorLoginState,
+    theme: &Theme,
+) {
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+    let (mut selected, mut scroll) = match &state.step {
+        VendorLoginStep::CodexAccounts { selected, scroll } => (*selected, *scroll),
+        _ => return,
+    };
+    state.row_map.clear();
+    if state.codex_accounts.is_empty() {
+        let message = state
+            .error
+            .as_deref()
+            .unwrap_or("No ChatGPT accounts. Press a to add one.");
+        Paragraph::new(Line::from(Span::styled(
+            truncate_str(message, area.width as usize),
+            Style::default().fg(if state.error.is_some() {
+                theme.accent_error
+            } else {
+                theme.gray_bright
+            }),
+        )))
+        .render(area, buf);
+        return;
+    }
+
+    selected = selected.min(state.codex_accounts.len() - 1);
+    let has_default = state.codex_accounts.iter().any(|account| account.is_default);
+    let header = if let Some(error) = state.error.as_deref() {
+        error
+    } else if has_default {
+        "Select an account to use as the default and in this session."
+    } else {
+        "No default account. Select one; no account is chosen automatically."
+    };
+    let header_style = if state.error.is_some() {
+        Style::default().fg(theme.accent_error)
+    } else if has_default {
+        Style::default().fg(theme.gray_bright)
+    } else {
+        Style::default().fg(theme.accent_model)
+    };
+    let header_text = truncate_str(header, area.width as usize);
+    buf.set_span(
+        area.x,
+        area.y,
+        &Span::styled(header_text, header_style),
+        area.width,
+    );
+
+    let rows_y = area.y.saturating_add(1);
+    let visible = area.height.saturating_sub(1).max(1) as usize;
+    if selected < scroll {
+        scroll = selected;
+    } else if selected >= scroll.saturating_add(visible) {
+        scroll = selected.saturating_add(1).saturating_sub(visible);
+    }
+    if let VendorLoginStep::CodexAccounts {
+        selected: state_selected,
+        scroll: state_scroll,
+    } = &mut state.step
+    {
+        *state_selected = selected;
+        *state_scroll = scroll;
+    }
+    for (row_idx, (account_idx, account)) in state
+        .codex_accounts
+        .iter()
+        .enumerate()
+        .skip(scroll)
+        .take(visible)
+        .enumerate()
+    {
+        let y = rows_y.saturating_add(row_idx as u16);
+        if y >= area.y.saturating_add(area.height) {
+            break;
+        }
+        state.row_map.push((y, account_idx));
+        let focused = account_idx == selected;
+        let background = if focused {
+            Style::default().bg(theme.bg_highlight)
+        } else {
+            Style::default()
+        };
+        if focused {
+            for x in area.x..area.x.saturating_add(area.width) {
+                if let Some(cell) = buf.cell_mut((x, y)) {
+                    cell.set_style(background);
+                }
+            }
+        }
+        let label = if account.label.trim().is_empty() {
+            "ChatGPT account"
+        } else {
+            account.label.as_str()
+        };
+        let current = state.current_codex_account.as_deref() == Some(account.id.as_str());
+        let status = match (current, account.is_default, account.needs_login) {
+            (true, true, true) => "current · default · needs sign-in",
+            (true, true, false) => "current · default",
+            (true, false, true) => "current · needs sign-in",
+            (true, false, false) => "current",
+            (false, true, true) => "default · needs sign-in",
+            (false, true, false) => "default",
+            (false, false, true) => "needs sign-in",
+            (false, false, false) => "",
+        };
+        let status_width = status.width() as u16;
+        let label_budget = area
+            .width
+            .saturating_sub(status_width.saturating_add(2))
+            .max(1) as usize;
+        let label_style = if focused {
+            Style::default()
+                .fg(theme.text_primary)
+                .bg(theme.bg_highlight)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(theme.text_primary)
+        };
+        let status_style = if account.needs_login {
+            Style::default().fg(theme.accent_model).bg(if focused {
+                theme.bg_highlight
+            } else {
+                theme.bg_base
+            })
+        } else if focused {
+            Style::default().fg(theme.gray_bright).bg(theme.bg_highlight)
+        } else {
+            Style::default().fg(theme.gray_bright)
+        };
+        let mut spans = vec![Span::styled(truncate_str(label, label_budget), label_style)];
+        if !status.is_empty() && area.width > status_width + 1 {
+            let used = spans[0].content.width() as u16;
+            let padding = area.width.saturating_sub(used).saturating_sub(status_width);
+            if padding > 0 {
+                spans.push(Span::styled(" ".repeat(padding as usize), background));
+            }
+            spans.push(Span::styled(status, status_style));
+        }
+        Paragraph::new(Line::from(spans)).render(
+            Rect {
+                x: area.x,
+                y,
+                width: area.width,
+                height: 1,
+            },
+            buf,
+        );
+    }
+}
+
+fn render_codex_rename(
+    buf: &mut Buffer,
+    area: Rect,
+    state: &VendorLoginState,
+    theme: &Theme,
+) {
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+    let account_id = match &state.step {
+        VendorLoginStep::CodexRename { account_id } => account_id,
+        _ => return,
+    };
+    let current = state
+        .codex_accounts
+        .iter()
+        .find(|account| account.id == account_id.as_str())
+        .map(|account| account.label.as_str())
+        .filter(|label| !label.trim().is_empty())
+        .unwrap_or("ChatGPT account");
+    let prompt = truncate_str(&format!("Name for {current}:"), area.width as usize);
+    Paragraph::new(Line::from(Span::styled(
+        prompt,
+        Style::default().fg(theme.text_secondary),
+    )))
+    .render(
+        Rect {
+            x: area.x,
+            y: area.y,
+            width: area.width,
+            height: 1,
+        },
+        buf,
+    );
+    if area.height >= 3 {
+        render_labeled_input(buf, area, area.y + 2, "Label", &state.editor, true, false, theme);
+    }
+    if area.height >= 5
+        && let Some(error) = state.error.as_deref()
+    {
+        let text = truncate_str(error, area.width as usize);
+        buf.set_span(
+            area.x,
+            area.y + 4,
+            &Span::styled(text, Style::default().fg(theme.accent_error)),
+            area.width,
+        );
+    }
+}
+
+fn render_codex_remove_confirm(
+    buf: &mut Buffer,
+    area: Rect,
+    state: &VendorLoginState,
+    theme: &Theme,
+) {
+    let account_id = match &state.step {
+        VendorLoginStep::CodexConfirmRemove { account_id } => account_id,
+        _ => return,
+    };
+    let account = state
+        .codex_accounts
+        .iter()
+        .find(|account| account.id == account_id.as_str());
+    let label = account
+        .map(|account| account.label.as_str())
+        .filter(|label| !label.trim().is_empty())
+        .unwrap_or("this ChatGPT account");
+    let mut lines = vec![
+        format!("Remove {label}?"),
+        "This removes only this ChatGPT account.".to_owned(),
+    ];
+    if account.is_some_and(|account| account.is_default) {
+        lines.push("Its provider default will be cleared; no account replaces it.".to_owned());
+    }
+    for (offset, line) in lines.iter().enumerate() {
+        if offset as u16 >= area.height {
+            break;
+        }
+        let text = truncate_str(line, area.width as usize);
+        buf.set_span(
+            area.x,
+            area.y + offset as u16,
+            &Span::styled(
+                text,
+                Style::default().fg(if offset == 0 {
+                    theme.text_primary
+                } else {
+                    theme.text_secondary
+                }),
+            ),
+            area.width,
+        );
+    }
+    if let Some(error) = state.error.as_deref() {
+        let y = area.y.saturating_add(lines.len() as u16);
+        if y < area.y.saturating_add(area.height) {
+            let text = truncate_str(error, area.width as usize);
+            buf.set_span(
+                area.x,
+                y,
+                &Span::styled(text, Style::default().fg(theme.accent_error)),
+                area.width,
+            );
         }
     }
 }

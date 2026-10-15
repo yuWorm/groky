@@ -4,7 +4,7 @@
 //! `vendor-auth.json`. Device-code login is deferred.
 
 use std::collections::HashMap;
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, LazyLock, Mutex};
 use std::time::Duration;
 
 use base64::Engine;
@@ -17,7 +17,7 @@ use tokio::sync::mpsc;
 use super::callback::{error_html, read_http_request, success_html, write_html};
 use super::pkce::generate_pkce;
 use super::{OAuthPending, parse_authorization_input};
-use crate::compat::auth_store::VendorAuthStore;
+use crate::compat::auth_store::{VendorAuthStore, VendorCredential};
 use crate::compat::probe::VendorLoginError;
 
 pub(super) const PROVIDER_ID: &str = "openai-codex";
@@ -32,7 +32,7 @@ const ORIGINATOR: &str = "grok-build";
 const JWT_AUTH_CLAIM: &str = "https://api.openai.com/auth";
 const LOGIN_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 const TOKEN_TIMEOUT: Duration = Duration::from_secs(30);
-const REFRESH_SKEW_SECS: i64 = 60;
+pub(super) const REFRESH_SKEW_SECS: i64 = 60;
 
 struct InFlight {
     verifier: String,
@@ -44,14 +44,21 @@ struct InFlight {
     listener: Mutex<Option<TcpListener>>,
 }
 
-static INFLIGHT: OnceLock<Mutex<HashMap<String, InFlight>>> = OnceLock::new();
-static REFRESH_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+static INFLIGHT: LazyLock<Mutex<HashMap<String, InFlight>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+static REFRESH_LOCKS: LazyLock<Mutex<HashMap<String, Arc<Mutex<()>>>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
 
 fn inflight_map() -> std::sync::MutexGuard<'static, HashMap<String, InFlight>> {
-    INFLIGHT
-        .get_or_init(|| Mutex::new(HashMap::new()))
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
+    INFLIGHT.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+fn refresh_lock(account_id: &str) -> Arc<Mutex<()>> {
+    let mut locks = REFRESH_LOCKS.lock().unwrap_or_else(|e| e.into_inner());
+    locks
+        .entry(account_id.to_owned())
+        .or_insert_with(|| Arc::new(Mutex::new(())))
+        .clone()
 }
 
 pub(super) fn login_label() -> &'static str {
@@ -86,6 +93,10 @@ pub(super) async fn begin() -> Result<OAuthPending, VendorLoginError> {
         .append_pair("code_challenge", &pkce.challenge)
         .append_pair("code_challenge_method", "S256")
         .append_pair("state", &state)
+        // OpenID Connect's standard `prompt=login` forces the browser to
+        // offer authentication rather than silently reusing its current
+        // session, allowing a user to select another ChatGPT account.
+        .append_pair("prompt", "login")
         .append_pair("id_token_add_organizations", "true")
         .append_pair("codex_cli_simplified_flow", "true")
         .append_pair("originator", ORIGINATOR);
@@ -366,26 +377,51 @@ fn persist_token(token: CodexToken) -> Result<(), VendorLoginError> {
     Ok(())
 }
 
-/// Refresh the stored Codex access token when it is expired or close to it.
-pub(super) fn refresh_if_needed() -> Result<(), VendorLoginError> {
-    let _guard = REFRESH_LOCK
-        .get_or_init(|| Mutex::new(()))
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
-    let store = VendorAuthStore::default_store()?;
-    let Some(cred) = store.credential(PROVIDER_ID).cloned() else {
+/// Refresh the selected Codex account only when its current snapshot is
+/// expiring. A file lock is acquired only while persisting the result, never
+/// while the token endpoint is contacted.
+pub(super) fn refresh_if_needed(account_id: &str) -> Result<(), VendorLoginError> {
+    let lock = refresh_lock(account_id);
+    let _guard = lock.lock().unwrap_or_else(|e| e.into_inner());
+    let mut store = VendorAuthStore::default_store()?;
+    refresh_if_needed_in(&mut store, account_id)
+}
+
+fn refresh_if_needed_in(
+    store: &mut VendorAuthStore,
+    account_id: &str,
+) -> Result<(), VendorLoginError> {
+    let Some(credential) = store.account_credential(PROVIDER_ID, account_id).cloned() else {
         return Ok(());
     };
-    if cred.kind != "oauth" || !cred.expires_soon(REFRESH_SKEW_SECS) {
+    if credential.kind != "oauth" || !credential.expires_soon(REFRESH_SKEW_SECS) {
         return Ok(());
     }
-    let Some(refresh) = cred.refresh.filter(|s| !s.trim().is_empty()) else {
+    let Some(refresh) = credential.refresh.as_deref().filter(|refresh| !refresh.trim().is_empty())
+    else {
         return Err(VendorLoginError::Probe(
             "ChatGPT Codex session expired; run /provider-login openai-codex".into(),
         ));
     };
-    let token = refresh_access_token_blocking(&refresh)?;
-    persist_token(token)
+    let token = refresh_access_token_blocking(refresh)?;
+    if token.account_id != account_id {
+        return Err(VendorLoginError::Probe(
+            "ChatGPT Codex refresh returned a different account".into(),
+        ));
+    }
+    let replacement = VendorCredential::oauth_slot(
+        token.access,
+        Some(token.refresh),
+        Some(token.expires),
+        Some(token.account_id),
+    );
+    let _ = store.replace_account_credential_if_matches(
+        PROVIDER_ID,
+        account_id,
+        &credential,
+        replacement,
+    )?;
+    Ok(())
 }
 
 fn refresh_access_token_blocking(refresh: &str) -> Result<CodexToken, VendorLoginError> {
@@ -422,14 +458,18 @@ fn refresh_access_token_blocking(refresh: &str) -> Result<CodexToken, VendorLogi
     token_from_json(&body, "refresh")
 }
 
-pub(super) fn inject_request_headers(headers: &mut indexmap::IndexMap<String, String>) {
-    if let Ok(store) = VendorAuthStore::default_store()
-        && let Some(id) = store
-            .credential(PROVIDER_ID)
-            .and_then(|c| c.account_id.clone())
-            .filter(|s| !s.is_empty())
+pub(super) fn inject_request_headers(
+    credential: Option<&VendorCredential>,
+    headers: &mut indexmap::IndexMap<String, String>,
+) {
+    // A session may have changed model/provider since this map was assembled.
+    // Never let a header from an earlier Codex snapshot ride with this request.
+    headers.shift_remove("chatgpt-account-id");
+    if let Some(id) = credential
+        .and_then(|credential| credential.account_id.as_deref())
+        .filter(|id| !id.trim().is_empty())
     {
-        headers.insert("chatgpt-account-id".into(), id);
+        headers.insert("chatgpt-account-id".into(), id.to_owned());
     }
     headers
         .entry("originator".into())
@@ -541,7 +581,8 @@ pub(super) fn account_id_from_access(access: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{account_id_from_access, parse_codex_input};
+    use super::{account_id_from_access, inject_request_headers, parse_codex_input};
+    use crate::compat::auth_store::VendorCredential;
     use base64::Engine;
     use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 
@@ -570,5 +611,22 @@ mod tests {
         let (code, state) = parse_codex_input("rawcode#st2").unwrap();
         assert_eq!(code, "rawcode");
         assert_eq!(state.as_deref(), Some("st2"));
+    }
+
+    #[test]
+    fn account_header_uses_the_supplied_credential_snapshot() {
+        let mut headers = indexmap::IndexMap::new();
+        headers.insert("chatgpt-account-id".into(), "stale-account".into());
+        inject_request_headers(None, &mut headers);
+        assert!(!headers.contains_key("chatgpt-account-id"));
+
+        let credential = VendorCredential::oauth_slot(
+            "token".into(),
+            Some("refresh".into()),
+            Some(i64::MAX),
+            Some("acct-42".into()),
+        );
+        inject_request_headers(Some(&credential), &mut headers);
+        assert_eq!(headers["chatgpt-account-id"], "acct-42");
     }
 }

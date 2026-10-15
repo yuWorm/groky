@@ -31,6 +31,29 @@ fn map_vendor_login_outcome(
         VendorLoginOutcome::SubmitOAuthCode { provider_id, code } => {
             InputOutcome::Action(Action::SubmitVendorOAuthCode { provider_id, code })
         }
+        VendorLoginOutcome::SelectAccount {
+            provider_id,
+            account_id,
+        } => InputOutcome::Action(Action::SelectVendorAccount {
+            provider_id,
+            account_id,
+        }),
+        VendorLoginOutcome::RenameAccount {
+            provider_id,
+            account_id,
+            label,
+        } => InputOutcome::Action(Action::RenameVendorAccount {
+            provider_id,
+            account_id,
+            label,
+        }),
+        VendorLoginOutcome::RemoveAccount {
+            provider_id,
+            account_id,
+        } => InputOutcome::Action(Action::RemoveVendorAccount {
+            provider_id,
+            account_id,
+        }),
         VendorLoginOutcome::SyncCustom {
             name,
             base_url,

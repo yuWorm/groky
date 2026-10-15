@@ -277,6 +277,10 @@ pub enum PersistenceMsg {
         /// Outer `None` keeps the saved context window. `Some(None)` resets it to the model default.
         context_window: Option<Option<std::num::NonZeroU64>>,
     },
+    /// Session-local provider account binding, persisted for resume/fork safety.
+    /// This is never a credential and may contain an explicitly missing id so
+    /// the restored request fails closed instead of using a new provider default.
+    VendorAccounts(indexmap::IndexMap<String, String>),
     PlanState(TodoState),
     PlanModeState(crate::session::plan_mode::PlanModeSnapshot),
     RewindPoint(RewindPoint),
@@ -690,6 +694,18 @@ pub(crate) fn find_summary_by_session_id_in_root(
         .ok()
         .flatten()?;
     read_summary_from_dir(&path).ok()
+}
+
+/// Returns the persisted account bindings before constructing the summary
+/// client needed to load the rest of a session. `None` is a legacy summary;
+/// `Some(empty)` remains an explicit no-account selection.
+pub(crate) fn persisted_vendor_accounts(
+    session_id: &str,
+) -> Option<indexmap::IndexMap<String, String>> {
+    let session_dir = find_persisted_session_dir_by_id_result(session_id)
+        .ok()
+        .flatten()?;
+    read_summary_from_dir(&session_dir).ok()?.vendor_accounts
 }
 
 fn read_summary_from_dir(session_dir: &Path) -> RelocationResult<Summary> {
@@ -1173,6 +1189,11 @@ pub struct Summary {
     #[serde(default)]
     pub num_chat_messages: usize,
     pub current_model_id: acp::ModelId,
+    /// Provider account selections pinned for this session. `None` means a
+    /// pre-binding legacy summary; `Some(empty)` is an intentional no-account
+    /// selection and must not be replaced by a current provider default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vendor_accounts: Option<indexmap::IndexMap<String, String>>,
     /// Parent session ID if this session was forked from another session
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent_session_id: Option<String>,
@@ -1333,6 +1354,7 @@ impl Summary {
             num_messages: 0,
             num_chat_messages: 0,
             current_model_id: model_id,
+            vendor_accounts: None,
             parent_session_id: None,
             forked_at: None,
             collection_id: None,
@@ -1443,6 +1465,34 @@ impl Summary {
         self.last_active_at
             .unwrap_or(self.updated_at)
             .timestamp_millis()
+    }
+}
+
+#[cfg(test)]
+mod vendor_account_summary_tests {
+    use super::{Info, Summary};
+    use agent_client_protocol as acp;
+
+    #[test]
+    fn legacy_and_explicit_empty_vendor_bindings_round_trip_distinctly() {
+        let info = Info {
+            id: acp::SessionId::new("vendor-account-summary"),
+            cwd: ".".to_owned(),
+        };
+        let legacy = Summary::new(&info, acp::ModelId::new("test")).expect("summary");
+        let legacy_json = serde_json::to_value(&legacy).expect("serialize legacy summary");
+        assert!(legacy_json.get("vendor_accounts").is_none());
+        let legacy_round_trip: Summary =
+            serde_json::from_value(legacy_json).expect("deserialize legacy summary");
+        assert_eq!(legacy_round_trip.vendor_accounts, None);
+
+        let mut explicit_empty = legacy;
+        explicit_empty.vendor_accounts = Some(Default::default());
+        let empty_json = serde_json::to_value(&explicit_empty).expect("serialize empty binding");
+        assert_eq!(empty_json.get("vendor_accounts"), Some(&serde_json::json!({})));
+        let empty_round_trip: Summary =
+            serde_json::from_value(empty_json).expect("deserialize empty binding");
+        assert_eq!(empty_round_trip.vendor_accounts, Some(Default::default()));
     }
 }
 
@@ -2262,6 +2312,15 @@ impl SessionPersistence {
                     }
                     if let Some(sync) = &self.remote_sync {
                         sync.set_model_id(model_id.0.to_string());
+                    }
+                }
+                PersistenceMsg::VendorAccounts(vendor_accounts) => {
+                    if let Err(error) = self
+                        .storage
+                        .set_vendor_accounts(&self.info, vendor_accounts)
+                        .await
+                    {
+                        tracing::warn!(%error, "failed to persist session vendor account binding");
                     }
                 }
                 PersistenceMsg::PlanState(state) => {

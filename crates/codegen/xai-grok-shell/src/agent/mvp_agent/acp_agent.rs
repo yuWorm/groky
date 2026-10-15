@@ -2394,6 +2394,35 @@ impl acp::Agent for MvpAgent {
         args: acp::ExtNotification,
     ) -> Result<(), acp::Error> {
         tracing::info!("Received extension notification: method={}", args.method);
+        if args.method.as_ref() == "groky/vendor_account_changed" {
+            #[derive(serde::Deserialize)]
+            struct VendorAccountChanged {
+                session_id: String,
+                provider_id: String,
+                account_id: String,
+            }
+            let change: VendorAccountChanged = serde_json::from_str(args.params.get())
+                .map_err(|error| acp::Error::invalid_params().data(error.to_string()))?;
+            if change.session_id.is_empty()
+                || change.provider_id.is_empty()
+                || change.account_id.is_empty()
+            {
+                return Err(acp::Error::invalid_params()
+                    .data("sessionId, providerId, and accountId must be non-empty"));
+            }
+            let session_id = acp::SessionId::new(change.session_id);
+            let handle = self
+                .resident_handle(&session_id)
+                .ok_or_else(|| acp::Error::invalid_params().data("unknown session id"))?;
+            handle
+                .cmd_tx
+                .send(crate::session::SessionCommand::SetVendorAccount {
+                    provider_id: change.provider_id,
+                    account_id: change.account_id,
+                })
+                .map_err(|_| acp::Error::invalid_params().data("session is no longer active"))?;
+            return Ok(());
+        }
         if args.method.as_ref() == "x.ai/yolo_mode_changed"
             && let Ok(params) = serde_json::from_str::<
                 serde_json::Value,

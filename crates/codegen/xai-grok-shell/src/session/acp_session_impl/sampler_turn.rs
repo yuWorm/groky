@@ -697,10 +697,16 @@ impl SessionActor {
         if use_bearer_resolver && let Some(am) = self.auth_manager.as_ref() {
             let _ = am.auth().await;
         }
-        // Session path: only seed a wire-valid AT
-        // Hard-expired keys must not land in default headers when the resolver has nothing to stamp
-        let api_key = if let Some(id) = vendor_id.as_deref() {
-            crate::compat::live_vendor_key_for_id(id)
+        // Resolve a selected vendor account once and use its coherent token +
+        // header snapshot together. An unavailable slot intentionally produces
+        // no credential; it must not fall back to the provider default.
+        let vendor_credential = vendor_id
+            .as_deref()
+            .and_then(|provider_id| self.pinned_vendor_credential(provider_id));
+        let api_key = if vendor_id.is_some() {
+            vendor_credential
+                .as_ref()
+                .and_then(|credential| credential.request_secret().map(str::to_owned))
         } else if use_bearer_resolver {
             // `use_bearer_resolver` means the endpoint is a first-party xAI URL.
             // A session from another authority must not seed the default headers either.
@@ -713,8 +719,12 @@ impl SessionActor {
         };
         let auth_scheme = model_facts.auth_scheme;
         let mut extra_headers = cfg.extra_headers;
-        if let Some(id) = vendor_id.as_deref() {
-            crate::compat::oauth::inject_request_headers(id, &mut extra_headers);
+        if let Some(provider_id) = vendor_id.as_deref() {
+            crate::compat::oauth::inject_request_headers(
+                provider_id,
+                vendor_credential.as_ref(),
+                &mut extra_headers,
+            );
         }
         // GROK_COMPAT_HOOK: session Fast mode as a sampler-stripped extra header.
         // Official OpenAI/Codex hosts, or a GPT wire/catalog id on a relay.
@@ -983,14 +993,17 @@ impl SessionActor {
             .auth_manager
             .as_ref()
             .and_then(|am| am.current_or_expired().map(|a| a.key.clone()));
-        let models = self.models_manager.models();
+        let models = crate::session::vendor_accounts::models_for_vendor_accounts(
+            self.models_manager.models(),
+            &self.vendor_accounts.read(),
+        );
         let endpoints = self.models_manager.endpoints();
         let disable_api_key_auth = self
             .auth_manager
             .as_ref()
             .map(|am| am.grok_com_config().api_key_auth_disabled())
             .unwrap_or(false);
-        crate::agent::config::resolve_aux_model_sampling_config(
+        let mut config = crate::agent::config::resolve_aux_model_sampling_config(
             slug,
             &models,
             &endpoints,
@@ -998,7 +1011,21 @@ impl SessionActor {
             disable_api_key_auth,
             creds.alpha_test_key.clone(),
             creds.client_version.clone(),
-        )
+        )?;
+        if let Some(provider_id) =
+            crate::agent::config::find_model_by_id(&models, slug).and_then(crate::compat::vendor_id_for_model)
+        {
+            let credential = self.pinned_vendor_credential(provider_id);
+            config.api_key = credential
+                .as_ref()
+                .and_then(|value| value.request_secret().map(str::to_owned));
+            crate::compat::oauth::inject_request_headers(
+                provider_id,
+                credential.as_ref(),
+                &mut config.extra_headers,
+            );
+        }
+        Some(config)
     }
 
     /// Resolve a dedicated sampler for the Auto-mode classifier model `slug`, stamping session-local auth/attribution like image-describe.

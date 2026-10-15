@@ -1288,6 +1288,19 @@ fn dispatch_inner(action: Action, app: &mut AppView) -> Vec<Effect> {
         Action::SubmitVendorOAuthCode { provider_id, code } => {
             super::vendor::dispatch_submit_vendor_oauth_code(app, provider_id, code)
         }
+        Action::SelectVendorAccount {
+            provider_id,
+            account_id,
+        } => super::vendor::dispatch_select_vendor_account(app, provider_id, account_id),
+        Action::RenameVendorAccount {
+            provider_id,
+            account_id,
+            label,
+        } => super::vendor::dispatch_rename_vendor_account(app, provider_id, account_id, label),
+        Action::RemoveVendorAccount {
+            provider_id,
+            account_id,
+        } => super::vendor::dispatch_remove_vendor_account(app, provider_id, account_id),
         Action::SyncVendorCustom {
             name: _,
             base_url,

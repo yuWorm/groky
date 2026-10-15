@@ -1232,6 +1232,9 @@ pub(super) fn make_test_handle(
         pending_interactions: std::sync::Arc::new(std::sync::Mutex::new(
             std::collections::HashMap::new(),
         )),
+        vendor_accounts: crate::session::vendor_accounts::shared_vendor_accounts(
+            Default::default(),
+        ),
         active_work: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         info: crate::session::info::Info {
             id: acp::SessionId::new("test"),

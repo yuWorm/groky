@@ -228,6 +228,9 @@ fn wedged_child_handle() -> (
         current_prompt_id: std::sync::Arc::new(std::sync::Mutex::new(None)),
         active_work: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         pending_interactions: std::sync::Arc::new(std::sync::Mutex::new(HashMap::new())),
+        vendor_accounts: crate::session::vendor_accounts::shared_vendor_accounts(
+            Default::default(),
+        ),
         info: SessionInfo {
             id: acp::SessionId::new("test"),
             cwd: "/tmp".to_string(),

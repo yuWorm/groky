@@ -59,11 +59,12 @@ groky
 | xAI Grok | `/login` — same flow as official Grok Build |
 | OpenAI / Anthropic / OpenRouter API key | `/provider-login` then pick the provider |
 | ChatGPT Codex (Plus/Pro, not an `sk-` key) | `/provider-login openai-codex` |
+| Manage multiple ChatGPT Codex accounts | `/provider-accounts` — add, label, select, or remove one account |
 | Claude Pro/Max (not an `sk-ant-` key) | `/provider-login anthropic-claude` |
 | Custom OpenAI-compatible endpoint | `/provider-login` → custom provider |
 | Switch model | `/model` |
 | Fast mode (GPT, including custom OpenAI-compatible relays) | `/fast` |
-| Drop a vendor key | `/provider-logout` |
+| Sign out a provider (all its accounts) | `/provider-logout` |
 | Refresh vendor model lists | `/sync-models-dev` (alias `/refresh-models`); provider picker `r`; custom model list `Ctrl+R` |
 | Update groky | `groky update` or `groky update --version 0.1.23` (Welcome: ctrl+u) |
 
@@ -71,6 +72,15 @@ xAI login is unchanged (`AuthManager`, `~/.grok/auth.json`, shared with
 official `grok`). Third-party keys never go in `config.toml`; they live in
 `~/.groky/vendor-auth.json`. A vendor 401 asks for `/provider-login`, not
 `/login`.
+
+Codex accounts keep separate credentials and model catalogs. In `/provider-accounts`
+(also available through `/provider-login openai-codex`), use `a` to add a login,
+`Enter` to select, `r` to label, and `d` to remove with confirmation. Selecting
+an account sets the default for new sessions and changes only the current session;
+a running turn finishes before the change takes effect. Other sessions keep their
+selection, including on resume. Removing the default leaves no default until you
+choose one. Existing single-account logins migrate automatically. Accounts do not
+rotate automatically or combine subscription quotas.
 
 ## What this fork changes
 

@@ -55,17 +55,25 @@ groky
 | xAI Grok | `/login` —— 与官方 Grok Build 相同 |
 | OpenAI / Anthropic / OpenRouter API key | `/provider-login` 再选供应商 |
 | ChatGPT Codex（Plus/Pro，不是 `sk-`） | `/provider-login openai-codex` |
+| 管理多个 ChatGPT Codex 账号 | `/provider-accounts` —— 添加、备注、选择或移除单个账号 |
 | Claude Pro/Max（不是 `sk-ant-`） | `/provider-login anthropic-claude` |
 | 自定义 OpenAI 兼容端点 | `/provider-login` → 自定义供应商 |
 | 切换模型 | `/model` |
 | Fast 模式（GPT，含自定义 OpenAI 兼容中转站） | `/fast` |
-| 去掉供应商密钥 | `/provider-logout` |
+| 退出供应商的所有账号 | `/provider-logout` |
 | 刷新供应商模型列表 | `/sync-models-dev`（别名 `/refresh-models`）；供应商列表 `r`；自定义模型列表 `Ctrl+R` |
 | 更新 groky | `groky update` 或 `groky update --version 0.1.23`（Welcome：ctrl+u） |
 
 xAI 登录未改（`AuthManager`、`~/.grok/auth.json`，与官方 `grok` 共用）。
 第三方密钥不进 `config.toml`，而在 `~/.groky/vendor-auth.json`。供应商
 401 会提示 `/provider-login`，不会跳 `/login`。
+
+Codex 各账号分别保存凭据和模型目录。在 `/provider-accounts` 中（也可通过
+`/provider-login openai-codex` 打开），按 `a` 添加登录、`Enter` 选择、
+`r` 修改备注、`d` 确认后移除。选择账号会设置新会话的默认账号，并只切换当前会话；
+正在执行的一轮会先完成，再应用切换。其他会话及恢复后的会话保留各自选择。
+删除默认账号后须手动选择，不会自动改用另一个账号。旧版单账号登录会自动迁移。
+不自动轮换账号，也不合并订阅额度。
 
 ## 相对官方改了什么
 

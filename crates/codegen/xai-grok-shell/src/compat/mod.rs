@@ -14,10 +14,11 @@ pub mod reasoning;
 mod self_update;
 mod vendor_models;
 
-pub use auth_store::{VendorAuthStore, VendorCredential};
+pub use auth_store::{VendorAccountInfo, VendorAuthStore, VendorCredential};
 pub use catalog::{
-    ProviderSpec, acp_models_for_provider, arg_items, builtin_providers, merge_vendor_catalog,
-    provider_by_id, provider_display_name, unlocked_provider_ids,
+    ProviderSpec, acp_models_for_provider, acp_models_for_provider_account, arg_items,
+    builtin_providers, merge_vendor_catalog, models_for_provider_account, provider_by_id,
+    provider_display_name, unlocked_provider_ids,
 };
 pub use probe::{VendorLoginError, login_with_api_key, logout_provider, probe_api_key};
 pub use self_update::{
@@ -27,7 +28,8 @@ pub use self_update::{
     set_product_version, updates_allowed as groky_updates_allowed,
 };
 pub use vendor_models::{
-    refresh as refresh_vendor_models, refresh_stale_unlocked as refresh_stale_vendor_models,
+    refresh as refresh_vendor_models, refresh_for_account as refresh_vendor_models_for_account,
+    refresh_stale_unlocked as refresh_stale_vendor_models,
     refresh_unlocked as refresh_unlocked_vendor_models,
 };
 
@@ -84,11 +86,13 @@ pub fn is_vendor_catalog_model(model: &ModelEntry) -> bool {
 }
 
 pub fn live_vendor_key_for_id(id: &str) -> Option<String> {
-    oauth::ensure_fresh(id);
-    VendorAuthStore::default_store()
-        .ok()?
-        .api_key(id)
-        .filter(|k| !k.trim().is_empty())
+    match oauth::request_credential(id, None) {
+        Ok(credential) => credential.and_then(|c| c.request_secret().map(str::to_owned)),
+        Err(error) => {
+            tracing::warn!(provider = id, %error, "vendor credential refresh failed");
+            None
+        }
+    }
 }
 
 pub fn vendor_auth_user_message(provider_id: &str) -> String {

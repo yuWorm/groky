@@ -309,6 +309,7 @@ async fn create_test_actor_inner(
         pending_inputs: VecDeque::new(),
         edit_holds: HashMap::new(),
         pending_notifications: Vec::new(),
+        pending_vendor_account_changes: Default::default(),
         notifications_suppressed: false,
         rewindable: false,
         front_message_committed: false,
@@ -344,6 +345,9 @@ async fn create_test_actor_inner(
         auth_method_id: test_auth_method_id("test-auth"),
         model_auth_memo: std::cell::RefCell::new(None),
         catalog_model_id: std::cell::RefCell::new(acp::ModelId::new("test")),
+        vendor_accounts: crate::session::vendor_accounts::shared_vendor_accounts(
+            Default::default(),
+        ),
         attribution_callback: None,
         auth_manager: None,
         is_chat_kind: false,

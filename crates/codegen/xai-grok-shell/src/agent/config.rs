@@ -4322,20 +4322,15 @@ pub(crate) fn resolve_credentials(
             info.base_url.clone(),
             xai_chat_state::AuthType::ApiKey,
         )
-    // GROK_COMPAT_HOOK begin
-    } else if let Some(key) = crate::compat::vendor_key_for_model(model) {
-        (
-            Some(key),
-            info.base_url.clone(),
-            xai_chat_state::AuthType::ApiKey,
-        )
+    // Vendor subscriptions are bound by the session actor from its pinned
+    // account slot.  Do not read the provider default while building a model
+    // config: that would race a multi-account switch.
     } else if crate::compat::is_vendor_catalog_model(model) {
         (
             None,
             info.base_url.clone(),
             xai_chat_state::AuthType::ApiKey,
         )
-    // GROK_COMPAT_HOOK end
     } else if let Some(key) = session_key
         && xai_grok_login::backend::AuthBackend::may_receive_session(
             &xai_grok_login::backend::ActiveAuthBackend::default(),
@@ -4490,7 +4485,14 @@ pub(crate) fn resolve_model_auth_facts_and_provider(
             },
             vendor_id: match lookup {
                 ModelLookup::Loaded(Some(e)) => {
-                    crate::compat::vendor_id_for_model(e).map(std::sync::Arc::from)
+                    crate::compat::vendor_id_for_model(e)
+                        .or_else(|| {
+                            (e.own_credential().is_none() && e.auth_provider.is_none())
+                                .then(|| crate::compat::vendor_auth_for_catalog_id(model_id))
+                                .flatten()
+                                .map(|(id, _)| id)
+                        })
+                        .map(std::sync::Arc::from)
                 }
                 _ => None,
             },
@@ -4556,7 +4558,11 @@ pub(crate) fn resolve_aux_model_sampling_config(
             None,
             None,
         );
-        if sampler.api_key.is_some() {
+        if sampler.api_key.is_some() || crate::compat::is_vendor_catalog_model(entry) {
+            // The session actor supplies a vendor subscription credential from
+            // its pinned account before this config is used. Keeping the config
+            // distinct here prevents a missing selected account from routing a
+            // helper request through the active/default model instead.
             return Some(sampler);
         }
         if entry.effective_auth_provider().is_some() {
@@ -4730,11 +4736,8 @@ pub(crate) fn sampling_config_for_model(
         alpha_test_key.as_deref(),
         &credentials.base_url,
     );
-    // GROK_COMPAT_HOOK begin
-    if let Some(provider_id) = crate::compat::vendor_id_for_model(model) {
-        crate::compat::oauth::inject_request_headers(provider_id, &mut extra_headers);
-    }
-    // GROK_COMPAT_HOOK end
+    // Vendor request headers are installed by the session actor from the same
+    // pinned credential snapshot as `api_key`; never resolve a default here.
     let api_backend = info.api_backend.clone();
     let extra_response_includes = response_include_extensions(
         info.supports_backend_search,

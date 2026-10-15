@@ -92,6 +92,7 @@ async fn test_e2e_idle_resume_refreshes_model_metadata() {
                 pending_inputs: VecDeque::new(),
                 edit_holds: HashMap::new(),
                 pending_notifications: Vec::new(),
+                pending_vendor_account_changes: Default::default(),
                 notifications_suppressed: false,
                 rewindable: false,
                 front_message_committed: false,
@@ -134,6 +135,9 @@ async fn test_e2e_idle_resume_refreshes_model_metadata() {
                 auth_method_id: test_auth_method_id("cached_token"),
                 model_auth_memo: std::cell::RefCell::new(None),
                 catalog_model_id: std::cell::RefCell::new(acp::ModelId::new("test-model")),
+                vendor_accounts: crate::session::vendor_accounts::shared_vendor_accounts(
+                    Default::default(),
+                ),
                 auth_manager: {
                     let dir = tempfile::tempdir().unwrap();
                     let mgr = std::sync::Arc::new(xai_grok_login::AuthManager::new(

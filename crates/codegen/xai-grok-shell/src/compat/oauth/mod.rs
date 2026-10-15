@@ -11,6 +11,7 @@ mod pkce;
 pub use openrouter::{begin as begin_openrouter, login_label as openrouter_login_label};
 
 use crate::compat::probe::VendorLoginError;
+use crate::compat::auth_store::{VendorAuthStore, VendorCredential};
 
 /// UI-facing start of an OAuth login (authorize URL + copy).
 #[derive(Debug, Clone)]
@@ -84,27 +85,62 @@ pub fn cancel(provider_id: &str) {
     }
 }
 
-/// Refresh expiring OAuth access tokens before a live request.
-pub fn ensure_fresh(provider_id: &str) {
-    let result = if provider_id == openai_codex::PROVIDER_ID {
-        Some(openai_codex::refresh_if_needed())
-    } else if provider_id == anthropic_claude::PROVIDER_ID {
-        Some(anthropic_claude::refresh_if_needed())
-    } else {
-        None
+/// Resolve one provider account, refresh only that exact account if necessary,
+/// and return a coherent credential snapshot. An explicit missing account is
+/// deliberately not replaced by the current default.
+pub fn request_credential(
+    provider_id: &str,
+    account_id: Option<&str>,
+) -> Result<Option<VendorCredential>, VendorLoginError> {
+    let store = VendorAuthStore::default_store()?;
+    let account_id = match account_id {
+        Some(account_id) => account_id,
+        None => match store.default_account_id(provider_id) {
+            Some(account_id) => account_id,
+            None => return Ok(None),
+        },
     };
-    if let Some(Err(error)) = result {
-        tracing::warn!(provider_id, error = %error, "vendor OAuth refresh failed");
+    let Some(credential) = store.account_credential(provider_id, account_id) else {
+        return Ok(None);
+    };
+    let refresh_skew = match provider_id {
+        openai_codex::PROVIDER_ID => Some(openai_codex::REFRESH_SKEW_SECS),
+        anthropic_claude::PROVIDER_ID => Some(anthropic_claude::REFRESH_SKEW_SECS),
+        _ => None,
+    };
+    if credential.kind != "oauth"
+        || refresh_skew.is_none_or(|skew| !credential.expires_soon(skew))
+    {
+        return Ok(Some(credential.clone()));
     }
+
+    match provider_id {
+        openai_codex::PROVIDER_ID => openai_codex::refresh_if_needed(account_id)?,
+        anthropic_claude::PROVIDER_ID => anthropic_claude::refresh_if_needed(account_id)?,
+        _ => {}
+    }
+
+    // Reload after any refresh. The slot chosen above is retained even if
+    // another process changed the provider default meanwhile.
+    Ok(VendorAuthStore::default_store()?
+        .account_credential(provider_id, account_id)
+        .cloned())
 }
 
-/// Headers that must ride on every Codex / Claude-subscription request.
-pub fn inject_request_headers(provider_id: &str, headers: &mut indexmap::IndexMap<String, String>) {
+
+/// Headers that must ride on every Codex / Claude-subscription request. The
+/// caller supplies the same snapshot used for Authorization so account
+/// identity cannot drift between independent store reads.
+pub fn inject_request_headers(
+    provider_id: &str,
+    credential: Option<&VendorCredential>,
+    headers: &mut indexmap::IndexMap<String, String>,
+) {
     if provider_id == openai_codex::PROVIDER_ID {
-        openai_codex::inject_request_headers(headers);
+        openai_codex::inject_request_headers(credential, headers);
     }
     if provider_id == anthropic_claude::PROVIDER_ID {
-        anthropic_claude::inject_request_headers(headers);
+        anthropic_claude::inject_request_headers(credential, headers);
     }
 }
 

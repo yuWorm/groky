@@ -1379,6 +1379,20 @@ impl StorageAdapter for JsonlStorageAdapter {
         )
         .await
     }
+    async fn set_vendor_accounts(
+        &self,
+        info: &Info,
+        vendor_accounts: indexmap::IndexMap<String, String>,
+    ) -> io::Result<()> {
+        self.apply_summary_patch(
+            info,
+            super::summary_write::SummaryPatch {
+                vendor_accounts: Some(vendor_accounts),
+                ..Default::default()
+            },
+        )
+        .await
+    }
     async fn update_collection_id(&self, info: &Info, collection_id: &str) -> io::Result<()> {
         self.apply_summary_patch(
             info,

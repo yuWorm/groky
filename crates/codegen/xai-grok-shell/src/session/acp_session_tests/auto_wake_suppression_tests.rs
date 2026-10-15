@@ -160,6 +160,7 @@ fn pending_notification_cap_keeps_newest_entries() {
         pending_inputs: std::collections::VecDeque::new(),
         edit_holds: HashMap::new(),
         pending_notifications: Vec::new(),
+        pending_vendor_account_changes: Default::default(),
         notifications_suppressed: true,
         rewindable: false,
         front_message_committed: false,

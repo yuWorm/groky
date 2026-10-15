@@ -104,6 +104,9 @@ pub(crate) struct SummaryPatch {
     pub session_kind_if_absent: Option<String>,
     /// The session's selected agent, applied as one unit (see [`Summary::set_agent`]).
     pub agent: Option<PersistedAgent>,
+    /// Session-local account bindings; last writer wins for the mapping as a
+    /// unit so resume cannot combine selections from two snapshots.
+    pub vendor_accounts: Option<indexmap::IndexMap<String, String>>,
 }
 
 impl Summary {
@@ -160,6 +163,9 @@ impl Summary {
         }
         if let Some(agent) = &patch.agent {
             self.set_agent(agent.clone());
+        }
+        if let Some(vendor_accounts) = &patch.vendor_accounts {
+            self.vendor_accounts = Some(vendor_accounts.clone());
         }
         if let Some(git_head) = &patch.git_head {
             self.head_commit = git_head.commit.clone();

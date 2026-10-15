@@ -178,7 +178,8 @@ impl MvpAgent {
                 ps.scheduler_handle.clone(),
             )
         })?;
-        let available_models = self.models_manager.models();
+        let parent_vendor_accounts = parent_handle.as_ref()?.vendor_accounts.clone();
+        let available_models = self.models_for_vendor_accounts(&parent_vendor_accounts);
         let (parent_lsp, parent_process_scope) = {
             let parent = parent_handle.as_ref();
             (
@@ -357,6 +358,7 @@ impl MvpAgent {
             },
             plugin_registry: self.plugin_registry_handle.snapshot(),
             models_manager: self.models_manager.clone(),
+            vendor_accounts: parent_vendor_accounts,
             file_tool_overrides: {
                 let cfg = self.cfg.borrow();
                 let effective = cfg

@@ -5,7 +5,7 @@
 //! identity / `_` tool prefix live in `xai-grok-sampler` `compat.rs`.
 
 use std::collections::HashMap;
-use std::sync::{Mutex, OnceLock};
+use std::sync::{LazyLock, Mutex};
 use std::time::Duration;
 
 use rand::RngCore;
@@ -16,7 +16,7 @@ use tokio::sync::mpsc;
 use super::callback::{error_html, read_http_request, success_html, write_html};
 use super::pkce::generate_pkce;
 use super::{OAuthPending, parse_authorization_input};
-use crate::compat::auth_store::VendorAuthStore;
+use crate::compat::auth_store::{VendorAuthStore, VendorCredential};
 use crate::compat::probe::VendorLoginError;
 
 pub(super) const PROVIDER_ID: &str = "anthropic-claude";
@@ -37,7 +37,7 @@ const CLAUDE_CLI_UA: &str = "claude-cli/2.1.220 (external, claude-desktop)";
 const OAUTH_INFERENCE_BETAS: &str = "oauth-2025-04-20,claude-code-20250219,interleaved-thinking-2025-05-14,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05,mid-conversation-system-2026-04-07,advanced-tool-use-2025-11-20,effort-2025-11-24,fallback-credit-2026-06-01";
 const LOGIN_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 const TOKEN_TIMEOUT: Duration = Duration::from_secs(30);
-const REFRESH_SKEW_SECS: i64 = 5 * 60;
+pub(super) const REFRESH_SKEW_SECS: i64 = 5 * 60;
 
 struct InFlight {
     verifier: String,
@@ -49,14 +49,12 @@ struct InFlight {
     listener: Mutex<Option<TcpListener>>,
 }
 
-static INFLIGHT: OnceLock<Mutex<HashMap<String, InFlight>>> = OnceLock::new();
-static REFRESH_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+static INFLIGHT: LazyLock<Mutex<HashMap<String, InFlight>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+static REFRESH_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
 fn inflight_map() -> std::sync::MutexGuard<'static, HashMap<String, InFlight>> {
-    INFLIGHT
-        .get_or_init(|| Mutex::new(HashMap::new()))
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
+    INFLIGHT.lock().unwrap_or_else(|e| e.into_inner())
 }
 
 pub(super) fn login_label() -> &'static str {
@@ -387,25 +385,38 @@ fn persist_token(token: ClaudeToken) -> Result<(), VendorLoginError> {
     Ok(())
 }
 
-pub(super) fn refresh_if_needed() -> Result<(), VendorLoginError> {
-    let _guard = REFRESH_LOCK
-        .get_or_init(|| Mutex::new(()))
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
-    let store = VendorAuthStore::default_store()?;
-    let Some(cred) = store.credential(PROVIDER_ID).cloned() else {
+pub(super) fn refresh_if_needed(account_id: &str) -> Result<(), VendorLoginError> {
+    let _guard = REFRESH_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let mut store = VendorAuthStore::default_store()?;
+    let Some(credential) = store.account_credential(PROVIDER_ID, account_id).cloned() else {
         return Ok(());
     };
-    if cred.kind != "oauth" || !cred.expires_soon(REFRESH_SKEW_SECS) {
+    if credential.kind != "oauth" || !credential.expires_soon(REFRESH_SKEW_SECS) {
         return Ok(());
     }
-    let Some(refresh) = cred.refresh.filter(|s| !s.trim().is_empty()) else {
+    let Some(refresh) = credential
+        .refresh
+        .as_deref()
+        .filter(|refresh| !refresh.trim().is_empty())
+    else {
         return Err(VendorLoginError::Probe(
             "Claude Pro/Max session expired; run /provider-login anthropic-claude".into(),
         ));
     };
-    let token = refresh_access_token_blocking(&refresh)?;
-    persist_token(token)
+    let token = refresh_access_token_blocking(refresh)?;
+    let replacement = VendorCredential::oauth_slot(
+        token.access,
+        Some(token.refresh),
+        Some(token.expires),
+        token.account_id,
+    );
+    let _ = store.replace_account_credential_if_matches(
+        PROVIDER_ID,
+        account_id,
+        &credential,
+        replacement,
+    )?;
+    Ok(())
 }
 
 fn refresh_access_token_blocking(refresh: &str) -> Result<ClaudeToken, VendorLoginError> {
@@ -439,7 +450,10 @@ fn refresh_access_token_blocking(refresh: &str) -> Result<ClaudeToken, VendorLog
 /// OAuth Messages requests must not send `x-api-key`. Fingerprint headers
 /// overwrite (OMP `enforcedHeaderKeys`) so a leftover thin beta list cannot
 /// ride through.
-pub(super) fn inject_request_headers(headers: &mut indexmap::IndexMap<String, String>) {
+pub(super) fn inject_request_headers(
+    _credential: Option<&VendorCredential>,
+    headers: &mut indexmap::IndexMap<String, String>,
+) {
     headers.insert("anthropic-version".into(), "2023-06-01".into());
     headers.insert("anthropic-beta".into(), OAUTH_INFERENCE_BETAS.to_owned());
     headers.insert("User-Agent".into(), CLAUDE_CLI_UA.to_owned());
@@ -570,7 +584,7 @@ mod tests {
             "anthropic-beta".into(),
             "oauth-2025-04-20,claude-code-20250219".into(),
         );
-        inject_request_headers(&mut headers);
+        inject_request_headers(None, &mut headers);
         assert_eq!(headers["anthropic-beta"], OAUTH_INFERENCE_BETAS);
         assert!(headers["anthropic-beta"].contains("oauth-2025-04-20"));
         assert!(headers["anthropic-beta"].contains("fallback-credit-2026-06-01"));

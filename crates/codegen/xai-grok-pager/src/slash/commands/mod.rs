@@ -47,6 +47,7 @@ pub mod personas;
 pub mod plan;
 pub mod plugin;
 pub mod privacy;
+pub mod provider_accounts;
 pub mod provider_login;
 pub mod provider_logout;
 pub mod queue;
@@ -163,6 +164,7 @@ pub fn builtin_commands() -> Vec<Arc<dyn SlashCommand>> {
         Arc::new(login::LoginCommand),
         Arc::new(logout::LogoutCommand),
         Arc::new(provider_login::ProviderLoginCommand),
+        Arc::new(provider_accounts::ProviderAccountsCommand),
         Arc::new(provider_logout::ProviderLogoutCommand),
         Arc::new(sync_models_dev::SyncModelsDevCommand),
         Arc::new(home::HomeCommand),

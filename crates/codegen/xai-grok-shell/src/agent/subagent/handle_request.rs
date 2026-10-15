@@ -1577,6 +1577,9 @@ pub(crate) async fn run_shell_child(
         ctx.managed_mcp_state.clone(),
         ctx.managed_mcp_proxy_base_url.clone(),
         effective_model_id,
+        Some(crate::session::vendor_accounts::shared_vendor_accounts(
+            ctx.vendor_accounts.read().clone(),
+        )),
         ctx.yolo_mode
             || matches!(
                 agent_permission_mode,

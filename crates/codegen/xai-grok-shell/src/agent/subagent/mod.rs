@@ -319,6 +319,10 @@ pub(crate) struct SubagentSpawnContext {
     pub plugin_registry: Option<std::sync::Arc<xai_grok_agent::plugins::PluginRegistry>>,
     /// Shared models manager for etag-triggered refresh.
     pub models_manager: crate::agent::remote_config::ModelsManager,
+    /// Parent's effective provider-account bindings. Shared with the parent so
+    /// a child inherits its selected account instead of consulting a global
+    /// provider default.
+    pub vendor_accounts: crate::session::VendorAccountBindings,
     /// Pre-resolved file tool overrides (hashline vs standard) from the parent.
     /// `None` means use the standard (default) file tools.
     pub file_tool_overrides: Option<Vec<xai_grok_tools::registry::types::ToolConfig>>,

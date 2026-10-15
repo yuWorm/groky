@@ -480,7 +480,7 @@ impl SessionActor {
     /// Skips the rewind-window close and notification hooks.
     /// Must not stamp an `eventId`: a reconnect cursor that points at an id absent from `updates.jsonl` never resolves and forces a full replay.
     /// Timestamp-only meta keeps the client clock without advancing the cursor.
-    pub(super) fn send_xai_notification_transient(&self, update: XaiSessionUpdate) {
+    pub(in crate::session) fn send_xai_notification_transient(&self, update: XaiSessionUpdate) {
         let notification = XaiSessionNotification {
             session_id: self.session_info.id.clone(),
             update,

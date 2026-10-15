@@ -1284,6 +1284,7 @@ fn write_test_summary(
         num_messages: 1,
         num_chat_messages: 1,
         current_model_id: default_model_id(),
+        vendor_accounts: None,
         parent_session_id: None,
         forked_at: None,
         collection_id: None,

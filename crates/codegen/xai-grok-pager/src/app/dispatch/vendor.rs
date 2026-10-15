@@ -1,6 +1,6 @@
 //! Third-party provider login / logout (GROK_COMPAT). Does not use xAI `/login`.
 
-use super::ctx::get_active_agent_mut;
+use super::ctx::{active_agent_session_id, get_active_agent_mut};
 use crate::acp::model_state::ModelState;
 use crate::app::actions::{Action, Effect};
 use crate::app::app_view::{AppView, InputOutcome};
@@ -34,6 +34,29 @@ fn map_vendor_login_outcome(outcome: VendorLoginOutcome) -> InputOutcome {
         VendorLoginOutcome::SubmitOAuthCode { provider_id, code } => {
             InputOutcome::Action(Action::SubmitVendorOAuthCode { provider_id, code })
         }
+        VendorLoginOutcome::SelectAccount {
+            provider_id,
+            account_id,
+        } => InputOutcome::Action(Action::SelectVendorAccount {
+            provider_id,
+            account_id,
+        }),
+        VendorLoginOutcome::RenameAccount {
+            provider_id,
+            account_id,
+            label,
+        } => InputOutcome::Action(Action::RenameVendorAccount {
+            provider_id,
+            account_id,
+            label,
+        }),
+        VendorLoginOutcome::RemoveAccount {
+            provider_id,
+            account_id,
+        } => InputOutcome::Action(Action::RemoveVendorAccount {
+            provider_id,
+            account_id,
+        }),
         VendorLoginOutcome::SyncCustom {
             name,
             base_url,
@@ -101,7 +124,7 @@ pub(super) fn dispatch_open_vendor_login(
     app: &mut AppView,
     provider_id: Option<String>,
 ) -> Vec<Effect> {
-    let state = match provider_id {
+    let mut state = match provider_id {
         Some(id) if id == "custom" || id == "add" => VendorLoginState::custom_form(),
         Some(id) => {
             if let Some(spec) = xai_grok_shell::compat::provider_by_id(&id) {
@@ -118,6 +141,11 @@ pub(super) fn dispatch_open_vendor_login(
         None => VendorLoginState::picker(),
     };
     if let Some(agent) = get_active_agent_mut(app) {
+        state.current_codex_account = agent.session.models.available.iter().find_map(|(id, model)| {
+            id.0.starts_with("openai-codex/").then_some(model)
+                .and_then(|model| model.meta.as_ref()?.get("grokyAccountId")?.as_str())
+                .map(str::to_owned)
+        });
         agent.vendor_login = Some(state);
     } else {
         app.welcome_vendor_login = Some(state);
@@ -243,6 +271,49 @@ pub(super) fn dispatch_submit_vendor_key(
 ) -> Vec<Effect> {
     vec![Effect::VendorProbe { provider_id, key }]
 }
+pub(super) fn dispatch_select_vendor_account(
+    app: &mut AppView,
+    provider_id: String,
+    account_id: String,
+) -> Vec<Effect> {
+    let session_id = active_agent_session_id(app);
+    let update_session_catalog = session_id.as_ref().is_some_and(|session_id| {
+        app.agents.values().any(|agent| {
+            agent.session.session_id.as_ref() == Some(session_id)
+                && !agent.session.state.is_turn_running()
+        })
+    });
+    vec![Effect::SelectVendorAccount {
+        provider_id,
+        account_id,
+        session_id,
+        update_session_catalog,
+    }]
+}
+
+pub(super) fn dispatch_rename_vendor_account(
+    _app: &mut AppView,
+    provider_id: String,
+    account_id: String,
+    label: String,
+) -> Vec<Effect> {
+    vec![Effect::RenameVendorAccount {
+        provider_id,
+        account_id,
+        label,
+    }]
+}
+
+pub(super) fn dispatch_remove_vendor_account(
+    _app: &mut AppView,
+    provider_id: String,
+    account_id: String,
+) -> Vec<Effect> {
+    vec![Effect::RemoveVendorAccount {
+        provider_id,
+        account_id,
+    }]
+}
 
 pub(super) fn dispatch_vendor_logout(app: &mut AppView, provider_id: String) -> Vec<Effect> {
     let _ = app;
@@ -299,6 +370,11 @@ fn inject_provider_models(app: &mut AppView, provider_id: &str) {
         .available
         .retain(|id, _| !id.0.starts_with(&prefix));
     app.models.available.extend(extras.clone());
+    // Codex catalogs are account-scoped. A default refresh must never replace
+    // another session's pinned account catalog.
+    if provider_id == "openai-codex" {
+        return;
+    }
     for agent in app.agents.values_mut() {
         agent
             .session
@@ -306,6 +382,74 @@ fn inject_provider_models(app: &mut AppView, provider_id: &str) {
             .available
             .retain(|id, _| !id.0.starts_with(&prefix));
         agent.session.models.available.extend(extras.clone());
+    }
+}
+
+fn inject_provider_models_for_account(
+    app: &mut AppView,
+    provider_id: &str,
+    account_id: &str,
+    update_default_catalog: bool,
+    session_id: Option<&acp::SessionId>,
+    update_session_catalog: bool,
+) {
+    if !update_default_catalog && !update_session_catalog {
+        return;
+    }
+    let extras = xai_grok_shell::compat::acp_models_for_provider_account(provider_id, account_id);
+    let prefix = format!("{provider_id}/");
+    let session_agent_id = if update_session_catalog {
+        session_id.and_then(|session_id| {
+            app.agents
+                .iter()
+                .find(|(_, agent)| agent.session.session_id.as_ref() == Some(session_id))
+                .map(|(agent_id, _)| agent_id.clone())
+        })
+    } else {
+        None
+    };
+
+    match (update_default_catalog, session_agent_id) {
+        (true, Some(agent_id)) => {
+            app.models
+                .available
+                .retain(|id, _| !id.0.starts_with(&prefix));
+            app.models.available.extend(extras.clone());
+            patch_model_state_reasoning(&mut app.models);
+
+            let agent = app
+                .agents
+                .get_mut(&agent_id)
+                .expect("session agent remains registered while updating account models");
+            agent
+                .session
+                .models
+                .available
+                .retain(|id, _| !id.0.starts_with(&prefix));
+            agent.session.models.available.extend(extras);
+            patch_model_state_reasoning(&mut agent.session.models);
+        }
+        (true, None) => {
+            app.models
+                .available
+                .retain(|id, _| !id.0.starts_with(&prefix));
+            app.models.available.extend(extras);
+            patch_model_state_reasoning(&mut app.models);
+        }
+        (false, Some(agent_id)) => {
+            let agent = app
+                .agents
+                .get_mut(&agent_id)
+                .expect("session agent remains registered while updating account models");
+            agent
+                .session
+                .models
+                .available
+                .retain(|id, _| !id.0.starts_with(&prefix));
+            agent.session.models.available.extend(extras);
+            patch_model_state_reasoning(&mut agent.session.models);
+        }
+        (false, None) => {}
     }
 }
 
@@ -344,6 +488,22 @@ fn patch_model_state_reasoning(models: &mut ModelState) {
         info.meta = Some(map);
     }
 }
+fn authenticate_vendor_if_needed(app: &mut AppView) -> Vec<Effect> {
+    if matches!(app.auth_state, crate::app::app_view::AuthState::Done) {
+        return vec![];
+    }
+    app.auth_state = crate::app::app_view::AuthState::Done;
+    app.welcome_prompt_focused = true;
+    let request_seq = app.next_auth_request_seq;
+    app.next_auth_request_seq += 1;
+    vec![Effect::Authenticate {
+        request_seq,
+        method_id: acp::AuthMethodId::new(xai_grok_shell::compat::VENDOR_AUTH_METHOD_ID),
+        use_oauth: false,
+        force_interactive: false,
+    }]
+}
+
 
 pub(super) fn handle_vendor_login_complete(
     app: &mut AppView,
@@ -365,6 +525,53 @@ pub(super) fn handle_vendor_login_complete(
         return vec![];
     }
 
+    if provider_id == "openai-codex" {
+        let account_ids = vendor_login_mut(app)
+            .map(VendorLoginState::complete_codex_oauth)
+            .unwrap_or_else(|| {
+                xai_grok_shell::compat::VendorAuthStore::default_store()
+                    .map(|store| {
+                        store
+                            .accounts("openai-codex")
+                            .into_iter()
+                            .map(|account| account.id)
+                            .collect()
+                    })
+                    .unwrap_or_default()
+            });
+        let default_account_id = xai_grok_shell::compat::VendorAuthStore::default_store()
+            .ok()
+            .and_then(|store| {
+                store
+                    .default_account_id("openai-codex")
+                    .map(str::to_owned)
+            });
+        if let Some(account_id) = default_account_id.as_deref() {
+            inject_provider_models_for_account(
+                app,
+                "openai-codex",
+                account_id,
+                true,
+                None,
+                false,
+            );
+        }
+        app.show_toast(
+            "Signed in to ChatGPT Codex. Select an account to use in this session.",
+        );
+        let mut effects: Vec<Effect> = account_ids
+            .into_iter()
+            .map(|account_id| Effect::RefreshVendorAccountCatalog {
+                provider_id: "openai-codex".into(),
+                account_id,
+                session_id: None,
+                update_session_catalog: false,
+            })
+            .collect();
+        effects.extend(authenticate_vendor_if_needed(app));
+        return effects;
+    }
+
     inject_provider_models(app, &provider_id);
     for agent in app.agents.values_mut() {
         agent.vendor_login = None;
@@ -372,21 +579,163 @@ pub(super) fn handle_vendor_login_complete(
     app.welcome_vendor_login = None;
     let name = xai_grok_shell::compat::provider_display_name(&provider_id);
     app.show_toast(&format!("Signed in to {name}. Use /model to switch."));
-    let mut effects = Vec::new();
-    if !matches!(app.auth_state, crate::app::app_view::AuthState::Done) {
-        app.auth_state = crate::app::app_view::AuthState::Done;
-        app.welcome_prompt_focused = true;
-        let request_seq = app.next_auth_request_seq;
-        app.next_auth_request_seq += 1;
-        effects.push(Effect::Authenticate {
-            request_seq,
-            method_id: acp::AuthMethodId::new(xai_grok_shell::compat::VENDOR_AUTH_METHOD_ID),
-            use_oauth: false,
-            force_interactive: false,
+    authenticate_vendor_if_needed(app)
+}
+pub(super) fn handle_vendor_account_selected(
+    app: &mut AppView,
+    provider_id: String,
+    account_id: String,
+    session_id: Option<acp::SessionId>,
+    update_session_catalog: bool,
+    error: Option<String>,
+) -> Vec<Effect> {
+    if let Some(state) = vendor_login_mut(app) {
+        state.complete_account_selection(&account_id, error.clone());
+    }
+    if let Some(error) = error {
+        if vendor_login_mut(app).is_none() {
+            app.show_toast(&format!("Could not select account: {error}"));
+        }
+        return vec![];
+    }
+
+    inject_provider_models_for_account(
+        app,
+        &provider_id,
+        &account_id,
+        true,
+        session_id.as_ref(),
+        update_session_catalog,
+    );
+    let mut effects = vec![Effect::RefreshVendorAccountCatalog {
+        provider_id: provider_id.clone(),
+        account_id: account_id.clone(),
+        session_id: session_id.clone(),
+        update_session_catalog,
+    }];
+    if let Some(session_id) = session_id {
+        effects.push(Effect::NotifyVendorAccountChanged {
+            session_id,
+            provider_id,
+            account_id,
         });
+        if update_session_catalog {
+            app.show_toast("Codex account selected for this session.");
+        } else {
+            app.show_toast(
+                "Codex account selected as default; this session will switch after the current turn.",
+            );
+        }
+    } else {
+        app.show_toast("Codex account selected as the provider default.");
     }
     effects
 }
+
+pub(super) fn handle_vendor_account_renamed(
+    app: &mut AppView,
+    account_id: String,
+    error: Option<String>,
+) -> Vec<Effect> {
+    if let Some(state) = vendor_login_mut(app) {
+        state.complete_account_rename(&account_id, error.clone());
+    }
+    if let Some(error) = error {
+        if vendor_login_mut(app).is_none() {
+            app.show_toast(&format!("Could not label account: {error}"));
+        }
+    } else {
+        app.show_toast("Codex account label saved.");
+    }
+    vec![]
+}
+
+pub(super) fn handle_vendor_account_removed(
+    app: &mut AppView,
+    provider_id: String,
+    error: Option<String>,
+    removed: bool,
+    was_default: bool,
+) -> Vec<Effect> {
+    if let Some(state) = vendor_login_mut(app) {
+        state.complete_account_remove(error.clone());
+    }
+    if let Some(error) = error {
+        if vendor_login_mut(app).is_none() {
+            app.show_toast(&format!("Could not remove account: {error}"));
+        }
+        return vec![];
+    }
+    if !removed {
+        app.show_toast("The selected Codex account no longer exists.");
+        return vec![];
+    }
+    if was_default {
+        let prefix = format!("{provider_id}/");
+        app.models
+            .available
+            .retain(|id, _| !id.0.starts_with(&prefix));
+        app.show_toast(
+            "Codex account removed. No default account is selected; choose one explicitly.",
+        );
+    } else {
+        app.show_toast("Codex account removed.");
+    }
+    vec![]
+}
+
+pub(super) fn handle_vendor_account_catalog_refreshed(
+    app: &mut AppView,
+    provider_id: String,
+    account_id: String,
+    session_id: Option<acp::SessionId>,
+    update_session_catalog: bool,
+    _count: usize,
+    error: Option<String>,
+) -> Vec<Effect> {
+    if let Some(error) = error {
+        if let Some(state) = vendor_login_mut(app) {
+            state.error = Some(format!("Could not refresh account models: {error}"));
+        } else {
+            app.show_toast(&format!("Could not refresh account models: {error}"));
+        }
+        return vec![];
+    }
+    let (account_exists, is_default) = xai_grok_shell::compat::VendorAuthStore::default_store()
+        .ok()
+        .map(|store| {
+            let account_exists = store.account_credential(&provider_id, &account_id).is_some();
+            let is_default = store
+                .default_account_id(&provider_id)
+                .is_some_and(|id| id == account_id.as_str());
+            (account_exists, is_default)
+        })
+        .unwrap_or((false, false));
+    if !account_exists {
+        return vec![];
+    }
+    let update_session_catalog = update_session_catalog
+        && session_id.as_ref().is_some_and(|session_id| {
+            app.agents.values().any(|agent| {
+                agent.session.session_id.as_ref() == Some(session_id)
+                    && agent.session.models.available.values().any(|model| {
+                        model.meta.as_ref()
+                            .and_then(|meta| meta.get("grokyAccountId"))
+                            .and_then(serde_json::Value::as_str) == Some(account_id.as_str())
+                    })
+            })
+        });
+    inject_provider_models_for_account(
+        app,
+        &provider_id,
+        &account_id,
+        is_default,
+        session_id.as_ref(),
+        update_session_catalog,
+    );
+    vec![]
+}
+
 
 pub(super) fn handle_vendor_logout_complete(
     app: &mut AppView,
@@ -411,7 +760,11 @@ pub(super) fn handle_vendor_logout_complete(
     }
     let name = xai_grok_shell::compat::provider_display_name(&provider_id);
     if removed {
-        app.show_toast(&format!("Signed out of {name}"));
+        if provider_id == "openai-codex" {
+            app.show_toast("Signed out of every stored ChatGPT Codex account.");
+        } else {
+            app.show_toast(&format!("Signed out of {name}"));
+        }
     } else {
         app.show_toast(&format!("No stored key for {name}"));
     }

@@ -922,6 +922,12 @@ pub enum SessionUpdate {
         /// Human-readable reason for the switch.
         reason: String,
     },
+    /// A session account selection has taken effect at a turn boundary.
+    VendorAccountChanged {
+        provider_id: String,
+        account_id: String,
+        models: Vec<agent_client_protocol::ModelInfo>,
+    },
     /// The session's model was switched via `session/setModel`. Broadcast to every client subscribed to the session in leader mode.
     /// Follower clients (TUI / IDE / web) mirror the change in their local state: status bar, `/model` dropdown, prompt header, etc.
     /// The originating client also receives this (the leader broadcasts to all subscribers of the session) but skips applying it. Its in-flight `SetSessionModel` response is the authority for its local state and drives the single "Switched to X" scrollback entry. Followers gate on their own `model_switch_pending` flag to distinguish "I'm waiting on my own switch" from "someone else's switch arrived."

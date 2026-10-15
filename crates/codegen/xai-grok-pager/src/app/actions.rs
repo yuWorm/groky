@@ -665,6 +665,23 @@ pub enum Action {
         provider_id: String,
         code: String,
     },
+    /// Select a provider account as the shared default and for the active session.
+    /// The session actor defers the switch until the current turn completes.
+    SelectVendorAccount {
+        provider_id: String,
+        account_id: String,
+    },
+    /// Change the user-visible label of one provider account.
+    RenameVendorAccount {
+        provider_id: String,
+        account_id: String,
+        label: String,
+    },
+    /// Remove one provider account without signing out every account for that provider.
+    RemoveVendorAccount {
+        provider_id: String,
+        account_id: String,
+    },
     /// GET `{base}/models` for a custom provider form.
     SyncVendorCustom {
         name: String,
@@ -1844,6 +1861,37 @@ pub enum Effect {
     VendorOAuthStart { provider_id: String },
     /// Wait for callback or pasted code, then persist the credential.
     VendorOAuthWait { provider_id: String },
+    /// Persist the selected provider account as the shared default.
+    SelectVendorAccount {
+        provider_id: String,
+        account_id: String,
+        session_id: Option<acp::SessionId>,
+        update_session_catalog: bool,
+    },
+    /// Persist a user-visible label for one provider account.
+    RenameVendorAccount {
+        provider_id: String,
+        account_id: String,
+        label: String,
+    },
+    /// Remove exactly one provider account.
+    RemoveVendorAccount {
+        provider_id: String,
+        account_id: String,
+    },
+    /// Refresh one account's provider catalog without reading another account's credential.
+    RefreshVendorAccountCatalog {
+        provider_id: String,
+        account_id: String,
+        session_id: Option<acp::SessionId>,
+        update_session_catalog: bool,
+    },
+    /// Tell the shell to bind one account to a single session.
+    NotifyVendorAccountChanged {
+        session_id: acp::SessionId,
+        provider_id: String,
+        account_id: String,
+    },
     VendorCustomSync {
         base_url: String,
         api_backend: String,
@@ -2491,6 +2539,37 @@ pub enum TaskResult {
     VendorLogoutComplete {
         provider_id: String,
         removed: bool,
+        error: Option<String>,
+    },
+    /// Persisting a provider-account selection completed.
+    VendorAccountSelected {
+        provider_id: String,
+        account_id: String,
+        session_id: Option<acp::SessionId>,
+        update_session_catalog: bool,
+        error: Option<String>,
+    },
+    /// Renaming one provider account completed.
+    VendorAccountRenamed {
+        provider_id: String,
+        account_id: String,
+        error: Option<String>,
+    },
+    /// Removing one provider account completed.
+    VendorAccountRemoved {
+        provider_id: String,
+        account_id: String,
+        removed: bool,
+        was_default: bool,
+        error: Option<String>,
+    },
+    /// Refreshing a selected account's model catalog completed.
+    VendorAccountCatalogRefreshed {
+        provider_id: String,
+        account_id: String,
+        session_id: Option<acp::SessionId>,
+        update_session_catalog: bool,
+        count: usize,
         error: Option<String>,
     },
     /// `/sync-models-dev` finished.
