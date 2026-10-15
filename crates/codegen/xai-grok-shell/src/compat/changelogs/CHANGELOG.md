@@ -1,3 +1,9 @@
+# 0.1.23 — 2026-10-15
+
+## Bug Fixes
+
+- **Windows builds** Fix the release shell, update incompatible compiler-helper dependencies, and make protobuf dependency generation work on Windows.
+
 # 0.1.22 — 2026-10-15
 
 ## Features

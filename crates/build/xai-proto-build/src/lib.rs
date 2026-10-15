@@ -142,6 +142,9 @@ impl XaiProtoBuilder {
         includes: impl IntoIterator<Item = &'a Path>,
     ) -> anyhow::Result<()> {
         let includes = Vec::from_iter(includes);
+        let temp_dir = tempfile::tempdir()?;
+        let dependency_path = temp_dir.path().join("dependencies");
+        let descriptor_sink = if cfg!(windows) { "NUL" } else { "/dev/null" };
 
         if let Some(protoc) = protoc {
             println!(
@@ -154,8 +157,8 @@ impl XaiProtoBuilder {
         for proto in protos {
             let mut command = Command::new(protoc.unwrap_or(Path::new("protoc")));
             command
-                .arg("--dependency_out=/dev/stdout")
-                .arg("--descriptor_set_out=/dev/null");
+                .arg(format!("--dependency_out={}", dependency_path.display()))
+                .arg(format!("--descriptor_set_out={descriptor_sink}"));
 
             // Add protoc's well-known types include directory first (if found).
             // This is needed for Bazel sandboxed builds where protoc and its
@@ -181,14 +184,14 @@ impl XaiProtoBuilder {
                 return Err(anyhow::anyhow!("protoc command failed"));
             }
 
-            let output =
-                String::from_utf8(output.stdout).context("protoc command output not UTF-8")?;
+            let output = fs::read_to_string(&dependency_path)
+                .context("reading protoc dependency output")?;
 
             let mut lines = output.lines();
             let first_line = lines.next().context("protoc command output is empty")?;
-            let prefix = "/dev/null:";
-            let rem = first_line.strip_prefix(prefix).with_context(|| {
-                format!("protoc command output must start with /dev/null: {output:?}")
+            let prefix = format!("{descriptor_sink}:");
+            let rem = first_line.strip_prefix(&prefix).with_context(|| {
+                format!("protoc command output must start with {prefix}: {output:?}")
             })?;
             for line in iter::once(rem).chain(lines) {
                 let line = line.trim();

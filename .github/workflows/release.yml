@@ -30,9 +30,6 @@ jobs:
   build:
     name: groky ${{ matrix.artifact_os }}-${{ matrix.artifact_arch }}
     runs-on: ${{ matrix.runner }}
-    # Upstream does not ship a Windows-tested tree; keep the job but don't
-    # block a Unix release if protoc/dotslash still fails on MSVC.
-    continue-on-error: ${{ matrix.optional }}
     strategy:
       fail-fast: false
       matrix:
@@ -41,28 +38,23 @@ jobs:
             artifact_os: macos
             artifact_arch: aarch64
             rust_target: aarch64-apple-darwin
-            optional: false
           - runner: macos-14
             artifact_os: macos
             artifact_arch: x86_64
             rust_target: x86_64-apple-darwin
-            optional: false
           - runner: ubuntu-24.04
             artifact_os: linux
             artifact_arch: x86_64
             rust_target: x86_64-unknown-linux-gnu
-            optional: false
           - runner: ubuntu-24.04-arm
             artifact_os: linux
             artifact_arch: aarch64
             rust_target: aarch64-unknown-linux-gnu
-            optional: false
           - runner: windows-latest
             artifact_os: windows
             artifact_arch: x86_64
             rust_target: x86_64-pc-windows-msvc
             exe: ".exe"
-            optional: true
 
     steps:
       - uses: actions/checkout@v5
@@ -104,12 +96,21 @@ jobs:
           echo "CXXFLAGS=-march=armv8-a" >> "$GITHUB_ENV"
 
       - name: Build groky
+        # Version normalization uses Bash syntax, including on Windows.
+        shell: bash
         env:
           GROKY_VERSION: ${{ github.event.inputs.tag || github.ref_name }}
         run: |
           version="${GROKY_VERSION#v}"
           export GROKY_VERSION="$version"
           cargo build -p xai-grok-pager-bin --locked --release --bin groky --target ${{ matrix.rust_target }} --features release-dist
+
+      - name: Verify Windows executable
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          & "target/${{ matrix.rust_target }}/release/groky.exe" --version
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Package
         shell: bash
@@ -141,7 +142,6 @@ jobs:
 
   release:
     needs: build
-    if: ${{ !cancelled() }}
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v5

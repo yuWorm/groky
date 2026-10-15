@@ -24,4 +24,4 @@ Voice: `**Lead** rest.` Lead is the noun the user already knows (`/default`, `Re
 
 ### Unreleased
 
-Next groky version after `v0.1.22`.
+Next groky version after `v0.1.23`.

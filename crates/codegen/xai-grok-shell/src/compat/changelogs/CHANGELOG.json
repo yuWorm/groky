@@ -1,5 +1,10 @@
 [
   {
+    "category": "fixes",
+    "description": "**Windows builds** Fix the release shell, update incompatible compiler-helper dependencies, and make protobuf dependency generation work on Windows.",
+    "breaking_change": false
+  },
+  {
     "category": "features",
     "description": "**ChatGPT Codex models** refresh from the signed-in account with a five-minute account-scoped cache and bundled fallback.",
     "breaking_change": false
