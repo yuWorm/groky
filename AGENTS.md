@@ -25,3 +25,5 @@ Voice: `**Lead** rest.` Lead is the noun the user already knows (`/default`, `Re
 ### Unreleased
 
 Next groky version after `v0.1.22`.
+
+- **Windows builds** Fix the release shell, update incompatible compiler-helper dependencies, and make protobuf dependency generation work on Windows.
