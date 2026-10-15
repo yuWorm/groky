@@ -7,7 +7,8 @@ This page is the release appendix (asset names, Windows).
 It is the same TUI as Grok Build (`xai-grok-pager-bin`), shipped under a
 different binary name so it can sit next to official `grok`.
 
-The **executable** is `~/.groky/bin/groky`. groky **config** is `~/.groky/`
+The **executable** is `~/.groky/bin/groky` on macOS/Linux or
+`%USERPROFILE%\.groky\bin\groky.exe` on Windows. groky **config** is `~/.groky/`
 (`config.toml`, `vendor-auth.json`). First launch copies those from `~/.grok/`
 when groky does not have them yet, and shares sessions / xAI login / memory /
 skills / plugins with official `grok` via `~/.grok/`. `GROK_HOME` isolates
@@ -20,21 +21,29 @@ curl -fsSL https://raw.githubusercontent.com/yuWorm/groky/main/scripts/install-g
 groky --version
 ```
 
-Windows PowerShell:
+Windows x86_64 PowerShell (binaries available from v0.1.23):
 
 ```powershell
 irm https://raw.githubusercontent.com/yuWorm/groky/main/scripts/install-groky.ps1 | iex
+groky --version
 ```
 
 Pin a version (downloads `github.com/.../releases/download/...` and does
 **not** call `api.github.com` — useful behind a shared VPN IP):
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/yuWorm/groky/main/scripts/install-groky.sh | bash -s 0.1.21
-groky update --version 0.1.21
+curl -fsSL https://raw.githubusercontent.com/yuWorm/groky/main/scripts/install-groky.sh | bash -s 0.1.23
+groky update --version 0.1.23
 ```
 
-PowerShell: `$env:GROKY_VERSION="0.1.21"; irm ... | iex`
+PowerShell:
+
+```powershell
+$env:GROKY_VERSION="0.1.23"
+irm https://raw.githubusercontent.com/yuWorm/groky/main/scripts/install-groky.ps1 | iex
+Remove-Item Env:GROKY_VERSION
+groky --version
+```
 
 Unpinned `groky update` / the installer without a version still query
 `/releases/latest`. A `GROKY_GITHUB_TOKEN` (or `GITHUB_TOKEN`) raises that

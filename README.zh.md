@@ -8,7 +8,7 @@ agent、tools、MCP、ACP、TUI 与官方同一套，额外支持第三方模型
 
 命令行二进制是 **`groky`**，可以和官方 `grok` 并存。
 
-最新版本：[v0.1.21](https://github.com/yuWorm/groky/releases/tag/v0.1.21)
+最新版本：[v0.1.23](https://github.com/yuWorm/groky/releases/tag/v0.1.23)
 
 ## 安装
 
@@ -19,18 +19,29 @@ curl -fsSL https://raw.githubusercontent.com/yuWorm/groky/main/scripts/install-g
 groky --version
 ```
 
-二进制在 `~/.groky/bin/groky`。groky 自己的配置在 `~/.groky/`
+Windows x86_64（在 PowerShell 中运行）：
+
+```powershell
+irm https://raw.githubusercontent.com/yuWorm/groky/main/scripts/install-groky.ps1 | iex
+groky --version
+```
+
+Windows 安装器会将 `groky.exe` 放到 `%USERPROFILE%\.groky\bin`，
+并将该目录加入用户 `PATH`。如果提示找不到 `groky`，请重新打开 PowerShell。
+
+
+macOS / Linux 二进制在 `~/.groky/bin/groky`。groky 自己的配置在 `~/.groky/`
 （`config.toml`、`vendor-auth.json`）。第一次启动（以及之后缺文件的升级）
 会从 `~/.grok/` 拷过来；会话、xAI 登录、记忆、技能、插件仍和官方 `grok`
 共用 `~/.grok/`（目录软链 + `GROK_AUTH_PATH`）。`GROK_HOME` 可整棵隔离；
 `GROKY_SKIP_HOME_MIGRATE=1` 跳过拷贝/链接。
 
-- 指定版本：`bash -s 0.1.0`
-- 升级：再跑一遍上面的 `curl | bash`
+- 指定版本：Bash 和 PowerShell 完整命令见 [INSTALL.md](INSTALL.md)
+- 升级：重新运行对应平台的一键安装命令
 - **不要**跑 `curl https://x.ai/cli/install.sh` —— 那会装官方 `grok`
 
-Windows 未包含在 v0.1.0 里（上游 `bin/protoc` 是 Unix 桩）。发版矩阵和后续
-PowerShell 脚本见 [INSTALL.md](INSTALL.md)。
+从 v0.1.23 起提供 Windows x86_64 二进制。发版矩阵和指定版本安装命令见
+[INSTALL.md](INSTALL.md)。
 
 ## 使用
 
@@ -50,7 +61,7 @@ groky
 | Fast 模式（GPT，含自定义 OpenAI 兼容中转站） | `/fast` |
 | 去掉供应商密钥 | `/provider-logout` |
 | 刷新供应商模型列表 | `/sync-models-dev`（别名 `/refresh-models`）；供应商列表 `r`；自定义模型列表 `Ctrl+R` |
-| 更新 groky | `groky update` 或 `groky update --version 0.1.21`（Welcome：ctrl+u） |
+| 更新 groky | `groky update` 或 `groky update --version 0.1.23`（Welcome：ctrl+u） |
 
 xAI 登录未改（`AuthManager`、`~/.grok/auth.json`，与官方 `grok` 共用）。
 第三方密钥不进 `config.toml`，而在 `~/.groky/vendor-auth.json`。供应商

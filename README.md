@@ -9,7 +9,7 @@ plus ChatGPT Codex OAuth.
 
 The CLI binary is **`groky`**. It can sit next to official `grok`.
 
-Latest release: [v0.1.21](https://github.com/yuWorm/groky/releases/tag/v0.1.21)
+Latest release: [v0.1.23](https://github.com/yuWorm/groky/releases/tag/v0.1.23)
 
 ## Install
 
@@ -20,7 +20,19 @@ curl -fsSL https://raw.githubusercontent.com/yuWorm/groky/main/scripts/install-g
 groky --version
 ```
 
-The binary lands in `~/.groky/bin/groky`. groky's own config lives under
+Windows x86_64 (PowerShell):
+
+```powershell
+irm https://raw.githubusercontent.com/yuWorm/groky/main/scripts/install-groky.ps1 | iex
+groky --version
+```
+
+On Windows, the installer places `groky.exe` in `%USERPROFILE%\.groky\bin`
+and adds that directory to your user `PATH`. If `groky` is not found,
+open a new PowerShell window.
+
+
+On macOS and Linux, the binary lands in `~/.groky/bin/groky`. groky's own config lives under
 `~/.groky/` (`config.toml`, `vendor-auth.json`). On first launch (and any
 later upgrade that is still missing a file) groky copies those from
 `~/.grok/` if present, then **shares** sessions, xAI login, memory, skills,
@@ -28,13 +40,12 @@ and plugins with official `grok` via `~/.grok/` (directory links +
 `GROK_AUTH_PATH`). Set `GROK_HOME` to isolate everything; set
 `GROKY_SKIP_HOME_MIGRATE=1` to skip the copy/link step.
 
-- Pin a version: `bash -s 0.1.0`
-- Upgrade: run the same `curl | bash` again
+- Pin a version: see [INSTALL.md](INSTALL.md) for Bash and PowerShell commands
+- Upgrade: run your platform's install command again
 - **Do not** run `curl https://x.ai/cli/install.sh` — that installs official `grok`
 
-Windows is not in v0.1.0 (upstream `bin/protoc` is a Unix stub). See
-[INSTALL.md](INSTALL.md) for the release matrix and the PowerShell script
-for later tags.
+Windows x86_64 binaries are available from v0.1.23. See
+[INSTALL.md](INSTALL.md) for the release matrix and version-pinned installation.
 
 ## Usage
 
@@ -54,7 +65,7 @@ groky
 | Fast mode (GPT, including custom OpenAI-compatible relays) | `/fast` |
 | Drop a vendor key | `/provider-logout` |
 | Refresh vendor model lists | `/sync-models-dev` (alias `/refresh-models`); provider picker `r`; custom model list `Ctrl+R` |
-| Update groky | `groky update` or `groky update --version 0.1.21` (Welcome: ctrl+u) |
+| Update groky | `groky update` or `groky update --version 0.1.23` (Welcome: ctrl+u) |
 
 xAI login is unchanged (`AuthManager`, `~/.grok/auth.json`, shared with
 official `grok`). Third-party keys never go in `config.toml`; they live in
