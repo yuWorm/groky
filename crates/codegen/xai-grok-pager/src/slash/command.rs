@@ -145,10 +145,10 @@ pub struct AppCtx<'a> {
     pub cwd: &'a std::path::Path,
     /// Whether any session announcement (critical or promo) exists; gates `/announcements` visibility.
     pub has_session_announcements: bool,
-    /// Whether the consumer billing surface is visible (`AppView::usage_visible`); gates `/usage` subcommands.
+    /// Whether consumer billing is visible; gates `/usage manage`.
     pub billing_surface_visible: bool,
-    /// Whether `/usage` is offered and executable.
-    /// False for external-auth deployments with no grok.com billing session.
+    /// Whether the original session/Grok usage surface is available.
+    /// False for external-auth deployments; provider quotas remain accessible.
     pub usage_command_visible: bool,
     pub workflows_available: bool,
     /// Saved or built-in workflow definitions advertised by the shell (`_meta.workflowSource`).
@@ -173,10 +173,10 @@ pub struct CommandExecCtx<'a> {
     pub session_id: Option<&'a acp::SessionId>,
     pub bundle_state: &'a BundleState,
     pub(crate) screen_mode: crate::app::ScreenMode,
-    /// Whether the consumer billing surface is visible (`AppView::usage_visible`); gates `/usage` subcommands.
+    /// Whether consumer billing is visible; gates `/usage manage`.
     pub billing_surface_visible: bool,
-    /// Whether `/usage` is offered and executable.
-    /// False for external-auth deployments with no grok.com billing session.
+    /// Whether the original session/Grok usage surface is available.
+    /// False for external-auth deployments; provider quotas remain accessible.
     pub usage_command_visible: bool,
     /// Snapshot of the active agent's PAGER-owned settings, built by the dispatcher when it builds the command.
     /// Slash commands like `/multiline` read this to compute `!current` and dispatch a typed `Action::SetX(new)`.

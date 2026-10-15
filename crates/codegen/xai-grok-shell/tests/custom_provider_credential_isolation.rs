@@ -33,6 +33,8 @@ fn install_provider(id: &str, key: &str, base_url: &str, wire_model: &str) {
             id: id.to_owned(),
             name: id.to_owned(),
             base_url: base_url.to_owned(),
+            platform: Default::default(),
+            usage_base_url: None,
             api_backend: "chat_completions".to_owned(),
             auth_scheme: "bearer".to_owned(),
             anthropic_version: None,

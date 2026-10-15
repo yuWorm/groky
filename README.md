@@ -9,7 +9,7 @@ plus ChatGPT Codex OAuth.
 
 The CLI binary is **`groky`**. It can sit next to official `grok`.
 
-Latest release: [v0.1.23](https://github.com/yuWorm/groky/releases/tag/v0.1.23)
+Latest release: [v0.1.24](https://github.com/yuWorm/groky/releases/tag/v0.1.24)
 
 ## Install
 
@@ -62,11 +62,12 @@ groky
 | Manage multiple ChatGPT Codex accounts | `/provider-accounts` — add, label, select, or remove one account |
 | Claude Pro/Max (not an `sk-ant-` key) | `/provider-login anthropic-claude` |
 | Custom OpenAI-compatible endpoint | `/provider-login` → custom provider |
+| Check subscription / gateway quotas | `/provider-usage` (aliases `/pusage`, `/usage providers`) |
 | Switch model | `/model` |
 | Fast mode (GPT, including custom OpenAI-compatible relays) | `/fast` |
 | Sign out a provider (all its accounts) | `/provider-logout` |
 | Refresh vendor model lists | `/sync-models-dev` (alias `/refresh-models`); provider picker `r`; custom model list `Ctrl+R` |
-| Update groky | `groky update` or `groky update --version 0.1.23` (Welcome: ctrl+u) |
+| Update groky | `groky update` or `groky update --version 0.1.24` (Welcome: ctrl+u) |
 
 xAI login is unchanged (`AuthManager`, `~/.grok/auth.json`, shared with
 official `grok`). Third-party keys never go in `config.toml`; they live in
@@ -81,6 +82,29 @@ a running turn finishes before the change takes effect. Other sessions keep thei
 selection, including on resume. Removing the default leaves no default until you
 choose one. Existing single-account logins migrate automatically. Accounts do not
 rotate automatically or combine subscription quotas.
+
+### Provider quotas
+
+`/provider-usage` lists saved accounts separately, with default and current-session
+markers. Press `r` to refresh. A failed refresh labels any retained snapshot as
+stale; changing credentials or removing an account discards its in-flight results.
+Checking quotas never switches accounts or combines their allowances. For multiple
+keys on the same gateway, add a separate custom provider for each key.
+
+Custom providers have an independent **Platform** choice: Generic, Sub2API, One API,
+or New API. This does not change the inference protocol. Existing providers default
+to Generic; edit them through `/provider-login` and press `Esc` from the model list
+to reach the form. The optional **Usage base URL** is the gateway service root,
+not a full usage endpoint, and must share the inference URL's origin. If omitted,
+groky removes a trailing `/v1` while preserving any path prefix.
+
+| Source | What is shown |
+| --- | --- |
+| Codex | Account-specific usage windows, reset times, and credits when returned. Uses an internal ChatGPT endpoint that may change. |
+| Sub2API / New API | Gateway-reported key, subscription, or wallet allowances, not upstream subscription quotas or local token counts. Missing currency conversion stays in gateway quota units. |
+| One API | Reported limit and usage separately. Public responses cannot establish key vs. account scope, so remaining balance stays unknown. |
+| Claude subscription | Official Settings → Usage link (`o`); no direct OAuth quota query. The browser's signed-in account determines which account that page shows. |
+| Generic | Unsupported until a compatible platform is selected. |
 
 ## What this fork changes
 

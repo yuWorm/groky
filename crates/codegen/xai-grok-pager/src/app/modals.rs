@@ -1654,7 +1654,23 @@ impl AgentView {
                 self.copy_usage_modal_text(&text);
                 InputOutcome::Changed
             }
-            UsageModalOutcome::Changed => InputOutcome::Changed,
+            UsageModalOutcome::RefreshProviderUsage => {
+                InputOutcome::Action(Action::RefreshProviderUsage)
+            }
+            UsageModalOutcome::OpenProviderUsagePage(url) => {
+                InputOutcome::Action(Action::OpenUrl(url))
+            }
+            UsageModalOutcome::Changed => {
+                if matches!(&self.active_modal,
+                    Some(ActiveModal::UsageInfo { state })
+                        if state.active_tab == crate::views::usage_modal::UsageInfoTab::Providers
+                            && state.provider_usage.nonce == 0)
+                {
+                    InputOutcome::Action(Action::RefreshProviderUsage)
+                } else {
+                    InputOutcome::Changed
+                }
+            }
             UsageModalOutcome::Unchanged => InputOutcome::Unchanged,
         }
     }

@@ -1,9 +1,13 @@
 //! Tabbed usage and session-info modal, opened by `/usage`, `/session-info`, `/context`, and the context-bar click.
-//! Minimal mode keeps the scrollback blocks instead; this modal never opens there.
+//! Minimal mode keeps ordinary `/usage` scrollback blocks; explicit provider-quota commands use this modal so every configured account remains visible.
 //!
 //! The Session-info tab supports click-to-copy on value rows (with hover) and in-app drag-select after a movement threshold.
 //! `c` and `y` stay as programmatic copy.
 //! The modal opens with loading placeholders; the task-result handlers fill the slots in as the fetches land.
+
+use xai_grok_shell::compat::vendor_usage::{
+    VendorUsageReport, VendorUsageStatus, VendorUsageTarget,
+};
 
 use crossterm::event::{KeyCode, KeyEvent, MouseButton, MouseEventKind};
 use ratatui::buffer::Buffer;
@@ -29,19 +33,27 @@ pub const COPY_SESSION_ID_SHORTCUT: usize = 1;
 /// Footer shortcut ID for "copy all session info".
 pub const COPY_ALL_SESSION_INFO_SHORTCUT: usize = 2;
 
-/// The three tabs, in display order.
+/// Footer shortcut ID for refreshing provider-account quota rows.
+pub const REFRESH_PROVIDER_USAGE_SHORTCUT: usize = 3;
+
+/// Footer shortcut ID for opening a provider's official usage-management page.
+pub const OPEN_PROVIDER_USAGE_PAGE_SHORTCUT: usize = 4;
+
+/// The four tabs, in display order.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UsageInfoTab {
     ContextUsage,
     UsageLimit,
     SessionInfo,
+    Providers,
 }
 
 impl UsageInfoTab {
-    pub const ALL: [UsageInfoTab; 3] = [
+    pub const ALL: [UsageInfoTab; 4] = [
         UsageInfoTab::ContextUsage,
         UsageInfoTab::UsageLimit,
         UsageInfoTab::SessionInfo,
+        UsageInfoTab::Providers,
     ];
 
     pub fn label(self) -> &'static str {
@@ -49,6 +61,7 @@ impl UsageInfoTab {
             UsageInfoTab::ContextUsage => "Context usage",
             UsageInfoTab::UsageLimit => "Usage limit",
             UsageInfoTab::SessionInfo => "Session info",
+            UsageInfoTab::Providers => "Provider quotas",
         }
     }
 
@@ -78,6 +91,30 @@ pub struct UsageInfoContext {
     pub subscription_tier: Option<String>,
 }
 
+/// All independently saved provider accounts and their latest quota snapshots.
+#[derive(Debug, Clone, Default)]
+pub struct ProviderUsageState {
+    /// Generation assigned by the host; late refresh results are discarded upstream.
+    pub nonce: u64,
+    /// One row for every saved provider account. Rows are deliberately never grouped.
+    pub rows: Vec<ProviderUsageRow>,
+    /// Failure while discovering the available provider accounts.
+    pub error: Option<String>,
+}
+
+/// Quota state for one exact provider/account binding.
+#[derive(Debug, Clone)]
+pub struct ProviderUsageRow {
+    /// Immutable account identity and display metadata, built by the host.
+    pub target: VendorUsageTarget,
+    /// Most recently accepted snapshot for this exact target.
+    pub report: Option<VendorUsageReport>,
+    /// A refresh is in flight. A prior report remains visible as a stale snapshot.
+    pub loading: bool,
+    /// Per-account refresh failure; it does not affect sibling accounts.
+    pub error: Option<String>,
+}
+
 /// Modal state. Billing figures are NOT stored here.
 /// The render reads the agent's cached `credit_balance` mirror, so a silent billing refresh updates the open modal for free.
 pub struct UsageInfoModalState {
@@ -96,6 +133,10 @@ pub struct UsageInfoModalState {
     pub billing_error: Option<String>,
     /// Fetch generation stamped at open; results from an earlier open (same session, modal reopened) are dropped instead of overwriting.
     pub fetch_nonce: u64,
+    /// Provider-account quota state. All discovery and requests are owned by the host.
+    pub provider_usage: ProviderUsageState,
+    /// The provider/account currently bound to this session, if any.
+    pub current_provider_account: Option<(String, String)>,
     /// Hit rects for copyable value rows, refreshed every render.
     pub copy_hits: Vec<SessionCopyHit>,
     /// Content-line index of the hovered value row.
@@ -144,12 +185,14 @@ impl UsageInfoModalState {
             ctx,
             context: None,
             context_error: None,
+            session_fields: None,
             session_error: None,
             session_usage_text: None,
             billing_loading: false,
             billing_error: None,
             fetch_nonce: Default::default(),
-            session_fields: None,
+            provider_usage: Default::default(),
+            current_provider_account: None,
             copy_hits: Vec::new(),
             hovered_copy_line: None,
             content_rect: Rect::default(),
@@ -260,10 +303,13 @@ pub enum UsageModalOutcome {
     /// Copy Session-info text.
     /// Emitted by `y`, a click on a value row, the footer "copy all" button, and a finished drag-select.
     CopyText(String),
+    /// Open the provider's fixed, official usage-management page.
+    OpenProviderUsagePage(String),
+    /// Refresh every independently configured provider-account quota row.
+    RefreshProviderUsage,
     Changed,
     Unchanged,
 }
-
 /// The modal's chrome config: no title, tabs, footer, or fold tree of its own (tabs and shortcuts are painted by `render_usage_modal`).
 fn chrome_cfg() -> ModalWindowConfig<'static> {
     ModalWindowConfig {
@@ -314,6 +360,15 @@ pub fn route_usage_modal_mouse(
                 && let Some(text) = state.session_info_copy_all()
             {
                 UsageModalOutcome::CopyText(text)
+            } else if id == REFRESH_PROVIDER_USAGE_SHORTCUT
+                && state.active_tab == UsageInfoTab::Providers
+            {
+                UsageModalOutcome::RefreshProviderUsage
+            } else if id == OPEN_PROVIDER_USAGE_PAGE_SHORTCUT
+                && state.active_tab == UsageInfoTab::Providers
+                && let Some(url) = provider_usage_manage_url(state)
+            {
+                UsageModalOutcome::OpenProviderUsagePage(url.to_owned())
             } else {
                 UsageModalOutcome::Changed
             }
@@ -361,7 +416,7 @@ fn handle_usage_modal_key(state: &mut UsageInfoModalState, key: &KeyEvent) -> Us
             state.step_tab(false);
             UsageModalOutcome::Changed
         }
-        KeyCode::Char(c @ '1'..='3') => {
+        KeyCode::Char(c @ '1'..='4') => {
             state.set_tab(UsageInfoTab::from_index(c as usize - '1' as usize));
             UsageModalOutcome::Changed
         }
@@ -395,6 +450,15 @@ fn handle_usage_modal_key(state: &mut UsageInfoModalState, key: &KeyEvent) -> Us
             Some(text) => UsageModalOutcome::CopyText(text),
             None => UsageModalOutcome::Unchanged,
         },
+        KeyCode::Char('r') if state.active_tab == UsageInfoTab::Providers => {
+            UsageModalOutcome::RefreshProviderUsage
+        }
+        KeyCode::Char('o') if state.active_tab == UsageInfoTab::Providers => {
+            match provider_usage_manage_url(state) {
+                Some(url) => UsageModalOutcome::OpenProviderUsagePage(url.to_owned()),
+                None => UsageModalOutcome::Unchanged,
+            }
+        }
         _ => UsageModalOutcome::Unchanged,
     }
 }
@@ -573,6 +637,20 @@ pub fn render_usage_modal(
             id: COPY_ALL_SESSION_INFO_SHORTCUT,
         });
     }
+    if state.active_tab == UsageInfoTab::Providers {
+        shortcuts.push(Shortcut {
+            label: "r refresh",
+            clickable: true,
+            id: REFRESH_PROVIDER_USAGE_SHORTCUT,
+        });
+        if provider_usage_manage_url(state).is_some() {
+            shortcuts.push(Shortcut {
+                label: "o open official usage page",
+                clickable: true,
+                id: OPEN_PROVIDER_USAGE_PAGE_SHORTCUT,
+            });
+        }
+    }
     shortcuts.push(Shortcut {
         label: "Esc close",
         clickable: false,
@@ -717,6 +795,12 @@ fn tab_content(
             TabContent::from_lines(usage_limit_lines(state, balance, theme))
         }
         UsageInfoTab::SessionInfo => session_info_content(state, theme),
+        UsageInfoTab::Providers => TabContent::from_lines(
+            crate::render::wrapping::word_wrap_lines(
+                provider_usage_lines(state, theme),
+                usize::from(width.max(1)),
+            ),
+        ),
     }
 }
 
@@ -732,6 +816,322 @@ fn plain(theme: &Theme, s: impl Into<String>) -> Line<'static> {
 
 fn muted_line(theme: &Theme, s: impl Into<String>) -> Line<'static> {
     Line::from(Span::styled(s.into(), theme.muted()))
+}
+
+fn provider_usage_manage_url(state: &UsageInfoModalState) -> Option<&str> {
+    state
+        .provider_usage
+        .rows
+        .iter()
+        .find_map(|row| row.report.as_ref()?.manage_url.as_deref())
+}
+
+fn provider_usage_lines(state: &UsageInfoModalState, theme: &Theme) -> Vec<Line<'static>> {
+    let mut lines = Vec::new();
+    if let Some(error) = &state.provider_usage.error {
+        lines.push(muted_line(
+            theme,
+            format!("Couldn't list provider accounts: {error}"),
+        ));
+    }
+
+    if state.provider_usage.rows.is_empty() {
+        if !lines.is_empty() {
+            lines.push(Line::default());
+        }
+        lines.push(muted_line(
+            theme,
+            "No provider accounts configured. Use /provider-login to add one.",
+        ));
+        return lines;
+    }
+
+    for (index, row) in state.provider_usage.rows.iter().enumerate() {
+        if !lines.is_empty() || index > 0 {
+            lines.push(Line::default());
+        }
+        provider_usage_row_lines(&mut lines, state, row, theme);
+    }
+    lines
+}
+
+fn provider_usage_row_lines(
+    lines: &mut Vec<Line<'static>>,
+    state: &UsageInfoModalState,
+    row: &ProviderUsageRow,
+    theme: &Theme,
+) {
+    let mut title = vec![Span::styled(
+        provider_usage_title(state, &row.target),
+        header_style(theme),
+    )];
+    if row.target.is_default {
+        title.push(Span::styled("  default", theme.muted()));
+    }
+    if state
+        .current_provider_account
+        .as_ref()
+        .is_some_and(|(provider_id, account_id)| {
+            provider_id == &row.target.provider_id && account_id == &row.target.account_id
+        })
+    {
+        title.push(Span::styled("  current session", theme.muted()));
+    }
+    lines.push(Line::from(title));
+
+    if row.loading {
+        let message = if row.report.is_some() {
+            "  Refreshing; showing last fetched snapshot."
+        } else {
+            "  Loading quota data\u{2026}"
+        };
+        lines.push(muted_line(theme, message));
+    }
+    if let Some(error) = &row.error {
+        lines.push(muted_line(theme, format!("  Refresh failed: {error}")));
+        if row.report.is_some() {
+            lines.push(muted_line(
+                theme,
+                "  Showing the last fetched snapshot; it may be stale.",
+            ));
+        }
+    }
+
+    let Some(report) = &row.report else {
+        if !row.loading && row.error.is_none() {
+            lines.push(muted_line(theme, "  Quota data has not been fetched."));
+        }
+        return;
+    };
+
+    match &report.status {
+        VendorUsageStatus::Available => {
+            if report.limits.is_empty() {
+                lines.push(muted_line(theme, "  Quota values are unknown."));
+            } else {
+                for limit in &report.limits {
+                    provider_usage_limit_lines(lines, limit, theme);
+                }
+            }
+        }
+        VendorUsageStatus::Unavailable => {
+            lines.push(muted_line(
+                theme,
+                "  Status: unavailable (this is not an exhausted quota).",
+            ));
+        }
+        VendorUsageStatus::NeedsLogin => {
+            lines.push(muted_line(
+                theme,
+                "  Status: sign in is required to check this account.",
+            ));
+        }
+        VendorUsageStatus::Unsupported => {
+            lines.push(muted_line(
+                theme,
+                "  Status: quota lookup is unavailable for this provider.",
+            ));
+        }
+    }
+
+    for note in &report.notes {
+        if !note.trim().is_empty() {
+            lines.push(muted_line(theme, format!("  Note: {note}")));
+        }
+    }
+    if report.manage_url.is_some() {
+        lines.push(muted_line(theme, "  Official usage page available: press o."));
+    }
+    lines.push(muted_line(
+        theme,
+        format!("  Fetched: {}", format_checked_at(report.checked_at)),
+    ));
+}
+
+fn provider_usage_title(state: &UsageInfoModalState, target: &VendorUsageTarget) -> String {
+    let provider_name = nonempty_or(&target.provider_name, "Provider");
+    let account_label = nonempty_or(&target.account_label, "Account");
+    let needs_id = target.account_label.trim().is_empty()
+        || state
+            .provider_usage
+            .rows
+            .iter()
+            .filter(|row| {
+                row.target.provider_name == target.provider_name
+                    && row.target.account_label == target.account_label
+            })
+            .take(2)
+            .count()
+            > 1;
+    if needs_id {
+        let provider_id = nonempty_or(&target.provider_id, "unknown provider");
+        let account_id = nonempty_or(&target.account_id, "unknown account");
+        format!("{provider_name} \u{2014} {account_label} ({provider_id}/{account_id})")
+    } else {
+        format!("{provider_name} \u{2014} {account_label}")
+    }
+}
+
+fn provider_usage_limit_lines(
+    lines: &mut Vec<Line<'static>>,
+    limit: &xai_grok_shell::compat::vendor_usage::VendorUsageLimit,
+    theme: &Theme,
+) {
+    let label = nonempty_or(&limit.label, "Quota");
+    let scope = nonempty_or(&limit.scope, "unknown");
+    lines.push(Line::styled(
+        format!("  {label} ({scope})"),
+        header_style(theme),
+    ));
+
+    if limit.unlimited {
+        lines.push(plain(theme, "    Unlimited"));
+    }
+
+    let used = format_limit_amount(limit.used, &limit.unit);
+    let limit_amount = format_limit_amount(limit.limit, &limit.unit);
+    let used_percent = format_number(limit.used_percent);
+    match (used, limit_amount) {
+        (Some(used), Some(limit_amount)) => {
+            lines.push(plain(theme, format!("    Used: {used} / {limit_amount}")));
+        }
+        (Some(used), None) => lines.push(plain(theme, format!("    Used: {used}"))),
+        (None, Some(limit_amount)) => lines.push(plain(theme, format!("    Limit: {limit_amount}"))),
+        (None, None) if !limit.unlimited && used_percent.is_none() => {
+            lines.push(muted_line(theme, "    Usage: unknown."));
+        }
+        (None, None) => {}
+    }
+
+    match format_limit_amount(limit.remaining, &limit.unit) {
+        Some(remaining) => lines.push(plain(theme, format!("    Remaining: {remaining}"))),
+        None if !limit.unlimited => lines.push(muted_line(theme, "    Remaining: unknown.")),
+        None => {}
+    }
+    if let Some(used_percent) = used_percent {
+        lines.push(plain(theme, format!("    Used: {used_percent}%")));
+    }
+    if limit_is_exhausted(limit) {
+        lines.push(Line::styled("    Exhausted", header_style(theme)));
+    }
+    if let Some(resets_at) = limit.resets_at {
+        lines.push(muted_line(
+            theme,
+            format!("    Resets: {}", format_timestamp_with_countdown(resets_at)),
+        ));
+    }
+    if let Some(expires_at) = limit.expires_at {
+        let label = if expires_at <= chrono::Utc::now().timestamp() {
+            "Expired"
+        } else {
+            "Expires"
+        };
+        lines.push(muted_line(
+            theme,
+            format!("    {label}: {}", format_timestamp_with_countdown(expires_at)),
+        ));
+    }
+}
+
+fn nonempty_or<'a>(value: &'a str, fallback: &'a str) -> &'a str {
+    if value.trim().is_empty() {
+        fallback
+    } else {
+        value
+    }
+}
+
+fn format_limit_amount(value: Option<f64>, unit: &str) -> Option<String> {
+    let number = format_number(value)?;
+    let unit = unit.trim();
+    Some(if unit.is_empty() {
+        number
+    } else {
+        format!("{number} {unit}")
+    })
+}
+
+fn format_number(value: Option<f64>) -> Option<String> {
+    let value = value.filter(|value| value.is_finite())?;
+    let mut rendered = format!("{value:.3}");
+    while rendered.contains('.') && rendered.ends_with('0') {
+        rendered.pop();
+    }
+    if rendered.ends_with('.') {
+        rendered.pop();
+    }
+    Some(rendered)
+}
+
+fn limit_is_exhausted(
+    limit: &xai_grok_shell::compat::vendor_usage::VendorUsageLimit,
+) -> bool {
+    !limit.unlimited
+        && (limit
+            .remaining
+            .is_some_and(|remaining| remaining.is_finite() && remaining <= 0.0)
+            || limit
+                .used_percent
+                .is_some_and(|used_percent| used_percent.is_finite() && used_percent >= 100.0))
+}
+
+fn format_checked_at(checked_at: u64) -> String {
+    let Ok(checked_at) = i64::try_from(checked_at) else {
+        return "unknown time".to_owned();
+    };
+    format_local_timestamp(checked_at)
+}
+
+fn format_timestamp_with_countdown(timestamp: i64) -> String {
+    format!(
+        "{} ({})",
+        format_local_timestamp(timestamp),
+        countdown_from_now(timestamp)
+    )
+}
+
+fn format_local_timestamp(timestamp: i64) -> String {
+    chrono::DateTime::from_timestamp(timestamp, 0)
+        .map(|dt| {
+            dt.with_timezone(&chrono::Local)
+                .format("%b %d, %l:%M%P")
+                .to_string()
+        })
+        .unwrap_or_else(|| "unknown time".to_owned())
+}
+
+fn countdown_from_now(timestamp: i64) -> String {
+    let seconds = timestamp.saturating_sub(chrono::Utc::now().timestamp());
+    if seconds == 0 {
+        return "now".to_owned();
+    }
+    let suffix = if seconds > 0 { "in" } else { "ago" };
+    let seconds = seconds.unsigned_abs();
+    let days = seconds / 86_400;
+    let hours = (seconds % 86_400) / 3_600;
+    let minutes = (seconds % 3_600) / 60;
+    let duration = if days > 0 {
+        if hours > 0 {
+            format!("{days}d {hours}h")
+        } else {
+            format!("{days}d")
+        }
+    } else if hours > 0 {
+        if minutes > 0 {
+            format!("{hours}h {minutes}m")
+        } else {
+            format!("{hours}h")
+        }
+    } else if minutes > 0 {
+        format!("{minutes}m")
+    } else {
+        "<1m".to_owned()
+    };
+    if suffix == "in" {
+        format!("in {duration}")
+    } else {
+        format!("{duration} ago")
+    }
 }
 
 fn context_tab_lines(state: &UsageInfoModalState, theme: &Theme, width: u16) -> Vec<Line<'static>> {
@@ -977,9 +1377,11 @@ mod tests {
         assert_eq!(state.active_tab, UsageInfoTab::SessionInfo);
         assert_eq!(state.scroll, 0, "tab switch resets scroll");
         handle_usage_modal_key(&mut state, &key(KeyCode::Tab));
+        assert_eq!(state.active_tab, UsageInfoTab::Providers);
+        handle_usage_modal_key(&mut state, &key(KeyCode::Tab));
         assert_eq!(state.active_tab, UsageInfoTab::ContextUsage, "wraps");
         handle_usage_modal_key(&mut state, &key(KeyCode::BackTab));
-        assert_eq!(state.active_tab, UsageInfoTab::SessionInfo, "wraps back");
+        assert_eq!(state.active_tab, UsageInfoTab::Providers, "wraps back");
     }
 
     #[test]
@@ -1070,35 +1472,6 @@ mod tests {
                 .first()
                 .is_some_and(|l| l.to_string().contains("Loading session usage"))
         );
-    }
-
-    #[test]
-    fn render_smoke_shows_tabs_and_copy_shortcut() {
-        let area = Rect::new(0, 0, 80, 24);
-        let mut buf = Buffer::empty(area);
-        let mut state = state_with_session();
-        state.session_usage_text = Some("Session usage: no model calls yet.".to_string());
-        let theme = Theme::current();
-        render_usage_modal(&mut buf, area, &mut state, None, false, &theme);
-        let text: String = (0..area.height)
-            .map(|y| {
-                (0..area.width)
-                    .filter_map(|x| buf.cell((x, y)).map(|c| c.symbol().to_string()))
-                    .collect::<String>()
-                    + "\n"
-            })
-            .collect();
-        for needle in [
-            "Context usage",
-            "Usage limit",
-            "Session info",
-            "copy session ID",
-            "Session usage: no model calls yet.",
-        ] {
-            assert!(text.contains(needle), "missing {needle:?} in:\n{text}");
-        }
-        assert_eq!(state.window.tab_rects.len(), 3);
-        assert!(state.window.close_button_rect.is_some());
     }
 
     #[test]

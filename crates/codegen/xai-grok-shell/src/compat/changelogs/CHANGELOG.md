@@ -1,3 +1,11 @@
+# 0.1.24 — 2026-10-16
+
+## Features
+
+- **Codex accounts** add, label, select, and remove multiple ChatGPT subscriptions with `/provider-accounts`; sessions retain their own account, switches wait for the current turn, and credentials and model catalogs stay isolated without automatic rotation.
+- **Provider quotas** check Codex subscriptions and supported gateways with `/provider-usage`; account-scoped snapshots, reset times, and refresh errors stay separate, stale requests are discarded after credential changes or account removal, and Claude subscriptions link to the official usage page.
+- **Custom providers** select Generic, Sub2API, One API, or New API independently of the inference protocol, with an optional same-origin usage service root; gateway quota units and unknown remaining balances are shown without inventing subscription allowances.
+
 # 0.1.23 — 2026-10-15
 
 ## Bug Fixes

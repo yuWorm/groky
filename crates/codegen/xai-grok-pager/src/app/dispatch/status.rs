@@ -12,6 +12,9 @@ use crate::app::app_view::{ActiveView, AppView, PendingCodingDataWrite};
 use crate::notifications::{NotificationEvent, NotificationEventKind};
 use crate::scrollback::block::RenderBlock;
 use crate::settings::CodingDataSharingLock;
+use xai_grok_shell::compat::vendor_usage::{
+    VendorUsageReport, report_is_current, usage_targets,
+};
 
 /// Temporary kill switch: client share links are disabled.
 pub(super) fn dispatch_share_session(app: &mut AppView) -> Vec<Effect> {
@@ -39,7 +42,7 @@ pub(super) fn usage_modal_state_mut(
 }
 
 /// Open (or re-tab) the usage/session-info modal and fire the fetch effects that populate it.
-/// Full-TUI only; minimal mode keeps scrollback blocks.
+/// Explicit provider quotas also use this modal in minimal mode.
 pub(super) fn open_usage_info_modal(
     app: &mut AppView,
     tab: crate::views::usage_modal::UsageInfoTab,
@@ -67,7 +70,10 @@ pub(super) fn open_usage_info_modal(
         return vec![];
     }
 
-    let billing_reachable = usage_visible && !agent.chat_kind && redirect_url.is_none();
+    let billing_reachable = usage_visible
+        && !app.has_external_auth_provider
+        && !agent.chat_kind
+        && redirect_url.is_none();
     let nonce = next_usage_fetch_nonce();
     let mut state = UsageInfoModalState::new(
         tab,
@@ -124,8 +130,10 @@ fn open_dashboard_usage_modal(
     use crate::views::usage_modal::{UsageInfoContext, UsageInfoModalState};
 
     let chat_kind = app.chat_mode;
-    let billing_reachable =
-        app.usage_visible && !chat_kind && app.usage_billing_redirect_url.is_none();
+    let billing_reachable = app.usage_visible
+        && !app.has_external_auth_provider
+        && !chat_kind
+        && app.usage_billing_redirect_url.is_none();
     let ctx = UsageInfoContext {
         session_id: None,
         usage_visible: app.usage_visible,
@@ -150,6 +158,131 @@ fn open_dashboard_usage_modal(
     }
     dashboard.usage_modal = Some(Box::new(state));
     effects
+}
+
+pub(super) fn dispatch_show_provider_usage(app: &mut AppView) -> Vec<Effect> {
+    let mut effects = open_usage_info_modal(
+        app,
+        crate::views::usage_modal::UsageInfoTab::Providers,
+    );
+    effects.extend(dispatch_refresh_provider_usage(app));
+    effects
+}
+
+fn provider_usage_modal_mut(
+    app: &mut AppView,
+    agent_id: Option<AgentId>,
+) -> Option<&mut crate::views::usage_modal::UsageInfoModalState> {
+    match agent_id {
+        Some(id) => app.agents.get_mut(&id).and_then(usage_modal_state_mut),
+        None => app.dashboard.as_mut()?.usage_modal.as_deref_mut(),
+    }
+}
+
+pub(super) fn dispatch_refresh_provider_usage(app: &mut AppView) -> Vec<Effect> {
+    use crate::views::usage_modal::ProviderUsageRow;
+
+    let agent_id = match app.active_view {
+        ActiveView::Agent(id) => Some(id),
+        ActiveView::AgentDashboard => None,
+        _ => return vec![],
+    };
+    let current = agent_id.and_then(|id| {
+        let models = &app.agents.get(&id)?.session.models;
+        let model_id = models.current.as_ref()?;
+        let (provider_id, _) = model_id.0.split_once('/')?;
+        let account_id = models.available.get(model_id)
+            .and_then(|info| info.meta.as_ref())
+            .and_then(|meta| meta.get("grokyAccountId"))
+            .and_then(serde_json::Value::as_str);
+        // Codex sessions are pinned: absence must not become the global default.
+        if provider_id == "openai-codex" {
+            Some((provider_id.to_owned(), account_id?.to_owned()))
+        } else {
+            Some((provider_id.to_owned(), "default".to_owned()))
+        }
+    });
+    let Some(state) = provider_usage_modal_mut(app, agent_id) else {
+        return vec![];
+    };
+    if state.provider_usage.rows.iter().any(|row| row.loading) {
+        return vec![];
+    }
+    state.current_provider_account = current;
+    let nonce = next_usage_fetch_nonce();
+    state.provider_usage.nonce = nonce;
+    state.provider_usage.error = None;
+    let targets = match usage_targets() {
+        Ok(targets) => targets,
+        Err(error) => {
+            state.provider_usage.rows.clear();
+            state.provider_usage.error = Some(error);
+            return vec![];
+        }
+    };
+    let mut previous = std::mem::take(&mut state.provider_usage.rows);
+    let mut effects = Vec::with_capacity(targets.len());
+    for target in targets {
+        // A display label/default may change independently of account identity.
+        // Revalidate the credential and configuration before retaining a snapshot.
+        let report = previous.iter_mut()
+            .find(|row| row.target.provider_id == target.provider_id
+                && row.target.account_id == target.account_id)
+            .and_then(|row| row.report.take())
+            .filter(report_is_current);
+        effects.push(Effect::FetchProviderUsage {
+            agent_id,
+            nonce,
+            target: target.clone(),
+        });
+        state.provider_usage.rows.push(ProviderUsageRow {
+            target,
+            report,
+            loading: true,
+            error: None,
+        });
+    }
+    effects
+}
+
+pub(super) fn handle_provider_usage_result(
+    app: &mut AppView,
+    agent_id: Option<AgentId>,
+    nonce: u64,
+    report: VendorUsageReport,
+) -> Vec<Effect> {
+    let Some(state) = provider_usage_modal_mut(app, agent_id) else {
+        return vec![];
+    };
+    if state.provider_usage.nonce != nonce {
+        return vec![];
+    }
+    let Some(row) = state.provider_usage.rows.iter_mut().find(|row| {
+        row.target.provider_id == report.target.provider_id
+            && row.target.account_id == report.target.account_id
+    }) else {
+        return vec![];
+    };
+    row.loading = false;
+    if !report_is_current(&report) {
+        row.report = None;
+        row.error = Some("Account or provider changed; refresh to reload.".to_owned());
+    } else if report.status == xai_grok_shell::compat::vendor_usage::VendorUsageStatus::Unavailable
+        && row.report.as_ref().is_some_and(|previous| {
+            previous.status == xai_grok_shell::compat::vendor_usage::VendorUsageStatus::Available
+                && report_is_current(previous)
+        })
+    {
+        row.error = Some(if report.notes.is_empty() {
+            "Quota query failed; showing the last successful snapshot.".to_owned()
+        } else {
+            report.notes.join(" ")
+        });
+    } else {
+        row.error = None;
+        row.report = Some(report);
+    }
+    vec![]
 }
 
 /// `/session-info`: open the usage modal on its "Session info" tab, or fetch-and-show in scrollback in minimal mode.

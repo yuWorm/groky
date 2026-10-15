@@ -8,7 +8,7 @@ agent、tools、MCP、ACP、TUI 与官方同一套，额外支持第三方模型
 
 命令行二进制是 **`groky`**，可以和官方 `grok` 并存。
 
-最新版本：[v0.1.23](https://github.com/yuWorm/groky/releases/tag/v0.1.23)
+最新版本：[v0.1.24](https://github.com/yuWorm/groky/releases/tag/v0.1.24)
 
 ## 安装
 
@@ -58,11 +58,12 @@ groky
 | 管理多个 ChatGPT Codex 账号 | `/provider-accounts` —— 添加、备注、选择或移除单个账号 |
 | Claude Pro/Max（不是 `sk-ant-`） | `/provider-login anthropic-claude` |
 | 自定义 OpenAI 兼容端点 | `/provider-login` → 自定义供应商 |
+| 查询订阅 / 网关额度 | `/provider-usage`（别名 `/pusage`、`/usage providers`） |
 | 切换模型 | `/model` |
 | Fast 模式（GPT，含自定义 OpenAI 兼容中转站） | `/fast` |
 | 退出供应商的所有账号 | `/provider-logout` |
 | 刷新供应商模型列表 | `/sync-models-dev`（别名 `/refresh-models`）；供应商列表 `r`；自定义模型列表 `Ctrl+R` |
-| 更新 groky | `groky update` 或 `groky update --version 0.1.23`（Welcome：ctrl+u） |
+| 更新 groky | `groky update` 或 `groky update --version 0.1.24`（Welcome：ctrl+u） |
 
 xAI 登录未改（`AuthManager`、`~/.grok/auth.json`，与官方 `grok` 共用）。
 第三方密钥不进 `config.toml`，而在 `~/.groky/vendor-auth.json`。供应商
@@ -74,6 +75,26 @@ Codex 各账号分别保存凭据和模型目录。在 `/provider-accounts` 中�
 正在执行的一轮会先完成，再应用切换。其他会话及恢复后的会话保留各自选择。
 删除默认账号后须手动选择，不会自动改用另一个账号。旧版单账号登录会自动迁移。
 不自动轮换账号，也不合并订阅额度。
+
+### 供应商额度
+
+`/provider-usage` 分别列出已保存的账号，标明默认账号和当前会话账号，按 `r`
+刷新。刷新失败时，保留的旧数据会标记为过期快照；更换凭据或删除账号后，会丢弃
+该账号尚未返回的旧请求结果。查询不会切换账号或合并额度。同一个网关有多个
+API key 时，为每个 key 添加独立的自定义供应商。
+
+自定义供应商可独立选择 **Platform**：Generic、Sub2API、One API、New API，
+不影响推理协议。旧配置默认 Generic；通过 `/provider-login` 编辑，在模型列表
+按 `Esc` 返回表单。可选的 **Usage base URL** 填网关服务根地址，不是完整用量接口，
+且必须与推理地址同源。留空时仅去掉末尾 `/v1`，保留其他路径前缀。
+
+| 来源 | 展示内容与限制 |
+| --- | --- |
+| Codex | 各账号的用量窗口、重置时间及服务端返回的 credits。使用 ChatGPT 内部接口，接口变化可能影响兼容性。 |
+| Sub2API / New API | 网关返回的 key、订阅或钱包额度，不等同于上游订阅额度或本地 token 统计；缺少货币换算信息时保留网关额度单位。 |
+| One API | 分别展示返回的上限和已用量。公开响应无法确定是 key 还是账号范围，因此不推算剩余额度。 |
+| Claude 订阅 | 按 `o` 打开官方 Settings → Usage，不直接用 OAuth 查询额度；网页实际显示的是浏览器当前登录的账号。 |
+| Generic | 选择兼容的平台类型后才能查询。 |
 
 ## 相对官方改了什么
 

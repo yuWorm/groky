@@ -656,6 +656,9 @@ pub(super) fn dispatch_task_result(result: TaskResult, app: &mut AppView) -> Vec
             }
             vec![]
         }
+        TaskResult::ProviderUsageFetched { agent_id, nonce, report } => {
+            super::status::handle_provider_usage_result(app, agent_id, nonce, *report)
+        }
         TaskResult::GateRefreshed { settings } => handle_gate_refreshed(app, settings),
         TaskResult::SessionLoaded {
             agent_id,

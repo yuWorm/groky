@@ -24,6 +24,4 @@ Voice: `**Lead** rest.` Lead is the noun the user already knows (`/default`, `Re
 
 ### Unreleased
 
-Next groky version after `v0.1.23`.
-
-- **Codex accounts** add, label, select, and remove multiple ChatGPT subscriptions with `/provider-accounts`; sessions retain their own account, switches wait for the current turn, and credentials and model catalogs stay isolated without automatic rotation.
+Next groky version after `v0.1.24`.

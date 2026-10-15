@@ -1,7 +1,5 @@
-//! `/usage` shows session token and cost totals; consumer accounts can also manage billing.
-//!
-//! External-auth deployments (`auth_provider_command`) never reach grok.com billing.
-//! [`AppCtx::usage_command_visible`] hides and refuses the command there.
+//! `/usage` shows session totals, Grok billing, or account-scoped provider quotas.
+//! External-auth deployments may query vendor quotas but never grok.com billing.
 
 use crate::app::actions::Action;
 use crate::slash::command::{
@@ -50,57 +48,67 @@ impl SlashCommand for UsageCommand {
     slash_meta! {
         name: "usage",
         aliases: ["cost"],
-        description: "View usage",
-        usage: "/usage [show|manage]",
+        description: "View usage and provider quotas",
+        usage: "/usage [show|providers|manage]",
         takes_args: true,
     }
 
-    fn visible(&self, ctx: &AppCtx) -> bool {
-        ctx.usage_command_visible
-    }
-
-    fn takes_args_now(&self, ctx: &AppCtx) -> bool {
-        // Non-consumer accounts get bare `/usage` only; Enter should send, not chain for args
-        ctx.usage_command_visible && ctx.billing_surface_visible
-    }
-
     fn suggest_args(&self, ctx: &AppCtx, _args_query: &str) -> Option<Vec<ArgItem>> {
-        if !ctx.usage_command_visible || !ctx.billing_surface_visible {
-            return None;
-        }
-        Some(vec![
-            ArgItem {
+        let mut items = vec![ArgItem {
+            display: "providers".into(),
+            match_text: "providers".into(),
+            insert_text: "providers".into(),
+            description: "View quotas for saved provider accounts".into(),
+        }];
+        if ctx.usage_command_visible {
+            items.push(ArgItem {
                 display: "show".into(),
                 match_text: "show".into(),
                 insert_text: "show".into(),
-                description: "View usage".into(),
-            },
-            ArgItem {
-                display: "manage".into(),
-                match_text: "manage".into(),
-                insert_text: "manage".into(),
-                description: "Manage billing".into(),
-            },
-        ])
+                description: "View session usage".into(),
+            });
+            if ctx.billing_surface_visible {
+                items.push(ArgItem {
+                    display: "manage".into(),
+                    match_text: "manage".into(),
+                    insert_text: "manage".into(),
+                    description: "Manage Grok billing".into(),
+                });
+            }
+        }
+        Some(items)
     }
 
     fn run(&self, ctx: &mut CommandExecCtx, args: &str) -> CommandResult {
-        if !ctx.usage_command_visible {
-            return CommandResult::Error("/usage is not available.".into());
+        match args.trim() {
+            "providers" => CommandResult::Action(Action::ShowProviderUsage),
+            "" if !ctx.usage_command_visible => CommandResult::Action(Action::ShowProviderUsage),
+            "" | "show" if ctx.usage_command_visible => CommandResult::Action(Action::ShowUsage),
+            "manage" if ctx.usage_command_visible && ctx.billing_surface_visible => {
+                CommandResult::Action(Action::ManageBilling)
+            }
+            _ => CommandResult::Error(
+                "Use /usage providers, /usage show, or /usage manage (Grok billing only).".into(),
+            ),
         }
-        let arg = args.trim();
-        if !ctx.billing_surface_visible {
-            return match arg {
-                "" => CommandResult::Action(Action::ShowUsage),
-                _ => CommandResult::Error(format!("Unknown argument: {arg}. Use /usage")),
-            };
-        }
-        match arg {
-            "" | "show" => CommandResult::Action(Action::ShowUsage),
-            "manage" => CommandResult::Action(Action::ManageBilling),
-            _ => CommandResult::Error(format!(
-                "Unknown argument: {arg}. Use /usage show or /usage manage"
-            )),
+    }
+}
+
+pub struct ProviderUsageCommand;
+
+impl SlashCommand for ProviderUsageCommand {
+    slash_meta! {
+        name: "provider-usage",
+        aliases: ["pusage"],
+        description: "View quotas for all saved provider accounts",
+        usage: "/provider-usage",
+    }
+
+    fn run(&self, _ctx: &mut CommandExecCtx, args: &str) -> CommandResult {
+        if args.trim().is_empty() {
+            CommandResult::Action(Action::ShowProviderUsage)
+        } else {
+            CommandResult::Error("Use /provider-usage without arguments.".into())
         }
     }
 }

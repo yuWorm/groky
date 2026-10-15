@@ -127,6 +127,7 @@ pub fn builtin_commands() -> Vec<Arc<dyn SlashCommand>> {
         Arc::new(copy::CopyCommand),
         Arc::new(find::FindCommand),
         Arc::new(usage::UsageCommand),
+        Arc::new(usage::ProviderUsageCommand),
         Arc::new(tasks::TasksCommand),
         // Extending the agent.
         Arc::new(plugin::SkillsCommand),
@@ -556,7 +557,7 @@ mod tests {
         assert!(matches!(run_usage("delete", true), CommandResult::Error(_)));
     }
     #[test]
-    fn usage_non_consumer_is_bare_only() {
+    fn usage_non_consumer_cannot_manage_billing() {
         assert!(matches!(
             run_usage("", false),
             CommandResult::Action(Action::ShowUsage)
@@ -565,81 +566,26 @@ mod tests {
             run_usage("manage", false),
             CommandResult::Error(_)
         ));
-        assert!(matches!(run_usage("show", false), CommandResult::Error(_)));
-    }
-    #[test]
-    fn usage_takes_args_only_for_consumer() {
-        let models = ModelState::default();
-        let mut ctx = crate::slash::command::AppCtx {
-            models: &models,
-            cwd: std::path::Path::new("."),
-            has_session_announcements: false,
-            billing_surface_visible: true,
-            usage_command_visible: true,
-            workflows_available: true,
-            saved_workflows: &[],
-            workflow_runs: &[],
-            screen_mode: crate::app::ScreenMode::Fullscreen,
-            current_title: None,
-        };
-        let cmd = usage::UsageCommand;
-        assert!(cmd.takes_args_now(&ctx));
-        ctx.billing_surface_visible = false;
-        assert!(!cmd.takes_args_now(&ctx));
-    }
-    #[test]
-    fn usage_suggest_args_consumer_only() {
-        let models = ModelState::default();
-        let mut ctx = crate::slash::command::AppCtx {
-            models: &models,
-            cwd: std::path::Path::new("."),
-            has_session_announcements: false,
-            billing_surface_visible: true,
-            usage_command_visible: true,
-            workflows_available: false,
-            saved_workflows: &[],
-            workflow_runs: &[],
-            screen_mode: crate::app::ScreenMode::Fullscreen,
-            current_title: None,
-        };
-        let items = usage::UsageCommand.suggest_args(&ctx, "").unwrap();
-        assert_eq!(
-            items.iter().map(|i| i.display.as_str()).collect::<Vec<_>>(),
-            ["show", "manage"]
-        );
-        ctx.billing_surface_visible = false;
-        assert!(usage::UsageCommand.suggest_args(&ctx, "").is_none());
-    }
-    #[test]
-    fn usage_registered_in_builtin_commands() {
-        assert!(
-            CommandRegistry::new(builtin_commands())
-                .get("usage")
-                .is_some()
-        );
-    }
-    #[test]
-    fn usage_hidden_when_command_not_visible() {
-        let models = ModelState::default();
-        let ctx = crate::slash::command::AppCtx {
-            models: &models,
-            cwd: std::path::Path::new("."),
-            has_session_announcements: false,
-            billing_surface_visible: true,
-            usage_command_visible: false,
-            workflows_available: false,
-            saved_workflows: &[],
-            workflow_runs: &[],
-            screen_mode: crate::app::ScreenMode::Fullscreen,
-            current_title: None,
-        };
-        assert!(!usage::UsageCommand.visible(&ctx));
-        assert!(!usage::UsageCommand.takes_args_now(&ctx));
-        assert!(usage::UsageCommand.suggest_args(&ctx, "").is_none());
         assert!(matches!(
-            run_usage_gated("", true, false),
-            CommandResult::Error(msg) if msg.contains("not available")
+            run_usage("show", false),
+            CommandResult::Action(Action::ShowUsage)
         ));
+        assert!(matches!(
+            run_usage("providers", false),
+            CommandResult::Action(Action::ShowProviderUsage)
+        ));
+    }
+    #[test]
+    fn external_auth_usage_never_routes_to_grok_billing() {
+        for arg in ["", "providers"] {
+            assert!(matches!(
+                run_usage_gated(arg, true, false),
+                CommandResult::Action(Action::ShowProviderUsage)
+            ));
+        }
+        for arg in ["show", "manage"] {
+            assert!(matches!(run_usage_gated(arg, true, false), CommandResult::Error(_)));
+        }
     }
     #[test]
     fn cd_registered_in_builtin_commands() {

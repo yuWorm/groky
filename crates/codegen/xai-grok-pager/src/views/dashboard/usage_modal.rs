@@ -6,6 +6,7 @@
 use crossterm::event::{Event, KeyEventKind};
 
 use super::state::DashboardState;
+use crate::app::actions::Action;
 use crate::app::app_view::InputOutcome;
 use crate::views::usage_modal::{
     UsageModalOutcome, route_usage_modal_key, route_usage_modal_mouse,
@@ -49,7 +50,22 @@ impl DashboardState {
                 self.copy_usage_modal_text(&text);
                 InputOutcome::Changed
             }
-            UsageModalOutcome::Changed => InputOutcome::Changed,
+            UsageModalOutcome::RefreshProviderUsage => {
+                InputOutcome::Action(Action::RefreshProviderUsage)
+            }
+            UsageModalOutcome::OpenProviderUsagePage(url) => {
+                InputOutcome::Action(Action::OpenUrl(url))
+            }
+            UsageModalOutcome::Changed => {
+                if self.usage_modal.as_ref().is_some_and(|state| {
+                    state.active_tab == crate::views::usage_modal::UsageInfoTab::Providers
+                        && state.provider_usage.nonce == 0
+                }) {
+                    InputOutcome::Action(Action::RefreshProviderUsage)
+                } else {
+                    InputOutcome::Changed
+                }
+            }
             UsageModalOutcome::Unchanged => InputOutcome::Unchanged,
         }
     }

@@ -21,6 +21,7 @@ use crate::views::modal_window::{
     ModalSizing, ModalWindowConfig, ModalWindowOutcome, ModalWindowState, Shortcut,
     handle_modal_key, handle_modal_mouse, render_modal_window,
 };
+use xai_grok_shell::compat::custom::CustomPlatform;
 
 const SHORTCUT_SUBMIT: usize = 1;
 const SHORTCUT_CANCEL: usize = 2;
@@ -35,11 +36,19 @@ const SHORTCUT_RENAME_ACCOUNT: usize = 10;
 const SHORTCUT_REMOVE_ACCOUNT: usize = 11;
 const ADD_CUSTOM_ID: &str = "__add_custom__";
 const PROTOCOLS: &[&str] = &["chat_completions", "responses", "messages"];
+const PLATFORMS: &[CustomPlatform] = &[
+    CustomPlatform::Generic,
+    CustomPlatform::Sub2Api,
+    CustomPlatform::OneApi,
+    CustomPlatform::NewApi,
+];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CustomField {
     Name,
     BaseUrl,
+    Platform,
+    UsageBaseUrl,
     Protocol,
     Key,
 }
@@ -50,6 +59,8 @@ struct CustomDraft {
     id: Option<String>,
     name: LineEditor,
     base_url: LineEditor,
+    platform: usize,
+    usage_base_url: LineEditor,
     key: LineEditor,
     protocol: usize,
     field: CustomField,
@@ -235,6 +246,8 @@ impl CustomDraft {
             id: None,
             name: LineEditor::default(),
             base_url,
+            platform: 0,
+            usage_base_url: LineEditor::default(),
             key: LineEditor::default(),
             protocol: 0,
             field: CustomField::Name,
@@ -251,10 +264,18 @@ impl CustomDraft {
         name.set_text(&provider.name);
         let mut base_url = LineEditor::default();
         base_url.set_text(&provider.base_url);
+        let mut usage_base_url = LineEditor::default();
+        if let Some(url) = provider.usage_base_url.as_deref() {
+            usage_base_url.set_text(url);
+        }
         let mut key_ed = LineEditor::default();
         if !key.is_empty() {
             key_ed.set_text(key);
         }
+        let platform = PLATFORMS
+            .iter()
+            .position(|platform| *platform == provider.platform)
+            .unwrap_or(0);
         let protocol = PROTOCOLS
             .iter()
             .position(|p| *p == provider.api_backend.as_str())
@@ -269,6 +290,8 @@ impl CustomDraft {
             id: Some(provider.id),
             name,
             base_url,
+            platform,
+            usage_base_url,
             key: key_ed,
             protocol,
             field: CustomField::Name,
@@ -284,17 +307,26 @@ impl CustomDraft {
         match self.field {
             CustomField::Name => Some(&mut self.name),
             CustomField::BaseUrl => Some(&mut self.base_url),
+            CustomField::UsageBaseUrl => Some(&mut self.usage_base_url),
             CustomField::Key => Some(&mut self.key),
-            CustomField::Protocol => None,
+            CustomField::Platform | CustomField::Protocol => None,
         }
     }
 
     fn cycle_field(&mut self, forward: bool) {
-        self.field = match (self.field, forward) {
-            (CustomField::Name, true) | (CustomField::Key, false) => CustomField::BaseUrl,
-            (CustomField::BaseUrl, true) | (CustomField::Name, false) => CustomField::Protocol,
-            (CustomField::Protocol, true) | (CustomField::BaseUrl, false) => CustomField::Key,
-            (CustomField::Key, true) | (CustomField::Protocol, false) => CustomField::Name,
+        const ORDER: [CustomField; 6] = [
+            CustomField::Name,
+            CustomField::BaseUrl,
+            CustomField::Platform,
+            CustomField::UsageBaseUrl,
+            CustomField::Protocol,
+            CustomField::Key,
+        ];
+        let index = ORDER.iter().position(|field| *field == self.field).unwrap_or(0);
+        self.field = if forward {
+            ORDER[(index + 1) % ORDER.len()]
+        } else {
+            ORDER[(index + ORDER.len() - 1) % ORDER.len()]
         };
     }
 
@@ -802,6 +834,8 @@ pub(crate) enum VendorLoginOutcome {
         base_url: String,
         api_backend: String,
         auth_scheme: String,
+        platform: CustomPlatform,
+        usage_base_url: Option<String>,
         key: String,
         models: Vec<xai_grok_shell::compat::custom::CustomModel>,
     },
@@ -1688,11 +1722,15 @@ pub(crate) fn handle_vendor_login_mouse(
             draft.field = match idx {
                 0 => CustomField::Name,
                 1 => CustomField::BaseUrl,
-                2 => CustomField::Protocol,
-                3 => CustomField::Key,
+                2 => CustomField::Platform,
+                3 => CustomField::UsageBaseUrl,
+                4 => CustomField::Protocol,
+                5 => CustomField::Key,
                 _ => return VendorLoginOutcome::Unchanged,
             };
-            if draft.field == CustomField::Protocol {
+            if draft.field == CustomField::Platform {
+                draft.platform = (draft.platform + 1) % PLATFORMS.len();
+            } else if draft.field == CustomField::Protocol {
                 draft.protocol = (draft.protocol + 1) % PROTOCOLS.len();
             }
             return VendorLoginOutcome::Changed;
@@ -1839,12 +1877,16 @@ fn handle_custom_form_key(state: &mut VendorLoginState, key: &KeyEvent) -> Vendo
                 draft.cycle_field(false);
                 VendorLoginOutcome::Changed
             }
+            KeyCode::Left if draft.field == CustomField::Platform => {
+                draft.platform = (draft.platform + PLATFORMS.len() - 1) % PLATFORMS.len();
+                VendorLoginOutcome::Changed
+            }
+            KeyCode::Right if draft.field == CustomField::Platform => {
+                draft.platform = (draft.platform + 1) % PLATFORMS.len();
+                VendorLoginOutcome::Changed
+            }
             KeyCode::Left if draft.field == CustomField::Protocol => {
-                if draft.protocol > 0 {
-                    draft.protocol -= 1;
-                } else {
-                    draft.protocol = PROTOCOLS.len() - 1;
-                }
+                draft.protocol = (draft.protocol + PROTOCOLS.len() - 1) % PROTOCOLS.len();
                 VendorLoginOutcome::Changed
             }
             KeyCode::Right if draft.field == CustomField::Protocol => {
@@ -1992,6 +2034,24 @@ fn handle_custom_models_key(state: &mut VendorLoginState, key: &KeyEvent) -> Ven
     }
 }
 
+fn validate_custom_form(draft: &CustomDraft) -> Result<(), String> {
+    let name = draft.name.text().trim();
+    let base_url = draft.base_url.text().trim();
+    if name.is_empty() || base_url.len() < 8 {
+        return Err("Name and base URL are required".into());
+    }
+    let usage_base_url = draft.usage_base_url.text().trim();
+    if !usage_base_url.is_empty() {
+        xai_grok_shell::compat::custom::validate_usage_base_url(base_url, usage_base_url)?;
+    }
+    Ok(())
+}
+
+fn optional_usage_base_url(draft: &CustomDraft) -> Option<String> {
+    let usage_base_url = draft.usage_base_url.text().trim();
+    (!usage_base_url.is_empty()).then(|| usage_base_url.to_owned())
+}
+
 fn submit_custom_sync(state: &mut VendorLoginState) -> VendorLoginOutcome {
     let Some(draft) = state.custom.as_ref() else {
         return VendorLoginOutcome::Unchanged;
@@ -2005,8 +2065,8 @@ fn submit_custom_sync(state: &mut VendorLoginState) -> VendorLoginOutcome {
     {
         key = stored;
     }
-    if name.is_empty() || base_url.len() < 8 {
-        state.error = Some("Name and base URL are required".into());
+    if let Err(error) = validate_custom_form(draft) {
+        state.error = Some(error);
         return VendorLoginOutcome::Changed;
     }
     let api_backend = PROTOCOLS[draft.protocol].to_owned();
@@ -2030,10 +2090,8 @@ fn skip_to_custom_models(state: &mut VendorLoginState) -> VendorLoginOutcome {
     let Some(draft) = state.custom.as_ref() else {
         return VendorLoginOutcome::Unchanged;
     };
-    let name = draft.name.text().trim().to_owned();
-    let base_url = draft.base_url.text().trim().to_owned();
-    if name.is_empty() || base_url.len() < 8 {
-        state.error = Some("Name and base URL are required".into());
+    if let Err(error) = validate_custom_form(draft) {
+        state.error = Some(error);
         return VendorLoginOutcome::Changed;
     }
     state.probing = false;
@@ -2309,8 +2367,14 @@ fn submit_custom_save(state: &mut VendorLoginState) -> VendorLoginOutcome {
         state.error = Some("Enable at least one model".into());
         return VendorLoginOutcome::Changed;
     }
+    if let Err(error) = validate_custom_form(draft) {
+        state.error = Some(error);
+        return VendorLoginOutcome::Changed;
+    }
     let name = draft.name.text().trim().to_owned();
     let base_url = draft.base_url.text().trim().to_owned();
+    let platform = PLATFORMS[draft.platform];
+    let usage_base_url = optional_usage_base_url(draft);
     let key = draft.key.text().trim().to_owned();
     let api_backend = PROTOCOLS[draft.protocol].to_owned();
     let auth_scheme = if api_backend == "messages" {
@@ -2326,6 +2390,8 @@ fn submit_custom_save(state: &mut VendorLoginState) -> VendorLoginOutcome {
         base_url,
         api_backend,
         auth_scheme,
+        platform,
+        usage_base_url,
         key,
         models,
     }
@@ -2752,6 +2818,8 @@ fn render_custom_form(buf: &mut Buffer, area: Rect, state: &VendorLoginState, th
     let fields = [
         (CustomField::Name, "Name", false),
         (CustomField::BaseUrl, "Base URL", false),
+        (CustomField::Platform, "Platform", false),
+        (CustomField::UsageBaseUrl, "Usage base URL (optional)", false),
         (CustomField::Protocol, "Protocol", false),
         (CustomField::Key, "API key", true),
     ];
@@ -2761,48 +2829,44 @@ fn render_custom_form(buf: &mut Buffer, area: Rect, state: &VendorLoginState, th
             break;
         }
         let focused = draft.field == *field;
-        if *field == CustomField::Protocol {
-            let bg = if focused {
-                theme.bg_visual
-            } else {
-                theme.bg_base
-            };
-            let row = Rect {
-                x: area.x,
-                y,
-                width: area.width,
-                height: 1,
-            };
-            buf.set_style(row, Style::default().bg(bg));
-            let value = PROTOCOLS[draft.protocol];
-            let line = format!("Protocol: {value}   ←/→");
-            buf.set_span(
-                area.x,
-                y,
-                &Span::styled(
-                    truncate_str(&line, area.width as usize),
-                    Style::default().fg(theme.text_primary).bg(bg),
-                ),
-                area.width,
-            );
-        } else {
-            let editor = match field {
-                CustomField::Name => &draft.name,
-                CustomField::BaseUrl => &draft.base_url,
-                CustomField::Key => &draft.key,
-                CustomField::Protocol => continue,
-            };
-            render_labeled_input(buf, area, y, label, editor, focused, *mask, theme);
+        match field {
+            CustomField::Platform => {
+                render_cycle_row(buf, area, y, label, PLATFORMS[draft.platform].label(), focused, theme);
+            }
+            CustomField::Protocol => {
+                render_cycle_row(buf, area, y, label, PROTOCOLS[draft.protocol], focused, theme);
+            }
+            CustomField::Name => {
+                render_labeled_input(buf, area, y, label, &draft.name, focused, *mask, theme);
+            }
+            CustomField::BaseUrl => {
+                render_labeled_input(buf, area, y, label, &draft.base_url, focused, *mask, theme);
+            }
+            CustomField::UsageBaseUrl => {
+                render_labeled_input(
+                    buf,
+                    area,
+                    y,
+                    label,
+                    &draft.usage_base_url,
+                    focused,
+                    *mask,
+                    theme,
+                );
+            }
+            CustomField::Key => {
+                render_labeled_input(buf, area, y, label, &draft.key, focused, *mask, theme);
+            }
         }
     }
-    let hint_y = area.y + 8;
+    let hint_y = area.y + 12;
     if hint_y < area.y + area.height {
         let hint = if state.probing {
             "Fetching /models…"
         } else if let Some(err) = &state.error {
             err.as_str()
         } else {
-            "Tab fields · Enter sync · ^Enter skip list"
+            "Usage URL is optional and must share Base URL origin · Tab fields · Enter sync · ^Enter skip list"
         };
         let style = if state.error.is_some() {
             Style::default().fg(theme.accent_error)
@@ -3716,28 +3780,42 @@ mod tests {
     }
 
     #[test]
-    fn custom_form_tab_and_protocol_cycle() {
+    fn custom_form_tab_and_platform_and_protocol_cycle() {
         let mut state = VendorLoginState::custom_form();
         assert_eq!(state.custom.as_ref().unwrap().field, CustomField::Name);
         let _ = handle_vendor_login_key(&mut state, &key(KeyCode::Tab));
         assert_eq!(state.custom.as_ref().unwrap().field, CustomField::BaseUrl);
         let _ = handle_vendor_login_key(&mut state, &key(KeyCode::Tab));
+        assert_eq!(state.custom.as_ref().unwrap().field, CustomField::Platform);
+        let platform = state.custom.as_ref().unwrap().platform;
+        let _ = handle_vendor_login_key(&mut state, &key(KeyCode::Right));
+        assert_eq!(
+            state.custom.as_ref().unwrap().platform,
+            (platform + 1) % PLATFORMS.len()
+        );
+        let _ = handle_vendor_login_key(&mut state, &key(KeyCode::Tab));
+        assert_eq!(state.custom.as_ref().unwrap().field, CustomField::UsageBaseUrl);
+        let _ = handle_vendor_login_key(&mut state, &key(KeyCode::Tab));
         assert_eq!(state.custom.as_ref().unwrap().field, CustomField::Protocol);
-        let start = state.custom.as_ref().unwrap().protocol;
+        let protocol = state.custom.as_ref().unwrap().protocol;
         let _ = handle_vendor_login_key(&mut state, &key(KeyCode::Right));
         assert_eq!(
             state.custom.as_ref().unwrap().protocol,
-            (start + 1) % PROTOCOLS.len()
+            (protocol + 1) % PROTOCOLS.len()
         );
         assert_eq!(PROTOCOLS[1], "responses");
     }
 
     #[test]
-    fn custom_form_sync_and_toggle_models() {
+    fn custom_form_sync_and_save_preserve_platform_and_usage_url() {
         let mut state = VendorLoginState::custom_form();
         let _ = handle_vendor_login_paste(&mut state, "Acme");
         let _ = handle_vendor_login_key(&mut state, &key(KeyCode::Tab));
         let _ = handle_vendor_login_paste(&mut state, "acme.example/v1");
+        let _ = handle_vendor_login_key(&mut state, &key(KeyCode::Tab));
+        let _ = handle_vendor_login_key(&mut state, &key(KeyCode::Right));
+        let _ = handle_vendor_login_key(&mut state, &key(KeyCode::Tab));
+        let _ = handle_vendor_login_paste(&mut state, "https://acme.example/usage");
         let _ = handle_vendor_login_key(&mut state, &key(KeyCode::Tab));
         let _ = handle_vendor_login_key(&mut state, &key(KeyCode::Tab));
         let _ = handle_vendor_login_paste(&mut state, "sk-test");
@@ -3771,10 +3849,17 @@ mod tests {
         match handle_vendor_login_key(&mut state, &key(KeyCode::Enter)) {
             VendorLoginOutcome::SaveCustom {
                 provider_id,
+                platform,
+                usage_base_url,
                 models,
                 ..
             } => {
                 assert!(provider_id.is_none());
+                assert_eq!(platform, CustomPlatform::Sub2Api);
+                assert_eq!(
+                    usage_base_url.as_deref(),
+                    Some("https://acme.example/usage")
+                );
                 assert!(!models[0].enabled);
                 assert!(models[1].enabled);
             }
@@ -3887,13 +3972,57 @@ mod tests {
         }
     }
 
+    #[test]
+    fn custom_edit_restores_platform_and_usage_url() {
+        let draft = CustomDraft::from_provider(
+            xai_grok_shell::compat::custom::CustomProvider {
+                id: "acme".into(),
+                name: "Acme".into(),
+                base_url: "https://acme.example/prefix/v1".into(),
+                platform: CustomPlatform::NewApi,
+                usage_base_url: Some("https://acme.example/prefix".into()),
+                api_backend: "responses".into(),
+                auth_scheme: "bearer".into(),
+                anthropic_version: None,
+                models: Vec::new(),
+            },
+            "",
+        );
+
+        assert_eq!(PLATFORMS[draft.platform], CustomPlatform::NewApi);
+        assert_eq!(
+            draft.usage_base_url.text(),
+            "https://acme.example/prefix"
+        );
+    }
+
     fn fill_custom_form(state: &mut VendorLoginState) {
         let _ = handle_vendor_login_paste(state, "Acme");
         let _ = handle_vendor_login_key(state, &key(KeyCode::Tab));
         let _ = handle_vendor_login_paste(state, "acme.example/v1");
-        let _ = handle_vendor_login_key(state, &key(KeyCode::Tab));
-        let _ = handle_vendor_login_key(state, &key(KeyCode::Tab));
+        for _ in 0..4 {
+            let _ = handle_vendor_login_key(state, &key(KeyCode::Tab));
+        }
         let _ = handle_vendor_login_paste(state, "sk-test");
+    }
+
+    #[test]
+    fn custom_form_rejects_cross_origin_usage_url() {
+        let mut state = VendorLoginState::custom_form();
+        fill_custom_form(&mut state);
+        let _ = handle_vendor_login_key(&mut state, &key(KeyCode::BackTab));
+        let _ = handle_vendor_login_key(&mut state, &key(KeyCode::BackTab));
+        assert_eq!(state.custom.as_ref().unwrap().field, CustomField::UsageBaseUrl);
+        let _ = handle_vendor_login_paste(&mut state, "https://other.example/usage");
+
+        let out = handle_vendor_login_key(&mut state, &key(KeyCode::Enter));
+
+        assert!(matches!(out, VendorLoginOutcome::Changed));
+        assert_eq!(
+            state.error.as_deref(),
+            Some("Usage base URL must use the same scheme, host, and port as Base URL")
+        );
+        assert!(!state.probing);
     }
 
     #[test]

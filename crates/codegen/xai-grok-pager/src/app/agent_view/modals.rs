@@ -73,6 +73,8 @@ fn map_vendor_login_outcome(
             base_url,
             api_backend,
             auth_scheme,
+            platform,
+            usage_base_url,
             key,
             models,
         } => InputOutcome::Action(Action::SaveVendorCustom {
@@ -81,6 +83,8 @@ fn map_vendor_login_outcome(
             base_url,
             api_backend,
             auth_scheme,
+            platform,
+            usage_base_url,
             key,
             models,
         }),

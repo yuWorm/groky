@@ -1,7 +1,7 @@
 //! User-defined providers (`$GROK_HOME/vendor-providers.json`, default `~/.groky`).
 //!
-//! Specs (name, base URL, protocol, enabled models) live here. Secrets
-//! stay in `vendor-auth.json`. Nothing is written to `config.toml`.
+//! Specs (name, inference and usage URLs, platform, protocol, enabled models)
+//! live here. Secrets stay in `vendor-auth.json`. Nothing is written to `config.toml`.
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -30,11 +30,37 @@ struct FileShape {
     providers: BTreeMap<String, CustomProvider>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum CustomPlatform {
+    #[default]
+    Generic,
+    Sub2Api,
+    OneApi,
+    NewApi,
+}
+
+impl CustomPlatform {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Generic => "Generic",
+            Self::Sub2Api => "Sub2API",
+            Self::OneApi => "One API",
+            Self::NewApi => "New API",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CustomProvider {
     pub id: String,
     pub name: String,
     pub base_url: String,
+    #[serde(default)]
+    pub platform: CustomPlatform,
+    /// Optional same-origin service root for platform-specific usage endpoints.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage_base_url: Option<String>,
     pub api_backend: String,
     pub auth_scheme: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -86,6 +112,26 @@ impl CustomProvider {
 
     pub fn auth_scheme(&self) -> AuthScheme {
         parse_auth_scheme(&self.auth_scheme)
+    }
+
+    /// Returns the validated service root for a platform usage endpoint.
+    ///
+    /// Without an explicit root, retain any path prefix from the inference URL
+    /// and remove only its trailing `/v1`.
+    pub fn usage_service_root(&self) -> Result<String, String> {
+        if let Some(usage_base_url) = self
+            .usage_base_url
+            .as_deref()
+            .map(str::trim)
+            .filter(|url| !url.is_empty())
+        {
+            validate_usage_base_url(&self.base_url, usage_base_url)?;
+            return Ok(normalize_base_url(usage_base_url));
+        }
+
+        let root = derive_usage_service_root(&self.base_url);
+        validate_http_url(&root, "Base URL")?;
+        Ok(root)
     }
 
     pub fn enabled_models(&self) -> impl Iterator<Item = &CustomModel> {
@@ -169,6 +215,46 @@ pub fn unique_id(name: &str) -> String {
 
 pub fn normalize_base_url(url: &str) -> String {
     url.trim().trim_end_matches('/').to_owned()
+}
+
+/// Derives a usage service root without discarding a deployment path prefix.
+pub fn derive_usage_service_root(base_url: &str) -> String {
+    let normalized = normalize_base_url(base_url);
+    normalized
+        .strip_suffix("/v1")
+        .unwrap_or(&normalized)
+        .to_owned()
+}
+
+/// Validates an explicitly configured usage root before an API key can be sent.
+pub fn validate_usage_base_url(
+    inference_base_url: &str,
+    usage_base_url: &str,
+) -> Result<(), String> {
+    let inference = validate_http_url(inference_base_url, "Base URL")?;
+    let usage = validate_http_url(usage_base_url, "Usage base URL")?;
+    if !usage.username().is_empty() || usage.password().is_some() {
+        return Err("Usage base URL must not include user info".into());
+    }
+    if usage.query().is_some() || usage.fragment().is_some() {
+        return Err("Usage base URL must not include a query or fragment".into());
+    }
+    if inference.scheme() != usage.scheme()
+        || inference.host() != usage.host()
+        || inference.port_or_known_default() != usage.port_or_known_default()
+    {
+        return Err("Usage base URL must use the same scheme, host, and port as Base URL".into());
+    }
+    Ok(())
+}
+
+fn validate_http_url(url: &str, label: &str) -> Result<url::Url, String> {
+    let parsed =
+        url::Url::parse(url).map_err(|_| format!("{label} must be a valid HTTP(S) URL"))?;
+    if !matches!(parsed.scheme(), "http" | "https") || parsed.host().is_none() {
+        return Err(format!("{label} must be an HTTP(S) URL with a host"));
+    }
+    Ok(parsed)
 }
 
 pub fn display_name(id: &str) -> Option<String> {
@@ -481,6 +567,14 @@ pub fn stored_secret(id: &str) -> Option<String> {
 pub fn save_custom_provider(spec: CustomProvider, api_key: &str) -> Result<(), VendorLoginError> {
     let mut spec = spec;
     spec.base_url = normalize_base_url(&spec.base_url);
+    spec.usage_base_url = spec
+        .usage_base_url
+        .as_deref()
+        .map(normalize_base_url)
+        .filter(|url| !url.is_empty());
+    if let Some(usage_base_url) = spec.usage_base_url.as_deref() {
+        validate_usage_base_url(&spec.base_url, usage_base_url).map_err(VendorLoginError::Probe)?;
+    }
     if spec.api_backend == "messages" && spec.anthropic_version.is_none() {
         spec.anthropic_version = Some("2023-06-01".into());
     }
@@ -758,9 +852,9 @@ pub fn acp_models_for_custom(
 #[cfg(test)]
 mod tests {
     use super::{
-        CustomModel, CustomProvider, CustomProviderStore, RemoteModel, merge_live_models,
-        merge_one, models_endpoint_candidates, parse_models_json, slugify,
-        vendor_model_display_name,
+        CustomModel, CustomPlatform, CustomProvider, CustomProviderStore, RemoteModel,
+        derive_usage_service_root, merge_live_models, merge_one, models_endpoint_candidates,
+        parse_models_json, slugify, validate_usage_base_url, vendor_model_display_name,
     };
     use indexmap::IndexMap;
     use xai_grok_sampling_types::ApiBackend;
@@ -870,6 +964,8 @@ mod tests {
                 id: "acme".into(),
                 name: "Acme".into(),
                 base_url: "https://acme.example/v1".into(),
+                platform: CustomPlatform::NewApi,
+                usage_base_url: Some("https://acme.example/gateway".into()),
                 api_backend: "responses".into(),
                 auth_scheme: "bearer".into(),
                 anthropic_version: None,
@@ -889,7 +985,56 @@ mod tests {
         let provider = store.get("acme").unwrap();
         assert_eq!(provider.name, "Acme");
         assert_eq!(provider.api_backend(), ApiBackend::Responses);
+        assert_eq!(provider.platform, CustomPlatform::NewApi);
+        assert_eq!(
+            provider.usage_base_url.as_deref(),
+            Some("https://acme.example/gateway")
+        );
         assert_eq!(provider.models[0].api_model, "acme-large");
+    }
+
+    #[test]
+    fn legacy_provider_defaults_to_generic_platform() {
+        let provider: CustomProvider = serde_json::from_str(
+            r#"{
+                "id": "legacy",
+                "name": "Legacy",
+                "base_url": "https://gateway.example/prefix/v1",
+                "api_backend": "chat_completions",
+                "auth_scheme": "bearer"
+            }"#,
+        )
+        .unwrap();
+
+        assert_eq!(provider.platform, CustomPlatform::Generic);
+        assert_eq!(provider.usage_base_url, None);
+        assert_eq!(
+            provider.usage_service_root().unwrap(),
+            "https://gateway.example/prefix"
+        );
+    }
+
+    #[test]
+    fn usage_service_root_keeps_path_prefix_and_rejects_other_origins() {
+        assert_eq!(
+            derive_usage_service_root("https://gateway.example/prefix/v1/"),
+            "https://gateway.example/prefix"
+        );
+        assert!(validate_usage_base_url(
+            "https://gateway.example/prefix/v1",
+            "https://gateway.example/prefix"
+        )
+        .is_ok());
+        assert!(validate_usage_base_url(
+            "https://gateway.example/prefix/v1",
+            "https://other.example/prefix"
+        )
+        .is_err());
+        assert!(validate_usage_base_url(
+            "https://gateway.example/prefix/v1",
+            "https://gateway.example/prefix?token=secret"
+        )
+        .is_err());
     }
 
     #[test]
@@ -908,6 +1053,8 @@ mod tests {
             id: "acme".into(),
             name: "Acme".into(),
             base_url: "https://acme.example/v1".into(),
+            platform: CustomPlatform::Generic,
+            usage_base_url: None,
             api_backend: "chat_completions".into(),
             auth_scheme: "bearer".into(),
             anthropic_version: None,
@@ -954,6 +1101,8 @@ mod tests {
             id: "openai".into(),
             name: "OpenAI".into(),
             base_url: "https://api.openai.com/v1".into(),
+            platform: CustomPlatform::Generic,
+            usage_base_url: None,
             api_backend: "chat_completions".into(),
             auth_scheme: "bearer".into(),
             anthropic_version: None,
@@ -982,6 +1131,8 @@ mod tests {
             id: "openai".into(),
             name: "OpenAI".into(),
             base_url: "https://api.openai.com/v1".into(),
+            platform: CustomPlatform::Generic,
+            usage_base_url: None,
             api_backend: "chat_completions".into(),
             auth_scheme: "bearer".into(),
             anthropic_version: None,
@@ -1009,6 +1160,8 @@ mod tests {
             id: "acme".into(),
             name: "Acme".into(),
             base_url: "https://acme.example/v1".into(),
+            platform: CustomPlatform::Generic,
+            usage_base_url: None,
             api_backend: "chat_completions".into(),
             auth_scheme: "bearer".into(),
             anthropic_version: None,

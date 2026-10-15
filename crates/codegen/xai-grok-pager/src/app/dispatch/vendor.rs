@@ -6,7 +6,7 @@ use crate::app::actions::{Action, Effect};
 use crate::app::app_view::{AppView, InputOutcome};
 use crate::views::vendor_login_modal::{VendorLoginOutcome, VendorLoginState};
 use agent_client_protocol as acp;
-use xai_grok_shell::compat::custom::CustomModel;
+use xai_grok_shell::compat::custom::{CustomModel, CustomPlatform};
 use xai_grok_shell::sampling::types::{
     REASONING_EFFORT_META_KEY, REASONING_EFFORTS_META_KEY, SUPPORTS_REASONING_EFFORT_META_KEY,
     parse_reasoning_effort_meta, reasoning_effort_meta_value, reasoning_efforts_meta_value,
@@ -76,6 +76,8 @@ fn map_vendor_login_outcome(outcome: VendorLoginOutcome) -> InputOutcome {
             base_url,
             api_backend,
             auth_scheme,
+            platform,
+            usage_base_url,
             key,
             models,
         } => InputOutcome::Action(Action::SaveVendorCustom {
@@ -84,6 +86,8 @@ fn map_vendor_login_outcome(outcome: VendorLoginOutcome) -> InputOutcome {
             base_url,
             api_backend,
             auth_scheme,
+            platform,
+            usage_base_url,
             key,
             models,
         }),
@@ -219,6 +223,8 @@ pub(super) fn dispatch_save_vendor_custom(
     base_url: String,
     api_backend: String,
     auth_scheme: String,
+    platform: CustomPlatform,
+    usage_base_url: Option<String>,
     key: String,
     models: Vec<CustomModel>,
 ) -> Vec<Effect> {
@@ -232,6 +238,8 @@ pub(super) fn dispatch_save_vendor_custom(
         base_url,
         api_backend,
         auth_scheme,
+        platform,
+        usage_base_url,
         key,
         models,
     }]

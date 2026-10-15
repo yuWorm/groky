@@ -13,6 +13,7 @@ mod probe;
 pub mod reasoning;
 mod self_update;
 mod vendor_models;
+pub mod vendor_usage;
 
 pub use auth_store::{VendorAccountInfo, VendorAuthStore, VendorCredential};
 pub use catalog::{

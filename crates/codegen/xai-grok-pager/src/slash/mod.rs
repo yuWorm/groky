@@ -353,9 +353,9 @@ pub struct SlashController {
     hide_session_scoped: bool,
     /// Offer `/announcements` when session announcements (critical or promo) exist.
     has_session_announcements: bool,
-    /// Consumer billing surface; gates `/usage` subcommands. Default `true`.
+    /// Consumer billing surface; gates `/usage manage`. Default `true`.
     billing_surface_visible: bool,
-    /// Whether `/usage` is offered. Default `true`; cleared for external auth.
+    /// Original session/Grok usage access; external auth still permits provider quotas.
     usage_command_visible: bool,
     workflows_available: bool,
     /// Session run handles for `/workflow` manage-verb autocomplete.

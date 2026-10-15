@@ -394,6 +394,8 @@ pub(crate) fn execute(
             base_url,
             api_backend,
             auth_scheme,
+            platform,
+            usage_base_url,
             key,
             models,
         } => {
@@ -409,6 +411,8 @@ pub(crate) fn execute(
                     base_url,
                     api_backend,
                     auth_scheme,
+                    platform,
+                    usage_base_url,
                     anthropic_version,
                     models,
                 };
@@ -4171,6 +4175,16 @@ pub(crate) fn execute(
                         }
                     }
                 });
+        }
+        Effect::FetchProviderUsage { agent_id, nonce, target } => {
+            tasks.spawn(async move {
+                let report = xai_grok_shell::compat::vendor_usage::fetch_vendor_usage(target).await;
+                TaskResult::ProviderUsageFetched {
+                    agent_id,
+                    nonce,
+                    report: Box::new(report),
+                }
+            });
         }
         Effect::SendFeedback {
             agent_id,

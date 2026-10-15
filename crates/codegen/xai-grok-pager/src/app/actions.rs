@@ -697,6 +697,8 @@ pub enum Action {
         base_url: String,
         api_backend: String,
         auth_scheme: String,
+        platform: xai_grok_shell::compat::custom::CustomPlatform,
+        usage_base_url: Option<String>,
         key: String,
         models: Vec<CustomModel>,
     },
@@ -743,6 +745,10 @@ pub enum Action {
     ShowContextInfo,
     /// `/usage`: session token/cost, plus consumer credits when visible.
     ShowUsage,
+    /// Show account-scoped provider quotas without requiring Grok billing.
+    ShowProviderUsage,
+    /// Refresh every account in the current provider-quota view.
+    RefreshProviderUsage,
     /// `/usage manage`: open consumer billing (a no-op when billing is hidden).
     ManageBilling,
     /// Commit a read-only list of the queued prompts as a system block (`/queue`).
@@ -1904,6 +1910,8 @@ pub enum Effect {
         base_url: String,
         api_backend: String,
         auth_scheme: String,
+        platform: xai_grok_shell::compat::custom::CustomPlatform,
+        usage_base_url: Option<String>,
         key: String,
         models: Vec<CustomModel>,
     },
@@ -2343,6 +2351,12 @@ pub enum Effect {
         session_id: acp::SessionId,
         /// Usage-modal fetch generation; echoed back on the task result.
         nonce: u64,
+    },
+    /// Fetch a single exact provider account for one modal generation.
+    FetchProviderUsage {
+        agent_id: Option<AgentId>,
+        nonce: u64,
+        target: xai_grok_shell::compat::vendor_usage::VendorUsageTarget,
     },
     /// Re-fetch remote settings to check subscription gate.
     RefreshGate,
@@ -3374,6 +3388,11 @@ pub enum TaskResult {
         error: String,
         /// Usage-modal fetch generation (`0` means a background refresh).
         nonce: u64,
+    },
+    ProviderUsageFetched {
+        agent_id: Option<AgentId>,
+        nonce: u64,
+        report: Box<xai_grok_shell::compat::vendor_usage::VendorUsageReport>,
     },
     GateRefreshed {
         settings: Option<xai_grok_shell::util::config::RemoteSettings>,
