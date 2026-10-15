@@ -21,6 +21,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: groky-x86_64-pc-windows-msvc
+          cache-on-failure: true
       - name: Build groky
         shell: bash
         env:

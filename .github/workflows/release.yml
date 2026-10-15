@@ -104,6 +104,8 @@ jobs:
           echo "CXXFLAGS=-march=armv8-a" >> "$GITHUB_ENV"
 
       - name: Build groky
+        # Version normalization uses Bash syntax, including on Windows.
+        shell: bash
         env:
           GROKY_VERSION: ${{ github.event.inputs.tag || github.ref_name }}
         run: |
