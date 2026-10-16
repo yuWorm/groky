@@ -94,6 +94,7 @@ impl ProviderAccounts {
             account_id.clone(),
             AccountSlot {
                 label: account_id.clone(),
+                label_is_custom: false,
                 credential,
             },
         );
@@ -125,15 +126,29 @@ impl ProviderAccounts {
             .map(|account| &account.credential)
     }
 
-    fn upsert(&mut self, account_id: String, credential: VendorCredential) {
+    fn upsert(
+        &mut self,
+        account_id: String,
+        credential: VendorCredential,
+        suggested_label: Option<String>,
+    ) {
+        let suggested_label = suggested_label.filter(|label| !label.trim().is_empty());
         let was_empty = self.accounts.is_empty();
         match self.accounts.get_mut(&account_id) {
-            Some(account) => account.credential = credential,
+            Some(account) => {
+                account.credential = credential;
+                if !account.label_is_custom && account.label == account_id
+                    && let Some(label) = suggested_label
+                {
+                    account.label = label;
+                }
+            }
             None => {
                 self.accounts.insert(
                     account_id.clone(),
                     AccountSlot {
-                        label: account_id.clone(),
+                        label: suggested_label.unwrap_or_else(|| account_id.clone()),
+                        label_is_custom: false,
                         credential,
                     },
                 );
@@ -149,6 +164,9 @@ impl ProviderAccounts {
 struct AccountSlot {
     #[serde(default)]
     label: String,
+    /// Explicit renames stay pinned even when the chosen label is the account id.
+    #[serde(default)]
+    label_is_custom: bool,
     credential: VendorCredential,
 }
 
@@ -385,6 +403,7 @@ impl VendorAuthStore {
             data.provider_accounts_mut(provider_id).upsert(
                 DEFAULT_ACCOUNT_ID.to_owned(),
                 VendorCredential::api_key_slot(key),
+                None,
             );
             Ok(((), true))
         })
@@ -392,6 +411,7 @@ impl VendorAuthStore {
 
     /// Store a provider OAuth token. Codex uses its stable ChatGPT account id
     /// as the slot; all legacy providers remain a `default` singleton.
+    /// A suggested label only fills an untouched account-id label, under the same file lock.
     pub fn set_oauth(
         &mut self,
         provider_id: &str,
@@ -399,12 +419,14 @@ impl VendorAuthStore {
         refresh: Option<String>,
         expires: Option<i64>,
         account_id: Option<String>,
+        suggested_label: Option<String>,
     ) -> io::Result<()> {
         let slot_id = account_slot_id(provider_id, account_id.as_deref());
         self.mutate(|data| {
             data.provider_accounts_mut(provider_id).upsert(
                 slot_id,
                 VendorCredential::oauth_slot(access, refresh, expires, account_id),
+                suggested_label,
             );
             Ok(((), true))
         })
@@ -420,6 +442,7 @@ impl VendorAuthStore {
             accounts.upsert(
                 DEFAULT_ACCOUNT_ID.to_owned(),
                 VendorCredential::connected_slot(),
+                None,
             );
             Ok(((), true))
         })
@@ -470,10 +493,11 @@ impl VendorAuthStore {
             let Some(account) = accounts.accounts.get_mut(account_id) else {
                 return Err(account_not_found(provider_id, account_id));
             };
-            let changed = account.label != label;
-            if changed {
+            let changed = account.label != label || !account.label_is_custom;
+            if account.label != label {
                 account.label = label.to_owned();
             }
+            account.label_is_custom = true;
             Ok(((), changed))
         })
     }
@@ -647,6 +671,81 @@ mod tests {
     }
 
     #[test]
+    fn login_backfills_legacy_default_labels_but_preserves_existing_labels() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("vendor-auth.json");
+        std::fs::write(&path, r#"{"providers":{"openai-codex":{
+            "defaultAccountId":"acct-a","accounts":{
+                "acct-a":{"label":"acct-a","credential":{"type":"oauth","access":"old-a","accountId":"acct-a"}},
+                "acct-b":{"label":"Team","credential":{"type":"oauth","access":"old-b","accountId":"acct-b"}}
+            }
+        }}}"#).unwrap();
+        let mut store = VendorAuthStore::load_from(path.clone()).unwrap();
+        for account_id in ["acct-a", "acct-b"] {
+            store.set_oauth(
+                "openai-codex",
+                "new-access".into(),
+                None,
+                None,
+                Some(account_id.into()),
+                Some("person@example.com".into()),
+            ).unwrap();
+        }
+        let mut store = VendorAuthStore::load_from(path.clone()).unwrap();
+        assert_eq!(store.accounts("openai-codex")[0].label, "person@example.com");
+        assert_eq!(store.accounts("openai-codex")[1].label, "Team");
+        store.set_oauth(
+            "openai-codex",
+            "next-access".into(),
+            None,
+            None,
+            Some("acct-a".into()),
+            None,
+        ).unwrap();
+        let store = VendorAuthStore::load_from(path).unwrap();
+        assert_eq!(store.accounts("openai-codex")[0].label, "person@example.com");
+        assert_eq!(store.default_account_id("openai-codex"), Some("acct-a"));
+    }
+
+    #[test]
+    fn explicit_default_label_survives_stale_login_and_refresh() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("vendor-auth.json");
+        let mut store = VendorAuthStore::load_from(path.clone()).unwrap();
+        store.set_oauth(
+            "openai-codex",
+            "access".into(),
+            None,
+            None,
+            Some("acct-a".into()),
+            None,
+        ).unwrap();
+        let mut stale_login = VendorAuthStore::load_from(path.clone()).unwrap();
+        store.rename_account("openai-codex", "acct-a", "acct-a").unwrap();
+        stale_login.set_oauth(
+            "openai-codex",
+            "new-access".into(),
+            None,
+            None,
+            Some("acct-a".into()),
+            Some("person@example.com".into()),
+        ).unwrap();
+        let mut store = VendorAuthStore::load_from(path.clone()).unwrap();
+        assert_eq!(store.accounts("openai-codex")[0].label, "acct-a");
+        let expected = store.account_credential("openai-codex", "acct-a").unwrap().clone();
+        store.rename_account("openai-codex", "acct-a", "Work").unwrap();
+        assert!(store.replace_account_credential_if_matches(
+            "openai-codex", "acct-a", &expected, oauth("refreshed", "next-refresh", "acct-a"),
+        ).unwrap());
+        let store = VendorAuthStore::load_from(path).unwrap();
+        assert_eq!(store.accounts("openai-codex")[0].label, "Work");
+        assert_eq!(
+            store.account_credential("openai-codex", "acct-a").unwrap().access.as_deref(),
+            Some("refreshed")
+        );
+    }
+
+    #[test]
     fn roundtrip_api_key() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("vendor-auth.json");
@@ -704,13 +803,25 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("vendor-auth.json");
         let mut store = VendorAuthStore::load_from(path).unwrap();
-        store
-            .set_oauth("openrouter", "or-key".into(), None, Some(i64::MAX), None)
+        store.set_oauth(
+            "openrouter",
+            "or-key".into(),
+            None,
+            Some(i64::MAX),
+            None,
+            None,
+        )
             .unwrap();
         assert_eq!(store.api_key("openrouter").as_deref(), Some("or-key"));
 
-        store
-            .set_oauth("openrouter", "or-key".into(), None, Some(1), None)
+        store.set_oauth(
+            "openrouter",
+            "or-key".into(),
+            None,
+            Some(1),
+            None,
+            None,
+        )
             .unwrap();
         assert!(store.api_key("openrouter").is_none());
         assert!(store.has_provider("openrouter"));
@@ -742,32 +853,32 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("vendor-auth.json");
         let mut store = VendorAuthStore::load_from(path).unwrap();
-        store
-            .set_oauth(
-                "openai-codex",
-                "token-a".into(),
-                Some("refresh-a".into()),
-                Some(i64::MAX),
-                Some("acct-a".into()),
-            )
+        store.set_oauth(
+            "openai-codex",
+            "token-a".into(),
+            Some("refresh-a".into()),
+            Some(i64::MAX),
+            Some("acct-a".into()),
+            None,
+        )
             .unwrap();
-        store
-            .set_oauth(
-                "openai-codex",
-                "token-b".into(),
-                Some("refresh-b".into()),
-                Some(i64::MAX),
-                Some("acct-b".into()),
-            )
+        store.set_oauth(
+            "openai-codex",
+            "token-b".into(),
+            Some("refresh-b".into()),
+            Some(i64::MAX),
+            Some("acct-b".into()),
+            None,
+        )
             .unwrap();
-        store
-            .set_oauth(
-                "openai-codex",
-                "new-token-a".into(),
-                Some("new-refresh-a".into()),
-                Some(i64::MAX),
-                Some("acct-a".into()),
-            )
+        store.set_oauth(
+            "openai-codex",
+            "new-token-a".into(),
+            Some("new-refresh-a".into()),
+            Some(i64::MAX),
+            Some("acct-a".into()),
+            None,
+        )
             .unwrap();
 
         assert_eq!(store.default_account_id("openai-codex"), Some("acct-a"));
@@ -791,23 +902,23 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("vendor-auth.json");
         let mut store = VendorAuthStore::load_from(path).unwrap();
-        store
-            .set_oauth(
-                "openai-codex",
-                "token-a".into(),
-                Some("refresh-a".into()),
-                Some(i64::MAX),
-                Some("acct-a".into()),
-            )
+        store.set_oauth(
+            "openai-codex",
+            "token-a".into(),
+            Some("refresh-a".into()),
+            Some(i64::MAX),
+            Some("acct-a".into()),
+            None,
+        )
             .unwrap();
-        store
-            .set_oauth(
-                "openai-codex",
-                "token-b".into(),
-                Some("refresh-b".into()),
-                Some(i64::MAX),
-                Some("acct-b".into()),
-            )
+        store.set_oauth(
+            "openai-codex",
+            "token-b".into(),
+            Some("refresh-b".into()),
+            Some(i64::MAX),
+            Some("acct-b".into()),
+            None,
+        )
             .unwrap();
         store
             .set_default_account("openai-codex", "acct-b")
@@ -836,23 +947,23 @@ mod tests {
         let mut first = VendorAuthStore::load_from(path.clone()).unwrap();
         let mut second = VendorAuthStore::load_from(path.clone()).unwrap();
 
-        first
-            .set_oauth(
-                "openai-codex",
-                "token-a".into(),
-                Some("refresh-a".into()),
-                Some(i64::MAX),
-                Some("acct-a".into()),
-            )
+        first.set_oauth(
+            "openai-codex",
+            "token-a".into(),
+            Some("refresh-a".into()),
+            Some(i64::MAX),
+            Some("acct-a".into()),
+            None,
+        )
             .unwrap();
-        second
-            .set_oauth(
-                "openai-codex",
-                "token-b".into(),
-                Some("refresh-b".into()),
-                Some(i64::MAX),
-                Some("acct-b".into()),
-            )
+        second.set_oauth(
+            "openai-codex",
+            "token-b".into(),
+            Some("refresh-b".into()),
+            Some(i64::MAX),
+            Some("acct-b".into()),
+            None,
+        )
             .unwrap();
 
         let store = VendorAuthStore::load_from(path).unwrap();
@@ -865,23 +976,23 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("vendor-auth.json");
         let mut store = VendorAuthStore::load_from(path).unwrap();
-        store
-            .set_oauth(
-                "openai-codex",
-                "token-a".into(),
-                Some("refresh-a".into()),
-                Some(i64::MAX),
-                Some("acct-a".into()),
-            )
+        store.set_oauth(
+            "openai-codex",
+            "token-a".into(),
+            Some("refresh-a".into()),
+            Some(i64::MAX),
+            Some("acct-a".into()),
+            None,
+        )
             .unwrap();
-        store
-            .set_oauth(
-                "openai-codex",
-                "token-b".into(),
-                Some("refresh-b".into()),
-                Some(i64::MAX),
-                Some("acct-b".into()),
-            )
+        store.set_oauth(
+            "openai-codex",
+            "token-b".into(),
+            Some("refresh-b".into()),
+            Some(i64::MAX),
+            Some("acct-b".into()),
+            None,
+        )
             .unwrap();
         let expected_a = store
             .account_credential("openai-codex", "acct-a")
@@ -909,14 +1020,14 @@ mod tests {
             .account_credential("openai-codex", "acct-a")
             .cloned()
             .unwrap();
-        store
-            .set_oauth(
-                "openai-codex",
-                "newer-a".into(),
-                Some("newer-refresh-a".into()),
-                Some(i64::MAX),
-                Some("acct-a".into()),
-            )
+        store.set_oauth(
+            "openai-codex",
+            "newer-a".into(),
+            Some("newer-refresh-a".into()),
+            Some(i64::MAX),
+            Some("acct-a".into()),
+            None,
+        )
             .unwrap();
         assert!(
             !store

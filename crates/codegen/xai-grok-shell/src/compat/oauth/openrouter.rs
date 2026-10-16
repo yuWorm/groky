@@ -219,7 +219,7 @@ async fn exchange_and_store(verifier: &str, code: &str) -> Result<(), VendorLogi
     let access = exchange_authorization_code(code, verifier).await?;
     probe_api_key(PROVIDER_ID, &access).await?;
     let mut store = VendorAuthStore::default_store()?;
-    store.set_oauth(PROVIDER_ID, access, None, Some(i64::MAX), None)?;
+    store.set_oauth(PROVIDER_ID, access, None, Some(i64::MAX), None, None)?;
     Ok(())
 }
 

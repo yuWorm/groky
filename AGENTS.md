@@ -25,3 +25,5 @@ Voice: `**Lead** rest.` Lead is the noun the user already knows (`/default`, `Re
 ### Unreleased
 
 Next groky version after `v0.1.24`.
+
+- **Codex account labels** use the sign-in email automatically when available, fill untouched account-ID labels on re-login, preserve manual labels and refresh behavior, and show separate account IDs when labels match.

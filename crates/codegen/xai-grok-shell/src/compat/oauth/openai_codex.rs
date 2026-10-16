@@ -270,7 +270,7 @@ fn finish_err(provider_id: &str, err: VendorLoginError) -> Result<(), VendorLogi
 
 async fn exchange_and_store(verifier: &str, code: &str) -> Result<(), VendorLoginError> {
     let token = exchange_authorization_code(code, verifier).await?;
-    persist_token(token)
+    persist_token(&mut VendorAuthStore::default_store()?, token)
 }
 
 struct CodexToken {
@@ -278,6 +278,7 @@ struct CodexToken {
     refresh: String,
     expires: i64,
     account_id: String,
+    email: Option<String>,
 }
 
 async fn exchange_authorization_code(
@@ -353,6 +354,10 @@ fn token_from_json(body: &Value, operation: &str) -> Result<CodexToken, VendorLo
     let account_id = account_id_from_access(access).ok_or_else(|| {
         VendorLoginError::Probe("Failed to extract ChatGPT account id from token".into())
     })?;
+    let email = body
+        .get("id_token")
+        .and_then(Value::as_str)
+        .and_then(|id_token| email_from_id_token(id_token, &account_id));
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
@@ -362,17 +367,18 @@ fn token_from_json(body: &Value, operation: &str) -> Result<CodexToken, VendorLo
         refresh: refresh.to_owned(),
         expires: now.saturating_add(expires_in.max(0)),
         account_id,
+        email,
     })
 }
 
-fn persist_token(token: CodexToken) -> Result<(), VendorLoginError> {
-    let mut store = VendorAuthStore::default_store()?;
+fn persist_token(store: &mut VendorAuthStore, token: CodexToken) -> Result<(), VendorLoginError> {
     store.set_oauth(
         PROVIDER_ID,
         token.access,
         Some(token.refresh),
         Some(token.expires),
         Some(token.account_id),
+        token.email,
     )?;
     Ok(())
 }
@@ -579,10 +585,36 @@ pub(super) fn account_id_from_access(access: &str) -> Option<String> {
         .map(str::to_owned)
 }
 
+/// Display metadata only: account identity still comes from the access token.
+fn email_from_id_token(id_token: &str, account_id: &str) -> Option<String> {
+    let payload = id_token.split('.').nth(1)?;
+    let bytes = decode_jwt_segment(payload)?;
+    let claims: Value = serde_json::from_slice(&bytes).ok()?;
+    if let Some(id) = claims.get(JWT_AUTH_CLAIM).and_then(|auth| auth.get("chatgpt_account_id"))
+        && id.as_str() != Some(account_id)
+    {
+        return None;
+    }
+    let usable_email = |value: &Value| {
+        value.as_str()
+            .map(str::trim)
+            .filter(|email| !email.is_empty() && !email.chars().any(char::is_control))
+            .map(str::to_owned)
+    };
+    claims.get("email").and_then(usable_email).or_else(|| {
+        claims.get("https://api.openai.com/profile")?
+            .get("email")
+            .and_then(usable_email)
+    })
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{account_id_from_access, inject_request_headers, parse_codex_input};
-    use crate::compat::auth_store::VendorCredential;
+    use super::{
+        account_id_from_access, inject_request_headers, parse_codex_input, persist_token,
+        token_from_json,
+    };
+    use crate::compat::auth_store::{VendorAuthStore, VendorCredential};
     use base64::Engine;
     use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 
@@ -593,6 +625,87 @@ mod tests {
                 .as_bytes(),
         );
         format!("{header}.{payload}.sig")
+    }
+
+    fn jwt_with_claims(claims: serde_json::Value) -> String {
+        let header = URL_SAFE_NO_PAD.encode(br#"{"alg":"none"}"#);
+        let payload = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&claims).unwrap());
+        format!("{header}.{payload}.sig")
+    }
+
+    #[test]
+    fn login_uses_email_label_without_merging_accounts() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("vendor-auth.json");
+        let mut store = VendorAuthStore::load_from(path.clone()).unwrap();
+        for account_id in ["acct-personal", "acct-work"] {
+            let token = token_from_json(
+                &serde_json::json!({
+                    "access_token": jwt_with_account(account_id),
+                    "refresh_token": format!("refresh-{account_id}"),
+                    "id_token": jwt_with_claims(serde_json::json!({
+                        "email": "person@example.com"
+                    }))
+                }),
+                "exchange",
+            )
+            .unwrap();
+            persist_token(&mut store, token).unwrap();
+        }
+        let store = VendorAuthStore::load_from(path).unwrap();
+        let accounts = store.accounts("openai-codex");
+        assert_eq!(accounts[0].id, "acct-personal");
+        assert_eq!(accounts[1].id, "acct-work");
+        assert_eq!(accounts[0].label, "person@example.com");
+        assert_eq!(accounts[1].label, "person@example.com");
+        assert_eq!(store.default_account_id("openai-codex"), Some("acct-personal"));
+        assert_eq!(
+            store.account_credential("openai-codex", "acct-work").unwrap().refresh.as_deref(),
+            Some("refresh-acct-work")
+        );
+    }
+
+    #[test]
+    fn optional_identity_metadata_never_blocks_login() {
+        use serde_json::json;
+        let cases = [
+            (json!(jwt_with_claims(json!({
+                "email": " primary@example.com ",
+                "https://api.openai.com/profile": {"email": "fallback@example.com"}
+            }))), "primary@example.com"),
+            (json!(jwt_with_claims(json!({
+                "email": null,
+                "https://api.openai.com/profile": {"email": "fallback@example.com"}
+            }))), "fallback@example.com"),
+            (serde_json::Value::Null, "acct-99"),
+            (json!("not-a-jwt"), "acct-99"),
+            (json!(jwt_with_claims(json!({"email": 42}))), "acct-99"),
+            (json!(jwt_with_claims(json!({"email": "  "}))), "acct-99"),
+            (json!(jwt_with_claims(json!({"email": "bad\u{1b}[31m@example.com"}))), "acct-99"),
+            (json!(jwt_with_claims(json!({
+                "email": "other@example.com",
+                "https://api.openai.com/auth": {"chatgpt_account_id": "another-account"}
+            }))), "acct-99"),
+        ];
+        for (id_token, expected_label) in cases {
+            let dir = tempfile::tempdir().unwrap();
+            let mut store = VendorAuthStore::load_from(dir.path().join("vendor-auth.json")).unwrap();
+            let access = jwt_with_account("acct-99");
+            let token = token_from_json(
+                &json!({
+                    "access_token": access,
+                    "refresh_token": "refresh",
+                    "id_token": id_token
+                }),
+                "exchange",
+            ).unwrap();
+            persist_token(&mut store, token).unwrap();
+            assert_eq!(store.accounts("openai-codex")[0].label, expected_label);
+            assert_eq!(
+                store.account_credential("openai-codex", "acct-99").unwrap().access.as_deref(),
+                Some(access.as_str())
+            );
+        }
     }
 
     #[test]

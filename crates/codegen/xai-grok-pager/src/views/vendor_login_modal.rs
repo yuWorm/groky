@@ -3244,7 +3244,11 @@ fn render_codex_accounts(
     );
 
     let rows_y = area.y.saturating_add(1);
-    let visible = area.height.saturating_sub(1).max(1) as usize;
+    let has_duplicate_labels = state.codex_accounts.iter().enumerate().any(|(index, account)| {
+        state.codex_accounts[index + 1..].iter().any(|other| other.label == account.label)
+    });
+    let row_height = if has_duplicate_labels { 2 } else { 1 };
+    let visible = (area.height.saturating_sub(1) / row_height).max(1) as usize;
     if selected < scroll {
         scroll = selected;
     } else if selected >= scroll.saturating_add(visible) {
@@ -3266,11 +3270,14 @@ fn render_codex_accounts(
         .take(visible)
         .enumerate()
     {
-        let y = rows_y.saturating_add(row_idx as u16);
+        let y = rows_y.saturating_add((row_idx as u16).saturating_mul(row_height));
         if y >= area.y.saturating_add(area.height) {
             break;
         }
         state.row_map.push((y, account_idx));
+        if row_height == 2 && y + 1 < area.y.saturating_add(area.height) {
+            state.row_map.push((y + 1, account_idx));
+        }
         let focused = account_idx == selected;
         let background = if focused {
             Style::default().bg(theme.bg_highlight)
@@ -3278,9 +3285,11 @@ fn render_codex_accounts(
             Style::default()
         };
         if focused {
-            for x in area.x..area.x.saturating_add(area.width) {
-                if let Some(cell) = buf.cell_mut((x, y)) {
-                    cell.set_style(background);
+            for row_y in y..y.saturating_add(row_height).min(area.y.saturating_add(area.height)) {
+                for x in area.x..area.x.saturating_add(area.width) {
+                    if let Some(cell) = buf.cell_mut((x, row_y)) {
+                        cell.set_style(background);
+                    }
                 }
             }
         }
@@ -3342,6 +3351,17 @@ fn render_codex_accounts(
             },
             buf,
         );
+        if row_height == 2 && y + 1 < area.y.saturating_add(area.height) && label != account.id {
+            buf.set_span(
+                area.x,
+                y + 1,
+                &Span::styled(
+                    truncate_str(&account.id, area.width as usize),
+                    background.fg(theme.gray_bright),
+                ),
+                area.width,
+            );
+        }
     }
 }
 

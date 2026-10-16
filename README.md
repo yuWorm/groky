@@ -83,6 +83,13 @@ selection, including on resume. Removing the default leaves no default until you
 choose one. Existing single-account logins migrate automatically. Accounts do not
 rotate automatically or combine subscription quotas.
 
+New Codex logins use the returned email as the account label when available.
+Signing in again fills an untouched account-ID label, but preserves existing
+labels and manual renames; token refresh never changes the label. Missing or
+unusable email metadata does not block login. Accounts with identical labels
+show their account IDs separately in the account manager. Email is display
+metadata only; credentials, model catalogs, and quotas remain keyed by account ID.
+
 ### Provider quotas
 
 `/provider-usage` lists saved accounts separately, with default and current-session

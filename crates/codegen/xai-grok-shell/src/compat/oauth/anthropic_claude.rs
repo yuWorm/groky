@@ -381,6 +381,7 @@ fn persist_token(token: ClaudeToken) -> Result<(), VendorLoginError> {
         Some(token.refresh),
         Some(token.expires),
         token.account_id,
+        None,
     )?;
     Ok(())
 }

@@ -1559,6 +1559,7 @@ mod tests {
             Some("refresh-a".into()),
             Some(i64::MAX),
             Some("account-a".into()),
+            None,
         )
         .unwrap();
         auth.set_oauth(
@@ -1567,6 +1568,7 @@ mod tests {
             Some("refresh-b".into()),
             Some(i64::MAX),
             Some("account-b".into()),
+            None,
         )
         .unwrap();
         auth.set_default_account(CODEX_PROVIDER_ID, "account-b")
@@ -1598,6 +1600,7 @@ mod tests {
             Some("replacement-refresh-a".into()),
             Some(i64::MAX),
             Some("account-a".into()),
+            None,
         )
         .unwrap();
         assert!(!report_is_current_in(&report, &auth, None));
