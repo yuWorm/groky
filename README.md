@@ -9,7 +9,7 @@ plus ChatGPT Codex OAuth.
 
 The CLI binary is **`groky`**. It can sit next to official `grok`.
 
-Latest release: [v0.1.24](https://github.com/yuWorm/groky/releases/tag/v0.1.24)
+Latest release: [v0.1.25](https://github.com/yuWorm/groky/releases/tag/v0.1.25)
 
 ## Install
 
@@ -68,7 +68,7 @@ groky
 | Fast mode (GPT, including custom OpenAI-compatible relays) | `/fast` |
 | Sign out a provider (all its accounts) | `/provider-logout` |
 | Refresh vendor model lists | `/sync-models-dev` (alias `/refresh-models`); provider picker `r`; custom model list `Ctrl+R` |
-| Update groky | `groky update` or `groky update --version 0.1.24` (Welcome: ctrl+u) |
+| Update groky | `groky update` or `groky update --version 0.1.25` (Welcome: ctrl+u) |
 
 xAI login is unchanged (`AuthManager`, `~/.grok/auth.json`, shared with
 official `grok`). Third-party keys never go in `config.toml`; they live in

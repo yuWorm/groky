@@ -32,14 +32,14 @@ Pin a version (downloads `github.com/.../releases/download/...` and does
 **not** call `api.github.com` — useful behind a shared VPN IP):
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/yuWorm/groky/main/scripts/install-groky.sh | bash -s 0.1.24
-groky update --version 0.1.24
+curl -fsSL https://raw.githubusercontent.com/yuWorm/groky/main/scripts/install-groky.sh | bash -s 0.1.25
+groky update --version 0.1.25
 ```
 
 PowerShell:
 
 ```powershell
-$env:GROKY_VERSION="0.1.24"
+$env:GROKY_VERSION="0.1.25"
 irm https://raw.githubusercontent.com/yuWorm/groky/main/scripts/install-groky.ps1 | iex
 Remove-Item Env:GROKY_VERSION
 groky --version

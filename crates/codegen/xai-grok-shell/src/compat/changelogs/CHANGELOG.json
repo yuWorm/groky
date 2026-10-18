@@ -1,4 +1,9 @@
 [
+  {"category": "features", "description": "**Codex account labels** use the sign-in email automatically when available, fill untouched account-ID labels on re-login, preserve manual labels and refresh behavior, and show separate account IDs when labels match.", "breaking_change": false},
+  {"category": "features", "description": "**Custom providers** can be removed from `/provider-login` with `d` or `Delete` and confirmation, deleting their configuration, models, and saved credentials without affecting built-in or other custom providers; in-flight model refreshes do not restore removed providers.", "breaking_change": false},
+  {"category": "features", "description": "**SSH targets** reuse existing SSH configuration with native password, key and agent authentication, held connections, host verification, and opt-in system credential storage through `/ssh` and `groky ssh`.", "breaking_change": false},
+  {"category": "features", "description": "**SSH tools** provide explicit remote read, write, edit, search, run and task controls directly over SSH/SFTP without installing remote groky, with session-scoped grants, selectable defaults, operation approval, immediate workerless revocation and no automatic replay after disconnects.", "breaking_change": false},
+  {"category": "features", "description": "**SSH projects** run workspace tools, Git and project extensions on a private remote worker while keeping the TUI, model requests and provider credentials local, including scoped discovery, remote resume/forks/worktrees and subagent authority.", "breaking_change": false},
   {
     "category": "features",
     "description": "**Codex accounts** add, label, select, and remove multiple ChatGPT subscriptions with `/provider-accounts`; sessions retain their own account, switches wait for the current turn, and credentials and model catalogs stay isolated without automatic rotation.",
