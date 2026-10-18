@@ -62,6 +62,7 @@ groky
 | Manage multiple ChatGPT Codex accounts | `/provider-accounts` — add, label, select, or remove one account |
 | Claude Pro/Max (not an `sk-ant-` key) | `/provider-login anthropic-claude` |
 | Custom OpenAI-compatible endpoint | `/provider-login` → custom provider |
+| Remove a custom provider | `/provider-login` → highlight it → `d` (or `Delete`) → `Enter` to confirm; `Esc` cancels |
 | Check subscription / gateway quotas | `/provider-usage` (aliases `/pusage`, `/usage providers`) |
 | Switch model | `/model` |
 | Fast mode (GPT, including custom OpenAI-compatible relays) | `/fast` |
@@ -73,6 +74,10 @@ xAI login is unchanged (`AuthManager`, `~/.grok/auth.json`, shared with
 official `grok`). Third-party keys never go in `config.toml`; they live in
 `~/.groky/vendor-auth.json`. A vendor 401 asks for `/provider-login`, not
 `/login`.
+
+Removing a custom provider deletes its configuration, models, and saved credentials,
+and refreshes the provider and model pickers. Built-in providers cannot be removed.
+`/provider-logout` only signs out; it keeps custom-provider configuration for later use.
 
 Codex accounts keep separate credentials and model catalogs. In `/provider-accounts`
 (also available through `/provider-login openai-codex`), use `a` to add a login,

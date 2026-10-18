@@ -2524,6 +2524,9 @@ pub(super) fn dispatch_task_result(result: TaskResult, app: &mut AppView) -> Vec
         TaskResult::VendorCustomSaved { provider_id, error } => {
             super::vendor::handle_vendor_login_complete(app, provider_id, error)
         }
+        TaskResult::VendorCustomRemoved { provider_id, error } => {
+            super::vendor::handle_vendor_custom_removed(app, provider_id, error)
+        }
         TaskResult::VendorLogoutComplete {
             provider_id,
             removed,

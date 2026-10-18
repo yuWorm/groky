@@ -34,6 +34,7 @@ const SHORTCUT_TOGGLE_REASONING: usize = 8;
 const SHORTCUT_REFRESH: usize = 9;
 const SHORTCUT_RENAME_ACCOUNT: usize = 10;
 const SHORTCUT_REMOVE_ACCOUNT: usize = 11;
+const SHORTCUT_REMOVE_CUSTOM: usize = 12;
 const ADD_CUSTOM_ID: &str = "__add_custom__";
 const PROTOCOLS: &[&str] = &["chat_completions", "responses", "messages"];
 const PLATFORMS: &[CustomPlatform] = &[
@@ -401,6 +402,12 @@ enum VendorLoginStep {
     CodexConfirmRemove {
         account_id: String,
     },
+    CustomConfirmRemove {
+        provider_id: String,
+        provider_name: String,
+        selected: usize,
+        scroll: usize,
+    },
     Method {
         provider_id: String,
         provider_name: String,
@@ -512,6 +519,7 @@ impl VendorLoginState {
             | VendorLoginStep::CodexAccounts { .. }
             | VendorLoginStep::CodexRename { .. }
             | VendorLoginStep::CodexConfirmRemove { .. }
+            | VendorLoginStep::CustomConfirmRemove { .. }
             | VendorLoginStep::CustomForm
             | VendorLoginStep::CustomModels => return,
         };
@@ -703,6 +711,30 @@ impl VendorLoginState {
         self.enter_codex_accounts();
     }
 
+    pub(crate) fn complete_custom_remove(&mut self, provider_id: &str, error: Option<String>) {
+        if !matches!(&self.step, VendorLoginStep::CustomConfirmRemove { provider_id: pending, .. } if pending == provider_id) {
+            return;
+        }
+        self.probing = false;
+        if let Some(error) = error {
+            self.error = Some(format!("Could not remove provider: {error}"));
+            return;
+        }
+        self.cancel_custom_remove();
+    }
+
+    fn cancel_custom_remove(&mut self) {
+        let VendorLoginStep::CustomConfirmRemove { selected, scroll, .. } = &self.step else {
+            return;
+        };
+        self.step = VendorLoginStep::Pick {
+            selected: *selected,
+            scroll: *scroll,
+        };
+        self.error = None;
+        self.row_map.clear();
+    }
+
 
     fn enter_custom_form(&mut self) {
         self.custom = Some(CustomDraft::new());
@@ -820,6 +852,9 @@ pub(crate) enum VendorLoginOutcome {
     RemoveAccount {
         provider_id: String,
         account_id: String,
+    },
+    RemoveCustom {
+        provider_id: String,
     },
     SyncCustom {
         name: String,
@@ -993,7 +1028,8 @@ fn step_shortcuts(state: &VendorLoginState) -> Vec<Shortcut<'static>> {
                 id: SHORTCUT_CANCEL,
             },
         ],
-        VendorLoginStep::CodexConfirmRemove { .. } => vec![
+        VendorLoginStep::CodexConfirmRemove { .. }
+        | VendorLoginStep::CustomConfirmRemove { .. } => vec![
             Shortcut {
                 label: if state.probing { "…" } else { "Enter remove" },
                 clickable: !state.probing,
@@ -1061,7 +1097,16 @@ fn step_shortcuts(state: &VendorLoginState) -> Vec<Shortcut<'static>> {
         ],
         VendorLoginStep::Pick { .. } => {
             let [submit, refresh, cancel] = pick_shortcuts();
-            vec![submit, refresh, cancel]
+            let mut shortcuts = vec![submit, refresh];
+            if selected_custom_provider(state).is_some() {
+                shortcuts.push(Shortcut {
+                    label: "d remove",
+                    clickable: !state.probing,
+                    id: SHORTCUT_REMOVE_CUSTOM,
+                });
+            }
+            shortcuts.push(cancel);
+            shortcuts
         }
         _ => {
             let [submit, _, cancel] = pick_shortcuts();
@@ -1125,6 +1170,10 @@ pub(crate) fn handle_vendor_login_key(
                 return VendorLoginOutcome::Changed;
             }
             VendorLoginStep::CodexAccounts { .. } => return VendorLoginOutcome::Close,
+            VendorLoginStep::CustomConfirmRemove { .. } => {
+                state.cancel_custom_remove();
+                return VendorLoginOutcome::Changed;
+            }
             VendorLoginStep::CustomModels => {
                 if let Some(draft) = state.custom.as_mut()
                     && draft.search_focused
@@ -1172,6 +1221,10 @@ pub(crate) fn handle_vendor_login_key(
             confirm_codex_remove(state)
         }
         VendorLoginStep::CodexConfirmRemove { .. } => VendorLoginOutcome::Unchanged,
+        VendorLoginStep::CustomConfirmRemove { .. } if key.code == KeyCode::Enter => {
+            confirm_custom_remove(state)
+        }
+        VendorLoginStep::CustomConfirmRemove { .. } => VendorLoginOutcome::Unchanged,
         VendorLoginStep::Method { .. } => handle_method_key(state, key),
         VendorLoginStep::OAuthWait { .. } => handle_oauth_wait_key(state, key),
         VendorLoginStep::Key { .. } => handle_key_form_key(state, key),
@@ -1350,12 +1403,55 @@ fn handle_oauth_wait_key(state: &mut VendorLoginState, key: &KeyEvent) -> Vendor
     }
 }
 
+fn selected_custom_provider(state: &VendorLoginState) -> Option<ProviderRow> {
+    let VendorLoginStep::Pick { selected, .. } = &state.step else {
+        return None;
+    };
+    provider_rows().into_iter().nth(*selected).filter(|row| {
+        row.id != ADD_CUSTOM_ID && xai_grok_shell::compat::provider_by_id(&row.id).is_none()
+    })
+}
+
+fn begin_custom_remove(state: &mut VendorLoginState) -> VendorLoginOutcome {
+    if state.probing {
+        return VendorLoginOutcome::Unchanged;
+    }
+    let Some(provider) = selected_custom_provider(state) else {
+        return VendorLoginOutcome::Unchanged;
+    };
+    let VendorLoginStep::Pick { selected, scroll } = &state.step else {
+        return VendorLoginOutcome::Unchanged;
+    };
+    state.step = VendorLoginStep::CustomConfirmRemove {
+        provider_id: provider.id,
+        provider_name: provider.name,
+        selected: *selected,
+        scroll: *scroll,
+    };
+    state.error = None;
+    state.row_map.clear();
+    VendorLoginOutcome::Changed
+}
+
+fn confirm_custom_remove(state: &mut VendorLoginState) -> VendorLoginOutcome {
+    let VendorLoginStep::CustomConfirmRemove { provider_id, .. } = &state.step else {
+        return VendorLoginOutcome::Unchanged;
+    };
+    let provider_id = provider_id.clone();
+    state.probing = true;
+    state.error = None;
+    VendorLoginOutcome::RemoveCustom { provider_id }
+}
+
 fn handle_pick_key(state: &mut VendorLoginState, key: &KeyEvent) -> VendorLoginOutcome {
     if matches!(key.code, KeyCode::Enter) {
         return confirm_pick(state);
     }
     if matches!(key.code, KeyCode::Char('r') | KeyCode::Char('R')) {
         return VendorLoginOutcome::RefreshCatalog;
+    }
+    if matches!(key.code, KeyCode::Char('d') | KeyCode::Char('D') | KeyCode::Delete) {
+        return begin_custom_remove(state);
     }
     let VendorLoginStep::Pick { selected, scroll } = &mut state.step else {
         return VendorLoginOutcome::Unchanged;
@@ -1410,6 +1506,7 @@ pub(crate) fn handle_vendor_login_paste(
             VendorLoginStep::Pick { .. }
                 | VendorLoginStep::CodexAccounts { .. }
                 | VendorLoginStep::CodexConfirmRemove { .. }
+                | VendorLoginStep::CustomConfirmRemove { .. }
                 | VendorLoginStep::Method { .. }
         )
     {
@@ -1536,6 +1633,10 @@ pub(crate) fn handle_vendor_login_mouse(
                         state.return_to_codex_accounts();
                         return VendorLoginOutcome::Changed;
                     }
+                    VendorLoginStep::CustomConfirmRemove { .. } => {
+                        state.cancel_custom_remove();
+                        return VendorLoginOutcome::Changed;
+                    }
                     VendorLoginStep::CustomModels => {
                         if let Some(draft) = state.custom.as_mut()
                             && draft.search_focused
@@ -1572,6 +1673,7 @@ pub(crate) fn handle_vendor_login_mouse(
                     handle_codex_rename_key(state, &KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
                 }
                 VendorLoginStep::CodexConfirmRemove { .. } => confirm_codex_remove(state),
+                VendorLoginStep::CustomConfirmRemove { .. } => confirm_custom_remove(state),
                 VendorLoginStep::Method { .. } => confirm_method(state),
                 VendorLoginStep::Key { .. } => submit_key(state),
                 VendorLoginStep::OAuthWait { .. } => submit_oauth_code(state),
@@ -1657,6 +1759,9 @@ pub(crate) fn handle_vendor_login_mouse(
         }
         ModalWindowOutcome::ShortcutActivated(SHORTCUT_REMOVE_ACCOUNT) => {
             return begin_codex_remove(state);
+        }
+        ModalWindowOutcome::ShortcutActivated(SHORTCUT_REMOVE_CUSTOM) => {
+            return begin_custom_remove(state);
         }
         ModalWindowOutcome::Handled => return VendorLoginOutcome::Changed,
         _ => {}
@@ -2471,6 +2576,7 @@ fn title_for(state: &VendorLoginState) -> String {
         VendorLoginStep::CodexAccounts { .. } => "ChatGPT Codex accounts".into(),
         VendorLoginStep::CodexRename { .. } => "Label ChatGPT account".into(),
         VendorLoginStep::CodexConfirmRemove { .. } => "Remove ChatGPT account?".into(),
+        VendorLoginStep::CustomConfirmRemove { .. } => "Remove custom provider?".into(),
         VendorLoginStep::CustomForm => {
             if state.custom.as_ref().is_some_and(|d| d.id.is_some()) {
                 "Edit custom provider".into()
@@ -2523,6 +2629,9 @@ pub(crate) fn render_vendor_login_modal(
         }
         VendorLoginStep::CodexConfirmRemove { .. } => {
             render_codex_remove_confirm(buf, areas.content, state, &theme)
+        }
+        VendorLoginStep::CustomConfirmRemove { .. } => {
+            render_custom_remove_confirm(buf, areas.content, state, &theme)
         }
         VendorLoginStep::Method { .. } => render_method_list(buf, areas.content, state, &theme),
         VendorLoginStep::Key { .. } => render_key_form(buf, areas.content, state, &theme),
@@ -3471,6 +3580,37 @@ fn render_codex_remove_confirm(
             );
         }
     }
+}
+
+fn render_custom_remove_confirm(
+    buf: &mut Buffer,
+    area: Rect,
+    state: &VendorLoginState,
+    theme: &Theme,
+) {
+    let VendorLoginStep::CustomConfirmRemove { provider_id, provider_name, .. } = &state.step else {
+        return;
+    };
+    let mut lines = vec![
+        Line::styled(
+            format!("Remove {provider_name} ({provider_id})?"),
+            Style::default().fg(theme.text_primary),
+        ),
+        Line::styled(
+            "Its configuration, models, and saved credentials will be removed.",
+            Style::default().fg(theme.text_secondary),
+        ),
+        Line::styled(
+            "This cannot be undone. Other providers are not affected.",
+            Style::default().fg(theme.text_secondary),
+        ),
+    ];
+    if let Some(error) = &state.error {
+        lines.push(Line::styled(error.as_str(), Style::default().fg(theme.accent_error)));
+    }
+    Paragraph::new(lines)
+        .wrap(ratatui::widgets::Wrap { trim: false })
+        .render(area, buf);
 }
 
 fn render_pick_list(buf: &mut Buffer, area: Rect, state: &mut VendorLoginState, theme: &Theme) {

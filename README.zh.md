@@ -58,6 +58,7 @@ groky
 | 管理多个 ChatGPT Codex 账号 | `/provider-accounts` —— 添加、备注、选择或移除单个账号 |
 | Claude Pro/Max（不是 `sk-ant-`） | `/provider-login anthropic-claude` |
 | 自定义 OpenAI 兼容端点 | `/provider-login` → 自定义供应商 |
+| 删除自定义供应商 | `/provider-login` → 选中供应商 → `d`（或 `Delete`）→ `Enter` 确认；`Esc` 取消 |
 | 查询订阅 / 网关额度 | `/provider-usage`（别名 `/pusage`、`/usage providers`） |
 | 切换模型 | `/model` |
 | Fast 模式（GPT，含自定义 OpenAI 兼容中转站） | `/fast` |
@@ -68,6 +69,9 @@ groky
 xAI 登录未改（`AuthManager`、`~/.grok/auth.json`，与官方 `grok` 共用）。
 第三方密钥不进 `config.toml`，而在 `~/.groky/vendor-auth.json`。供应商
 401 会提示 `/provider-login`，不会跳 `/login`。
+
+删除自定义供应商会一并移除其配置、模型和保存的凭据，并立即刷新供应商与模型列表。
+内置供应商不能删除；`/provider-logout` 仅退出登录，保留自定义供应商配置供以后使用。
 
 Codex 各账号分别保存凭据和模型目录。在 `/provider-accounts` 中（也可通过
 `/provider-login openai-codex` 打开），按 `a` 添加登录、`Enter` 选择、

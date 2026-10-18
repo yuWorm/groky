@@ -430,6 +430,15 @@ pub(crate) fn execute(
                 }
             });
         }
+        Effect::VendorCustomRemove { provider_id } => {
+            tasks.spawn(async move {
+                let result = xai_grok_shell::compat::custom::remove_custom_provider(&provider_id);
+                TaskResult::VendorCustomRemoved {
+                    provider_id,
+                    error: result.err().map(|error| error.to_string()),
+                }
+            });
+        }
         Effect::SyncModelsDev => {
             tasks.spawn(async move {
                 let (count, error) =

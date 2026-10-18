@@ -765,6 +765,8 @@ pub enum Action {
         key: String,
         models: Vec<CustomModel>,
     },
+    /// Delete a manually configured provider and its saved credentials.
+    RemoveVendorCustom { provider_id: String },
     /// Fetch models.dev (reasoning + context/output limits) into `~/.grok`.
     SyncModelsDev,
     /// Cancel an in-progress login that was started from inside a session (`/login` or a 401 re-auth prompt) and return to the previous view.
@@ -1978,6 +1980,7 @@ pub enum Effect {
         key: String,
         models: Vec<CustomModel>,
     },
+    VendorCustomRemove { provider_id: String },
     /// GET https://models.dev/api.json and persist the compact overlay.
     SyncModelsDev,
     /// Refresh the ChatGPT Codex account catalog when its five-minute cache is stale.
@@ -2773,6 +2776,10 @@ pub enum TaskResult {
         error: Option<String>,
     },
     VendorCustomSaved {
+        provider_id: String,
+        error: Option<String>,
+    },
+    VendorCustomRemoved {
         provider_id: String,
         error: Option<String>,
     },

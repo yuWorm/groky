@@ -590,6 +590,21 @@ pub fn save_custom_provider(spec: CustomProvider, api_key: &str) -> Result<(), V
     Ok(())
 }
 
+/// Remove a manually configured provider and all of its saved credentials.
+pub fn remove_custom_provider(provider_id: &str) -> Result<bool, VendorLoginError> {
+    if provider_by_id(provider_id).is_some() {
+        return Err(VendorLoginError::UnknownProvider(provider_id.to_owned()));
+    }
+    let mut catalog = CustomProviderStore::default_store()?;
+    if !catalog.has(provider_id) {
+        return Ok(false);
+    }
+    // Keep the provider editable if credential removal fails.
+    let mut auth = VendorAuthStore::default_store()?;
+    auth.remove(provider_id)?;
+    Ok(catalog.remove(provider_id)?)
+}
+
 pub fn is_custom_provider(id: &str) -> bool {
     #[cfg(test)]
     {
@@ -790,8 +805,8 @@ pub async fn refresh(provider_id: &str) -> Result<usize, VendorLoginError> {
     }
     #[cfg(not(test))]
     {
-        let mut catalog = CustomProviderStore::default_store()?;
-        let Some(mut provider) = catalog.get(provider_id).cloned() else {
+        let catalog = CustomProviderStore::default_store()?;
+        let Some(provider) = catalog.get(provider_id).cloned() else {
             return Ok(0);
         };
         let key = stored_secret(provider_id).unwrap_or_default();
@@ -805,6 +820,12 @@ pub async fn refresh(provider_id: &str) -> Result<usize, VendorLoginError> {
         if listed.is_empty() {
             return Ok(0);
         }
+        // A refresh may finish after the user removed a provider. Never restore
+        // its stale configuration (or overwrite edits made during the request).
+        let mut catalog = CustomProviderStore::default_store()?;
+        let Some(mut provider) = catalog.get(provider_id).cloned() else {
+            return Ok(0);
+        };
         let n = listed.len();
         provider.models = merge_live_models(&provider.models, listed);
         catalog.upsert(provider)?;

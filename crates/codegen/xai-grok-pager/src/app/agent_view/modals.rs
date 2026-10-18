@@ -54,6 +54,9 @@ fn map_vendor_login_outcome(
             provider_id,
             account_id,
         }),
+        VendorLoginOutcome::RemoveCustom { provider_id } => {
+            InputOutcome::Action(Action::RemoveVendorCustom { provider_id })
+        }
         VendorLoginOutcome::SyncCustom {
             name,
             base_url,

@@ -27,6 +27,7 @@ Voice: `**Lead** rest.` Lead is the noun the user already knows (`/default`, `Re
 Next groky version after `v0.1.24`.
 
 - **Codex account labels** use the sign-in email automatically when available, fill untouched account-ID labels on re-login, preserve manual labels and refresh behavior, and show separate account IDs when labels match.
+- **Custom providers** can be removed from `/provider-login` with `d` or `Delete` and confirmation, deleting their configuration, models, and saved credentials without affecting built-in or other custom providers; in-flight model refreshes do not restore removed providers.
 - **SSH targets** reuse existing SSH configuration with native password, key and agent authentication, held connections, host verification, and opt-in system credential storage through `/ssh` and `groky ssh`.
 - **SSH tools** provide explicit remote read, write, edit, search, run and task controls directly over SSH/SFTP without installing remote groky, with session-scoped grants, selectable defaults, operation approval, immediate workerless revocation and no automatic replay after disconnects.
 - **SSH projects** run workspace tools, Git and project extensions on a private remote worker while keeping the TUI, model requests and provider credentials local, including scoped discovery, remote resume/forks/worktrees and subagent authority.

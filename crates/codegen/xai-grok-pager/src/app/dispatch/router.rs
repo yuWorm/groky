@@ -1414,6 +1414,9 @@ fn dispatch_inner(action: Action, app: &mut AppView) -> Vec<Effect> {
             key,
             models,
         ),
+        Action::RemoveVendorCustom { provider_id } => {
+            super::vendor::dispatch_remove_vendor_custom(app, provider_id)
+        }
         Action::SyncModelsDev => super::vendor::dispatch_sync_models_dev(app),
         Action::CancelLogin => dispatch_cancel_login(app),
         Action::SubmitAuthCode(code) => dispatch_submit_auth_code(app, code),

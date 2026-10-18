@@ -57,6 +57,9 @@ fn map_vendor_login_outcome(outcome: VendorLoginOutcome) -> InputOutcome {
             provider_id,
             account_id,
         }),
+        VendorLoginOutcome::RemoveCustom { provider_id } => {
+            InputOutcome::Action(Action::RemoveVendorCustom { provider_id })
+        }
         VendorLoginOutcome::SyncCustom {
             name,
             base_url,
@@ -326,6 +329,10 @@ pub(super) fn dispatch_remove_vendor_account(
 pub(super) fn dispatch_vendor_logout(app: &mut AppView, provider_id: String) -> Vec<Effect> {
     let _ = app;
     vec![Effect::VendorLogoutPersist { provider_id }]
+}
+
+pub(super) fn dispatch_remove_vendor_custom(_app: &mut AppView, provider_id: String) -> Vec<Effect> {
+    vec![Effect::VendorCustomRemove { provider_id }]
 }
 
 pub(super) fn dispatch_sync_models_dev(app: &mut AppView) -> Vec<Effect> {
@@ -745,16 +752,24 @@ pub(super) fn handle_vendor_account_catalog_refreshed(
 }
 
 
-pub(super) fn handle_vendor_logout_complete(
+pub(super) fn handle_vendor_custom_removed(
     app: &mut AppView,
     provider_id: String,
-    removed: bool,
     error: Option<String>,
 ) -> Vec<Effect> {
-    if let Some(err) = error {
-        app.show_toast(&format!("Logout failed: {err}"));
+    if let Some(state) = vendor_login_mut(app) {
+        state.complete_custom_remove(&provider_id, error.clone());
+    }
+    if let Some(error) = error {
+        app.show_toast(&format!("Could not remove provider: {error}"));
         return vec![];
     }
+    remove_provider_models(app, &provider_id);
+    app.show_toast(&format!("Removed custom provider {provider_id}"));
+    vec![]
+}
+
+fn remove_provider_models(app: &mut AppView, provider_id: &str) {
     let prefix = format!("{provider_id}/");
     app.models
         .available
@@ -766,6 +781,19 @@ pub(super) fn handle_vendor_logout_complete(
             .available
             .retain(|id, _| !id.0.starts_with(&prefix));
     }
+}
+
+pub(super) fn handle_vendor_logout_complete(
+    app: &mut AppView,
+    provider_id: String,
+    removed: bool,
+    error: Option<String>,
+) -> Vec<Effect> {
+    if let Some(err) = error {
+        app.show_toast(&format!("Logout failed: {err}"));
+        return vec![];
+    }
+    remove_provider_models(app, &provider_id);
     let name = xai_grok_shell::compat::provider_display_name(&provider_id);
     if removed {
         if provider_id == "openai-codex" {
