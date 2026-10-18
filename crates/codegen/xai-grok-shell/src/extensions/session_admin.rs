@@ -891,12 +891,78 @@ async fn handle_commands_list(agent: &MvpAgent, args: &acp::ExtRequest) -> ExtRe
 async fn handle_session_fork(agent: &MvpAgent, args: &acp::ExtRequest) -> ExtResult {
     use crate::session::fork::{ForkSessionRequest, fork_session};
 
-    let request: ForkSessionRequest = parse_params(args)?;
+    let mut request: ForkSessionRequest = parse_params(args)?;
+    if request.source_project_location.is_none() {
+        request.source_project_location =
+            crate::session::persistence::find_summary_by_session_id(&request.source_session_id)
+                .and_then(|summary| summary.project_location);
+    }
+    if request.new_project_location.is_none() {
+        request.new_project_location = request.source_project_location.clone();
+    }
 
+    let source_session_id = request.source_session_id.clone();
+    let project_location = request.new_project_location.clone();
     let agent_id = agent_id();
     let response = fork_session(request, &agent_id, Some(agent.auth_manager.clone()))
         .await
         .map_err(|e| acp::Error::internal_error().data(e.to_string()))?;
+
+    if let Some(location) = project_location {
+        let service = agent.session_ssh.as_ref().ok_or_else(|| {
+            acp::Error::internal_error().data("SSH session fork requires the host-owned SSH service")
+        })?;
+        let source_state = service.snapshot_session(&source_session_id).await;
+        let parent_binding = source_state
+            .default_binding_id
+            .as_ref()
+            .and_then(|id| {
+                source_state
+                    .grants
+                    .iter()
+                    .find(|grant| grant.binding.id == *id)
+            })
+            .ok_or_else(|| {
+                acp::Error::invalid_params()
+                    .data("SSH session fork source has no selected binding")
+            })?;
+        let xai_grok_workspace_types::ssh::ProjectLocation::Ssh { target_id, root } = &location
+        else {
+            return Err(acp::Error::invalid_params()
+                .data("SSH session fork must retain an SSH project location"));
+        };
+        if parent_binding.binding.target_id != *target_id || parent_binding.binding.root != *root {
+            return Err(acp::Error::invalid_params()
+                .data("SSH session fork binding does not match its persisted project location"));
+        }
+        service
+            .inherit_session(
+                &source_session_id,
+                response.new_session_id.clone(),
+                std::slice::from_ref(&parent_binding.binding.id),
+                parent_binding.binding.capabilities,
+            )
+            .await
+            .map_err(|error| acp::Error::invalid_params().data(error.to_string()))?;
+        let child_info = xai_grok_shared::session::info_for_location(
+            acp::SessionId::new(response.new_session_id.clone()),
+            &location,
+        );
+        service
+            .register_project_location(
+                &response.new_session_id,
+                Some(child_info.clone()),
+                &location,
+            )
+            .await
+            .map_err(|error| acp::Error::internal_error().data(error.to_string()))?;
+        crate::session::persistence::persist_ssh_state(
+            &child_info,
+            service.snapshot_session(&response.new_session_id).await,
+        )
+        .await
+        .map_err(|error| crate::session::persistence::io_error_to_acp(&error))?;
+    }
 
     to_raw_response(&response)
 }

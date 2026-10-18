@@ -72,6 +72,7 @@ pub(crate) mod screen_mode_relaunch;
 mod session_load_barrier;
 mod startup_failure;
 use reader_thread::ReaderThread;
+pub(crate) mod ssh_control;
 pub mod signal_handler;
 mod teardown_fence;
 mod terminal_restore;
@@ -89,7 +90,8 @@ pub(crate) use crate::terminal::{kitty_flags_pushed, kitty_releases_reported};
 use anyhow::Context as _;
 pub use cli::{
     AgentArgs, AgentCmd, Command, HeadlessArgs, LeaderArgs, LeaderMgmtArgs, LeaderMgmtCommand,
-    LeaderTargetArgs, OutputFormat, PagerArgs, ServeArgs, WrapArgs,
+    LeaderTargetArgs, OutputFormat, PagerArgs, ServeArgs, SshAddArgs, SshArgs, SshCommand,
+    SshProjectOpen, SshWorkerArgs, WrapArgs,
 };
 pub use cli::{WorkspaceMgmtArgs, WorkspaceMgmtCommand, WorkspaceStartArgs};
 use crossterm::cursor::{self, SetCursorStyle};
@@ -1167,6 +1169,14 @@ pub async fn run(
     };
     let agent_guard =
         crate::acp::spawn::AgentShutdownGuard::new(cancel.clone(), connection.agent_thread.take());
+    if let Some(embedded) = connection.embedded_ssh.as_ref() {
+        crate::app::ssh_control::install_embedded(
+            std::sync::Arc::clone(&embedded.service),
+            embedded.client_id,
+        )
+        .await
+        .context("install embedded SSH control service")?;
+    }
     let effective_args = PagerArgs {
         resume_session: None,
         load_session: None,

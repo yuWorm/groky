@@ -7,6 +7,7 @@ edition.workspace = true
 agent-client-protocol = { workspace = true }
 anyhow = { workspace = true }
 base64 = { workspace = true }
+blake3 = { workspace = true }
 xai-dirs = { workspace = true }
 dunce = { workspace = true }
 image = { workspace = true, features = ["png", "jpeg", "gif", "webp"] }
@@ -22,6 +23,7 @@ urlencoding = { workspace = true }
 xai-grok-models = { workspace = true }
 xai-grok-status-line = { workspace = true }
 xai-grok-config = { workspace = true }
+xai-grok-workspace-types = { path = "../xai-grok-workspace-types" }
 xai-grok-image = { workspace = true }
 xai-tty-utils = { workspace = true }
 

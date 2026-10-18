@@ -5,6 +5,7 @@ use bytes::{Buf, BytesMut};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 use crate::cpu_profile::{ControlError, ProfileArtifactFormat};
+use crate::ssh::{SshControlCommand, SshControlReply, SshEvent};
 
 const MAX_MESSAGE_SIZE: u32 = 64 * 1024 * 1024;
 const FRAME_HEADER_LEN: usize = 4;
@@ -360,7 +361,7 @@ pub struct CursorWorkerStartArgs {
     pub max_agents: Option<u32>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ControlCommand {
     GetLeaderInfo,
@@ -391,6 +392,8 @@ pub enum ControlCommand {
     RelaunchForUpdate {
         to_version: String,
     },
+    /// Local-only SSH control. This does not traverse provider/model auth.
+    Ssh(SshControlCommand),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -478,9 +481,10 @@ pub enum ControlPayload {
     /// Response to [`ControlCommand::RelaunchForUpdate`] when the leader will not relaunch.
     /// E.g. it is already running `to_version` or newer, or a relaunch is already in progress.
     RelaunchDeclined { reason: String },
+    Ssh(SshControlReply),
 }
 
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ClientMessage {
     Register {
@@ -545,6 +549,9 @@ pub enum ServerMessage {
         request_id: String,
         result: Result<ControlPayload, ControlError>,
     },
+    /// Local-only SSH event. It is not ACP, is never persisted in a session
+    /// replay, and is routed to the originating local client by the leader.
+    SshEvent { event: SshEvent },
     Pong,
     Error {
         code: i32,

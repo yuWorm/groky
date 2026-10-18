@@ -107,6 +107,7 @@ pub fn bootstrap_with_cancel(
     cancel: &CancellationToken,
     boot: Option<BootstrapPrefetch>,
 ) -> Result<(AgentConfig, ModelsManager), BootstrapError> {
+    crate::ssh::register_tool_pack();
     let _permit = acquire_bootstrap_gate(cancel)?;
     ensure_bootstrap_not_cancelled(cancel)?;
     let (boot_wait, boot_models) = match boot {

@@ -113,6 +113,104 @@ groky removes a trailing `/v1` while preserving any path prefix.
 | Claude subscription | Official Settings → Usage link (`o`); no direct OAuth quota query. The browser's signed-in account determines which account that page shows. |
 | Generic | Unsupported until a compatible platform is selected. |
 
+### SSH projects and explicit SSH tools
+
+SSH targets reuse literal aliases from `~/.ssh/config` and the system SSH
+configuration. A connection alone does **not** authorize an agent to use it.
+
+```sh
+groky ssh list
+groky ssh add my-server --id dev --label "Development"
+groky ssh open dev /srv/project
+# With an existing noninteractive authentication method:
+groky ssh connect dev
+groky ssh disconnect dev
+```
+
+Install a matching `groky` binary on the remote machine first. The default remote
+command is `groky worker --stdio`; it must be available in the noninteractive SSH
+`PATH`, along with the tools your project needs (including Git and ripgrep).
+groky does not silently install a worker or require an xAI login on that host.
+Use `--worker-command '/absolute/path/groky worker --stdio'` when needed.
+
+Open `/ssh` in a session, or press `Ctrl+S` on Welcome, to manage targets. `Enter`
+connects/disconnects, `g` requests a root-scoped grant, `u` selects an authorized
+default, `r` revokes a grant, and `o` opens its remote project. Passwords, encrypted
+private keys, ssh-agent and keyboard-interactive authentication are supported.
+Host trust and access grants are separate confirmations. Passwords are masked and
+remembered only by explicit opt-in to the OS credential store; if that store is
+unavailable, remembering is disabled rather than falling back to a plaintext file.
+`ssh connect` is noninteractive: use `/ssh` when authentication or host trust needs
+an answer.
+
+There are two execution modes:
+
+- **SSH project:** ordinary file, edit, search, command and Git operations use the
+  remote workspace. Remote project instructions, skills, hooks, MCP and LSP follow
+  that workspace. The TUI, model requests, transcripts and provider credentials remain
+  local. Remote hooks receive the verified remote cwd/root, not a local transcript path.
+  Discovered instructions and skills stay within the authorized root: ancestor
+  instructions and symlinks escaping that root are excluded. Skill bodies, including
+  slash-command skills, are read on the remote worker, not from matching local paths.
+- **Explicit SSH tools in any session:** `ssh_read`, `ssh_write`, `ssh_edit`,
+  `ssh_search` and `ssh_run` take an optional `target`. An explicit target wins;
+  otherwise a user-selected SSH default is required. This default never redirects
+  ordinary local tools. `ssh_targets` lists only the current session's grants;
+  `ssh_request_access` asks the user for a grant rather than granting itself access.
+  `ssh_task_query` and `ssh_task_cancel` operate within the selected binding.
+  Query with `task_id` to read task output, with `operation_id` to inspect a
+  recorded operation, or neither to list tasks; these IDs are not local task IDs.
+  Agent/session tool allowlists, denylists and capability restrictions still apply;
+  curated profiles that disable default tool injection keep their explicit toolset.
+
+Grants specify a remote root and read/write/execute capabilities. They are
+session-scoped unless the user explicitly saves a project rule; subagents inherit
+only an authorized subset. A grant does not bypass operation approval. **A run
+working directory is not a sandbox:** commands run with the remote SSH user's OS
+permissions. Revocation blocks new calls locally immediately; a disconnected
+worker remains “remote confirmation pending” until it acknowledges revocation.
+Already-running tasks require separate cancellation.
+
+Headless resume can reuse an existing grant with noninteractive SSH authentication
+and the normal tool permissions. Required SSH interaction fails promptly;
+`--always-approve` does not answer remote operation approvals.
+
+SSH resume restores conversation only unless `--restore-code` is set. With that
+flag, groky requests approval to check out the session's saved Git HEAD in its
+verified remote root. Current dirty tracked/untracked files are stashed before
+changing HEAD; the result reports the stash reference or any preservation failure.
+This is **HEAD-only restoration**, not recovery of historical staged, unstaged or
+untracked file snapshots. No matching local checkout is touched.
+With `--resume <session-id> --worktree --restore-code`, the original remote checkout
+is left unchanged. The new worktree needs its own root grant, and restoration runs
+only in that child. Omitting `--restore-code` keeps the normal worktree copy behavior.
+
+For persistent overrides, use the user-global `~/.groky/config.toml`:
+
+```toml
+[ssh.targets.dev]
+host = "my-server" # existing OpenSSH alias
+label = "Development"
+user = "developer" # optional override
+worker_command = ["/usr/local/bin/groky", "worker", "--stdio"]
+```
+
+Groky target overrides take precedence over user SSH config, then system SSH
+config, then defaults. Matching files retain first-value-wins semantics and
+accumulate `IdentityFile` entries; repository config cannot override connection
+identity or credentials. This is not complete OpenSSH compatibility: unsupported
+active directives, including `Match exec`, GSSAPI authentication, ControlMaster
+and agent forwarding, fail explicitly instead of being silently ignored.
+
+Connections are pooled and held independently of individual tool calls.
+The default embedded TUI owns its pool for that process's lifetime. Start with
+`groky --leader` to share a persistent pool with other leader-backed TUIs and
+manual `groky ssh connect` holds; grants still belong to individual sessions.
+Transport loss does not automatically replay writes, edits or commands. The
+private remote worker retains tasks across SSH channel disconnects; if the worker
+itself exits, unfinished results are unknown, not proof that side effects did not
+occur.
+
 ## What this fork changes
 
 | Added | Left alone |

@@ -822,6 +822,7 @@ impl SessionActor {
                     &parsed_skills,
                     &slash_skills,
                     &self.session_id_string(),
+                    self.workspace_ops.is_ssh().then_some(&self.workspace_ops),
                 )
                 .await;
                 original_blocks

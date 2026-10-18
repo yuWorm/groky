@@ -5267,6 +5267,32 @@ async fn bind_mcp_config_rejects_rpc_reconfiguration() {
             .contains("bind-time MCP configuration is immutable")
     );
 }
+
+#[tokio::test]
+async fn configured_mcp_registers_tools_without_a_hub() {
+    let state = BindMcpTestState::default();
+    let (url, server_task) = spawn_bind_mcp_server(state).await;
+    let factory = Arc::new(TestSessionContextFactory::new());
+    let config = WorkspaceHandle::test_config(factory.temp.path().to_path_buf(), factory.clone());
+    let handle = WorkspaceHandle::new(config).unwrap();
+    handle.create_session("main").unwrap();
+
+    let started = handle
+        .start_session_mcp_servers("main", vec![configured_test_mcp("local", url)])
+        .await
+        .expect("hub-less workspace must install MCP tools locally");
+    assert_eq!(started.started, vec!["local"]);
+    let session = handle.session("main").expect("session exists");
+    assert!(
+        session
+            .toolset()
+            .tool_definitions()
+            .iter()
+            .any(|definition| definition.function.name == "local__echo"),
+        "the discovered MCP handler must be callable from the local session toolset"
+    );
+    server_task.abort();
+}
 #[tokio::test]
 async fn zero_tool_bind_mcp_is_reused_on_soft_rebind() {
     let state = BindMcpTestState {

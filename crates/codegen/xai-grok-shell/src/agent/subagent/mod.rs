@@ -339,6 +339,12 @@ pub(crate) struct SubagentSpawnContext {
     pub api_key_provider: Option<xai_grok_tools::types::SharedApiKeyProvider>,
     pub image_description_model: String,
     pub workspace_ops: xai_grok_workspace::WorkspaceOps,
+    /// The embedded host's fixed interaction identity, if any. Child workers
+    /// retain that same host authority without minting a new identity.
+    pub session_ssh_client_id: Option<u64>,
+    /// The host-owned authority service. SSH children must receive a fresh
+    /// inherited binding rather than reusing the parent's worker session.
+    pub session_ssh: Option<std::sync::Arc<crate::ssh::SessionSsh>>,
     pub auth_manager: std::sync::Arc<xai_grok_login::AuthManager>,
     /// The parent SessionActor's live `Auth401AttributionCallback`, captured at spawn time. Subagents inherit this so the child's `OaiCompatClient` 401 sites emit attribution under the parent's session id.
     /// It is joined with the parent's live `AuthManager`. Reading from `ctx.sampling_config.attribution_callback` would not work.

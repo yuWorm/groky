@@ -87,6 +87,89 @@ static WORKSPACE_RPC_DURATION_SECONDS: std::sync::LazyLock<HistogramVec> =
         .unwrap()
     });
 const UNKNOWN_METHOD_LABEL: &str = "unknown";
+
+/// Conservative authorization class for a raw `workspace.*` request.
+///
+/// This is intentionally independent of the Hub transport: the SSH worker
+/// invokes this before it reaches [`WorkspaceRpcHandler::dispatch`]. Unknown
+/// methods fail closed as writes, so adding a new RPC cannot accidentally
+/// become remotely read-authorized.
+pub fn workspace_rpc_operation(method: &str) -> xai_grok_workspace_types::ssh::SshOperation {
+    use xai_grok_workspace_types::ssh::SshOperation;
+    if matches!(
+        method,
+        "workspace.info"
+            | "workspace.git_status"
+            | "workspace.git_branch_info"
+            | "workspace.tool_definitions"
+            | "workspace.list_background_tasks"
+            | "workspace.tasks_snapshot"
+            | "workspace.list_todos"
+            | "workspace.resolve_file_references"
+            | "workspace.get_files"
+            | "workspace.fs_list"
+            | "workspace.fs_exists"
+            | "workspace.fs_read_file"
+            | "workspace.client_fs_list"
+            | "workspace.client_fs_stat"
+            | "workspace.client_fs_read_file"
+            | "workspace.discover_skills"
+            | "workspace.skill_content"
+            | "workspace.discover_agents_md"
+            | "workspace.discover_plugins"
+            | "workspace.hook_registry"
+            | "workspace.load_project_config"
+            | "workspace.load_permissions"
+            | "workspace.on_before_turn"
+            | "workspace.on_after_turn"
+            | "workspace.project_bootstrap"
+            | "workspace.git_metadata"
+            | "workspace.git_head_snapshot"
+            | "workspace.fuzzy_status"
+            | "workspace.repos_list"
+            | "workspace.git_status_ext"
+            | "workspace.git_files"
+            | "workspace.git_diff"
+            | "workspace.git_info"
+            | "workspace.git_branches"
+            | "workspace.git_collect_changes"
+            | "workspace.git_resolve_root"
+            | "workspace.git_current_commit"
+            | "workspace.detect_vcs_kind"
+            | "workspace.hunk_get_all_file_contents"
+            | "workspace.hunk_get_session_summary"
+            | "workspace.hunk_get_all_hunks"
+            | "workspace.hunk_get_staged_files"
+            | "workspace.hunk_get_filtered_hunks"
+            | "workspace.hunk_get_file_summaries"
+            | "workspace.code_goto_definition"
+            | "workspace.code_goto_references"
+            | "workspace.code_find_definitions"
+            | "workspace.code_find_references"
+            | "workspace.code_index_status"
+            | "workspace.fuzzy_open"
+            | "workspace.fuzzy_change"
+            | "workspace.fuzzy_close"
+            | "workspace.search"
+            | "workspace.ripgrep"
+    ) {
+        SshOperation::Read
+    } else if matches!(
+        method,
+        "workspace.load_envrc"
+            | "workspace.dispatch_hook"
+            | "workspace.dispatch_prompt_hook"
+            | "workspace.dispatch_stop_hook"
+            | "workspace.worktree_create_sync"
+            | "workspace.worktree_create_from_worktree_sync"
+            | "workspace.checkout_session_commit"
+    ) {
+        // These execute trusted project commands on the authorized remote host.
+        SshOperation::Execute
+    } else {
+        SshOperation::Write
+    }
+}
 /// Zero-init this module's metric families. See [`crate::init_metrics`].
 pub(crate) fn init_metrics() {
     WORKSPACE_RPC_REQUESTS_TOTAL
@@ -381,15 +464,18 @@ async fn list_session_todos(
         .collect()
 }
 /// Routes JSON-RPC `workspace.*` method calls to [`WorkspaceHandle`].
-pub(crate) struct WorkspaceRpcHandler {
+///
+/// The SSH worker uses this exact dispatcher after its own binding/epoch/path
+/// authorization. Hub callers retain their existing envelope-bound identity.
+pub struct WorkspaceRpcHandler {
     workspace: WorkspaceHandle,
 }
 impl WorkspaceRpcHandler {
-    pub(crate) fn new(workspace: WorkspaceHandle) -> Self {
+    pub fn new(workspace: WorkspaceHandle) -> Self {
         Self { workspace }
     }
     /// Route a `workspace.*` method; `bound_session` is the caller's server-bound session.
-    async fn dispatch(
+    pub async fn dispatch(
         &self,
         method: &str,
         params: Value,
@@ -460,6 +546,34 @@ impl WorkspaceRpcHandler {
                         .map_err(|e| WorkspaceError::HubError(e.to_string())),
                     Err(_) => Ok(Value::Null),
                 }
+            }
+            "workspace.on_before_turn" => {
+                let session_id = bound_session.ok_or_else(|| {
+                    WorkspaceError::HubError("before_turn requires a bound session".into())
+                })?;
+                let payload = serde_json::from_value(
+                    params
+                        .get("payload")
+                        .cloned()
+                        .ok_or_else(|| WorkspaceError::HubError("missing before_turn payload".into()))?,
+                )
+                .map_err(|error| WorkspaceError::HubError(format!("invalid before_turn payload: {error}")))?;
+                self.workspace.on_before_turn(session_id, &payload).await;
+                Ok(Value::Null)
+            }
+            "workspace.on_after_turn" => {
+                let session_id = bound_session.ok_or_else(|| {
+                    WorkspaceError::HubError("after_turn requires a bound session".into())
+                })?;
+                let payload = serde_json::from_value(
+                    params
+                        .get("payload")
+                        .cloned()
+                        .ok_or_else(|| WorkspaceError::HubError("missing after_turn payload".into()))?,
+                )
+                .map_err(|error| WorkspaceError::HubError(format!("invalid after_turn payload: {error}")))?;
+                self.workspace.on_after_turn(session_id, &payload).await;
+                Ok(Value::Null)
             }
             <ToolDefinitionsReq as WorkspaceRpc>::METHOD => {
                 let session_id = params
@@ -806,6 +920,32 @@ impl WorkspaceRpcHandler {
                 let metadata =
                     crate::session::git::resolve_persisted_session_git_metadata_sync(&cwd);
                 Ok(serde_json::to_value(metadata).unwrap_or(Value::Null))
+            }
+            "workspace.git_head_snapshot" => {
+                let cwd = self.workspace.root_cwd()?;
+                let snapshot = crate::session::git::git_head_snapshot(cwd).await;
+                serde_json::to_value(snapshot)
+                    .map_err(|error| WorkspaceError::HubError(error.to_string()))
+            }
+            "workspace.checkout_session_commit" => {
+                let session_id = resolve_mutation_caller(
+                    "checkout_session_commit",
+                    bound_session,
+                    params.get("session_id").and_then(Value::as_str),
+                )?;
+                let target_sha = params
+                    .get("target_sha")
+                    .and_then(Value::as_str)
+                    .filter(|sha| crate::restore_fetch::is_full_object_id(sha))
+                    .ok_or_else(|| {
+                        WorkspaceError::HubError("session checkout requires a full Git object ID".into())
+                    })?;
+                let cwd = self.workspace.root_cwd()?;
+                let outcome =
+                    crate::session::git::checkout_session_commit(&cwd, target_sha, true, session_id)
+                        .await;
+                serde_json::to_value(outcome)
+                    .map_err(|error| WorkspaceError::HubError(error.to_string()))
             }
             <FuzzyStatusReq as WorkspaceRpc>::METHOD => {
                 let search_id = params

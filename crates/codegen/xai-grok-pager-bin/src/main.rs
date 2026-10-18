@@ -33,9 +33,9 @@ use tokio_util::sync::CancellationToken;
 use xai_grok_pager::agent_runtime::AgentRuntime;
 use xai_grok_pager::app::{
     AgentCmd, Command, EARLY_PREFETCH_WAIT, HeadlessArgs, LeaderMgmtArgs, LeaderMgmtCommand,
-    LeaderMode, LeaderTargetArgs, PagerArgs, resolve_use_leader, warn_leader_disabled_by_sandbox,
+    LeaderMode, LeaderTargetArgs, PagerArgs, SshCommand, SshWorkerArgs, resolve_use_leader,
+    WorkspaceMgmtArgs, WorkspaceMgmtCommand, WorkspaceStartArgs, warn_leader_disabled_by_sandbox,
 };
-use xai_grok_pager::app::{WorkspaceMgmtArgs, WorkspaceMgmtCommand, WorkspaceStartArgs};
 use xai_grok_pager::client_identity::PAGER_CLIENT_VERSION;
 use xai_grok_shell::agent::app::{run_headless, run_leader};
 use xai_grok_shell::agent::config::Config as AgentConfig;
@@ -53,7 +53,7 @@ mod agent_command;
 fn process_identity(command: Option<&Command>, is_interactive: bool) -> Option<ProcessIdentity> {
     use xai_grok_telemetry::process_info::LeaderMode::Standalone;
     let (entrypoint, interactivity) = match command {
-        Some(Command::Agent(_)) => return None,
+        Some(Command::Agent(_)) | Some(Command::Worker(_)) => return None,
         Some(Command::Dashboard) => return None,
         Some(Command::Login { .. }) => (Entrypoint::Cli, Interactivity::Interactive),
         Some(
@@ -77,7 +77,8 @@ fn process_identity(command: Option<&Command>, is_interactive: bool) -> Option<P
             | Command::Completions { .. }
             | Command::Worktree(_)
             | Command::DiskUsage(_)
-            | Command::Workspace(_),
+            | Command::Workspace(_)
+            | Command::Ssh(_),
         ) => (Entrypoint::Cli, Interactivity::Unattended),
         None if is_interactive => return None,
         None => (Entrypoint::Headless, Interactivity::Unattended),
@@ -116,7 +117,9 @@ fn command_needs_pre_sandbox_policy_heal(command: Option<&Command>) -> bool {
             | Command::Version { .. }
             | Command::Completions { .. }
             | Command::DiskUsage(_)
-            | Command::Workspace(_),
+            | Command::Workspace(_)
+            | Command::Ssh(_)
+            | Command::Worker(_),
         ) => false,
     }
 }
@@ -261,6 +264,19 @@ fn init_tracing_simple(app_entrypoint: &'static str) {
             },
         ),
     );
+}
+/// Run the internal SSH worker without touching provider or model authentication.
+async fn run_ssh_worker(args: SshWorkerArgs) -> Result<()> {
+    match (args.stdio, args.daemon) {
+        (true, false) => xai_grok_workspace::ssh_worker::run_stdio().await,
+        (false, true) => {
+            let socket = args
+                .socket
+                .unwrap_or_else(xai_grok_workspace::ssh_worker::default_private_socket_path);
+            xai_grok_workspace::ssh_worker::run_private_daemon(socket).await
+        }
+        _ => anyhow::bail!("`groky worker` requires exactly one of `--stdio` or `--daemon`"),
+    }
 }
 /// `json` prints the managed configuration without installing it.
 #[tracing::instrument(level = "debug", skip_all)]
@@ -2177,6 +2193,24 @@ async fn async_main(mut args: PagerArgs) -> Result<()> {
     if let Some(Command::Wrap(ref wrap_args)) = args.command {
         return xai_grok_pager::wrap_cmd::run(wrap_args);
     }
+    if let Some(Command::Worker(worker_args)) = &args.command {
+        init_tracing_simple("ssh-worker");
+        return run_ssh_worker(worker_args.clone()).await;
+    }
+    if let Some(Command::Ssh(ssh_args)) = args.command.clone() {
+        match ssh_args.command {
+            SshCommand::Open { target, root } => {
+                // Fall through to the ordinary TUI bootstrap, which installs the TUI tracing
+                // subscriber exactly once before showing local SSH consent.
+                args.ssh_project_open = Some(xai_grok_pager::ssh_cmd::prepare_open(target, root)?);
+                args.command = None;
+            }
+            _ => {
+                init_tracing_simple("ssh");
+                return xai_grok_pager::ssh_cmd::run(ssh_args).await;
+            }
+        }
+    }
     let is_interactive = args.command.is_none()
         && args.single.is_none()
         && args.prompt_json.is_none()
@@ -2294,6 +2328,14 @@ async fn async_main(mut args: PagerArgs) -> Result<()> {
                 )
                 .await;
             }
+            Command::Worker(worker_args) => return run_ssh_worker(worker_args).await,
+            Command::Ssh(ssh_args) => match ssh_args.command {
+                SshCommand::Open { target, root } => {
+                    args.ssh_project_open =
+                        Some(xai_grok_pager::ssh_cmd::prepare_open(target, root)?);
+                }
+                _ => return xai_grok_pager::ssh_cmd::run(ssh_args).await,
+            },
             Command::Doctor(_) => {
                 unreachable!("doctor was consumed before runtime startup")
             }

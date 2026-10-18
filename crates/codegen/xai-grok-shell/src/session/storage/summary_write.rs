@@ -17,6 +17,7 @@ use agent_client_protocol as acp;
 use chrono::{DateTime, Utc};
 use fs2::FileExt;
 use xai_grok_sampling_types::ReasoningEffort;
+use xai_grok_workspace_types::ssh::ProjectLocation;
 
 use crate::session::persistence::{PersistedAgent, Summary};
 use crate::session::worktree::WorktreeIdentity;
@@ -107,6 +108,12 @@ pub(crate) struct SummaryPatch {
     /// Session-local account bindings; last writer wins for the mapping as a
     /// unit so resume cannot combine selections from two snapshots.
     pub vendor_accounts: Option<indexmap::IndexMap<String, String>>,
+    /// Immutable SSH execution location, recorded when an opaque SSH storage bucket is created.
+    pub project_location_if_absent: Option<ProjectLocation>,
+    /// Session-scoped SSH grants/default selection. The service supplies only
+    /// secret-free snapshots, and this last-writer-wins field is written under
+    /// the same summary lock as every other persisted session state.
+    pub ssh_state: Option<crate::ssh::PersistedSshState>,
 }
 
 impl Summary {
@@ -181,6 +188,14 @@ impl Summary {
         }
         if let Some(recap) = &patch.last_recap {
             self.last_recap = recap.clone();
+        }
+        if let Some(location) = &patch.project_location_if_absent
+            && self.project_location.is_none()
+        {
+            self.project_location = Some(location.clone());
+        }
+        if let Some(ssh_state) = &patch.ssh_state {
+            self.ssh_state = Some(ssh_state.clone());
         }
         if let Some(kind) = &patch.session_kind_if_absent
             && self.session_kind.is_none()

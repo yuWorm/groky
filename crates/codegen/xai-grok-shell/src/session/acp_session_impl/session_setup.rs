@@ -39,6 +39,16 @@ impl SessionActor {
         save_system_prompt(&self.session_info, &system_prompt);
         let system_message = ConversationItem::system(system_prompt);
         let mut messages = vec![system_message];
+        // Spawn may already have installed authenticated remote instructions.
+        // They do not constitute restored chat history: keep them while still
+        // initializing the system prompt, baseline skills and deferred prefix.
+        messages.extend(
+            self.chat_state_handle
+                .get_conversation()
+                .await
+                .into_iter()
+                .filter(is_project_instructions),
+        );
         if let Some(effects) = self.inject_baseline_skill_reminder(&mut messages).await
             && effects.send_available_commands
         {
@@ -199,17 +209,27 @@ impl SessionActor {
     /// Returns the number of skills discovered.
     #[tracing::instrument(skip_all)]
     pub(super) async fn reload_skills_from_disk(&self) -> usize {
-        let cwd = &self.session_info.cwd;
-        let skills_config = crate::util::config::load_config().await.skills;
-        let plugin_snapshot = self.plugin_registry.borrow().clone();
-        let new_skills = xai_grok_agent::prompt::skills::list_skills_with_plugins(
-            Some(cwd),
-            &skills_config,
-            plugin_snapshot.as_deref(),
-            self.rebuild_spec.compat,
-            crate::agent::folder_trust::project_scope_allowed(std::path::Path::new(cwd)),
-        )
-        .await;
+        let new_skills = if self.workspace_ops.is_ssh() {
+            match self.workspace_ops.remote_skills().await {
+                Ok(skills) => skills,
+                Err(error) => {
+                    tracing::warn!(%error, "SSH skill reload failed; retaining the authorized baseline");
+                    return self.slash_skills_for_resolve().await.len();
+                }
+            }
+        } else {
+            let cwd = &self.session_info.cwd;
+            let skills_config = crate::util::config::load_config().await.skills;
+            let plugin_snapshot = self.plugin_registry.borrow().clone();
+            xai_grok_agent::prompt::skills::list_skills_with_plugins(
+                Some(cwd),
+                &skills_config,
+                plugin_snapshot.as_deref(),
+                self.rebuild_spec.compat,
+                crate::agent::folder_trust::project_scope_allowed(std::path::Path::new(cwd)),
+            )
+            .await
+        };
         let skill_count = new_skills.len();
         tracing::info!(
             session_id = %self.session_info.id.0,

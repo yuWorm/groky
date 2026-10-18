@@ -1213,6 +1213,20 @@ impl StorageAdapter for JsonlStorageAdapter {
             Ok(summary)
         }
     }
+    async fn set_project_location_if_absent(
+        &self,
+        info: &Info,
+        location: xai_grok_workspace_types::ssh::ProjectLocation,
+    ) -> io::Result<()> {
+        self.apply_summary_patch(
+            info,
+            super::summary_write::SummaryPatch {
+                project_location_if_absent: Some(location),
+                ..Default::default()
+            },
+        )
+        .await
+    }
     async fn update_session_title(&self, info: &Info, session_title: String) -> io::Result<()> {
         self.apply_summary_patch(
             info,

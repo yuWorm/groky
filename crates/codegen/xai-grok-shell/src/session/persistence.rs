@@ -37,6 +37,7 @@ use crate::util::grok_home::grok_home;
 use agent_client_protocol as acp;
 use xai_acp_lib::AcpAgentGatewaySender as GatewaySender;
 use xai_grok_sampling_types::ReasoningEffort;
+use xai_grok_workspace_types::ssh::ProjectLocation;
 
 use crate::extensions::notification::{
     DISK_FULL_ERROR_TYPE, DISK_FULL_USER_MESSAGE, RetryState,
@@ -566,6 +567,8 @@ fn find_local_child_for_remote_in_root(
 /// Searches across ALL cwd directories under `~/.grok/sessions/`.
 /// Use `session_exists_for_cwd` instead when the target cwd is known to avoid false-positive matches.
 /// Unlike [`resolve_local_session`] which only checks a single CWD, this scans every encoded-CWD subdirectory.
+/// Returns the local cwd for a local session, or its opaque storage identity for
+/// an SSH session. An SSH identity must never be used as a process cwd.
 pub fn resolve_local_session_any_cwd(session_id: &str) -> Option<String> {
     resolve_local_session_any_cwd_result(session_id)
         .ok()
@@ -612,7 +615,7 @@ fn resolve_local_session_any_cwd_in_root(
     };
     Ok(session_path
         .parent()
-        .and_then(crate::util::grok_home::decode_cwd_from_dirname))
+        .and_then(xai_grok_shared::session::storage_cwd_from_dirname))
 }
 
 /// Scan all CWD directories for a session and return its directory path.
@@ -1166,6 +1169,13 @@ impl<'de> serde::Deserialize<'de> for PersistedAgentSelection {
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Summary {
     pub info: Info,
+    /// SSH execution identity for location-aware storage. `None` preserves legacy local histories.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_location: Option<ProjectLocation>,
+    /// Session-scoped SSH grants/default selection. It contains no credentials.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ssh_state: Option<crate::ssh::PersistedSshState>,
+
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1292,6 +1302,23 @@ pub struct Summary {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_recap: Option<String>,
 }
+/// Atomically persist the secret-free SSH authorization snapshot for a session.
+/// SSH control mutations call this after changing the in-memory service state;
+/// loading restores it before remote workspace dispatch is constructed.
+pub(crate) async fn persist_ssh_state(
+    info: &Info,
+    state: crate::ssh::PersistedSshState,
+) -> io::Result<()> {
+    JsonlStorageAdapter::new()
+        .apply_summary_patch(
+            info,
+            crate::session::storage::summary_write::SummaryPatch {
+                ssh_state: Some(state),
+                ..Default::default()
+            },
+        )
+        .await
+}
 
 /// `Summary::session_kind` for sessions whose cwd is inside a grok-managed worktree.
 /// `source_workspace_dir` is only ever set alongside this kind.
@@ -1336,12 +1363,17 @@ impl Summary {
     }
 
     pub(crate) fn new(info: &Info, model_id: acp::ModelId) -> std::io::Result<Self> {
-        let git_metadata =
+        let git_metadata = if xai_grok_shared::session::is_ssh_storage_cwd(&info.cwd) {
+            Default::default()
+        } else {
             xai_grok_workspace::session::git::resolve_persisted_session_git_metadata_sync(
                 std::path::Path::new(&info.cwd),
-            );
+            )
+        };
         let mut summary = Self {
             info: info.clone(),
+            project_location: None,
+            ssh_state: None,
             agent_id: None,
             attempt_id: None,
             cwd_generation: 0,
@@ -1385,7 +1417,9 @@ impl Summary {
             last_turn_summary_prompt_id: None,
             last_recap: None,
         };
-        if let Some(identity) = crate::session::worktree::worktree_identity_for_cwd(&info.cwd) {
+        if !xai_grok_shared::session::is_ssh_storage_cwd(&info.cwd)
+            && let Some(identity) = crate::session::worktree::worktree_identity_for_cwd(&info.cwd)
+        {
             summary.stamp_worktree_identity(&identity);
         }
         Ok(summary)
@@ -2922,6 +2956,9 @@ const WORKTREE_TOUCH_INIT_TIMEOUT: std::time::Duration = std::time::Duration::fr
 /// A detached touch can land after gc's pre-removal re-check reads the row, letting gc delete a worktree that is actively being opened or resumed.
 /// Awaiting a blocking-pool task does not block the runtime.
 async fn touch_worktree_for_session(info: &Info) {
+    if xai_grok_shared::session::is_ssh_storage_cwd(&info.cwd) {
+        return;
+    }
     if tokio::time::timeout(WORKTREE_TOUCH_INIT_TIMEOUT, spawn_worktree_touch(info))
         .await
         .is_err()
@@ -2956,6 +2993,25 @@ pub(crate) async fn new(
     model_id: acp::ModelId,
     deps: SessionDeps,
 ) -> io::Result<(PersistenceHandle, SessionIdentity)> {
+    new_with_project_location(info, model_id, deps, None).await
+}
+
+/// Create a session whose opaque local storage bucket represents an SSH project.
+pub(crate) async fn new_at_project_location(
+    info: &Info,
+    model_id: acp::ModelId,
+    deps: SessionDeps,
+    project_location: &ProjectLocation,
+) -> io::Result<(PersistenceHandle, SessionIdentity)> {
+    new_with_project_location(info, model_id, deps, Some(project_location)).await
+}
+
+async fn new_with_project_location(
+    info: &Info,
+    model_id: acp::ModelId,
+    deps: SessionDeps,
+    project_location: Option<&ProjectLocation>,
+) -> io::Result<(PersistenceHandle, SessionIdentity)> {
     let SessionDeps {
         sampling_client,
         storage_mode,
@@ -2971,6 +3027,23 @@ pub(crate) async fn new(
     let storage = JsonlStorageAdapter::with_root(root_dir);
 
     let mut summary = storage.init_session(info, model_id.clone()).await?;
+    if let Some(location) = project_location {
+        match summary.project_location.as_ref() {
+            Some(existing) if existing != location => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "SSH session storage bucket belongs to a different project location",
+                ));
+            }
+            Some(_) => {}
+            None => {
+                storage
+                    .set_project_location_if_absent(info, location.clone())
+                    .await?;
+                summary.project_location = Some(location.clone());
+            }
+        }
+    }
     touch_worktree_for_session(info).await;
     // Mint under the summary lock against the live on-disk id, not the pre-lock snapshot:
     // a concurrent cold-spawn stamp that already persisted a parseable agent must survive
@@ -3042,6 +3115,9 @@ pub(crate) enum ExplicitSessionOpen {
 
 /// Used for subagent child sessions (top-level `sessions/<cwd>/<id>` dirs; only their metadata nests under the parent's session dir).
 /// Skips remote and relay sync; lifecycle notifications are handled by the coordinator.
+/// Used for local subagent child sessions. SSH children must call
+/// [`new_with_explicit_dir_at_project_location`] so their opaque storage bucket
+/// retains the immutable remote project identity.
 pub(crate) async fn new_with_explicit_dir(
     info: &Info,
     target_dir: PathBuf,
@@ -3049,6 +3125,29 @@ pub(crate) async fn new_with_explicit_dir(
     sampling_client: OaiCompatClient,
     session_summary_model: String,
     open: ExplicitSessionOpen,
+) -> io::Result<PersistenceHandle> {
+    new_with_explicit_dir_at_project_location(
+        info,
+        target_dir,
+        model_id,
+        sampling_client,
+        session_summary_model,
+        open,
+        None,
+    )
+    .await
+}
+
+/// Open a subagent session in an explicit storage directory while binding that
+/// history to its immutable project location.
+pub(crate) async fn new_with_explicit_dir_at_project_location(
+    info: &Info,
+    target_dir: PathBuf,
+    model_id: acp::ModelId,
+    sampling_client: OaiCompatClient,
+    session_summary_model: String,
+    open: ExplicitSessionOpen,
+    project_location: Option<&ProjectLocation>,
 ) -> io::Result<PersistenceHandle> {
     let storage = JsonlStorageAdapter::with_explicit_session_dir(target_dir);
 
@@ -3065,6 +3164,23 @@ pub(crate) async fn new_with_explicit_dir(
     } else {
         storage.init_session(info, model_id.clone()).await?
     };
+    if let Some(location) = project_location {
+        match summary.project_location.as_ref() {
+            Some(existing) if existing != location => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "subagent project location does not match persisted execution location",
+                ));
+            }
+            Some(_) => {}
+            None => {
+                storage
+                    .set_project_location_if_absent(info, location.clone())
+                    .await?;
+                summary.project_location = Some(location.clone());
+            }
+        }
+    }
     touch_worktree_for_session(info).await;
     if !is_wake {
         if summary
@@ -3184,6 +3300,35 @@ pub(crate) async fn load_light(
     starts_attempt: bool,
     deps: SessionDeps,
 ) -> io::Result<(PersistedInfo, PersistenceHandle)> {
+    load_light_at_project_location(info, backend, starts_attempt, deps, None).await
+}
+
+/// Load a session persisted in an opaque SSH project bucket and verify the
+/// stored execution location before any actor is resumed.
+pub(crate) async fn load_light_for_project_location(
+    info: &Info,
+    backend: Option<&crate::remote::BackendClient>,
+    starts_attempt: bool,
+    deps: SessionDeps,
+    project_location: &ProjectLocation,
+) -> io::Result<(PersistedInfo, PersistenceHandle)> {
+    load_light_at_project_location(
+        info,
+        backend,
+        starts_attempt,
+        deps,
+        Some(project_location),
+    )
+    .await
+}
+
+async fn load_light_at_project_location(
+    info: &Info,
+    backend: Option<&crate::remote::BackendClient>,
+    starts_attempt: bool,
+    deps: SessionDeps,
+    project_location: Option<&ProjectLocation>,
+) -> io::Result<(PersistedInfo, PersistenceHandle)> {
     let SessionDeps {
         sampling_client,
         storage_mode,
@@ -3209,6 +3354,14 @@ pub(crate) async fn load_light(
             None => return Err(e),
         },
     };
+    if let Some(expected) = project_location
+        && persisted.summary.project_location.as_ref() != Some(expected)
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "SSH session storage bucket does not match the requested project location",
+        ));
+    }
     // Touch on load too: resuming must reset the worktree's gc expiry clock.
     touch_worktree_for_session(&loaded_info).await;
     if starts_attempt {

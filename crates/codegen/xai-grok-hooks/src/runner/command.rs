@@ -218,6 +218,10 @@ pub async fn run_command_hook(
         .current_dir(ctx.workspace_root)
         // SECURITY: extra_env is applied before the GROK_* identity vars so a hook cannot spoof them.
         .envs(&spec.extra_env)
+        // Shells may retain the parent PWD value even after `current_dir`; keep
+        // the visible directory aligned with the process directory and remote
+        // workspace identity.
+        .env("PWD", env_root.as_ref())
         .env("GROK_HOOK_EVENT", envelope.hook_event_name.to_string())
         .env("GROK_HOOK_NAME", &spec.name)
         .env("GROK_SESSION_ID", ctx.session_id)

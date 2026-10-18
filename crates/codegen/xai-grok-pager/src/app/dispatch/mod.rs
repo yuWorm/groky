@@ -29,6 +29,7 @@ mod rewind;
 mod router;
 mod session;
 mod settings;
+pub(crate) mod ssh;
 mod status;
 mod task_result;
 mod transcript;

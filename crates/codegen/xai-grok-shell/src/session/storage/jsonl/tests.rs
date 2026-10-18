@@ -1272,6 +1272,8 @@ fn write_test_summary(
             id: acp::SessionId::new(session_id),
             cwd: urlencoding::decode(cwd_encoded).unwrap().into_owned(),
         },
+        project_location: None,
+        ssh_state: None,
         agent_id: None,
         attempt_id: None,
         cwd_generation: 0,

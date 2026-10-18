@@ -791,6 +791,7 @@ pub async fn run_leader(
     let agent_busy = Arc::new(AtomicBool::new(false));
     let agent_activity = crate::agent::activity::AgentActivity::default();
     let external_roster = ExternalRoster::new();
+    let session_ssh = Arc::new(crate::ssh::SessionSsh::new(grok_home::grok_home()));
     let control_state = LeaderServerControlState::new(LeaderServerMetadata {
         pid: std::process::id(),
         socket_path: socket_path.clone(),
@@ -804,7 +805,8 @@ pub async fn run_leader(
         agent_config.hub.url.clone(),
         grok_home::grok_home(),
         external_roster.clone(),
-    );
+    )
+    .with_session_ssh(session_ssh.clone());
     let workspace_control = control_state.workspace.clone();
     let cursor_worker_control = control_state.cursor_worker.clone();
     let leader_pid = control_state.metadata.pid;
@@ -931,8 +933,8 @@ pub async fn run_leader(
             None,
         )
     };
-    local_set
-        .run_until(async move {
+    let session_ssh_for_agent = session_ssh.clone();
+    local_set.run_until(async move {
             let (config_watcher_path_tx, config_watcher_path_rx_opt) = if recursive_config_watch_enabled {
                 let (tx, rx) = mpsc::unbounded_channel::<std::path::PathBuf>();
                 (Some(tx), Some(rx))
@@ -951,6 +953,7 @@ pub async fn run_leader(
                     auth_manager_for_agent,
                     models_manager_for_agent,
                 );
+                agent.set_session_ssh(session_ssh_for_agent, None);
                 agent.set_activity(agent_activity_for_agent);
                 if let Some(mc) = memory_config {
                     agent.set_memory_config(mc);

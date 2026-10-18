@@ -698,6 +698,31 @@ fn parse_session_load_restore_meta_rejects_unknown_degree() {
     let (_, _, degree) = parse_session_load_restore_meta(meta.as_object());
     assert!(degree.is_none());
 }
+#[test]
+fn parse_ssh_project_location_meta_accepts_only_nonempty_ssh_identity() {
+    let meta = serde_json::json!({
+        "x.ai/projectLocation": {
+            "type": "ssh",
+            "data": { "target_id": "build-host", "root": "/srv/project" }
+        }
+    });
+    let location = parse_ssh_project_location_meta(meta.as_object()).expect("SSH location");
+    assert_eq!(location.target_id, "build-host");
+    assert_eq!(location.root, "/srv/project");
+
+    let local = serde_json::json!({
+        "x.ai/projectLocation": { "type": "local", "data": { "root": "/tmp/project" } }
+    });
+    assert!(parse_ssh_project_location_meta(local.as_object()).is_none());
+
+    let malformed = serde_json::json!({
+        "x.ai/projectLocation": {
+            "type": "ssh",
+            "data": { "target_id": "build-host", "root": " " }
+        }
+    });
+    assert!(parse_ssh_project_location_meta(malformed.as_object()).is_none());
+}
 /// A deadline is `Timeout` and a decode/persist panic is `Panicked`, never `ReadFailed`; the deadline arm returns without waiting on the stalled thread.
 #[tokio::test]
 async fn clipboard_probe_stage_names_a_deadline_and_a_panic_apart_from_a_read_failure() {

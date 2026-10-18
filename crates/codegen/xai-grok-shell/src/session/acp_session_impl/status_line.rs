@@ -149,7 +149,22 @@ impl SessionActor {
         // Both stats run on the blocking pool, off the actor's thread.
         let transcript = self.transcript_path();
         let (repo_state, transcript_path, turn_start_ms) = tokio::join!(
-            Self::repo_state(cwd.clone()),
+            async {
+                if self.workspace_ops.is_ssh() {
+                    self.workspace_ops.git_head_snapshot().await.map(|snapshot| RepoState {
+                        repo_root: snapshot.repo_root,
+                        branch: snapshot.branch,
+                        is_worktree: snapshot.is_worktree,
+                        main_root: snapshot.main_root,
+                        repo: snapshot.origin_url.as_deref()
+                            .and_then(normalize_repo_url)
+                            .as_deref()
+                            .and_then(split_normalized_remote),
+                    }).unwrap_or_default()
+                } else {
+                    Self::repo_state(cwd.clone()).await
+                }
+            },
             tokio::task::spawn_blocking(move || {
                 transcript
                     .exists()

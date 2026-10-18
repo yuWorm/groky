@@ -167,18 +167,27 @@ struct ReplayRouting<'a> {
 }
 /// The workspace a session runs in, with its MCP servers already merged.
 struct SessionWorkspace {
+    /// Local launch cwd. For SSH this is only the ACP/client cwd, never the remote root.
     cwd: AbsPathBuf,
+    project_location: Option<xai_grok_workspace_types::ssh::ProjectLocation>,
     remote_settings: Option<crate::util::config::RemoteSettings>,
     initial_client_mcp_servers: Vec<acp::McpServer>,
     mcp_servers: Vec<acp::McpServer>,
     mcp_meta_config_map: McpMetaConfigMap,
     trust_scan: crate::agent::folder_trust::TrustScan,
 }
-fn session_info_for(session_id: &acp::SessionId, cwd: &AbsPathBuf) -> SessionInfo {
-    SessionInfo {
-        id: session_id.clone(),
-        cwd: cwd.as_str().to_owned(),
-    }
+fn session_info_for(
+    session_id: &acp::SessionId,
+    cwd: &AbsPathBuf,
+    project_location: Option<&xai_grok_workspace_types::ssh::ProjectLocation>,
+) -> SessionInfo {
+    project_location.map_or_else(
+        || SessionInfo {
+            id: session_id.clone(),
+            cwd: cwd.as_str().to_owned(),
+        },
+        |location| xai_grok_shared::session::info_for_location(session_id.clone(), location),
+    )
 }
 /// The liveness bump runs on every call, before the sweep and before this session is loaded:
 /// another process's sweep may be judging the dir right now, and it only sees mtimes.
@@ -245,12 +254,108 @@ impl MvpAgent {
             .await;
         Ok(SessionWorkspace {
             cwd,
+            project_location: None,
             remote_settings,
             initial_client_mcp_servers,
             mcp_servers,
             mcp_meta_config_map: parse_mcp_meta_config(meta),
             trust_scan,
         })
+    }
+
+    /// Resolve an SSH project without treating its remote root as a local path.
+    /// Project trust, MCP discovery, and all workspace discovery run in the
+    /// remote worker; only the ACP launch cwd stays local.
+    async fn resolve_ssh_workspace(
+        &self,
+        local_launch_cwd: &std::path::Path,
+        project_location: xai_grok_workspace_types::ssh::ProjectLocation,
+    ) -> Result<SessionWorkspace, acp::Error> {
+        let cwd = AbsPathBuf::new(local_launch_cwd.to_path_buf())
+            .map_err(|e| acp::Error::invalid_params().data(e.to_string()))?;
+        Ok(SessionWorkspace {
+            cwd,
+            project_location: Some(project_location),
+            remote_settings: self.cfg.borrow().remote_settings.clone(),
+            initial_client_mcp_servers: Vec::new(),
+            mcp_servers: Vec::new(),
+            mcp_meta_config_map: Default::default(),
+            trust_scan: folder_trust::TrustScan::skipped(),
+        })
+    }
+
+    async fn resolve_session_workspace(
+        &self,
+        local_launch_cwd: &std::path::Path,
+        client_mcp_servers: Vec<acp::McpServer>,
+        meta: Option<&acp::Meta>,
+        project_location: Option<xai_grok_workspace_types::ssh::ProjectLocation>,
+    ) -> Result<SessionWorkspace, acp::Error> {
+        match project_location {
+            Some(location) => self.resolve_ssh_workspace(local_launch_cwd, location).await,
+            None => self.resolve_workspace(local_launch_cwd, client_mcp_servers, meta).await,
+        }
+    }
+
+    /// Resolve the SSH interaction identity for this host. An embedded host's
+    /// stable local identity always wins over request metadata; leader routing
+    /// retains the request-bound `x.ai/sshClientId` identity.
+    pub(crate) fn ssh_control_client_id(&self, meta: Option<&acp::Meta>) -> Option<u64> {
+        self.session_ssh_client_id.or_else(|| {
+            meta.and_then(|meta| meta.get("x.ai/sshClientId"))
+                .and_then(|value| {
+                    value
+                        .as_u64()
+                        .or_else(|| value.as_str().and_then(|id| id.parse().ok()))
+                })
+        })
+    }
+
+
+    /// Bind the already-authorized session grant to the remote worker before
+    /// the actor is spawned. The local ACP cwd is intentionally not involved.
+    async fn ssh_project_workspace_ops(
+        &self,
+        session_id: &acp::SessionId,
+        project_location: &xai_grok_workspace_types::ssh::ProjectLocation,
+        meta: Option<&acp::Meta>,
+    ) -> Result<xai_grok_workspace::WorkspaceOps, acp::Error> {
+        let metadata_binding_id = crate::project::ssh_binding_id_from_meta(meta)?;
+        let client_id = self.ssh_control_client_id(meta);
+        let service = self.session_ssh.as_ref().ok_or_else(|| {
+            acp::Error::invalid_params().data("SSH projects require a host-owned SSH service")
+        })?;
+        let binding_id = match metadata_binding_id {
+            Some(binding_id) => binding_id,
+            None => service
+                .snapshot_session(session_id.0.as_ref())
+                .await
+                .default_binding_id
+                .ok_or_else(|| {
+                    acp::Error::invalid_params()
+                        .data("SSH project session has no persisted default binding")
+                })?,
+        };
+        let xai_grok_workspace_types::ssh::ProjectLocation::Ssh { target_id, root } =
+            project_location
+        else {
+            return Err(acp::Error::invalid_params().data(
+                "SSH project metadata must name an SSH location",
+            ));
+        };
+        let granted = service
+            .bind_project(session_id.0.as_ref(), &binding_id)
+            .await
+            .map_err(|error| acp::Error::invalid_params().data(error.to_string()))?;
+        if granted.binding.target_id != *target_id || granted.binding.root != *root {
+            return Err(acp::Error::invalid_params()
+                .data("SSH project binding does not match the requested target and root"));
+        }
+        let client = service
+            .project_workspace_client(session_id.0.as_ref(), &binding_id, client_id)
+            .await
+            .map_err(|error| acp::Error::invalid_params().data(error.to_string()))?;
+        Ok(xai_grok_workspace::WorkspaceOps::ssh(client))
     }
     /// Start the relay mirror for a session and forward its connection state to the client.
     /// Returns `None` when relay is not configured.
@@ -399,20 +504,25 @@ impl MvpAgent {
         self.seed_client_config_auth_if_available();
         self.spawn_settings_reapply();
         self.report_setup_phase(SessionSetupPhase::ResolveWorkspace);
+        let requested_project_location =
+            crate::project::ssh_project_location_from_meta(arguments.meta.as_ref())?;
         let SessionWorkspace {
             cwd,
+            project_location,
             remote_settings,
             initial_client_mcp_servers,
             mcp_servers,
             mcp_meta_config_map,
             trust_scan,
         } = self
-            .resolve_workspace(
+            .resolve_session_workspace(
                 &arguments.cwd,
                 arguments.mcp_servers,
                 arguments.meta.as_ref(),
+                requested_project_location,
             )
             .await?;
+        let is_ssh_project = project_location.is_some();
         let client_session_id = arguments
             .meta
             .as_ref()
@@ -425,12 +535,15 @@ impl MvpAgent {
             .as_ref()
             .and_then(|m| m.get("modelId").and_then(|v| v.as_str()))
             .filter(|s| !s.is_empty());
+        let mut session_meta_for_stamp = arguments.meta.clone();
         #[cfg(all(feature = "local-workspace", unix))]
-        self.report_setup_phase(SessionSetupPhase::LocalWorkspace);
-        #[cfg(all(feature = "local-workspace", unix))]
-        let pending_local_workspace = self
-            .start_own_local_workspace_if_needed(&mut session_meta_for_stamp, cwd.as_path())
-            .await?;
+        let pending_local_workspace = if is_ssh_project {
+            None
+        } else {
+            self.report_setup_phase(SessionSetupPhase::LocalWorkspace);
+            self.start_own_local_workspace_if_needed(&mut session_meta_for_stamp, cwd.as_path())
+                .await?
+        };
         #[cfg(all(feature = "local-workspace", not(unix)))]
         {
             use crate::gateway_bridge::local_workspace_supervisor::LocalWorkspaceIntent;
@@ -440,6 +553,10 @@ impl MvpAgent {
                 parse_local_workspace_intent(session_meta_for_stamp.as_ref()),
                 Some(LocalWorkspaceIntent::Own { .. })
             ) {
+                if is_ssh_project {
+                    return Err(acp::Error::invalid_params()
+                        .data("SSH projects cannot start a local workspace"));
+                }
                 return Err(SupervisorError::UnsupportedPlatform.into_acp_error());
             }
         }
@@ -447,6 +564,9 @@ impl MvpAgent {
         let session_computer_sessions = resolve_session_computer_sessions(arguments.meta.as_ref())?;
         let is_chat_kind =
             ChatKindClaim::from_meta(arguments.meta.as_ref()).declared() == SessionKind::Chat;
+        if is_ssh_project && is_chat_kind {
+            return Err(acp::Error::invalid_params().data("SSH projects require a Build session"));
+        }
         let session_yolo_mode = arguments
             .meta
             .as_ref()
@@ -473,14 +593,17 @@ impl MvpAgent {
         SESSION_SETUP_CONTEXT
             .with(|ctx| ctx.borrow_mut().session_id = Some(session_id.0.to_string()));
         reject_direct_hub_cloud_meta(arguments.meta.as_ref())?;
-        let mut prefetch =
+        let mut prefetch = (!is_ssh_project).then(|| {
             crate::session::session_create_prefetch::SessionCreatePrefetch::launch_from_meta(
                 cwd.as_path(),
                 trust_scan,
                 self.plugin_registry_handle.clone(),
                 arguments.meta.as_ref(),
-            );
-        prefetch.resolve_trust(cwd.as_path(), remote_settings.as_ref());
+            )
+        });
+        if let Some(prefetch) = prefetch.as_mut() {
+            prefetch.resolve_trust(cwd.as_path(), remote_settings.as_ref());
+        }
         #[cfg(all(feature = "local-workspace", unix))]
         let mut local_ws_reap_guard =
             self.new_local_workspace_reap_guard(session_id.clone(), false);
@@ -506,7 +629,30 @@ impl MvpAgent {
                     .and_then(|v| v.as_str())
                     .map(|s| s.to_string())
             });
-        let session_info = session_info_for(&session_id, &cwd);
+        let session_info = session_info_for(&session_id, &cwd, project_location.as_ref());
+        if let Some(location) = project_location.as_ref() {
+            let service = self.session_ssh.as_ref().ok_or_else(|| {
+                acp::Error::internal_error().data("SSH project requires the host-owned SSH service")
+            })?;
+            // Project rules are keyed by this exact location, never by the
+            // launch cwd or target alone. The durable storage row does not
+            // exist until below, so register its identity after construction.
+            service
+                .register_project_location(session_id.0.as_ref(), None, location)
+                .await
+                .map_err(|error| acp::Error::invalid_params().data(error.to_string()))?;
+            service
+                .restore_project_rules(session_id.0.as_ref(), location)
+                .await
+                .map_err(|error| acp::Error::invalid_params().data(error.to_string()))?;
+        }
+        let workspace_ops = match project_location.as_ref() {
+            Some(location) => Some(
+                self.ssh_project_workspace_ops(&session_id, location, arguments.meta.as_ref())
+                    .await?,
+            ),
+            None => None,
+        };
         let vendor_accounts = crate::session::vendor_accounts::snapshot_default_vendor_accounts();
         spawn_session_sweep(&session_info);
         let mut model_agent_type: Option<String> = None;
@@ -619,32 +765,69 @@ impl MvpAgent {
         spawn_sampler_transport_prewarm(&session_sampling.base_url);
         let (summary_client, summary_model) =
             self.build_summary_client(&session_sampling, Some(&vendor_accounts))?;
-        let relay_sync = self.start_relay_sync(&session_id, &session_info);
+        let relay_sync = (!is_ssh_project)
+            .then(|| self.start_relay_sync(&session_id, &session_info))
+            .flatten();
         self.report_setup_phase(SessionSetupPhase::PersistenceInit);
         let (persistence, root_identity) = if is_chat_kind {
             (crate::session::persistence::PersistenceHandle::noop(), None)
         } else {
             let _timer = crate::instrumentation_timer!("session.persistence_init");
-            let registry_title_sync = self.registry_title_sync();
-            crate::session::persistence::new(
-                &session_info,
-                model_id,
-                crate::session::persistence::SessionDeps {
-                    sampling_client: summary_client,
-                    storage_mode: self.storage_mode.get(),
-                    auth_manager: Some(self.auth_manager.clone()),
-                    relay_sync,
-                    gateway: Some(self.gateway.clone()),
-                    session_summary_model: summary_model,
-                    registry_title_sync,
-                    search_index: self.search_index_cell(),
-                    session_kind: client_session_kind,
+            let registry_title_sync = (!is_ssh_project)
+                .then(|| self.registry_title_sync())
+                .flatten();
+            let deps = crate::session::persistence::SessionDeps {
+                sampling_client: summary_client,
+                storage_mode: if is_ssh_project {
+                    crate::config::StorageMode::Local
+                } else {
+                    self.storage_mode.get()
                 },
+                auth_manager: (!is_ssh_project).then(|| self.auth_manager.clone()),
+                relay_sync,
+                gateway: Some(self.gateway.clone()),
+                session_summary_model: summary_model,
+                registry_title_sync,
+                search_index: self.search_index_cell(),
+                session_kind: client_session_kind,
+            };
+            let persisted = if let Some(location) = project_location.as_ref() {
+                crate::session::persistence::new_at_project_location(
+                    &session_info,
+                    model_id,
+                    deps,
+                    location,
+                )
+                .await
+            } else {
+                crate::session::persistence::new(&session_info, model_id, deps).await
+            };
+            persisted
+                .map(|(persistence, identity)| (persistence, Some(identity)))
+                .map_err(|e| crate::session::persistence::io_error_to_acp(&e))?
+        };
+        if is_ssh_project {
+            let service = self.session_ssh.as_ref().ok_or_else(|| {
+                acp::Error::internal_error().data("SSH project requires the host-owned SSH service")
+            })?;
+            let location = project_location
+                .as_ref()
+                .expect("SSH project has an execution location");
+            service
+                .register_project_location(
+                    session_id.0.as_ref(),
+                    Some(session_info.clone()),
+                    location,
+                )
+                .await
+                .map_err(|error| acp::Error::internal_error().data(error.to_string()))?;
+            crate::session::persistence::persist_ssh_state(
+                &session_info,
+                service.snapshot_session(session_id.0.as_ref()).await,
             )
             .await
-            .map(|(persistence, identity)| (persistence, Some(identity)))
-            .map_err(|e| crate::session::persistence::io_error_to_acp(&e))?
-        };
+            .map_err(|error| crate::session::persistence::io_error_to_acp(&error))?;
+        }
         self.set_turn_number(&session_id, 0u64);
         let chat_history = vec![];
         let ClientCaps {
@@ -670,6 +853,8 @@ impl MvpAgent {
                 SessionSpawnOptions {
                     session_info: session_info.clone(),
                     cwd: cwd.clone(),
+                    project_location: project_location.clone(),
+                    workspace_ops: workspace_ops.clone(),
                     mcp_servers,
                     initial_client_mcp_servers,
                     mcp_meta_config_map,
@@ -704,13 +889,15 @@ impl MvpAgent {
                     initial_reasoning_effort: spawn_effort,
                     session_yolo_mode,
                     session_auto_mode: session_auto_mode && !session_yolo_mode,
-                    prompt_display_cwd: None,
+                    prompt_display_cwd: project_location
+                        .as_ref()
+                        .map(|location| location.root().to_owned()),
                     is_headless,
                     is_chat_kind: false,
                 }
             };
             spawn_opts.vendor_accounts = Some(vendor_accounts.clone());
-            spawn_opts.prefetch = Some(prefetch);
+            spawn_opts.prefetch = prefetch;
             let mut spawn_timer = crate::instrumentation_timer!("session.spawn");
             spawn_timer.with_field("session_id", session_id.0.as_ref());
             spawn_timer.with_subphase(xai_grok_telemetry::startup::Subphase::SessionSpawn);
@@ -737,17 +924,19 @@ impl MvpAgent {
                 .store(false, std::sync::atomic::Ordering::Release);
         }
         #[cfg(feature = "local-workspace")]
-        if local_workspace_intent_present(arguments.meta.as_ref()) {
+        if !is_ssh_project && local_workspace_intent_present(arguments.meta.as_ref()) {
             self.mark_local_workspace_bound(session_id.clone());
         }
-        self.maybe_spawn_interactive_trust_prompt(
-            &session_id,
-            cwd.as_path(),
-            remote_settings.as_ref(),
-        );
+        if !is_ssh_project {
+            self.maybe_spawn_interactive_trust_prompt(
+                &session_id,
+                cwd.as_path(),
+                remote_settings.as_ref(),
+            );
+        }
         let bridge_attach = BridgeAttach::NotAttached;
         let product_analytics = self.product_analytics_enabled();
-        if product_analytics || xai_grok_telemetry::external::is_active() {
+        if !is_ssh_project && (product_analytics || xai_grok_telemetry::external::is_active()) {
             let sid = session_id.0.to_string();
             let ci = client_identifier.clone();
             let cv = self.client_version();
@@ -824,12 +1013,17 @@ impl MvpAgent {
             )
             .await;
         }
-        let indexed_roots = self.indexed_roots_for(cwd.as_path());
+        let indexed_roots = (!is_ssh_project)
+            .then(|| self.indexed_roots_for(cwd.as_path()))
+            .unwrap_or_default();
         self.report_setup_phase(SessionSetupPhase::GitDiscovery);
-        let git_discovery_timer =
-            crate::instrumentation_timer!("session.new_session.git_discovery");
-        let (git_root, is_git_repo, discovery_failed) =
-            match xai_grok_workspace::session::git::discover_git_root(cwd.as_path()) {
+        let (git_root, is_git_repo, discovery_failed) = if is_ssh_project {
+            // Git discovery is owned by the bound remote workspace.
+            (None, false, false)
+        } else {
+            let git_discovery_timer =
+                crate::instrumentation_timer!("session.new_session.git_discovery");
+            let result = match xai_grok_workspace::session::git::discover_git_root(cwd.as_path()) {
                 GitDiscoveryResult::Found(root) => {
                     let root_str = root.to_string_lossy().trim_end_matches('/').to_string();
                     (Some(root_str), true, false)
@@ -838,16 +1032,18 @@ impl MvpAgent {
                     tracing::debug!("new_session: not a git repository");
                     (None, false, false)
                 }
-                GitDiscoveryResult::DiscoveryFailed(e) => {
+                GitDiscoveryResult::DiscoveryFailed(error) => {
                     tracing::warn!(
-                        error = %e,
+                        %error,
                         cwd = %cwd.as_str(),
                         "new_session: git repo discovery failed unexpectedly"
                     );
                     (None, false, true)
                 }
             };
-        drop(git_discovery_timer);
+            drop(git_discovery_timer);
+            result
+        };
         let (show_non_git_warning, feedback_enabled) = {
             let cfg = self.cfg.borrow();
             let show_non_git_warning = !is_git_repo
@@ -890,8 +1086,12 @@ impl MvpAgent {
             }
         };
         drop(echo_timer);
+        let display_cwd = project_location
+            .as_ref()
+            .map(|location| location.root().to_owned())
+            .unwrap_or_else(|| cwd.as_str().to_owned());
         let mut meta = serde_json::json!({
-            "currentWorkingDirectory": cwd.as_str().to_owned(),
+            "currentWorkingDirectory": display_cwd,
             "codebaseIndexed": indexed_roots,
             "isGitRepo": is_git_repo,
             "gitRoot": git_root,
@@ -899,10 +1099,20 @@ impl MvpAgent {
             "feedbackEnabled": feedback_enabled,
         });
         if let Some(obj) = meta.as_object_mut() {
+            if let Some(location) = &project_location {
+                obj.insert(
+                    crate::project::PROJECT_LOCATION_META_KEY.to_owned(),
+                    serde_json::to_value(location)
+                        .expect("ProjectLocation is always serializable"),
+                );
+            }
             self.insert_session_config_meta(
                 obj,
                 &session_id,
-                cwd.as_str().to_owned(),
+                project_location
+                    .as_ref()
+                    .map(|location| location.root().to_owned())
+                    .unwrap_or_else(|| cwd.as_str().to_owned()),
                 None,
                 &models,
             );
@@ -939,9 +1149,30 @@ impl MvpAgent {
         let attach_started_at = std::time::Instant::now();
         let load_guard = self.begin_session_load(&arguments.session_id);
         reject_chat_kind_without_feature(arguments.meta.as_ref())?;
+        let requested_project_location =
+            crate::project::ssh_project_location_from_meta(arguments.meta.as_ref())?;
+        // A normal resume has no SSH pager metadata. Recover the immutable
+        // execution location from the summary before computing its opaque
+        // storage identity; an explicit request may only repeat that location.
+        let persisted_project_location =
+            crate::session::persistence::find_summary_by_session_id(arguments.session_id.0.as_ref())
+                .and_then(|summary| summary.project_location);
+        let project_location = match (requested_project_location, persisted_project_location) {
+            (Some(requested), Some(persisted)) if requested != persisted => {
+                return Err(acp::Error::invalid_params().data(
+                    "session project location does not match its persisted execution location",
+                ));
+            }
+            (Some(requested), _) => Some(requested),
+            (None, persisted) => persisted,
+        };
+        // `arguments.cwd` remains the caller's local launch cwd for ACP only.
+        // The SSH root is taken exclusively from validated metadata or summary.
         let live_cwd = AbsPathBuf::new(arguments.cwd.clone())
             .map_err(|e| acp::Error::invalid_params().data(e.to_string()))?;
-        let session_info = session_info_for(&arguments.session_id, &live_cwd);
+        let session_info =
+            session_info_for(&arguments.session_id, &live_cwd, project_location.as_ref());
+        let is_ssh_project = project_location.is_some();
         spawn_session_sweep(&session_info);
         self.sweep_dead_sessions();
         if !self.is_resident(&arguments.session_id) {
@@ -972,23 +1203,31 @@ impl MvpAgent {
         let policy = AttachPolicy::resolve(op, request_meta.as_ref(), self.restore_code);
         let SessionWorkspace {
             cwd,
+            project_location,
             remote_settings,
             initial_client_mcp_servers,
             mcp_servers,
             mcp_meta_config_map,
             trust_scan,
         } = self
-            .resolve_workspace(&cwd, client_mcp_servers, request_meta.as_ref())
+            .resolve_session_workspace(
+                &cwd,
+                client_mcp_servers,
+                request_meta.as_ref(),
+                project_location.clone(),
+            )
             .await?;
         let mut load_timer = crate::instrumentation_timer!("session.load_session");
         load_timer.with_field("session_id", session_id.0.as_ref());
         load_timer.with_field("cwd", cwd.as_str());
-        let git_root =
-            xai_grok_workspace::session::git::find_git_root_from_path(cwd.as_path()).ok();
-        if let Some(root) = git_root {
-            tokio::task::spawn_blocking(move || {
-                crate::session::worktree_pool::cleanup_stale_pool_worktrees(Some(&root));
-            });
+        if !is_ssh_project {
+            let git_root =
+                xai_grok_workspace::session::git::find_git_root_from_path(cwd.as_path()).ok();
+            if let Some(root) = git_root {
+                tokio::task::spawn_blocking(move || {
+                    crate::session::worktree_pool::cleanup_stale_pool_worktrees(Some(&root));
+                });
+            }
         }
         let session_exists = self.is_resident(&session_id);
         let no_replay = policy.no_replay;
@@ -1035,34 +1274,48 @@ impl MvpAgent {
         );
         let (summary_client, summary_model) =
             self.build_summary_client(&load_session_sampling, Some(&vendor_accounts))?;
-        let relay_sync = self.start_relay_sync(&session_id, &session_info);
+        let relay_sync = (!is_ssh_project)
+            .then(|| self.start_relay_sync(&session_id, &session_info))
+            .flatten();
         let mut persistence_timer = crate::instrumentation_timer!("session.load");
         persistence_timer.with_field("session_id", session_id.0.as_ref());
         persistence_timer.with_subphase(xai_grok_telemetry::startup::Subphase::SessionLoad);
-        let backend = if self.build_registry_config().is_some() {
-            Some(crate::remote::BackendClient::new().with_auth_manager(self.auth_manager.clone()))
-        } else {
-            None
-        };
-        let registry_title_sync = self.registry_title_sync();
-        let (persistence_info, persistence) = crate::session::persistence::load_light(
-            &session_info,
-            backend.as_ref(),
-            false,
-            crate::session::persistence::SessionDeps {
-                sampling_client: summary_client,
-                storage_mode: self.storage_mode.get(),
-                auth_manager: Some(self.auth_manager.clone()),
-                relay_sync,
-                gateway: Some(self.gateway.clone()),
-                session_summary_model: summary_model,
-                registry_title_sync,
-                search_index: self.search_index_cell(),
-                session_kind: None,
+        let backend = (!is_ssh_project && self.build_registry_config().is_some()).then(|| {
+            crate::remote::BackendClient::new().with_auth_manager(self.auth_manager.clone())
+        });
+        let registry_title_sync = (!is_ssh_project)
+            .then(|| self.registry_title_sync())
+            .flatten();
+        let deps = crate::session::persistence::SessionDeps {
+            sampling_client: summary_client,
+            storage_mode: if is_ssh_project {
+                crate::config::StorageMode::Local
+            } else {
+                self.storage_mode.get()
             },
-        )
-        .await
-        .map_err(|e| crate::session::persistence::io_error_to_acp(&e))?;
+            auth_manager: (!is_ssh_project).then(|| self.auth_manager.clone()),
+            relay_sync,
+            gateway: Some(self.gateway.clone()),
+            session_summary_model: summary_model,
+            registry_title_sync,
+            search_index: self.search_index_cell(),
+            session_kind: None,
+        };
+        let loaded = if let Some(location) = project_location.as_ref() {
+            crate::session::persistence::load_light_for_project_location(
+                &session_info,
+                None,
+                false,
+                deps,
+                location,
+            )
+            .await
+        } else {
+            crate::session::persistence::load_light(&session_info, backend.as_ref(), false, deps)
+                .await
+        };
+        let (persistence_info, persistence) = loaded
+            .map_err(|e| crate::session::persistence::io_error_to_acp(&e))?;
         drop(persistence_timer);
         let crate::session::persistence::PersistedInfo {
             summary,
@@ -1076,6 +1329,43 @@ impl MvpAgent {
             goal_mode_state: _persisted_goal_mode,
             workflow_runs: persisted_workflow_runs,
         } = persistence_info;
+        let workspace_ops = if let Some(location) = project_location.as_ref() {
+            let service = self.session_ssh.as_ref().ok_or_else(|| {
+                acp::Error::internal_error().data("SSH project requires the host-owned SSH service")
+            })?;
+            service
+                .register_project_location(
+                    session_id.0.as_ref(),
+                    Some(session_info.clone()),
+                    location,
+                )
+                .await
+                .map_err(|error| acp::Error::internal_error().data(error.to_string()))?;
+            // Summary state is credential-free. Restored grants are marked for
+            // identity/root revalidation by SessionSsh before worker dispatch.
+            service
+                .restore_session(
+                    session_id.0.to_string(),
+                    summary.ssh_state.clone().unwrap_or_default(),
+                )
+                .await;
+            service
+                .restore_project_rules(session_id.0.as_ref(), location)
+                .await
+                .map_err(|error| acp::Error::internal_error().data(error.to_string()))?;
+            crate::session::persistence::persist_ssh_state(
+                &session_info,
+                service.snapshot_session(session_id.0.as_ref()).await,
+            )
+            .await
+            .map_err(|error| crate::session::persistence::io_error_to_acp(&error))?;
+            Some(
+                self.ssh_project_workspace_ops(&session_id, location, request_meta.as_ref())
+                    .await?,
+            )
+        } else {
+            None
+        };
         let persisted_base_url = self
             .resolve_sampling_config_for_model(&summary.current_model_id, origin_client.clone())
             .base_url;
@@ -1127,37 +1417,46 @@ impl MvpAgent {
         );
         #[allow(unused_variables)]
         let session_computer_sessions = resolve_session_computer_sessions(request_meta.as_ref())?;
-        let code_restore_info = self
-            .restore_session_code(&session_id, &cwd, &summary, policy.restore_code)
-            .await;
-        let load_envrc = {
-            let skip_envrc = request_meta
-                .as_ref()
-                .and_then(|m| m.get("x.ai/skip_envrc"))
-                .and_then(|v| v.as_bool())
-                .unwrap_or(false);
-            if skip_envrc {
-                false
-            } else {
-                self.cfg.borrow().session.load_envrc.unwrap_or(true)
-            }
+        let code_restore_info = if let Some(ops) = workspace_ops.as_ref() {
+            self.restore_ssh_session_code(&session_id, ops, &summary, policy.restore_code)
+                .await?
+        } else {
+            self.restore_session_code(&session_id, &cwd, &summary, policy.restore_code)
+                .await
         };
-        let envrc = if !load_envrc {
-            Some(xai_grok_workspace::envrc::spawn_envrc_load(
-                cwd.as_path().to_path_buf(),
-                false,
-            ))
-        } else if session_exists {
+        let envrc = if is_ssh_project {
             None
         } else {
-            Some(xai_grok_workspace::envrc::spawn_envrc_load(
-                cwd.as_path().to_path_buf(),
-                folder_trust::project_scope_allowed(cwd.as_path()),
-            ))
+            let load_envrc = {
+                let skip_envrc = request_meta
+                    .as_ref()
+                    .and_then(|m| m.get("x.ai/skip_envrc"))
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                if skip_envrc {
+                    false
+                } else {
+                    self.cfg.borrow().session.load_envrc.unwrap_or(true)
+                }
+            };
+            if !load_envrc {
+                Some(xai_grok_workspace::envrc::spawn_envrc_load(
+                    cwd.as_path().to_path_buf(),
+                    false,
+                ))
+            } else if session_exists {
+                None
+            } else {
+                Some(xai_grok_workspace::envrc::spawn_envrc_load(
+                    cwd.as_path().to_path_buf(),
+                    folder_trust::project_scope_allowed(cwd.as_path()),
+                ))
+            }
         };
-        let gateway_backed = session_computer_sessions
-            .as_ref()
-            .is_some_and(|sessions| !sessions.is_empty());
+        let gateway_backed = !is_ssh_project
+            && session_computer_sessions
+                .as_ref()
+                .is_some_and(|sessions| !sessions.is_empty());
         if gateway_backed && let Some(handle) = self.resident_handle(&session_id) {
             handle
                 .emit_local_background_tasks
@@ -1201,6 +1500,7 @@ impl MvpAgent {
             .and_then(|m| m.get("x.ai/display_cwd"))
             .and_then(|v| v.as_str())
             .map(|s| s.to_string())
+            .or_else(|| project_location.as_ref().map(|location| location.root().to_owned()))
             .or_else(|| summary.prompt_display_cwd.clone());
         let restored_from_disk = if !self.is_resident(&session_id) {
             tracing::info!(
@@ -1222,13 +1522,16 @@ impl MvpAgent {
             let mut spawn_timer = crate::instrumentation_timer!("session.spawn");
             spawn_timer.with_field("session_id", session_id.0.as_ref());
             spawn_timer.with_subphase(xai_grok_telemetry::startup::Subphase::SessionSpawn);
-            let prefetch =
+            let prefetch = if is_ssh_project {
+                crate::session::session_create_prefetch::SessionCreatePrefetch::ready(None)
+            } else {
                 crate::session::session_create_prefetch::SessionCreatePrefetch::launch_from_meta(
                     cwd.as_path(),
                     trust_scan,
                     self.plugin_registry_handle.clone(),
                     request_meta.as_ref(),
-                );
+                )
+            };
             let (restore_profile, restore_model_agent_type): (
                 Option<xai_grok_agent::AgentDefinition>,
                 Option<String>,
@@ -1252,6 +1555,8 @@ impl MvpAgent {
                     SessionSpawnOptions {
                         session_info: session_info.clone(),
                         cwd: cwd.clone(),
+                        project_location: project_location.clone(),
+                        workspace_ops: workspace_ops.clone(),
                         mcp_servers,
                         initial_client_mcp_servers,
                         mcp_meta_config_map,
@@ -1377,11 +1682,13 @@ impl MvpAgent {
             session_yolo_mode,
             session_auto_mode,
         );
-        self.maybe_spawn_interactive_trust_prompt(
-            &session_id,
-            cwd.as_path(),
-            remote_settings.as_ref(),
-        );
+        if !is_ssh_project {
+            self.maybe_spawn_interactive_trust_prompt(
+                &session_id,
+                cwd.as_path(),
+                remote_settings.as_ref(),
+            );
+        }
         self.heal_orphaned_subagents(&session_id, &unfinished_subagents)
             .await;
         self.restore_persisted_model(&session_id, &summary, initial_reasoning_effort)
@@ -1431,6 +1738,37 @@ impl MvpAgent {
         );
         Ok(response)
     }
+    /// SSH ops have already been rebound to the persisted target, identity and
+    /// canonical root. Never compare that remote root against the local ACP cwd.
+    async fn restore_ssh_session_code(
+        &self,
+        session_id: &acp::SessionId,
+        ops: &xai_grok_workspace::WorkspaceOps,
+        summary: &crate::session::persistence::Summary,
+        restore_code_requested: bool,
+    ) -> Result<Option<serde_json::Value>, acp::Error> {
+        if !restore_code_requested {
+            return Ok(None);
+        }
+        let Some(target_sha) = summary.head_commit.as_deref() else {
+            return Ok(None);
+        };
+        let outcome = ops
+            .checkout_session_commit(target_sha, session_id.0.as_ref())
+            .await
+            .map_err(|error| {
+                acp::Error::internal_error().data(format!("SSH code restore failed: {error}"))
+            })?;
+        let kind = if outcome.checked_out {
+            xai_grok_workspace::session::git::RestoreKind::RegistryOff
+        } else {
+            xai_grok_workspace::session::git::RestoreKind::CheckoutFailed
+        };
+        Ok(crate::agent::restore_code::build_code_restore_meta(
+            target_sha, &outcome, kind,
+        ))
+    }
+
     /// Refuses a cwd that is neither a grok worktree nor the session's own, so it cannot detach a real checkout.
     async fn restore_session_code(
         &self,
@@ -1910,6 +2248,16 @@ impl MvpAgent {
         let session_id = session_id.clone();
         let mut response_meta_map = serde_json::Map::new();
         response_meta_map.insert("sessionId".to_string(), serde_json::json!(session_id));
+        let ssh_location = summary.project_location.as_ref().filter(|location| {
+            matches!(location, xai_grok_workspace_types::ssh::ProjectLocation::Ssh { .. })
+        });
+        if let Some(location) = ssh_location {
+            response_meta_map.insert(
+                crate::project::PROJECT_LOCATION_META_KEY.to_owned(),
+                serde_json::to_value(location)
+                    .expect("ProjectLocation is always serializable"),
+            );
+        }
         if let Some(persist) = persist_data {
             response_meta_map.insert("x.ai/persist".to_string(), persist);
         }
@@ -1918,13 +2266,15 @@ impl MvpAgent {
             .map(|h| h.info.cwd.clone());
         let indexed_roots = session_cwd
             .as_deref()
+            .filter(|_| ssh_location.is_none())
             .map(|c| self.indexed_roots_for(std::path::Path::new(c)))
             .unwrap_or_default();
         response_meta_map.insert(
             "codebaseIndexed".to_string(),
             serde_json::json!(indexed_roots),
         );
-        if summary.head_commit.is_some()
+        if ssh_location.is_none()
+            && summary.head_commit.is_some()
             && let Some(ref cwd) = session_cwd
             && summary.git_root_dir.as_deref().is_none_or(|root| {
                 xai_grok_workspace::session::git::find_git_root_from_path(std::path::Path::new(
@@ -1964,10 +2314,17 @@ impl MvpAgent {
             );
         }
         let model_state = self.model_state(Some(&session_id));
+        let display_cwd = ssh_location
+            .map(|location| location.root().to_owned())
+            .unwrap_or_else(|| session_cwd.clone().unwrap_or_default());
+        response_meta_map.insert(
+            "currentWorkingDirectory".to_owned(),
+            serde_json::json!(&display_cwd),
+        );
         self.insert_session_config_meta(
             &mut response_meta_map,
             &session_id,
-            session_cwd.clone().unwrap_or_default(),
+            display_cwd,
             summary.display_title_opt(),
             &model_state,
         );

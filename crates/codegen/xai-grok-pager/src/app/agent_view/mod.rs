@@ -737,8 +737,18 @@ pub(crate) struct BlockViewerResume {
     pub scroll_offset: usize,
     pub follow_mode: bool,
 }
+/// Remote location rendered for an SSH-backed project. It is deliberately not
+/// a local `Path`: the local launch cwd never identifies remote work.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SshProjectLocation {
+    pub(crate) target_id: String,
+    pub(crate) root: String,
+}
+
 pub struct AgentView {
     pub session: AgentSession,
+    /// The authoritative remote identity for an SSH project, if this view owns one.
+    pub(crate) ssh_project_location: Option<SshProjectLocation>,
     pub(crate) session_binding_epoch: u32,
     pub scrollback: ScrollbackState,
     pub prompt: PromptWidget,
@@ -1197,6 +1207,8 @@ pub struct AgentView {
     pub(crate) agents_modal: Option<crate::views::agents_modal::AgentsModalState>,
     /// Third-party provider API-key overlay (`/provider-login`). Not xAI `/login`.
     pub(crate) vendor_login: Option<crate::views::vendor_login_modal::VendorLoginState>,
+    /// SSH manager, authorization, and local authentication overlay for this session.
+    pub(crate) ssh_manager: Option<crate::views::ssh_modal::SshManagerState>,
     pub(crate) persona_detail: Option<crate::views::persona_detail::PersonaDetailState>,
     /// Active /btw side question overlay. When `Some`, renders as a dismissible
     /// overlay and captures keyboard input (Esc/Enter/Space to dismiss).
@@ -1437,6 +1449,17 @@ pub struct AgentView {
     /// Set by `dispatch_fork_resolved`; stores the parent session id and worktree flag so the banner can be formatted with the child's session id (not known until `SessionLoaded`). `None` for non-fork sessions.
     /// Cleared on all failure paths: `SessionLoadFailed`, `WorktreeSessionFailed` (non-orphan branch), and `ForkSessionFailed`.
     pub(crate) pending_fork_banner: Option<PendingForkBanner>,
+    /// Exact source session authorizing an optimistic cold `--resume -w` child.
+    ///
+    /// The child has no session ID until the remote worktree extension completes, but the
+    /// source binding owns its operation approvals. This typed correlation lets that exact
+    /// source surface approvals on the visible child without accepting unrelated events.
+    pub(crate) pending_worktree_source_session_id: Option<String>,
+    /// Pre-minted child session authenticated for an optimistic remote worktree.
+    ///
+    /// Retained after its consent card settles so checkout approvals and their completion still
+    /// route to the visible child before `WorktreeForked` binds the ACP session.
+    pub(crate) pending_worktree_child_session_id: Option<String>,
     /// Set when `session/load` failed, so this tab has no session and a plain prompt is refused with a notice.
     pub(crate) load_failed: bool,
     /// Entry ID of the "Loading session ..." placeholder block pushed by `dispatch_load_session_inner`. Cleared by the `SessionLoaded`

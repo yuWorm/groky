@@ -12,11 +12,13 @@ pub(crate) use helpers::timed_out_while;
 pub use session_list::ConversationsPartial;
 pub(super) use helpers::{
     parse_session_load_running_prompt_id, parse_session_memory_mode,
+    parse_ssh_project_location_meta,
 };
 pub(crate) use helpers::{
     EffectMeta, RestoreProgressMsg, SessionFlags, acp_send_bounded, compact_error,
-    is_disk_full_error, parse_worktree_restore_payload, parse_worktree_strategy_summary,
-    persist_permission_mode_and_notify, persist_setting, sanitize_user_error,
+    is_disk_full_error, parse_ssh_project_location_value, parse_worktree_restore_payload,
+    parse_worktree_strategy_summary, persist_permission_mode_and_notify, persist_setting,
+    sanitize_user_error,
 };
 #[cfg(feature = "local-workspace")]
 pub(crate) use helpers::reject_non_fs_only_advertised_tools;
@@ -504,6 +506,528 @@ pub(crate) fn execute(
                 });
             meta.auth_abort_handle = Some((request_seq, abort_handle));
         }
+        Effect::SshListTargets {
+            session_id,
+            client_id,
+        } => {
+            tasks.spawn(async move { load_ssh_targets(session_id, client_id).await });
+        }
+        Effect::SshAddTarget {
+            session_id,
+            client_id,
+            draft,
+        } => {
+            tasks.spawn(async move {
+                let result = tokio::task::spawn_blocking(move || add_ssh_target(draft)).await;
+                let actual_client_id = ssh_control_client_id(client_id).await;
+                match result {
+                    Ok(Ok(target)) => TaskResult::SshActionComplete {
+                        session_id,
+                        client_id: actual_client_id,
+                        target_id: Some(target.id),
+                        message: Some("SSH target saved.".into()),
+                        error: None,
+                    },
+                    Ok(Err(error)) => TaskResult::SshActionComplete {
+                        session_id,
+                        client_id: actual_client_id,
+                        target_id: None,
+                        message: None,
+                        error: Some(format!("Could not save SSH target: {error}")),
+                    },
+                    Err(error) => TaskResult::SshActionComplete {
+                        session_id,
+                        client_id: actual_client_id,
+                        target_id: None,
+                        message: None,
+                        error: Some(format!("Could not save SSH target: {error}")),
+                    },
+                }
+            });
+        }
+        Effect::SshConnect {
+            target_id,
+            client_id,
+        } => {
+            tasks.spawn(async move {
+                ssh_target_status_action(
+                    client_id,
+                    target_id.clone(),
+                    xai_grok_shell::ssh::SshControlCommand::Connect {
+                        target_id,
+                        interactive: true,
+                    },
+                    "SSH local service returned an unexpected connection response.",
+                )
+                .await
+            });
+        }
+        Effect::SshDisconnect {
+            target_id,
+            client_id,
+        } => {
+            tasks.spawn(async move {
+                ssh_target_status_action(
+                    client_id,
+                    target_id.clone(),
+                    xai_grok_shell::ssh::SshControlCommand::Disconnect { target_id },
+                    "SSH local service returned an unexpected disconnect response.",
+                )
+                .await
+            });
+        }
+        Effect::SshRequestGrant {
+            session_id,
+            client_id,
+            target_id,
+            root,
+            capabilities,
+            lifetime: _,
+            set_default: _,
+        } => {
+            tasks.spawn(async move {
+                ssh_grant_reply(
+                    Some(session_id.clone()),
+                    client_id,
+                    xai_grok_shell::ssh::SshControlCommand::RequestGrant {
+                        session_id,
+                        target_id: Some(target_id),
+                        root: Some(root),
+                        capabilities: ssh_capabilities(capabilities),
+                        reason: "User requested SSH access from the local SSH manager.".into(),
+                    },
+                )
+                .await
+            });
+        }
+        Effect::SshInspectGrantTarget {
+            session_id,
+            request_id,
+            target_id,
+            client_id,
+        } => {
+            tasks.spawn(async move {
+                ssh_grant_reply(
+                    session_id,
+                    client_id,
+                    xai_grok_shell::ssh::SshControlCommand::InspectGrantTarget {
+                        request_id,
+                        target_id,
+                    },
+                )
+                .await
+            });
+        }
+        Effect::SshApproveGrant {
+            session_id,
+            request_id,
+            client_id,
+            approved,
+            target_id,
+            root,
+            capabilities,
+            lifetime,
+            set_default,
+        } => {
+            tasks.spawn(async move {
+                let client_id = ssh_control_client_id(client_id).await;
+                ssh_grant_decision(
+                    session_id,
+                    target_id.clone(),
+                    client_id,
+                    xai_grok_shell::ssh::SshGrantDecision {
+                        request_id,
+                        approved,
+                        target_id,
+                        root,
+                        capabilities: capabilities.map(ssh_capabilities),
+                        scope: ssh_grant_scope(lifetime),
+                        make_default: set_default,
+                        client_id,
+                    },
+                )
+                .await
+            });
+        }
+        Effect::SshUseBinding {
+            session_id,
+            binding_id,
+            client_id,
+        } => {
+            tasks.spawn(async move {
+                ssh_action(
+                    Some(session_id.clone()),
+                    None,
+                    client_id,
+                    xai_grok_shell::ssh::SshControlCommand::UseBinding {
+                        session_id,
+                        binding_id,
+                    },
+                    "SSH default target selected for this session.",
+                )
+                .await
+            });
+        }
+        Effect::SshRevokeBinding {
+            session_id,
+            binding_id,
+            client_id,
+        } => {
+            tasks.spawn(async move {
+                ssh_action(
+                    Some(session_id.clone()),
+                    None,
+                    client_id,
+                    xai_grok_shell::ssh::SshControlCommand::RevokeBinding {
+                        session_id,
+                        binding_id,
+                    },
+                    "SSH access revoked locally; waiting for worker confirmation.",
+                )
+                .await
+            });
+        }
+        Effect::SshBeginProjectGrant { project, client_id } => {
+            tasks.spawn(async move {
+                let client_id = ssh_control_client_id(client_id).await;
+                let session_id = project.project_session_id.clone();
+                let target_id = project.target_id.clone();
+                let location = xai_grok_shell::ssh::ProjectLocation::Ssh {
+                    target_id: target_id.clone(),
+                    root: project.root.clone(),
+                };
+                let restored = ssh_control_reply(
+                    xai_grok_shell::ssh::SshControlCommand::RestoreProjectGrant {
+                        session_id: session_id.clone(),
+                        location: location.clone(),
+                    },
+                    client_id,
+                )
+                .await;
+                match restored {
+                    Ok((
+                        client_id,
+                        xai_grok_shell::ssh::SshControlReply::ProjectGrantRestored {
+                            binding: Some(binding),
+                        },
+                    )) if binding.session_id == session_id && binding.target_id == target_id => {
+                        TaskResult::SshProjectGrantRestored {
+                            target_id,
+                            project_session_id: session_id,
+                            binding,
+                            client_id,
+                        }
+                    }
+                    Ok((
+                        client_id,
+                        xai_grok_shell::ssh::SshControlReply::ProjectGrantRestored {
+                            binding: Some(_),
+                        },
+                    )) => TaskResult::SshProjectOpenSetupFailed {
+                        session_id,
+                        client_id,
+                        target_id,
+                        error: "SSH local service returned a binding for a different project."
+                            .into(),
+                    },
+                    Ok((
+                        client_id,
+                        xai_grok_shell::ssh::SshControlReply::ProjectGrantRestored {
+                            binding: None,
+                        },
+                    )) => {
+                        let registered = ssh_control_reply(
+                            xai_grok_shell::ssh::SshControlCommand::RegisterProjectLocation {
+                                session_id: session_id.clone(),
+                                location,
+                            },
+                            client_id,
+                        )
+                        .await;
+                        match registered {
+                            Ok((
+                                _,
+                                xai_grok_shell::ssh::SshControlReply::ProjectLocationRegistered,
+                            )) => match ssh_control_reply(
+                                xai_grok_shell::ssh::SshControlCommand::RequestGrant {
+                                    session_id: session_id.clone(),
+                                    target_id: Some(target_id.clone()),
+                                    root: Some(project.root),
+                                    capabilities: xai_grok_shell::ssh::SshCapabilities::all(),
+                                    reason: "User requested a new local SSH project.".into(),
+                                },
+                                client_id,
+                            )
+                            .await
+                            {
+                                Ok((
+                                    client_id,
+                                    xai_grok_shell::ssh::SshControlReply::GrantRequested(request),
+                                )) => TaskResult::SshControlEvent {
+                                    session_id: Some(session_id),
+                                    client_id,
+                                    event: xai_grok_shell::ssh::SshEvent::GrantRequested(request),
+                                },
+                                Ok((client_id, _)) => TaskResult::SshProjectOpenSetupFailed {
+                                    session_id,
+                                    client_id,
+                                    target_id,
+                                    error: "SSH local service returned an unexpected project grant response."
+                                        .into(),
+                                },
+                                Err((client_id, error)) => TaskResult::SshProjectOpenSetupFailed {
+                                    session_id,
+                                    client_id,
+                                    target_id,
+                                    error,
+                                },
+                            },
+                            Ok((client_id, _)) => TaskResult::SshProjectOpenSetupFailed {
+                                session_id,
+                                client_id,
+                                target_id,
+                                error: "SSH local service rejected the project location registration."
+                                    .into(),
+                            },
+                            Err((client_id, error)) => TaskResult::SshProjectOpenSetupFailed {
+                                session_id,
+                                client_id,
+                                target_id,
+                                error,
+                            },
+                        }
+                    }
+                    Ok((client_id, _)) => TaskResult::SshProjectOpenSetupFailed {
+                        session_id,
+                        client_id,
+                        target_id,
+                        error: "SSH local service returned an unexpected project restore response."
+                            .into(),
+                    },
+                    Err((client_id, error)) => TaskResult::SshProjectOpenSetupFailed {
+                        session_id,
+                        client_id,
+                        target_id,
+                        error,
+                    },
+                }
+            });
+        }
+        Effect::SshInheritBinding {
+            source_session_id,
+            source_binding_id,
+            project_session_id,
+            target_id,
+            root,
+            capabilities,
+            client_id,
+        } => {
+            tasks.spawn(async move {
+                let client_id = ssh_control_client_id(client_id).await;
+                let location = xai_grok_shell::ssh::ProjectLocation::Ssh {
+                    target_id: target_id.clone(),
+                    root: root.clone(),
+                };
+                let registered = ssh_control_reply(
+                    xai_grok_shell::ssh::SshControlCommand::RegisterProjectLocation {
+                        session_id: project_session_id.clone(),
+                        location,
+                    },
+                    client_id,
+                )
+                .await;
+                match registered {
+                    Ok((_, xai_grok_shell::ssh::SshControlReply::ProjectLocationRegistered)) => {}
+                    Ok((client_id, _)) => {
+                        return TaskResult::SshActionComplete {
+                            session_id: Some(source_session_id),
+                            client_id,
+                            target_id: Some(target_id),
+                            message: None,
+                            error: Some("SSH local service rejected the project location registration.".into()),
+                        };
+                    }
+                    Err((client_id, error)) => {
+                        return TaskResult::SshActionComplete {
+                            session_id: Some(source_session_id),
+                            client_id,
+                            target_id: Some(target_id),
+                            message: None,
+                            error: Some(error),
+                        };
+                    }
+                }
+                match ssh_control_reply(
+                    xai_grok_shell::ssh::SshControlCommand::InheritSession {
+                        source_session_id: source_session_id.clone(),
+                        binding_id: source_binding_id,
+                        target_session_id: project_session_id.clone(),
+                        capabilities: ssh_capabilities(capabilities),
+                    },
+                    client_id,
+                )
+                .await
+                {
+                    Ok((client_id, xai_grok_shell::ssh::SshControlReply::InheritedBindings(
+                        mut bindings,
+                    ))) if bindings.len() == 1 => TaskResult::SshProjectBindingInherited {
+                        target_id,
+                        root,
+                        project_session_id,
+                        binding: bindings.pop().expect("one inherited binding"),
+                        client_id,
+                    },
+                    Ok((client_id, xai_grok_shell::ssh::SshControlReply::InheritedBindings(_))) => {
+                        TaskResult::SshActionComplete {
+                            session_id: Some(source_session_id),
+                            client_id,
+                            target_id: Some(target_id),
+                            message: None,
+                            error: Some("SSH local service did not mint exactly one project binding.".into()),
+                        }
+                    }
+                    Ok((client_id, _)) => TaskResult::SshActionComplete {
+                        session_id: Some(source_session_id),
+                        client_id,
+                        target_id: Some(target_id),
+                        message: None,
+                        error: Some("SSH local service returned an unexpected project binding response.".into()),
+                    },
+                    Err((client_id, error)) => TaskResult::SshActionComplete {
+                        session_id: Some(source_session_id),
+                        client_id,
+                        target_id: Some(target_id),
+                        message: None,
+                        error: Some(error),
+                    },
+                }
+            });
+        }
+        Effect::SshSubmitAuthentication {
+            client_id,
+            challenge_id,
+            connection_generation,
+            accept_host_key,
+            remember,
+            secret,
+            answers,
+        } => {
+            tasks.spawn(async move {
+                let client_id = ssh_control_client_id(client_id).await;
+                let response = xai_grok_shell::ssh::SshAuthControlResponse {
+                    client_id,
+                    connection_generation,
+                    challenge_id,
+                    accepted: accept_host_key,
+                    host_key_decision: match accept_host_key {
+                        Some(true) => Some(xai_grok_shell::ssh::SshHostKeyDecision::TrustOnce),
+                        Some(false) => Some(xai_grok_shell::ssh::SshHostKeyDecision::Reject),
+                        None => None,
+                    },
+                    remember,
+                    secret: secret.map(crate::views::ssh_modal::SshSecret::into_bytes),
+                    answers: answers
+                        .into_iter()
+                        .map(crate::views::ssh_modal::SshSecret::into_bytes)
+                        .collect(),
+                };
+                ssh_action(
+                    None,
+                    None,
+                    client_id,
+                    xai_grok_shell::ssh::SshControlCommand::SubmitAuthentication(response),
+                    "SSH authentication response sent to the local service.",
+                )
+                .await
+            });
+        }
+        Effect::SshApproveOperation {
+            session_id,
+            client_id,
+            approval_id,
+            approved,
+        } => {
+            tasks.spawn(async move {
+                let client_id = ssh_control_client_id(client_id).await;
+                let reply = ssh_control_reply(
+                    xai_grok_shell::ssh::SshControlCommand::SubmitOperationApproval(
+                        xai_grok_shell::ssh::SshOperationApprovalDecision {
+                            client_id,
+                            approval_id: approval_id.clone(),
+                            approved,
+                        },
+                    ),
+                    client_id,
+                )
+                .await;
+                match reply {
+                    Ok((client_id, _)) => TaskResult::SshOperationApprovalComplete {
+                        session_id,
+                        client_id,
+                        approval_id,
+                        error: None,
+                    },
+                    Err((client_id, error)) => TaskResult::SshOperationApprovalComplete {
+                        session_id,
+                        client_id,
+                        approval_id,
+                        error: Some(error),
+                    },
+                }
+            });
+        }
+        Effect::SshAwaitEvent {
+            client_id,
+            session_id,
+        } => {
+            tasks.spawn(async move { await_ssh_event(session_id, client_id).await });
+        }
+        Effect::OpenSshProject {
+            agent_id,
+            local_launch_cwd,
+            start,
+            ssh_client_id,
+        } => {
+            let tx = acp_tx.clone();
+            let mut meta = session_flags.to_meta();
+            start.merge_session_meta(&mut meta);
+            meta.get_or_insert_with(acp::Meta::new)
+                .insert("x.ai/sshClientId".into(), serde_json::json!(ssh_client_id));
+            tasks.spawn(async move {
+                let result = create_session_in_backend_rpc(
+                    acp::NewSessionRequest::new(local_launch_cwd).mcp_servers(Vec::new()),
+                    meta,
+                    &tx,
+                    "SSH project creation",
+                )
+                .await;
+                match result {
+                    Ok(response) => {
+                        let ssh_project_location =
+                            parse_ssh_project_location_meta(response.meta.as_ref());
+                        TaskResult::WithPinnedMemoryMode {
+                            agent_id,
+                            memory_mode: parse_session_memory_mode(response.meta.as_ref()),
+                            result: Box::new(TaskResult::WithSshProjectLocation {
+                                agent_id,
+                                location: ssh_project_location,
+                                result: Box::new(TaskResult::SessionCreated {
+                                    agent_id,
+                                    session_id: response.session_id,
+                                    models: response.models,
+                                    modes: response.modes,
+                                }),
+                            }),
+                        }
+                    }
+                    Err(error) => TaskResult::SessionFailed {
+                        agent_id,
+                        error: sanitize_user_error(&error.to_string()),
+                        timed_out: error.timed_out(),
+                    },
+                }
+            });
+        }
         Effect::CreateSession {
             agent_id,
             cwd: session_cwd,
@@ -575,14 +1099,20 @@ pub(crate) fn execute(
                             }),
                                 ),
                             );
+                            let ssh_project_location =
+                                parse_ssh_project_location_meta(resp.meta.as_ref());
                             TaskResult::WithPinnedMemoryMode {
                                 agent_id,
                                 memory_mode: parse_session_memory_mode(resp.meta.as_ref()),
-                                result: Box::new(TaskResult::SessionCreated {
+                                result: Box::new(TaskResult::WithSshProjectLocation {
                                     agent_id,
-                                    session_id: resp.session_id,
-                                    models: resp.models,
-                                    modes: resp.modes,
+                                    location: ssh_project_location,
+                                    result: Box::new(TaskResult::SessionCreated {
+                                        agent_id,
+                                        session_id: resp.session_id,
+                                        models: resp.models,
+                                        modes: resp.modes,
+                                    }),
                                 }),
                             }
                         }
@@ -670,16 +1200,21 @@ pub(crate) fn execute(
                             .await
                         {
                             Ok(resumed) => {
-                                TaskResult::WorktreeForked {
+                                let ssh_project_location = resumed.ssh_project_location;
+                                TaskResult::WithSshProjectLocation {
                                     agent_id,
-                                    session_id: acp::SessionId::new(resumed.session_id),
-                                    worktree_path: resumed.worktree_root,
-                                    session_cwd: resumed.session_cwd,
-                                    code_restored: resumed.code_restored,
-                                    restore_summary: resumed.restore_summary,
-                                    restore_degree: resumed.restore_degree,
-                                    resume_session_id: Some(sid),
-                                    strategy_summary: resumed.strategy_summary,
+                                    location: ssh_project_location,
+                                    result: Box::new(TaskResult::WorktreeForked {
+                                        agent_id,
+                                        session_id: acp::SessionId::new(resumed.session_id),
+                                        worktree_path: resumed.worktree_root,
+                                        session_cwd: resumed.session_cwd,
+                                        code_restored: resumed.code_restored,
+                                        restore_summary: resumed.restore_summary,
+                                        restore_degree: resumed.restore_degree,
+                                        resume_session_id: Some(sid),
+                                        strategy_summary: resumed.strategy_summary,
+                                    }),
                                 }
                             }
                             Err(e) => {
@@ -742,17 +1277,23 @@ pub(crate) fn execute(
                         .await;
                     match result {
                         Ok(resp) => {
+                            let ssh_project_location =
+                                parse_ssh_project_location_meta(resp.meta.as_ref());
                             TaskResult::WithPinnedMemoryMode {
                                 agent_id,
                                 memory_mode: parse_session_memory_mode(resp.meta.as_ref()),
-                                result: Box::new(TaskResult::WorktreeSessionCreated {
+                                result: Box::new(TaskResult::WithSshProjectLocation {
                                     agent_id,
-                                    session_id: resp.session_id,
-                                    worktree_path: worktree_root,
-                                    session_cwd,
-                                    models: resp.models,
-                                    modes: resp.modes,
-                                    strategy_summary,
+                                    location: ssh_project_location,
+                                    result: Box::new(TaskResult::WorktreeSessionCreated {
+                                        agent_id,
+                                        session_id: resp.session_id,
+                                        worktree_path: worktree_root,
+                                        session_cwd,
+                                        models: resp.models,
+                                        modes: resp.modes,
+                                        strategy_summary,
+                                    }),
                                 }),
                             }
                         }
@@ -814,18 +1355,24 @@ pub(crate) fn execute(
                             let running_prompt_id = parse_session_load_running_prompt_id(
                                 resp.meta.as_ref(),
                             );
+                            let ssh_project_location =
+                                parse_ssh_project_location_meta(resp.meta.as_ref());
                             TaskResult::WithPinnedMemoryMode {
                                 agent_id,
                                 memory_mode: parse_session_memory_mode(resp.meta.as_ref()),
-                                result: Box::new(TaskResult::SessionLoaded {
+                                result: Box::new(TaskResult::WithSshProjectLocation {
                                     agent_id,
-                                    session_id: acp_session_id,
-                                    models: resp.models,
-                                    modes: resp.modes,
-                                    code_restored,
-                                    restore_summary,
-                                    restore_degree,
-                                    running_prompt_id,
+                                    location: ssh_project_location,
+                                    result: Box::new(TaskResult::SessionLoaded {
+                                        agent_id,
+                                        session_id: acp_session_id,
+                                        models: resp.models,
+                                        modes: resp.modes,
+                                        code_restored,
+                                        restore_summary,
+                                        restore_degree,
+                                        running_prompt_id,
+                                    }),
                                 }),
                             }
                         }
@@ -5479,6 +6026,358 @@ pub(crate) fn execute(
         }
     }
     (false, meta)
+}
+
+async fn ssh_control_reply(
+    command: xai_grok_shell::ssh::SshControlCommand,
+    fallback_client_id: u64,
+) -> std::result::Result<(u64, xai_grok_shell::ssh::SshControlReply), (u64, String)> {
+    crate::app::ssh_control::request(command)
+        .await
+        .map_err(|error| {
+            (
+                fallback_client_id,
+                sanitize_user_error(&format!("SSH local service: {error}")),
+            )
+        })
+}
+
+async fn ssh_control_client_id(fallback_client_id: u64) -> u64 {
+    crate::app::ssh_control::client_id()
+        .await
+        .unwrap_or(fallback_client_id)
+}
+
+async fn await_ssh_event(session_id: Option<String>, fallback_client_id: u64) -> TaskResult {
+    match crate::app::ssh_control::next_event().await {
+        Ok((client_id, event)) => TaskResult::SshControlEvent {
+            session_id,
+            client_id,
+            event,
+        },
+        Err(error) => TaskResult::SshActionComplete {
+            session_id,
+            client_id: fallback_client_id,
+            target_id: None,
+            message: None,
+            error: Some(sanitize_user_error(&error.to_string())),
+        },
+    }
+}
+
+/// Apply the authoritative status returned by connect/disconnect immediately.
+///
+/// The broadcast status is still consumed for asynchronous changes, but an interactive
+/// authentication can complete before a replacement event waiter is installed.
+async fn ssh_target_status_action(
+    fallback_client_id: u64,
+    target_id: String,
+    command: xai_grok_shell::ssh::SshControlCommand,
+    unexpected_response: &str,
+) -> TaskResult {
+    match ssh_control_reply(command, fallback_client_id).await {
+        Ok((client_id, xai_grok_shell::ssh::SshControlReply::TargetStatus(status))) => {
+            TaskResult::SshControlEvent {
+                session_id: None,
+                client_id,
+                event: xai_grok_shell::ssh::SshEvent::TargetStatus(status),
+            }
+        }
+        Ok((client_id, _)) => TaskResult::SshActionComplete {
+            session_id: None,
+            client_id,
+            target_id: Some(target_id),
+            message: None,
+            error: Some(unexpected_response.into()),
+        },
+        Err((client_id, error)) => TaskResult::SshActionComplete {
+            session_id: None,
+            client_id,
+            target_id: Some(target_id),
+            message: None,
+            error: Some(error),
+        },
+    }
+}
+
+async fn ssh_action(
+    session_id: Option<String>,
+    target_id: Option<String>,
+    fallback_client_id: u64,
+    command: xai_grok_shell::ssh::SshControlCommand,
+    success: &str,
+) -> TaskResult {
+    match ssh_control_reply(command, fallback_client_id).await {
+        Ok((client_id, _)) => TaskResult::SshActionComplete {
+            session_id,
+            client_id,
+            target_id,
+            message: Some(success.into()),
+            error: None,
+        },
+        Err((client_id, error)) => TaskResult::SshActionComplete {
+            session_id,
+            client_id,
+            target_id,
+            message: None,
+            error: Some(error),
+        },
+    }
+}
+
+async fn ssh_grant_reply(
+    session_id: Option<String>,
+    fallback_client_id: u64,
+    command: xai_grok_shell::ssh::SshControlCommand,
+) -> TaskResult {
+    match ssh_control_reply(command, fallback_client_id).await {
+        Ok((client_id, xai_grok_shell::ssh::SshControlReply::GrantRequested(request))) => {
+            TaskResult::SshControlEvent {
+                session_id,
+                client_id,
+                event: xai_grok_shell::ssh::SshEvent::GrantRequested(request),
+            }
+        }
+        Ok((client_id, _)) => TaskResult::SshActionComplete {
+            session_id,
+            client_id,
+            target_id: None,
+            message: None,
+            error: Some("SSH local service returned an unexpected grant response.".into()),
+        },
+        Err((client_id, error)) => TaskResult::SshActionComplete {
+            session_id,
+            client_id,
+            target_id: None,
+            message: None,
+            error: Some(error),
+        },
+    }
+}
+
+async fn ssh_grant_decision(
+    session_id: String,
+    target_id: Option<String>,
+    fallback_client_id: u64,
+    decision: xai_grok_shell::ssh::SshGrantDecision,
+) -> TaskResult {
+    let request_id = decision.request_id.clone();
+    match ssh_control_reply(
+        xai_grok_shell::ssh::SshControlCommand::ApproveGrant(decision),
+        fallback_client_id,
+    )
+    .await
+    {
+        Ok((client_id, xai_grok_shell::ssh::SshControlReply::GrantResolved { binding })) => {
+            TaskResult::SshControlEvent {
+                session_id: Some(session_id),
+                client_id,
+                event: xai_grok_shell::ssh::SshEvent::GrantResolved {
+                    request_id,
+                    approved: binding.is_some(),
+                    binding,
+                },
+            }
+        }
+        Ok((client_id, _)) => TaskResult::SshActionComplete {
+            session_id: Some(session_id),
+            client_id,
+            target_id,
+            message: None,
+            error: Some("SSH local service returned an unexpected grant decision response.".into()),
+        },
+        Err((client_id, error)) => TaskResult::SshActionComplete {
+            session_id: Some(session_id),
+            client_id,
+            target_id,
+            message: None,
+            error: Some(error),
+        },
+    }
+}
+
+async fn load_ssh_targets(session_id: Option<String>, fallback_client_id: u64) -> TaskResult {
+    let (client_id, configured) = match ssh_control_reply(
+        xai_grok_shell::ssh::SshControlCommand::ListConfiguredTargets,
+        fallback_client_id,
+    )
+    .await
+    {
+        Ok((client_id, xai_grok_shell::ssh::SshControlReply::ConfiguredTargets(targets))) => {
+            (client_id, targets)
+        }
+        Ok((client_id, _)) => {
+            return TaskResult::SshTargetsLoaded {
+                session_id,
+                client_id,
+                targets: Vec::new(),
+                error: Some("SSH local service returned an unexpected target list.".into()),
+            };
+        }
+        Err((client_id, error)) => {
+            return TaskResult::SshTargetsLoaded {
+                session_id,
+                client_id,
+                targets: Vec::new(),
+                error: Some(error),
+            };
+        }
+    };
+    let configured = match serde_json::from_str::<Vec<xai_grok_ssh::SshTarget>>(&configured) {
+        Ok(targets) => targets,
+        Err(error) => {
+            return TaskResult::SshTargetsLoaded {
+                session_id,
+                client_id,
+                targets: Vec::new(),
+                error: Some(format!("Could not read SSH target configuration: {error}")),
+            };
+        }
+    };
+    let accesses = if let Some(session_id) = session_id.as_deref() {
+        match ssh_control_reply(
+            xai_grok_shell::ssh::SshControlCommand::ListSessionTargets {
+                session_id: session_id.to_owned(),
+            },
+            client_id,
+        )
+        .await
+        {
+            Ok((_, xai_grok_shell::ssh::SshControlReply::SessionTargets(accesses))) => accesses,
+            Ok(_) => {
+                return TaskResult::SshTargetsLoaded {
+                    session_id: Some(session_id.to_owned()),
+                    client_id,
+                    targets: Vec::new(),
+                    error: Some("SSH local service returned an unexpected session target list.".into()),
+                };
+            }
+            Err((_, error)) => {
+                return TaskResult::SshTargetsLoaded {
+                    session_id: Some(session_id.to_owned()),
+                    client_id,
+                    targets: Vec::new(),
+                    error: Some(error),
+                };
+            }
+        }
+    } else {
+        Vec::new()
+    };
+
+    let store = xai_grok_ssh::TargetStore::new(xai_grok_shell::util::grok_home::grok_home());
+    let mut views = Vec::with_capacity(configured.len());
+    for target in configured {
+        let effective_address = match store.resolve(&target.id) {
+            Ok(resolved) => format!("{}@{}:{}", resolved.username, resolved.hostname, resolved.port),
+            Err(error) => format!("configuration error: {error}"),
+        };
+        let grant = accesses
+            .iter()
+            .find(|access| access.target_id == target.id)
+            .map(|access| crate::views::ssh_modal::SshGrantView::Granted {
+                binding_id: access.binding_id.clone(),
+                root: access.root.clone(),
+                capabilities: crate::views::ssh_modal::SshCapabilitiesView {
+                    read: access.capabilities.read,
+                    write: access.capabilities.write,
+                    execute: access.capabilities.execute,
+                },
+                is_default: access.is_default,
+            })
+            .unwrap_or(crate::views::ssh_modal::SshGrantView::NotGranted);
+        let status = match ssh_control_reply(
+            xai_grok_shell::ssh::SshControlCommand::ConnectionStatus {
+                target_id: target.id.clone(),
+            },
+            client_id,
+        )
+        .await
+        {
+            Ok((_, xai_grok_shell::ssh::SshControlReply::TargetStatus(status))) => status,
+            Ok(_) => xai_grok_shell::ssh::SshTargetStatus {
+                target_id: target.id.clone(),
+                connection: xai_grok_shell::ssh::SshConnectionState::Disconnected,
+                detail: Some("Connection status unavailable.".into()),
+            },
+            Err((_, error)) => xai_grok_shell::ssh::SshTargetStatus {
+                target_id: target.id.clone(),
+                connection: xai_grok_shell::ssh::SshConnectionState::Disconnected,
+                detail: Some(error),
+            },
+        };
+        let source = match &target.source {
+            xai_grok_ssh::TargetSource::User => "Groky config".into(),
+            xai_grok_ssh::TargetSource::Imported { path, line } => {
+                format!("OpenSSH {}:{line}", path.display())
+            }
+        };
+        let connected = matches!(status.connection, xai_grok_shell::ssh::SshConnectionState::Connected);
+        let connection_detail = status.detail.unwrap_or_else(|| match status.connection {
+            xai_grok_shell::ssh::SshConnectionState::Disconnected => "Not connected.".into(),
+            xai_grok_shell::ssh::SshConnectionState::Connecting => "Connecting through local SSH service…".into(),
+            xai_grok_shell::ssh::SshConnectionState::Connected => "Connected through local SSH service.".into(),
+            xai_grok_shell::ssh::SshConnectionState::AuthenticationRequired => "Local authentication is required.".into(),
+            xai_grok_shell::ssh::SshConnectionState::Failed => "Connection failed.".into(),
+        });
+        views.push(crate::views::ssh_modal::SshTargetView {
+            target_id: target.id,
+            label: target.label,
+            source,
+            effective_address,
+            connected,
+            connection_detail,
+            grant,
+        });
+    }
+    TaskResult::SshTargetsLoaded {
+        session_id,
+        client_id,
+        targets: views,
+        error: None,
+    }
+}
+
+fn add_ssh_target(
+    draft: crate::views::ssh_modal::SshManualTargetDraft,
+) -> std::result::Result<xai_grok_ssh::SshTarget, String> {
+    let mut target = xai_grok_ssh::SshTarget::new(draft.host);
+    if let Some(label) = draft.label {
+        target.label = label;
+    }
+    target.user = draft.user;
+    target.port = draft.port;
+    target.identity_files = draft.identity_file.into_iter().map(Into::into).collect();
+    if let Some(worker_command) = draft.worker_command {
+        target.worker_command = xai_grok_ssh::parse_worker_command(&worker_command)
+            .map_err(|error| error.to_string())?;
+    }
+    xai_grok_ssh::TargetStore::new(xai_grok_shell::util::grok_home::grok_home())
+        .upsert(target)
+        .map_err(|error| error.to_string())
+}
+
+fn ssh_capabilities(
+    capabilities: crate::views::ssh_modal::SshCapabilitiesView,
+) -> xai_grok_shell::ssh::SshCapabilities {
+    xai_grok_shell::ssh::SshCapabilities {
+        read: capabilities.read,
+        write: capabilities.write,
+        execute: capabilities.execute,
+    }
+}
+
+fn ssh_grant_scope(
+    lifetime: crate::views::ssh_modal::SshGrantLifetime,
+) -> xai_grok_shell::ssh::SshGrantScope {
+    match lifetime {
+        crate::views::ssh_modal::SshGrantLifetime::CurrentSession => {
+            xai_grok_shell::ssh::SshGrantScope::CurrentSession
+        }
+        crate::views::ssh_modal::SshGrantLifetime::ProjectRule => {
+            xai_grok_shell::ssh::SshGrantScope::ProjectRule
+        }
+    }
 }
 /// Fetch session info from ACP via `x.ai/session/info`.
 async fn fetch_session_info(

@@ -218,6 +218,11 @@ fn resolve_session_computer_sessions(
 pub(crate) struct SessionSpawnOptions<'a> {
     pub session_info: SessionInfo,
     pub cwd: AbsPathBuf,
+    /// Execution location. `None` is the legacy local workspace.
+    pub project_location: Option<xai_grok_workspace_types::ssh::ProjectLocation>,
+    /// Pre-bound remote workspace transport. SSH projects never fall back to the
+    /// process-wide local workspace operations.
+    pub workspace_ops: Option<xai_grok_workspace::WorkspaceOps>,
     pub mcp_servers: Vec<acp::McpServer>,
     pub initial_client_mcp_servers: Vec<acp::McpServer>,
     pub mcp_meta_config_map: McpMetaConfigMap,
@@ -371,6 +376,8 @@ pub(crate) fn chat_session_spawn_options<'a>(
     SessionSpawnOptions {
         session_info,
         cwd,
+        project_location: None,
+        workspace_ops: None,
         mcp_servers: Vec::new(),
         initial_client_mcp_servers: Vec::new(),
         mcp_meta_config_map: Default::default(),
@@ -688,6 +695,12 @@ pub struct MvpAgent {
     pub(crate) sampling_config: RefCell<SamplingConfig>,
     pub(crate) auth_manager: Arc<AuthManager>,
     pub(crate) models_manager: crate::agent::remote_config::ModelsManager,
+    /// SSH authorization and remote-worker service injected by the persistent
+    /// leader or an embedded host.
+    pub(crate) session_ssh: Option<Arc<crate::ssh::SessionSsh>>,
+    /// Stable embedded-host interaction identity. Persistent leaders leave
+    /// this unset and derive ownership only from SSH-project request metadata.
+    pub(crate) session_ssh_client_id: Option<u64>,
     /// grok.com chat-product catalog (`/rest/modes`) for chat sessions; distinct from `models_manager` (the build `/v1/models` catalog).
     pub(crate) chat_modes: crate::agent::chat_modes::ChatModesManager,
     /// Single-flight guard for interactive login (device poll / loopback wait).

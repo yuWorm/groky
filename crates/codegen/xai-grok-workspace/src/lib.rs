@@ -47,6 +47,7 @@ pub mod sandbox;
 pub mod sandbox_mode;
 pub mod session;
 pub mod status_config;
+pub mod ssh_worker;
 pub(crate) mod telemetry;
 pub use status_config::{ProactiveRefreshConfig, StatusConfig};
 pub mod trust;
@@ -78,6 +79,11 @@ pub use session::{file_state, git, jj};
 pub use upload::environment::{WorkspaceEnvironment, WorkspaceIdentity};
 pub use workspace_ops::{WorkspaceOp, WorkspaceOps};
 pub use xai_grok_workspace_client::WorkspaceClient;
+pub use xai_grok_workspace_client::ssh::{
+    BoxSshStream, DenySshApprovals, SshClientCallbacks, SshClientError, SshMutationStatus,
+    SshWorkspaceClient,
+};
+pub use xai_grok_workspace_types::ssh_wire::SshProjectBootstrap;
 pub use xai_grok_workspace_types::WorkspaceEvent;
 pub use xai_hunk_tracker::HunkTrackerHandle;
 /// Zero-init every workspace metric family so idle panels render a `0` baseline instead of "No data".

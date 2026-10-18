@@ -14,6 +14,7 @@ use serde::Serialize;
 use crate::agent::session_registry_client::{SessionRecord, SessionRegistryClient};
 use crate::session::persistence::{Summary, list_summaries};
 use xai_grok_workspace::session::git::normalize_repo_url;
+use xai_grok_workspace_types::ssh::ProjectLocation;
 
 pub const REMOTE_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -32,6 +33,10 @@ pub struct MergedSession {
     pub updated_at: String,
     pub created_at: String,
     pub cwd: String,
+    /// Immutable execution target needed to resume an SSH project without
+    /// rebuilding a remote root from the local ACP cwd.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub project_location: Option<ProjectLocation>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub hostname: Option<String>,
     /// Where this entry came from: "local", "remote", or "both".
@@ -296,6 +301,7 @@ pub fn merge(
                 updated_at: s.updated_at.to_rfc3339(),
                 created_at: s.created_at.to_rfc3339(),
                 cwd: s.info.cwd,
+                project_location: s.project_location,
                 hostname: None,
                 source: "local".to_string(),
                 model_id: Some(s.current_model_id.to_string()),
@@ -354,6 +360,7 @@ pub fn merge(
                 updated_at: r.updated_at,
                 created_at: r.created_at,
                 cwd: r.cwd,
+                project_location: local.project_location,
                 hostname: r.hostname,
                 source: source.to_string(),
                 model_id: r.model_id,
@@ -464,6 +471,8 @@ mod tests {
                 id: acp::SessionId::new(id),
                 cwd: "/test".into(),
             },
+            project_location: None,
+            ssh_state: None,
             agent_id: None,
             attempt_id: None,
             cwd_generation: 0,
@@ -1382,6 +1391,7 @@ mod tests {
             last_turn_summary: None,
             last_recap: None,
             session_kind: None,
+            project_location: None,
         }
     }
 

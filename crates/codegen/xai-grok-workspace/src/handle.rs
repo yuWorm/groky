@@ -2601,32 +2601,45 @@ impl WorkspaceHandle {
         }
         let tool_server = {
             let hub_guard = self.shared.hub_handle.lock().await;
-            let hub = hub_guard
-                .as_ref()
-                .ok_or_else(|| WorkspaceError::HubError("no hub connection".into()))?;
-            hub.server.clone()
+            hub_guard.as_ref().map(|hub| hub.server.clone())
         };
+        if tool_server.is_none() && self.shared.hub_config.is_some() {
+            return Err(WorkspaceError::HubError("no hub connection".into()));
+        }
         let session = self
             .session(session_id)
             .ok_or_else(|| WorkspaceError::SessionNotFound(session_id.to_owned()))?;
         let sid = SessionId::new(session_id)
             .map_err(|e| WorkspaceError::HubError(format!("invalid session_id: {e}")))?;
         let _update_guard = session.update_lock.lock().await;
-        let live: Vec<String> = session
-            .mcp_binding
-            .lock()
-            .await
-            .active()
-            .map(|active| active.servers.keys().cloned().collect())
-            .unwrap_or_default();
+        let (live, local_tool_ids): (Vec<String>, Vec<ToolId>) = {
+            let binding = session.mcp_binding.lock().await;
+            match binding.active() {
+                Some(active) => (
+                    active.servers.keys().cloned().collect(),
+                    active
+                        .servers
+                        .values()
+                        .flat_map(|server| server.tool_ids.iter().cloned())
+                        .collect(),
+                ),
+                None => (Vec::new(), Vec::new()),
+            }
+        };
+        let session_toolset = session.toolset();
         crate::mcp::stop_servers(
             &session,
             &sid,
-            Some(&tool_server),
+            tool_server.as_ref(),
             &live,
             crate::mcp::Restart::OnReconfigured,
         )
         .await;
+        if tool_server.is_none() {
+            for tool_id in local_tool_ids {
+                session_toolset.unregister_tool_by_name(tool_id.as_str());
+            }
+        }
         {
             let _binding = session.mcp_binding.lock().await;
             let mut state = session.mcp_state.lock().await;
@@ -2646,14 +2659,24 @@ impl WorkspaceHandle {
             started: started.servers.iter().map(|s| s.name.clone()).collect(),
             failed: started.failed.clone(),
         };
-        crate::mcp::install_and_advertise_qualified(
-            &session,
-            &sid,
-            &tool_server,
-            started.servers,
-            life,
-        )
-        .await?;
+        if let Some(tool_server) = &tool_server {
+            crate::mcp::install_and_advertise_qualified(
+                &session,
+                &sid,
+                tool_server,
+                started.servers,
+                life,
+            )
+            .await?;
+        } else {
+            crate::mcp::install_and_register_local_qualified(
+                &session,
+                &session_toolset,
+                started.servers,
+                life,
+            )
+            .await?;
+        }
         if !result.started.is_empty() {
             let _ =
                 self.shared

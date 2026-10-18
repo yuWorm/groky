@@ -657,6 +657,13 @@ pub fn local_build_session_on_disk(session_id: &str, cwd: &Path) -> bool {
     let cwd_str = cwd.to_string_lossy();
     xai_grok_shell::session::resolve_local_session(session_id, &cwd_str).is_some()
 }
+/// Converts a session-storage directory identity into a local cwd only when it
+/// is an absolute local path. SSH sessions use opaque `ssh-v1-*` storage
+/// identities and must retain the actual launch cwd for ACP.
+pub(crate) fn local_cwd_from_session_storage(storage_cwd: &str) -> Option<PathBuf> {
+    let path = Path::new(storage_cwd);
+    path.is_absolute().then(|| path.to_path_buf())
+}
 /// Pure policy: process-wide `--chat` refuses a local Build disk row.
 /// The exception is a caller-marked explicit conversation entry (picker `source == "conversation"`).
 pub fn chat_mode_refuses_local_build(
@@ -994,19 +1001,30 @@ async fn resolve_existing_session(
             suppress_code_restore: false,
         });
     }
-    if let Some(original_cwd) = xai_grok_shell::session::resolve_local_session_any_cwd(session_id) {
-        tracing::info!(
-            session_id = %session_id,
-            original_cwd = %original_cwd,
-            "Session found locally under different CWD"
-        );
-        eprintln!(
-            "Session {} found locally (originally in {})",
-            session_id, original_cwd
-        );
+    if let Some(storage_cwd) = xai_grok_shell::session::resolve_local_session_any_cwd(session_id)
+    {
+        let original_cwd = local_cwd_from_session_storage(&storage_cwd);
+        if let Some(original_cwd) = original_cwd.as_ref() {
+            tracing::info!(
+                session_id = %session_id,
+                original_cwd = %original_cwd.display(),
+                "Session found locally under different CWD"
+            );
+            eprintln!(
+                "Session {} found locally (originally in {})",
+                session_id,
+                original_cwd.display()
+            );
+        } else {
+            tracing::info!(
+                session_id = %session_id,
+                storage_identity = %storage_cwd,
+                "Session found with non-path storage identity"
+            );
+        }
         return Ok(ResolvedExisting {
             id: session_id.to_string(),
-            original_cwd: Some(PathBuf::from(original_cwd)),
+            original_cwd,
             title: None,
             deferred_local_miss: false,
             suppress_code_restore: false,
@@ -1344,6 +1362,14 @@ mod tests {
     }
     fn parse(args: &[&str]) -> PagerArgs {
         PagerArgs::try_parse_from(args).unwrap()
+    }
+    #[test]
+    fn only_absolute_storage_id_is_used_as_local_cwd() {
+        assert_eq!(
+            local_cwd_from_session_storage("/Users/test/project"),
+            Some(PathBuf::from("/Users/test/project"))
+        );
+        assert_eq!(local_cwd_from_session_storage("ssh-v1-abc123"), None);
     }
     #[test]
     fn traceparent_of_span_captures_own_span_id_not_parent() {

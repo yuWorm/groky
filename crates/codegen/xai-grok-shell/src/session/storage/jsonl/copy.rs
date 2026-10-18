@@ -540,12 +540,19 @@ fn fork_summary(
     counters: ForkCounters,
 ) -> Summary {
     let target_worktree_identity =
-        crate::session::worktree::worktree_identity_for_cwd(&target_info.cwd);
+        (!xai_grok_shared::session::is_ssh_storage_cwd(&target_info.cwd))
+            .then(|| crate::session::worktree::worktree_identity_for_cwd(&target_info.cwd))
+            .flatten();
     let identity = options.mint_session_identity.then(|| {
         crate::session::persistence::mint_next_session_identity(source.agent_id.as_deref(), true)
     });
     let mut summary = Summary {
         info: target_info.clone(),
+        project_location: options
+            .project_location
+            .clone()
+            .or(source.project_location),
+        ssh_state: None,
         agent_id: identity.as_ref().map(|identity| identity.agent_id.clone()),
         attempt_id: identity.map(|identity| identity.attempt_id),
         cwd_generation: source.cwd_generation,

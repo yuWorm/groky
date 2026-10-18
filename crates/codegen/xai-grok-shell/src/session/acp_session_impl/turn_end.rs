@@ -66,21 +66,52 @@ impl SessionActor {
 
     /// Emit `x.ai/git_head_changed` after an edit or shell command that may have moved HEAD (e.g. `git checkout`, `git commit`).
     /// Clients then update their status bar and changes panel immediately instead of waiting for the debounced fs-watch refresh.
-    pub(super) async fn maybe_notify_git_branch(&self) {
-        if !self.git_head_enabled {
+    pub(super) async fn maybe_notify_git_branch(&self, persist: bool) {
+        let is_ssh = self.workspace_ops.is_ssh();
+        if !self.git_head_enabled && !is_ssh {
             return;
         }
         let cwd = self.tool_context.cwd.as_path();
 
-        // `get_worktree_info` doubles as the "in a git repo?" probe (None when not).
-        let (worktree_info, branch, commit) = tokio::join!(
-            xai_grok_workspace::session::git::get_worktree_info(cwd),
-            xai_grok_workspace::session::git::get_branch(cwd),
-            xai_grok_workspace::session::git::get_current_commit(cwd),
-        );
-        let Some((is_worktree, main_repo)) = worktree_info else {
-            return;
+        let (is_worktree, main_repo, branch, commit) = if is_ssh {
+            let Ok(Ok(snapshot)) = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                self.workspace_ops.git_head_snapshot(),
+            ).await else {
+                return;
+            };
+            if snapshot.repo_root.is_none() {
+                return;
+            }
+            (
+                snapshot.is_worktree,
+                snapshot.main_root.map(|path| path.to_string_lossy().into_owned()),
+                snapshot.branch,
+                snapshot.commit,
+            )
+        } else {
+            let (worktree_info, branch, commit) = tokio::join!(
+                xai_grok_workspace::session::git::get_worktree_info(cwd),
+                xai_grok_workspace::session::git::get_branch(cwd),
+                xai_grok_workspace::session::git::get_current_commit(cwd),
+            );
+            let Some((is_worktree, main_repo)) = worktree_info else {
+                return;
+            };
+            (is_worktree, main_repo, branch, commit)
         };
+
+        // SSH has no local fs watcher. Persist independently of tracing and
+        // client notification capabilities so resume can restore the saved HEAD.
+        if is_ssh && persist {
+            let _ = self.notifications.persistence_tx.send(PersistenceMsg::GitHead {
+                commit: commit.clone(),
+                branch: branch.clone(),
+            });
+        }
+        if !self.git_head_enabled {
+            return;
+        }
 
         let dedup_key = git_head_dedup_key(
             branch.as_deref(),
@@ -395,6 +426,9 @@ impl SessionActor {
         elapsed_ms: Option<u64>,
         snapshot: Option<&TurnDeltaSnapshot>,
     ) {
+        if self.workspace_ops.is_ssh() {
+            self.maybe_notify_git_branch(true).await;
+        }
         let (stop_reason, agent_result, error_kind) =
             crate::sampling::error::prompt_complete_fields(mapped);
         let extra = crate::session::commands::cancellation_meta(

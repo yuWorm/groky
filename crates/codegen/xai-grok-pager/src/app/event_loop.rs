@@ -1702,6 +1702,17 @@ pub(crate) async fn run(
     let mut suspend_retry_after: Option<Instant> = None;
     let mut suspend_wait_reports = SuspendWaitReports::default();
     presenter.request_presentation(&mut app, terminal, false);
+    // Consume local-control events before starting any session load. Restoring an
+    // SSH project can require authentication before SessionCreated/SessionLoaded.
+    // The same receiver also owns later approvals while the manager is closed.
+    app.ssh_event_consumer_active = true;
+    let ssh_events = vec![super::actions::Effect::SshAwaitEvent {
+        client_id: app.ssh_client_id,
+        session_id: None,
+    }];
+    if process_effects(ssh_events, &mut tasks, &mut app, &progress_tx) {
+        return Ok(finish_run(&mut app));
+    }
     if matches!(app.auth_state, AuthState::Done) {
         let effs = dispatch::dispatch(Action::RequestBundleStatus, &mut app);
         if process_effects(effs, &mut tasks, &mut app, &progress_tx) {
@@ -1731,11 +1742,13 @@ pub(crate) async fn run(
         return Ok(finish_run(&mut app));
     }
     use crate::app::session_startup::MaterializedStartup;
-    let startup_action = match &materialized {
+    let startup_action = if let Some(project) = args.ssh_project_open.clone() {
+        Some(Action::BeginSshProjectOpen(project))
+    } else {
+        match &materialized {
         MaterializedStartup::Resume {
             session_id,
             deferred_local_miss,
-            suppress_code_restore,
             ..
         } if args.worktree.is_some() => {
             tracing::info!(
@@ -1744,14 +1757,28 @@ pub(crate) async fn run(
                 "RESTORE_CODE_DEBUG: worktree+resume path taken"
             );
             app.resume_local_miss = deferred_local_miss.then(|| session_id.clone());
-            if *suppress_code_restore {
-                app.suppress_code_restore_once = Some(session_id.clone());
-            }
-            Some(Action::NewWorktreeSession {
-                load_session_id: Some(session_id.clone()),
-                label: args.worktree.as_ref().filter(|s| !s.is_empty()).cloned(),
-                git_ref: args.worktree_ref.clone(),
-            })
+            // A remote source session must never restore code into the local launch
+            // directory. Consume this one-shot guard on the source `LoadSession`; the
+            // retained global restore preference then applies to its worktree child.
+            app.suppress_code_restore_once = Some(session_id.clone());
+            // The remote worktree extension operates on a resident source workspace.
+            // Retain this exact startup intent until SessionLoaded, then reuse the normal
+            // worktree flow instead of falling back to a local workspace.
+            app.deferred_startup.session =
+                Some(crate::app::session_startup::DeferredSessionStartup::Load {
+                    session_id: session_id.clone(),
+                    session_cwd: session_cwd.clone(),
+                    chat_kind: false,
+                });
+            app.deferred_startup.worktree = true;
+            app.deferred_startup.worktree_label =
+                args.worktree.as_ref().filter(|s| !s.is_empty()).cloned();
+            app.deferred_startup.worktree_ref = args.worktree_ref.clone();
+            Some(Action::LoadSession(
+                session_id.clone(),
+                session_cwd.clone(),
+                false,
+            ))
         }
         MaterializedStartup::Resume {
             session_id,
@@ -1802,6 +1829,7 @@ pub(crate) async fn run(
             })
         }
         MaterializedStartup::NewAuto => None,
+        }
     };
     if let Some(action) = startup_action {
         let effs = dispatch::dispatch(action, &mut app);
@@ -4658,6 +4686,35 @@ mod tests {
             take_load_restore_code(&mut app, std::slice::from_ref(&load)),
             Some(true),
             "later loads must use app.restore_code, not sticky false"
+        );
+        app.suppress_code_restore_once = Some("remote-source".into());
+        let source_load = Effect::LoadSession {
+            agent_id: AgentId(0),
+            session_id: "remote-source".into(),
+            session_cwd: None,
+            chat_kind: false,
+        };
+        assert_eq!(
+            take_load_restore_code(&mut app, std::slice::from_ref(&source_load)),
+            Some(false),
+            "a cold SSH source load must not restore into the local launch directory"
+        );
+        assert!(app.suppress_code_restore_once.is_none());
+        let child_worktree = Effect::CreateWorktreeSession {
+            agent_id: AgentId(0),
+            load_session_id: Some("remote-source".into()),
+            label: None,
+            git_ref: None,
+            model_id: None,
+            permission_mode_override: None,
+            preferred_session_id: None,
+            minted_session_id: None,
+            chat_kind: false,
+        };
+        assert_eq!(
+            take_load_restore_code(&mut app, std::slice::from_ref(&child_worktree)),
+            Some(true),
+            "the retained restore preference applies to the remote worktree child"
         );
     }
     #[test]

@@ -431,7 +431,7 @@ async fn spawn_agent(
     options: &HeadlessOptions,
 ) -> Result<SpawnedAgent> {
     let _ = options;
-    spawn_grok_shell(agent_config, cancel, memory_config).await
+    spawn_grok_shell(agent_config, cancel, memory_config, None).await
 }
 /// Authenticate via the agent's `defaultAuthMethodId`, failing closed when none is available.
 /// Returns whether the selected method is API-key auth.
@@ -669,11 +669,13 @@ async fn resume_session_in_new_worktree(
     )
     .await
     .map_err(|e| anyhow::anyhow!("{e}"))?;
+    let remote_worktree = resumed.ssh_project_location.is_some();
     tracing::info!(
         session_id = %resumed.session_id,
         worktree = %resumed.worktree_root.display(),
         session_cwd = %resumed.session_cwd.display(),
         code_restored = resumed.code_restored,
+        remote_worktree,
         "headless: session resumed into worktree"
     );
     open_session(
@@ -684,10 +686,14 @@ async fn resume_session_in_new_worktree(
     )
     .await
     .map_err(|e| {
-        anyhow::anyhow!(
-            "{}",
-            note_orphaned_worktree(&e.to_string(), &resumed.worktree_root)
-        )
+        if remote_worktree {
+            anyhow::anyhow!("{e}")
+        } else {
+            anyhow::anyhow!(
+                "{}",
+                note_orphaned_worktree(&e.to_string(), &resumed.worktree_root)
+            )
+        }
     })
 }
 /// Apply `-m` / effort after session open.

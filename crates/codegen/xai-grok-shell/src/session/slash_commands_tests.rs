@@ -388,7 +388,7 @@ async fn build_skill_information_for_refs_loads_and_wraps() {
 
     let parsed = parse_skill_references("/commit fix typo", &skills, all_gated())
         .expect("known skill must parse");
-    let info = build_skill_information_for_refs(&parsed, &skills, "sid-1")
+    let info = build_skill_information_for_refs(&parsed, &skills, "sid-1", None)
         .await
         .expect("skill body must load");
     assert!(info.starts_with("<skill_information>"), "got: {info}");
@@ -406,7 +406,7 @@ async fn build_skill_information_for_refs_loads_and_wraps() {
     let parsed =
         parse_skill_references("/ghost", &missing, all_gated()).expect("known skill must parse");
     assert_eq!(
-        build_skill_information_for_refs(&parsed, &missing, "sid-1").await,
+        build_skill_information_for_refs(&parsed, &missing, "sid-1", None).await,
         None
     );
 }
@@ -428,7 +428,7 @@ async fn build_skill_information_for_refs_caps_oversized_body() {
 
     let parsed =
         parse_skill_references("/big go", &skills, all_gated()).expect("known skill must parse");
-    let info = build_skill_information_for_refs(&parsed, &skills, "sid-1")
+    let info = build_skill_information_for_refs(&parsed, &skills, "sid-1", None)
         .await
         .expect("skill body must load");
     assert!(!info.contains("01100 "));

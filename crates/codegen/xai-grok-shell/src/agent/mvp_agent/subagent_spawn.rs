@@ -271,6 +271,7 @@ impl MvpAgent {
                 .unwrap_or_else(|| acp::AuthMethodId::new("default")),
             model_id: parent_model_id,
             auth: self.current_or_buffered_auth(),
+            auth_manager: self.auth_manager.clone(),
             parent_cwd: parent_cwd.clone(),
             parent_session_id: parent_session_id.to_string(),
             active_message_parent_prompt_index: parent_handle
@@ -379,7 +380,8 @@ impl MvpAgent {
             api_key_provider: Some(Arc::new(xai_grok_login::SharedAuthKeyProvider(am.clone()))),
             image_description_model: self.resolve_image_description_model(),
             workspace_ops: parent_workspace_ops.clone(),
-            auth_manager: am.clone(),
+            session_ssh_client_id: self.session_ssh_client_id,
+            session_ssh: self.session_ssh.clone(),
             attribution_callback: parent_attribution_callback,
             parent_agent_name,
             parent_model_agent_type,

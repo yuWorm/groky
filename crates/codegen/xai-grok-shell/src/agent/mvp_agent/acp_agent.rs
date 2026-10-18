@@ -2036,7 +2036,7 @@ impl acp::Agent for MvpAgent {
             }
             "x.ai/session/resolve_local_for_worktree_resume"
             | "x.ai/session/rehydrate" => {
-                let ops = self.resolve_workspace_ops()?;
+                let ops = self.workspace_ops_for_ext_request(&args)?;
                 crate::extensions::worktree::handle(self, &ops, &args).await
             }
             #[cfg(feature = "local-workspace")]
@@ -2300,11 +2300,11 @@ impl acp::Agent for MvpAgent {
                 crate::agent::handlers::session::handle(self, &args).await
             }
             s if s.starts_with("x.ai/git/worktree/") => {
-                let ops = self.resolve_workspace_ops()?;
+                let ops = self.workspace_ops_for_ext_request(&args)?;
                 crate::extensions::worktree::handle(self, &ops, &args).await
             }
             s if s.starts_with("x.ai/git/") => {
-                let ops = self.resolve_workspace_ops()?;
+                let ops = self.workspace_ops_for_ext_request(&args)?;
                 crate::extensions::git::handle(self, &ops, &args).await
             }
             s if s.starts_with("x.ai/compact_conversation") => {
@@ -2320,7 +2320,7 @@ impl acp::Agent for MvpAgent {
                 crate::extensions::hooks::handle(self, &args).await
             }
             s if s.starts_with("x.ai/hunk-tracker/") => {
-                let ops = self.resolve_workspace_ops()?;
+                let ops = self.workspace_ops_for_ext_request(&args)?;
                 crate::extensions::hunk_tracker::handle(self, &ops, &args).await
             }
             s if s.starts_with("x.ai/pr/") => {
@@ -2351,7 +2351,7 @@ impl acp::Agent for MvpAgent {
                 crate::extensions::bundle::handle(self, &args).await
             }
             s if s.starts_with("x.ai/code/") => {
-                let ops = self.resolve_workspace_ops()?;
+                let ops = self.workspace_ops_for_ext_request(&args)?;
                 crate::extensions::code_nav::handle(self, &ops, &args).await
             }
             s if s.starts_with("x.ai/skills/") || s == "x.ai/workflows/list" => {

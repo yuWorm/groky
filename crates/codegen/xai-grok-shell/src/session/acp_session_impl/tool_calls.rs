@@ -42,6 +42,56 @@ fn is_mcp_create_pull_request(tool_name: &str) -> bool {
 fn is_mcp_error_result(output: &ToolsToolOutput) -> bool {
     matches!(output, ToolsToolOutput::MCP(_)) && output.is_error()
 }
+
+fn remote_post_tool_delivery(
+    outcome: &xai_grok_workspace_types::ssh_wire::SshPostToolHookOutcome,
+) -> PostToolUseDelivery {
+    PostToolUseDelivery {
+        model_output: None,
+        additional_context: outcome
+            .additional_context
+            .iter()
+            .map(|note| xai_grok_hooks::dispatcher::AdditionalContext {
+                hook_name: note.hook_name.clone(),
+                text: note.text.clone(),
+            })
+            .collect(),
+        blocks: outcome
+            .blocks
+            .iter()
+            .map(|note| xai_grok_hooks::dispatcher::PostToolUseBlock {
+                hook_name: note.hook_name.clone(),
+                reason: note.text.clone(),
+            })
+            .collect(),
+    }
+}
+
+fn remote_post_tool_failure_contexts(
+    outcome: Option<&xai_grok_workspace_types::ssh_wire::SshPostToolHookOutcome>,
+) -> Vec<xai_grok_hooks::dispatcher::AdditionalContext> {
+    outcome
+        .into_iter()
+        .flat_map(|outcome| outcome.additional_context.iter())
+        .map(|note| xai_grok_hooks::dispatcher::AdditionalContext {
+            hook_name: note.hook_name.clone(),
+            text: note.text.clone(),
+        })
+        .collect()
+}
+
+fn remote_pre_tool_contexts(
+    outcome: Option<&xai_grok_workspace_types::ssh_wire::SshPostToolHookOutcome>,
+) -> Vec<xai_grok_hooks::dispatcher::AdditionalContext> {
+    outcome
+        .into_iter()
+        .flat_map(|outcome| outcome.pre_tool_context.iter())
+        .map(|note| xai_grok_hooks::dispatcher::AdditionalContext {
+            hook_name: note.hook_name.clone(),
+            text: note.text.clone(),
+        })
+        .collect()
+}
 /// Maps a typed tool result onto the fixed span/log outcome set (`success` / `error` / `unconfirmed`).
 /// A delivery the tool could not confirm still dispatched successfully, so it reports `unconfirmed`, never `error`.
 pub(super) fn tool_output_span_outcome(
@@ -305,6 +355,9 @@ pub(super) struct BridgeToolSuccess<'a> {
     pub model_id: &'a str,
     pub tool_parsed_args: &'a serde_json::Value,
     pub model_output_override: Option<String>,
+    /// A remote workspace already replaced `prompt_text`; preserve it through
+    /// the actor's image/PDF-specific rendering.
+    pub remote_output_replaced: bool,
 }
 impl SessionActor {
     /// Merge the canonical `x.ai/tool` identity envelope into a tool-call event's `_meta`, resolving the tool from the live toolset by wire name.
@@ -1057,6 +1110,20 @@ impl SessionActor {
             let mut post_tool_use_failure_contexts: Vec<
                 xai_grok_hooks::dispatcher::AdditionalContext,
             > = Vec::new();
+            let remote_hook_call_id = prepared.tool_call_id.0.as_ref().to_owned();
+            let remote_post_hook = self
+                .workspace_ops
+                .take_ssh_post_tool_hook_outcome(
+                    &self.session_info.id.0,
+                    &remote_hook_call_id,
+                )
+                .await;
+            let remote_hook_outcome = remote_post_hook.as_ref().map(|effects| &effects.outcome);
+            let remote_output_replaced = remote_post_hook
+                .as_ref()
+                .is_some_and(|effects| effects.output_replaced);
+            let remote_pre_contexts = remote_pre_tool_contexts(remote_hook_outcome);
+            let remote_workspace = self.workspace_ops.is_ssh();
             let tool_result_size_bytes: Option<u64> = match &result {
                 Ok(tool_result) => Some(tool_result.prompt_text.len() as u64),
                 Err(_) => None,
@@ -1088,13 +1155,23 @@ impl SessionActor {
                     let drained = DrainedToolSuccess::new(tool_result);
                     let mcp_failed = is_mcp_error_result(drained.output());
                     let (model_output_override, deferred_hook_scrollback) = if mcp_failed {
-                        post_tool_use_failure_contexts = self
-                            .dispatch_tool_failure(
+                        post_tool_use_failure_contexts = if remote_workspace {
+                            remote_post_tool_failure_contexts(remote_hook_outcome)
+                        } else {
+                            self.dispatch_tool_failure(
                                 &prepared,
                                 drained.output().to_prompt_format(),
                                 duration_ms,
                             )
-                            .await;
+                            .await
+                        };
+                        (None, None)
+                    } else if remote_workspace {
+                        post_tool_use_delivery = Some(
+                            remote_hook_outcome
+                                .map(remote_post_tool_delivery)
+                                .unwrap_or_default(),
+                        );
                         (None, None)
                     } else {
                         let (mut delivery, deferred_hook_scrollback) = self
@@ -1120,6 +1197,7 @@ impl SessionActor {
                             model_id: prepared.model_id.as_deref().unwrap_or(""),
                             tool_parsed_args: prepared.authored_arguments(),
                             model_output_override,
+                            remote_output_replaced,
                         })
                         .await;
                     if let Some(scrollback) = deferred_hook_scrollback {
@@ -1148,9 +1226,19 @@ impl SessionActor {
                         )
                         .await;
                     deferred_followups.extend(err_followups);
-                    post_tool_use_failure_contexts = self
-                        .dispatch_tool_failure(&prepared, format!("{err:#}"), duration_ms)
-                        .await;
+                    post_tool_use_failure_contexts = if remote_workspace {
+                        if let Some(outcome) = remote_hook_outcome
+                            && !outcome.post_tool_failure
+                        {
+                            post_tool_use_delivery = Some(remote_post_tool_delivery(outcome));
+                            Vec::new()
+                        } else {
+                            remote_post_tool_failure_contexts(remote_hook_outcome)
+                        }
+                    } else {
+                        self.dispatch_tool_failure(&prepared, format!("{err:#}"), duration_ms)
+                            .await
+                    };
                     ToolLoop::Continue
                 }
             };
@@ -1167,6 +1255,14 @@ impl SessionActor {
                 }
             }
             for context in &prepared.additional_context {
+                deferred_followups.push(self.wrap_hook_note(
+                    xai_grok_hooks::event::HookEventName::PreToolUse,
+                    HookNoteKind::Context,
+                    &context.hook_name,
+                    &context.text,
+                ));
+            }
+            for context in &remote_pre_contexts {
                 deferred_followups.push(self.wrap_hook_note(
                     xai_grok_hooks::event::HookEventName::PreToolUse,
                     HookNoteKind::Context,
@@ -1309,7 +1405,9 @@ impl SessionActor {
     ) -> Result<Result<PreToolUseGate, ToolLoop>, acp::Error> {
         let mut envelope = self.make_pre_tool_use_envelope(resolved_tool_name, &call.id, raw_input);
         let mut gate = PreToolUseGate::default();
-        let hook_registry_snapshot = self.hook_registry.borrow().clone();
+        let hook_registry_snapshot = (!self.workspace_ops.is_ssh())
+            .then(|| self.hook_registry.borrow().clone())
+            .flatten();
         if let Some(registry) = hook_registry_snapshot {
             let ctx = self.hook_run_ctx();
             let batch = self.announce_hook_run(&registry, &envelope, &ctx);
@@ -2972,6 +3070,7 @@ impl SessionActor {
             model_id,
             tool_parsed_args,
             model_output_override,
+            remote_output_replaced,
         } = args;
         let (mut result, mut tool_layer_images) = drained.into_parts();
         let consumed_ids =
@@ -2989,7 +3088,7 @@ impl SessionActor {
                 xai_grok_tools::types::output::SearchReplaceOutput::EditsApplied(_)
             ) | ToolsToolOutput::Bash(_)
         ) {
-            self.maybe_notify_git_branch().await;
+            self.maybe_notify_git_branch(true).await;
         }
         if let xai_grok_tools::types::output::ToolOutput::Bash(ref b) = result.output
             && b.was_bare_echo
@@ -3050,7 +3149,7 @@ impl SessionActor {
             self.send_update(acp::SessionUpdate::Plan(acp_plan), None)
                 .await;
         }
-        let output_replaced = model_output_override.is_some();
+        let output_replaced = model_output_override.is_some() || remote_output_replaced;
         if let Some(replacement) = model_output_override {
             result.prompt_text =
                 substitute_rendered_output(&result.prompt_text, &result.output, replacement);

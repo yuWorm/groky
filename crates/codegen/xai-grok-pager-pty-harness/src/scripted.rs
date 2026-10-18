@@ -11,7 +11,8 @@ use anyhow::{Context, Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    AgentTurnExpectation, ContentController, PtyHarness, StyledLine, pager_binary, parse_keys,
+    AgentTurnExpectation, ContentController, PtyHarness, ScriptedResponse, SseEvent, StyledLine,
+    pager_binary, parse_keys,
 };
 
 const SGR_LEFT_BUTTON: u16 = 0;
@@ -159,11 +160,34 @@ pub struct WorkspaceConfig {
 pub struct MockConfig {
     #[serde(default = "default_mock_response")]
     pub response: String,
-    /// Ordered per-turn expectations; every listed turn must be satisfied. Falls back to `response` when exhausted.
+    /// Ordered per-turn expectations; every listed turn must be satisfied. Falls back to
+    /// `response` when exhausted.
     #[serde(default)]
-    pub turns: Vec<String>,
+    pub turns: Vec<MockTurn>,
     #[serde(default)]
     pub fixture_images: Vec<ImageFixture>,
+}
+
+/// One mocked model turn. A tool turn emits a real protocol function call, then supplies the
+/// assistant response after the pager executes that call.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum MockTurn {
+    Text(String),
+    Tool(MockToolTurn),
+}
+
+/// One function call sent by a mocked model turn.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MockToolTurn {
+    /// Stable model-protocol call identifier for this one turn.
+    pub call_id: String,
+    /// Tool identifier advertised by the real pager session.
+    pub name: String,
+    /// Structured tool arguments; they are serialized into the protocol's JSON string field.
+    pub arguments: serde_json::Value,
+    /// Assistant text returned only after the actual tool result has been submitted to the model.
+    pub response: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -348,6 +372,13 @@ pub enum ScenarioStep {
         #[serde(default)]
         request_index: Option<usize>,
     },
+    /// Assert no request body contains the literal `text`.
+    AssertRequestNotContains {
+        text: String,
+        /// Restrict to the Nth most recent request body (0 is the newest).
+        #[serde(default)]
+        request_index: Option<usize>,
+    },
     /// Assert no `*.tmp` files remain anywhere under the mock content home directory.
     AssertNoTempArtifacts {},
 
@@ -499,15 +530,31 @@ impl ScriptedScenarioRunner {
             .await
             .context("start mock content")?;
         content.set_response(&scenario.mock.response);
-        let turn_expectations: Vec<_> = scenario
-            .mock
-            .turns
-            .iter()
-            .enumerate()
-            .map(|(index, turn)| {
-                content.expect_agent_turn(format!("scenario turn {}", index + 1), turn)
-            })
-            .collect();
+        let mut turn_expectations = Vec::new();
+        for (index, turn) in scenario.mock.turns.iter().enumerate() {
+            match turn {
+                MockTurn::Text(text) => {
+                    turn_expectations
+                        .push(content.expect_agent_turn(format!("scenario turn {}", index + 1), text));
+                }
+                MockTurn::Tool(tool) => {
+                    let arguments = serde_json::to_string(&tool.arguments).with_context(|| {
+                        format!("serialize mock tool arguments for {}", tool.call_id)
+                    })?;
+                    let (responses, chat_completions) =
+                        tool_call_responses(&tool.call_id, &tool.name, &arguments);
+                    turn_expectations.push(content.expect_agent_turn_with_responses(
+                        format!("scenario tool turn {} ({})", index + 1, tool.call_id),
+                        responses,
+                        chat_completions,
+                    ));
+                    turn_expectations.push(content.expect_agent_turn(
+                        format!("scenario tool follow-up {} ({})", index + 1, tool.call_id),
+                        &tool.response,
+                    ));
+                }
+            }
+        }
 
         if let Some(config_toml) = &scenario.environment.config_toml {
             let grok_home = content.home().join(".grok");
@@ -643,6 +690,162 @@ impl ScriptedScenarioRunner {
         write_bug_markdown(&run_dir, &report)?;
         Ok(report)
     }
+}
+
+/// Mock one tool invocation on both inference APIs so a scripted scenario still drives the pager's
+/// normal tool execution and model follow-up path.
+fn tool_call_responses(
+    call_id: &str,
+    name: &str,
+    arguments: &str,
+) -> (ScriptedResponse, ScriptedResponse) {
+    let item_id = format!("fc_{call_id}");
+    let responses = ScriptedResponse::sse(vec![
+        SseEvent::data(
+            serde_json::json!({
+                "type": "response.created",
+                "sequence_number": 0,
+                "response": {
+                    "id": "resp-scripted-tool",
+                    "object": "response",
+                    "created_at": 1234567890,
+                    "model": "test-model",
+                    "status": "in_progress",
+                    "output": []
+                }
+            })
+            .to_string(),
+        ),
+        SseEvent::data(
+            serde_json::json!({
+                "type": "response.output_item.added",
+                "sequence_number": 1,
+                "output_index": 0,
+                "item": {
+                    "type": "function_call",
+                    "id": &item_id,
+                    "call_id": call_id,
+                    "name": name,
+                    "arguments": "",
+                    "status": "in_progress"
+                }
+            })
+            .to_string(),
+        ),
+        SseEvent::data(
+            serde_json::json!({
+                "type": "response.function_call_arguments.delta",
+                "sequence_number": 2,
+                "item_id": &item_id,
+                "output_index": 0,
+                "delta": arguments
+            })
+            .to_string(),
+        ),
+        SseEvent::data(
+            serde_json::json!({
+                "type": "response.function_call_arguments.done",
+                "sequence_number": 3,
+                "item_id": &item_id,
+                "output_index": 0,
+                "name": name,
+                "arguments": arguments
+            })
+            .to_string(),
+        ),
+        SseEvent::data(
+            serde_json::json!({
+                "type": "response.output_item.done",
+                "sequence_number": 4,
+                "output_index": 0,
+                "item": {
+                    "type": "function_call",
+                    "id": &item_id,
+                    "call_id": call_id,
+                    "name": name,
+                    "arguments": arguments,
+                    "status": "completed"
+                }
+            })
+            .to_string(),
+        ),
+        SseEvent::data(
+            serde_json::json!({
+                "type": "response.completed",
+                "sequence_number": 5,
+                "response": {
+                    "id": "resp-scripted-tool",
+                    "object": "response",
+                    "created_at": 1234567890,
+                    "model": "test-model",
+                    "status": "completed",
+                    "output": [{
+                        "type": "function_call",
+                        "id": &item_id,
+                        "call_id": call_id,
+                        "name": name,
+                        "arguments": arguments,
+                        "status": "completed"
+                    }],
+                    "usage": {
+                        "input_tokens": 10,
+                        "output_tokens": 20,
+                        "total_tokens": 30,
+                        "input_tokens_details": {"cached_tokens": 0},
+                        "output_tokens_details": {"reasoning_tokens": 0}
+                    }
+                }
+            })
+            .to_string(),
+        ),
+        SseEvent::data("[DONE]"),
+    ]);
+    let chat_completions = ScriptedResponse::sse(vec![
+        SseEvent::data(
+            serde_json::json!({
+                "id": "chatcmpl-scripted-tool",
+                "object": "chat.completion.chunk",
+                "created": 1234567890,
+                "model": "test-model",
+                "choices": [{
+                    "index": 0,
+                    "delta": {
+                        "role": "assistant",
+                        "content": null,
+                        "tool_calls": [{
+                            "index": 0,
+                            "id": call_id,
+                            "type": "function",
+                            "function": {"name": name, "arguments": arguments}
+                        }]
+                    },
+                    "finish_reason": null
+                }]
+            })
+            .to_string(),
+        ),
+        SseEvent::data(
+            serde_json::json!({
+                "id": "chatcmpl-scripted-tool",
+                "object": "chat.completion.chunk",
+                "created": 1234567890,
+                "model": "test-model",
+                "choices": [{
+                    "index": 0,
+                    "delta": {},
+                    "finish_reason": "tool_calls"
+                }],
+                "usage": {
+                    "prompt_tokens": 10,
+                    "completion_tokens": 20,
+                    "total_tokens": 30
+                }
+            })
+            .to_string(),
+        ),
+        SseEvent::data("[DONE]"),
+    ]);
+    (responses, chat_completions)
 }
 
 /// Create a temp dir for a scenario [`WorkspaceConfig`]: write its files (creating parent dirs) and optionally `git init` it.
@@ -1001,6 +1204,10 @@ fn run_step(
             text,
             request_index,
         } => assert_request_contains(&content.request_bodies(), text, *request_index)?,
+        ScenarioStep::AssertRequestNotContains {
+            text,
+            request_index,
+        } => assert_request_not_contains(&content.request_bodies(), text, *request_index)?,
         ScenarioStep::AssertNoTempArtifacts {} => assert_no_temp_artifacts(content.home())?,
         ScenarioStep::Resize { rows, cols } => harness
             .resize(*rows, *cols)
@@ -1483,35 +1690,56 @@ fn assert_inline_images(
     Ok(())
 }
 
+fn request_haystacks(
+    bodies: &[serde_json::Value],
+    request_index: Option<usize>,
+) -> Result<Vec<String>> {
+    if bodies.is_empty() {
+        bail!("no request bodies were captured");
+    }
+    match request_index {
+        Some(index) => {
+            let total = bodies.len();
+            if index >= total {
+                bail!(
+                    "request_index {index} out of range (only {total} request body/bodies captured)"
+                );
+            }
+            Ok(vec![serde_json::to_string(&bodies[total - 1 - index]).unwrap_or_default()])
+        }
+        None => Ok(bodies
+            .iter()
+            .map(|body| serde_json::to_string(body).unwrap_or_default())
+            .collect()),
+    }
+}
+
 fn assert_request_contains(
     bodies: &[serde_json::Value],
     needle: &str,
     request_index: Option<usize>,
 ) -> Result<()> {
-    if bodies.is_empty() {
-        bail!("expected request body containing {needle:?}, but no requests were captured");
-    }
-    let haystacks: Vec<String> = match request_index {
-        Some(idx) => {
-            let total = bodies.len();
-            if idx >= total {
-                bail!(
-                    "request_index {idx} out of range (only {total} request body/bodies captured)"
-                );
-            }
-            let body = &bodies[total - 1 - idx];
-            vec![serde_json::to_string(body).unwrap_or_default()]
-        }
-        None => bodies
-            .iter()
-            .map(|b| serde_json::to_string(b).unwrap_or_default())
-            .collect(),
-    };
-    if haystacks.iter().any(|s| s.contains(needle)) {
+    let haystacks = request_haystacks(bodies, request_index)?;
+    if haystacks.iter().any(|body| body.contains(needle)) {
         return Ok(());
     }
     bail!(
         "no request body contained {needle:?}; searched {} request(s)",
+        haystacks.len()
+    );
+}
+
+fn assert_request_not_contains(
+    bodies: &[serde_json::Value],
+    needle: &str,
+    request_index: Option<usize>,
+) -> Result<()> {
+    let haystacks = request_haystacks(bodies, request_index)?;
+    if haystacks.iter().all(|body| !body.contains(needle)) {
+        return Ok(());
+    }
+    bail!(
+        "a request body unexpectedly contained {needle:?}; searched {} request(s)",
         haystacks.len()
     );
 }
@@ -1883,6 +2111,7 @@ fn action_name(step: &ScenarioStep) -> &'static str {
         ScenarioStep::AssertRequestImageCount { .. } => "assert_request_image_count",
         ScenarioStep::AssertInlineImages { .. } => "assert_inline_images",
         ScenarioStep::AssertRequestContains { .. } => "assert_request_contains",
+        ScenarioStep::AssertRequestNotContains { .. } => "assert_request_not_contains",
         ScenarioStep::AssertNoTempArtifacts {} => "assert_no_temp_artifacts",
         ScenarioStep::Resize { .. } => "resize",
         ScenarioStep::Wait { .. } => "wait",
@@ -2145,6 +2374,20 @@ mod tests {
     }
 
     #[test]
+    fn assert_request_not_contains_rejects_leaked_request_context() {
+        let bodies = vec![
+            serde_json::json!({"k": "remote instructions"}),
+            serde_json::json!({"k": "local launch marker"}),
+        ];
+        assert_request_not_contains(&bodies, "forbidden", None).expect("absent marker");
+        assert!(assert_request_not_contains(&bodies, "local launch marker", None).is_err());
+        assert_request_not_contains(&bodies, "local launch marker", Some(1))
+            .expect("oldest body has no local marker");
+        assert_request_not_contains(&bodies, "local launch marker", Some(0))
+            .expect_err("newest body contains local marker");
+    }
+
+    #[test]
     fn assert_no_temp_artifacts_scans_recursively() {
         let dir = tempfile::tempdir().expect("tempdir");
         assert_no_temp_artifacts(dir.path()).expect("empty dir is clean");
@@ -2176,6 +2419,24 @@ mod tests {
             } => {
                 assert_eq!(text, "hello");
                 assert_eq!(request_index, None);
+            }
+            other => panic!("unexpected step: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_assert_request_not_contains_action() {
+        let step: ScenarioStep = serde_yaml::from_str(
+            "action: assert_request_not_contains\ntext: local-marker\nrequest_index: 0",
+        )
+        .expect("parse");
+        match step {
+            ScenarioStep::AssertRequestNotContains {
+                text,
+                request_index,
+            } => {
+                assert_eq!(text, "local-marker");
+                assert_eq!(request_index, Some(0));
             }
             other => panic!("unexpected step: {other:?}"),
         }

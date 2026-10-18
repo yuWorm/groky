@@ -19,6 +19,7 @@ mod settings;
 mod status;
 mod status_line;
 mod task_result;
+mod ssh;
 mod transcript;
 mod turn;
 mod voice;
@@ -293,6 +294,10 @@ fn test_app() -> AppView {
         relaunch: None,
         import_claude_modal: None,
         welcome_vendor_login: None,
+        welcome_ssh_manager: None,
+        ssh_client_id: 1,
+        ssh_event_consumer_active: false,
+        pending_ssh_project_open: None,
         welcome_doc_viewer: None,
         screen_mode: crate::app::ScreenMode::Inline,
         pending_screen_mode_switch: None,

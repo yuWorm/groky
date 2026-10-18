@@ -519,10 +519,31 @@ pub(crate) async fn run_shell_child(
         &ctx,
         &mut definition,
     );
-    let cwd = ctx
-        .parent_session_info
-        .as_ref()
-        .map(|i| std::path::Path::new(&i.cwd));
+    let is_ssh_project = ctx.workspace_ops.is_ssh();
+    let (ssh_project_location, parent_ssh_binding_id) = if is_ssh_project {
+        let binding = ctx
+            .workspace_ops
+            .ssh_client()
+            .expect("SSH WorkspaceOps always exposes its client")
+            .binding()
+            .await;
+        (
+            Some(xai_grok_workspace_types::ssh::ProjectLocation::Ssh {
+                target_id: binding.target_id,
+                root: binding.root,
+            }),
+            Some(binding.id),
+        )
+    } else {
+        (None, None)
+    };
+    let cwd = (!is_ssh_project)
+        .then(|| {
+            ctx.parent_session_info
+                .as_ref()
+                .map(|i| std::path::Path::new(&i.cwd))
+        })
+        .flatten();
     let mut effective_runtime = xai_grok_subagent_resolution::resolve_runtime_config(
         &request.subagent_type,
         &request.runtime_overrides,
@@ -591,7 +612,9 @@ pub(crate) async fn run_shell_child(
         };
         return child_run_output(failure_result(&request, &message), completion_data, None);
     }
-    let worktree_path = if let Some(ref source) = resume_source {
+    let worktree_path = if is_ssh_project {
+        None
+    } else if let Some(ref source) = resume_source {
         if effective_runtime.isolation != xai_tool_types::SubagentIsolationMode::None
             && source.worktree_path.is_none()
         {
@@ -744,28 +767,39 @@ pub(crate) async fn run_shell_child(
         };
         root.record("isolation", isolation);
     }
-    if let Some(raw_cwd) = request.cwd.as_deref() {
-        match sanitize_cwd_value(raw_cwd) {
-            Some(cwd_path) => {
-                if worktree_path.is_none() && resume_source.is_none() {
-                    let p = Path::new(&cwd_path);
-                    if !p.is_dir() {
-                        let msg = if p.exists() {
-                            format!("cwd \"{cwd_path}\" exists but is not a directory")
-                        } else {
-                            format!("cwd \"{cwd_path}\" does not exist")
-                        };
-                        return child_run_output(
-                            failure_result(&request, &msg),
-                            completion_data,
-                            None,
-                        );
+    if !is_ssh_project {
+        if let Some(raw_cwd) = request.cwd.as_deref() {
+            match sanitize_cwd_value(raw_cwd) {
+                Some(cwd_path) => {
+                    if worktree_path.is_none() && resume_source.is_none() {
+                        let p = Path::new(&cwd_path);
+                        if !p.is_dir() {
+                            let msg = if p.exists() {
+                                format!("cwd \"{cwd_path}\" exists but is not a directory")
+                            } else {
+                                format!("cwd \"{cwd_path}\" does not exist")
+                            };
+                            return child_run_output(
+                                failure_result(&request, &msg),
+                                completion_data,
+                                None,
+                            );
+                        }
                     }
+                    request.cwd = Some(cwd_path);
                 }
-                request.cwd = Some(cwd_path);
+                None => request.cwd = None,
             }
-            None => request.cwd = None,
         }
+    } else if request.cwd.is_some() {
+        return child_run_output(
+            failure_result(
+                &request,
+                "SSH subagents inherit the parent project root and cannot override cwd",
+            ),
+            completion_data,
+            None,
+        );
     }
     if effective_runtime.reasoning_effort.is_some() || effective_runtime.capability_mode.is_some() {
         tracing::info!(
@@ -910,22 +944,77 @@ pub(crate) async fn run_shell_child(
         ctx.resolve_auto_compact_threshold_percent(&subagent_model_id);
     let subagent_id = request.id.clone();
     let child_session_id = acp::SessionId::new(subagent_id.clone());
-    let override_cwd = select_override_cwd(resume_source.as_ref(), request.cwd.as_deref());
-    let effective_cwd = resolve_child_cwd(worktree_path.as_deref(), override_cwd, &ctx.parent_cwd)
-        .to_string_lossy()
-        .into_owned();
-    let child_session_info = SessionInfo {
-        id: child_session_id.clone(),
-        cwd: effective_cwd,
+    let child_workspace_ops = match parent_ssh_binding_id.as_deref() {
+        Some(parent_binding_id) => {
+            let Some(service) = ctx.session_ssh.as_ref() else {
+                return child_run_output(
+                    failure_result(
+                        &request,
+                        "SSH subagents require the host-owned SSH service",
+                    ),
+                    completion_data,
+                    None,
+                );
+            };
+            let client = match service
+                .inherit_binding(
+                    &ctx.parent_session_id,
+                    child_session_id.0.as_ref(),
+                    parent_binding_id,
+                )
+                .await
+            {
+                Ok(client) => client,
+                Err(error) => {
+                    return child_run_output(
+                        failure_result(
+                            &request,
+                            &format!("failed to inherit SSH project binding: {error}"),
+                        ),
+                        completion_data,
+                        None,
+                    );
+                }
+            };
+            xai_grok_workspace::WorkspaceOps::ssh(client)
+        }
+        None => ctx.workspace_ops.clone(),
     };
+    let child_session_info = match ssh_project_location.as_ref() {
+        Some(location) => {
+            xai_grok_shared::session::info_for_location(child_session_id.clone(), location)
+        }
+        None => {
+            let override_cwd = select_override_cwd(resume_source.as_ref(), request.cwd.as_deref());
+            let effective_cwd =
+                resolve_child_cwd(worktree_path.as_deref(), override_cwd, &ctx.parent_cwd)
+                    .to_string_lossy()
+                    .into_owned();
+            SessionInfo {
+                id: child_session_id.clone(),
+                cwd: effective_cwd,
+            }
+        }
+    };
+    let child_display_cwd = ssh_project_location
+        .as_ref()
+        .map(|location| location.root().to_owned())
+        .unwrap_or_else(|| child_session_info.cwd.clone());
     let child_session_dir = session::persistence::session_dir(&child_session_info);
     if let Err(e) = crate::util::grok_home::ensure_sessions_cwd_dir(&child_session_info.cwd) {
         tracing::warn!(?e, "failed to ensure sessions cwd dir for subagent session");
     }
-    let parent_session_dir = session::persistence::session_dir(&SessionInfo {
-        id: acp::SessionId::new(ctx.parent_session_id.clone()),
-        cwd: ctx.parent_cwd.to_string_lossy().to_string(),
-    });
+    let parent_session_info = match ssh_project_location.as_ref() {
+        Some(location) => xai_grok_shared::session::info_for_location(
+            acp::SessionId::new(ctx.parent_session_id.clone()),
+            location,
+        ),
+        None => SessionInfo {
+            id: acp::SessionId::new(ctx.parent_session_id.clone()),
+            cwd: ctx.parent_cwd.to_string_lossy().to_string(),
+        },
+    };
+    let parent_session_dir = session::persistence::session_dir(&parent_session_info);
     #[cfg(test)]
     let subagent_meta_dir = ctx
         .run_shell_child_harness
@@ -1016,7 +1105,7 @@ pub(crate) async fn run_shell_child(
         fork_copy_error: fork_copy_error.clone(),
         persona: effective_runtime.persona.clone(),
         resumed_from: request.resume_from.clone(),
-        child_cwd: Some(child_session_info.cwd.clone()),
+        child_cwd: Some(child_display_cwd.clone()),
         worktree_path: worktree_path
             .as_ref()
             .map(|p| p.to_string_lossy().to_string()),
@@ -1027,7 +1116,7 @@ pub(crate) async fn run_shell_child(
         bucket_url: ctx.gcs_bucket_url.clone(),
         upload_method: ctx.gcs_upload_method.clone(),
         model_id: Some(effective_model_id.0.to_string()),
-        cwd: Some(child_session_info.cwd.clone()),
+        cwd: Some(child_display_cwd.clone()),
         reasoning_effort: effective_runtime.reasoning_effort.clone(),
         role_name: effective_runtime.role_name.clone(),
         parent_prompt_id: request.parent_prompt_id.clone(),
@@ -1164,7 +1253,7 @@ pub(crate) async fn run_shell_child(
     };
     let turn_number = wake_persistence.turn_number(completion_data.turn_number);
     completion_data.turn_number = Some(turn_number);
-    let persistence = match session::persistence::new_with_explicit_dir(
+    let persistence = match session::persistence::new_with_explicit_dir_at_project_location(
         &child_session_info,
         persistence_dir,
         effective_model_id.clone(),
@@ -1181,6 +1270,7 @@ pub(crate) async fn run_shell_child(
                 next_trace_turn: Some(turn_number.saturating_add(1)),
             }
         },
+        ssh_project_location.as_ref(),
     )
     .await
     {
@@ -1198,16 +1288,87 @@ pub(crate) async fn run_shell_child(
             );
         }
     };
-    let child_cwd = resolve_child_cwd(worktree_path.as_deref(), override_cwd, &ctx.parent_cwd);
-    let covered_by_parent = xai_fsnotify::watch_root_covers(&ctx.parent_cwd, &child_cwd);
-    let subagent_fs_watch = FsWatchCapabilities {
-        hunk_tracking: ctx.hunk_tracking_enabled && !covered_by_parent,
-        ..FsWatchCapabilities::none()
+    if let Some(location) = ssh_project_location.as_ref() {
+        let Some(service) = ctx.session_ssh.as_ref() else {
+            return setup_failure_output(
+                "SSH subagents require the host-owned SSH service",
+                &request,
+                &child_session_id,
+                &subagent_meta_dir,
+                &early_gcs_ctx,
+                start_artifacts.terminal_persistence_allowed(),
+                completion_data,
+            );
+        };
+        if let Err(error) = service
+            .register_project_location(
+                child_session_id.0.as_ref(),
+                Some(child_session_info.clone()),
+                location,
+            )
+            .await
+        {
+            return setup_failure_output(
+                &format!("failed to register SSH subagent project: {error}"),
+                &request,
+                &child_session_id,
+                &subagent_meta_dir,
+                &early_gcs_ctx,
+                start_artifacts.terminal_persistence_allowed(),
+                completion_data,
+            );
+        }
+        if let Err(error) = crate::session::persistence::persist_ssh_state(
+            &child_session_info,
+            service.snapshot_session(child_session_id.0.as_ref()).await,
+        )
+        .await
+        {
+            return setup_failure_output(
+                &format!("failed to persist SSH subagent binding: {error}"),
+                &request,
+                &child_session_id,
+                &subagent_meta_dir,
+                &early_gcs_ctx,
+                start_artifacts.terminal_persistence_allowed(),
+                completion_data,
+            );
+        }
+    }
+    let (child_cwd, subagent_fs_watch) = match ssh_project_location.as_ref() {
+        Some(location) => (
+            std::path::PathBuf::from(location.root()),
+            FsWatchCapabilities::none(),
+        ),
+        None => {
+            let override_cwd =
+                select_override_cwd(resume_source.as_ref(), request.cwd.as_deref());
+            let child_cwd =
+                resolve_child_cwd(worktree_path.as_deref(), override_cwd, &ctx.parent_cwd);
+            let covered_by_parent = xai_fsnotify::watch_root_covers(&ctx.parent_cwd, &child_cwd);
+            (
+                child_cwd,
+                FsWatchCapabilities {
+                    hunk_tracking: ctx.hunk_tracking_enabled && !covered_by_parent,
+                    ..FsWatchCapabilities::none()
+                },
+            )
+        }
     };
-    let child_cwd_abs = xai_grok_paths::AbsPathBuf::new(child_cwd).unwrap_or_else(|_| {
-        xai_grok_paths::AbsPathBuf::new(std::env::current_dir().unwrap_or_default())
-            .expect("current_dir should be absolute")
-    });
+    let child_cwd_abs = match xai_grok_paths::AbsPathBuf::new(child_cwd) {
+        Ok(cwd) => cwd,
+        Err(error) => {
+            return setup_failure_output(
+                &format!("subagent cwd must be absolute: {error}"),
+                &request,
+                &child_session_id,
+                &subagent_meta_dir,
+                &early_gcs_ctx,
+                start_artifacts.terminal_persistence_allowed(),
+                completion_data,
+            );
+        }
+    };
     let mut tool_ctx = ToolContext::with_preloaded_env(
         child_cwd_abs,
         Some(gateway.clone()),
@@ -1217,7 +1378,7 @@ pub(crate) async fn run_shell_child(
         ctx.hunk_tracker_handle.clone(),
         (*ctx.session_env).clone(),
     )
-    .with_hunk_tracking_enabled(ctx.hunk_tracking_enabled);
+    .with_hunk_tracking_enabled(ctx.hunk_tracking_enabled && !is_ssh_project);
     tool_ctx.subagent_event_tx = Some(ctx.subagent_event_tx.clone());
     let active_agent_messages_enabled = ctx.active_agent_messages_enabled
         && agent_message_sender.is_some()
@@ -1235,10 +1396,10 @@ pub(crate) async fn run_shell_child(
     tool_ctx.sampler_retry_only_before_output = task_output_budget.is_some();
     tool_ctx.monitor_event_buffer = Some(MonitorEventBuffer::default());
     tool_ctx.subagent_depth = child_depth;
-    tool_ctx.lsp = ctx.lsp.clone();
+    tool_ctx.lsp = (!is_ssh_project).then(|| ctx.lsp.clone()).flatten();
     tool_ctx.process_scope = ctx.process_scope.clone();
     let parent_traceparent = xai_grok_otel::current_traceparent();
-    let tracker_child_cwd = child_session_info.cwd.clone();
+    let tracker_child_cwd = child_display_cwd.clone();
     let tracker_model_id = effective_model_id.0.to_string();
     let initial_child_tokens = xai_chat_state::estimate_conversation_tokens(&forked_conversation);
     let model_entry = crate::agent::config::find_model_by_id(
@@ -1508,7 +1669,10 @@ pub(crate) async fn run_shell_child(
             parent_session_id: Some(ctx.parent_session_id.clone()),
             subagent_type: Some(request.subagent_type.clone()),
             preserve_inherited_system: verbatim_mirror_fork,
-            parent_cwd: Some(ctx.parent_cwd.clone()),
+            parent_cwd: ssh_project_location
+                .as_ref()
+                .map(|location| std::path::PathBuf::from(location.root()))
+                .or_else(|| Some(ctx.parent_cwd.clone())),
             ..Default::default()
         },
         xai_grok_workspace::permission::ClientType::Generic,
@@ -1558,7 +1722,7 @@ pub(crate) async fn run_shell_child(
         None,
         Vec::new(),
         None,
-        if verbatim_mirror_fork {
+        if is_ssh_project || verbatim_mirror_fork {
             None
         } else if let Some(scope) = agent_memory_scope {
             ctx.memory_config.as_ref().map(|mc| {
@@ -1574,8 +1738,16 @@ pub(crate) async fn run_shell_child(
         },
         false,
         Default::default(),
-        ctx.managed_mcp_state.clone(),
-        ctx.managed_mcp_proxy_base_url.clone(),
+        if is_ssh_project {
+            Default::default()
+        } else {
+            ctx.managed_mcp_state.clone()
+        },
+        if is_ssh_project {
+            String::new()
+        } else {
+            ctx.managed_mcp_proxy_base_url.clone()
+        },
         effective_model_id,
         Some(crate::session::vendor_accounts::shared_vendor_accounts(
             ctx.vendor_accounts.read().clone(),
@@ -1617,22 +1789,34 @@ pub(crate) async fn run_shell_child(
         ctx.respect_gitignore,
         ctx.path_not_found_hints,
         std::mem::take(&mut ctx.tool_params_json),
-        crate::session::session_create_prefetch::SessionCreatePrefetch::ready(
-            ctx.plugin_registry.clone(),
-        ),
+        if is_ssh_project {
+            crate::session::session_create_prefetch::SessionCreatePrefetch::ready(None)
+        } else {
+            crate::session::session_create_prefetch::SessionCreatePrefetch::ready(
+                ctx.plugin_registry.clone(),
+            )
+        },
         None,
         ctx.models_manager.clone(),
         parent_traceparent,
         ctx.permission_handle.clone(),
         ctx.api_key_provider.clone(),
         ctx.image_description_model.clone(),
-        ctx.hook_registry.clone(),
-        ctx.workspace_ops.clone(),
+        if is_ssh_project {
+            None
+        } else {
+            ctx.hook_registry.clone()
+        },
+        child_workspace_ops.clone(),
         vec![],
         ctx.todo_gate,
         ctx.remote_settings.clone(),
         std::mem::take(&mut ctx.laziness_debug_log),
-        ctx.parent_terminal_backend.clone(),
+        if is_ssh_project {
+            None
+        } else {
+            ctx.parent_terminal_backend.clone()
+        },
         if request.owner.is_workflow() {
             None
         } else {
@@ -1684,15 +1868,74 @@ pub(crate) async fn run_shell_child(
         handle: child_handle,
         permission_events_rx: mut permission_rx,
         toolset: child_toolset,
+        tool_bridge: child_tool_bridge,
         ..
     } = child_init;
-    session::bind_installed_toolset(
-        &ctx.workspace_ops,
-        &child_handle.info.id,
-        child_handle.tool_context.cwd.as_path(),
-        &child_handle.hunk_tracker_handle,
-        &child_toolset,
-    );
+    if let (Some(service), Some(client_id)) = (ctx.session_ssh.as_ref(), ctx.session_ssh_client_id)
+    {
+        // Embedded children retain the host's stable interaction identity for
+        // explicit SSH tools even when their primary workspace is local.
+        service
+            .seed_resources_for_client(
+                &child_tool_bridge,
+                child_session_id.0.to_string(),
+                client_id,
+            )
+            .await;
+    }
+    if child_workspace_ops.is_ssh() {
+        let Some(service) = ctx.session_ssh.as_ref() else {
+            return child_run_output(
+                failure_result(&request, "SSH subagents require the host-owned SSH service"),
+                completion_data,
+                None,
+            );
+        };
+        if ctx.session_ssh_client_id.is_none() {
+            service
+                .seed_resources(&child_tool_bridge, child_session_id.0.to_string())
+                .await;
+        }
+        if let Err(error) = child_workspace_ops.register_remote_tools(&child_tool_bridge).await {
+            return child_run_output(
+                failure_result(
+                    &request,
+                    &format!("failed to register SSH subagent tools: {error}"),
+                ),
+                completion_data,
+                None,
+            );
+        }
+        let mut worker_events = service
+            .subscribe_session_events(child_session_id.0.to_string())
+            .await;
+        let worker_gateway = gateway.clone();
+        tokio::task::spawn_local(async move {
+            loop {
+                match worker_events.recv().await {
+                    Ok(event) => {
+                        let Ok(params) = serde_json::value::to_raw_value(&event) else {
+                            continue;
+                        };
+                        worker_gateway.forward_fire_and_forget(acp::ExtNotification::new(
+                            "x.ai/ssh/worker_event",
+                            params.into(),
+                        ));
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                }
+            }
+        });
+    } else {
+        session::bind_installed_toolset(
+            &child_workspace_ops,
+            &child_handle.info.id,
+            child_handle.tool_context.cwd.as_path(),
+            &child_handle.hunk_tracker_handle,
+            &child_toolset,
+        );
+    }
     let ready_to_first_turn_span = phase_region(SubagentSpawnPhase::ReadyToFirstTurn);
     let (receipt_sink, receipt_stream) = mpsc::channel(ACTIVE_MESSAGE_RECEIPT_CAPACITY);
     let receipt_drain = PromptTurnReceiptDrain::start(
@@ -1900,7 +2143,7 @@ pub(crate) async fn run_shell_child(
         let result = cancel_pending_shell_child(
             &child_handle.cmd_tx,
             child_thread,
-            &ctx.workspace_ops,
+            &child_workspace_ops,
             &subagent_id,
             &child_session_id,
             &subagent_meta_dir,
@@ -2353,8 +2596,9 @@ pub(crate) async fn run_shell_child(
             "completed child actor did not exit before the teardown bound"
         );
     }
-    ctx.workspace_ops
-        .end_local_session(child_session_id.0.as_ref());
+    if !child_workspace_ops.is_ssh() {
+        child_workspace_ops.end_local_session(child_session_id.0.as_ref());
+    }
     let mut disposed_snapshot_ref: Option<String> = None;
     let mut worktree_removed = false;
     if let Some(ref wt_path) = worktree_path {

@@ -1114,6 +1114,42 @@ pub(in crate::app::dispatch) fn drain_startup_actions(app: &mut AppView) -> Vec<
     }
     effects
 }
+/// After a cold `--resume -w`, the source session must be loaded before the
+/// worktree extension can ask its resident workspace for a remote worktree.
+///
+/// This deliberately reuses the ordinary load and worktree paths: it creates no
+/// alternate remote authority path and only consumes the exact startup session
+/// that was staged by the event loop.
+pub(in crate::app::dispatch) fn dispatch_loaded_session_in_worktree(
+    app: &mut AppView,
+    loaded_session_id: &acp::SessionId,
+) -> Vec<Effect> {
+    let matches_loaded_startup = app.deferred_startup.worktree
+        && matches!(
+            app.deferred_startup.session.as_ref(),
+            Some(crate::app::session_startup::DeferredSessionStartup::Load {
+                session_id,
+                ..
+            }) if session_id == loaded_session_id.0.as_ref()
+        );
+    if !matches_loaded_startup {
+        return vec![];
+    }
+    let label = app.deferred_startup.worktree_label.take();
+    let git_ref = app.deferred_startup.worktree_ref.take();
+    app.deferred_startup.worktree = false;
+    app.deferred_startup.session = None;
+    dispatch_new_worktree_session(
+        app,
+        Some(loaded_session_id.0.to_string()),
+        label,
+        None,
+        None,
+        git_ref,
+        None,
+    )
+}
+
 /// Create a placeholder agent in a new git worktree, then create a session.
 pub(in crate::app::dispatch) fn dispatch_new_worktree_session(
     app: &mut AppView,
@@ -1253,6 +1289,7 @@ pub(in crate::app::dispatch) fn dispatch_new_worktree_session(
     } else {
         AgentCommand::CreateWorktree
     };
+    agent.pending_worktree_source_session_id = load_session_id.clone();
     agent.session.start_command(cmd);
     agent.turn_started_at = Some(Instant::now());
     app.agents.insert(agent_id, agent);
@@ -1391,6 +1428,9 @@ pub(in crate::app::dispatch) fn handle_session_created(
     let identity_rebind = super::super::dashboard::WorkspaceIdentityRebind::capture(app);
     crate::app::workspace_sync::allow_loaded_session(app, session_id.0.as_ref());
     let agent_count = app.agents.len();
+    let ssh_client_id = app.ssh_client_id;
+    let start_ssh_event_consumer = !app.ssh_event_consumer_active;
+    app.ssh_event_consumer_active = true;
     let switch_hint =
         crate::views::dashboard::session_switch_hint_command(app.screen_mode.is_minimal());
     let has_switch_target =
@@ -1484,6 +1524,14 @@ pub(in crate::app::dispatch) fn handle_session_created(
                 session_id_clone.clone(),
             ));
         }
+        // SSH local-control prompts must remain consumed while the optional manager overlay is
+        // closed. One receiver serves this pager's local-control connection and re-arms itself.
+        if start_ssh_event_consumer {
+            effects.push(Effect::SshAwaitEvent {
+                client_id: ssh_client_id,
+                session_id: Some(session_id_clone.to_string()),
+            });
+        }
         effects.push(Effect::RegisterActiveSession {
             session_id: session_id_clone,
             cwd: agent.session.cwd.display().to_string(),
@@ -1532,26 +1580,37 @@ pub(in crate::app::dispatch) fn handle_worktree_session_created(
     let identity_rebind = super::super::dashboard::WorkspaceIdentityRebind::capture(app);
     crate::app::workspace_sync::allow_loaded_session(app, session_id.0.as_ref());
     if let Some(agent) = app.agents.get_mut(&agent_id) {
+        agent.pending_worktree_source_session_id = None;
+        agent.pending_worktree_child_session_id = None;
         agent.session.finish_command();
         agent.mark_turn_finished(TurnEnd::Aborted);
         let session_id_clone = session_id.clone();
         agent.bind_session_id(session_id);
-        agent.session.cwd = session_cwd.clone();
+        let remote_worktree = agent.ssh_project_location.is_some();
+        if !remote_worktree {
+            agent.session.cwd = session_cwd.clone();
+        }
         agent.session.is_worktree = true;
         agent.current_branch = None;
         agent.main_repo = None;
         agent.is_worktree = true;
-        crate::git_info::populate_from_cwd_async(session_cwd.clone());
+        if !remote_worktree {
+            crate::git_info::populate_from_cwd_async(session_cwd.clone());
+        }
         if let Some(m) = new_models {
             app.models = Some(m).into();
             agent.session.models = app.models.clone();
         }
         agent.apply_session_modes(modes);
-        agent.prompt.file_search.retarget(&session_cwd);
-        agent.scrollback.push_block(RenderBlock::system(format!(
-            "Worktree ready: {}",
-            worktree_path.display()
-        )));
+        if !remote_worktree {
+            agent.prompt.file_search.retarget(&session_cwd);
+        }
+        let worktree_label = if remote_worktree {
+            format!("Remote worktree ready: {}", worktree_path.display())
+        } else {
+            format!("Worktree ready: {}", worktree_path.display())
+        };
+        agent.scrollback.push_block(RenderBlock::system(worktree_label));
         if let Some(summary) = strategy_summary {
             agent.scrollback.push_block(RenderBlock::system(summary));
         }
@@ -1867,7 +1926,8 @@ pub(in crate::app::dispatch) fn handle_worktree_session_failed(
         agent.mcp_init_progress = None;
         agent.session_new_phase = None;
         agent.pending_session_id = None;
-        agent.session.finish_command();
+        agent.pending_worktree_source_session_id = None;
+        agent.pending_worktree_child_session_id = None;
         let elapsed = agent.turn_elapsed();
         agent.mark_turn_finished(TurnEnd::Aborted);
         agent.pending_first_prompt = None;

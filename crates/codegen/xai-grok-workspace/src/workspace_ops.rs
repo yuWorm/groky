@@ -1,11 +1,11 @@
-//! [`WorkspaceOps`]: dual-mode workspace operations handle.
+//! [`WorkspaceOps`]: local and authenticated-remote workspace operations.
 //!
-//! Two modes:
+//! Modes:
 //!
 //! - **`Local`**: extensions dispatch through [`WorkspaceHandle`]; tool calls dispatch through the workspace session's [`FinalizedToolset`].
 //!   The toolset is installed via [`WorkspaceOps::bind_local_session`] after the agent is built.
-//!
-//! - **`Proxy`**: everything routes through hub WebSocket to a remote workspace server.
+//! - **`Proxy`**: everything routes through the existing Hub WebSocket.
+//! - **`Ssh`**: RPCs and tool calls route through an authenticated worker stream with binding/epoch checks.
 //!
 //! ## Type safety
 //!
@@ -16,19 +16,31 @@
 use crate::error::{WorkspaceError, WorkspaceResult};
 use crate::file_system::ContentSearchRequest;
 use crate::handle::WorkspaceHandle;
+use crate::host_kind::WorkspaceHostKind;
 use crate::worktree::{ApplyWorktreeRequest, CreateWorktreeRequest, RemoveWorktreeRequest};
 use async_trait::async_trait;
 use base64::Engine;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::collections::HashMap;
 use std::io::Write;
 use std::sync::Arc;
+use std::sync::LazyLock;
 use std::sync::atomic::AtomicBool;
 use xai_computer_hub_sdk::ToolHarness;
-use xai_grok_tools::types::output::ToolRunResult;
+use xai_grok_tools::bridge::ToolBridge;
+use xai_grok_tools::types::definition::ToolDefinition;
+use xai_grok_tools::types::output::{ToolOutput, ToolRunResult};
 use xai_grok_tools::types::resources::SessionFolder;
+use xai_grok_tools::types::tool::{ToolKind, ToolNamespace};
+use xai_grok_tools::types::tool_metadata::ToolMetadata;
+use xai_grok_workspace_client::ssh::{SshClientError, SshWorkspaceClient};
 use xai_grok_workspace_client::{WorkspaceClient, is_transport_fatal};
+use xai_grok_workspace_types::ssh::{ResolvedSshInvocation, SshOperation};
+use xai_grok_workspace_types::ssh_wire::{
+    SshPostToolHookOutcome, SshPostToolReplacement, SshProjectBootstrap,
+};
 pub use xai_grok_workspace_types::rpc::agents_md::DiscoverAgentsMdReq;
 pub use xai_grok_workspace_types::rpc::code_nav::{
     CodeFindDefinitionsReq, CodeFindReferencesReq, CodeGotoDefinitionReq, CodeGotoReferencesReq,
@@ -1507,8 +1519,100 @@ impl WorkspaceOp for WorktreeDbStatsReq {
 pub enum WorkspaceOps {
     /// Local in-process mode: extensions dispatch through the handle, tool calls through the workspace session's toolset.
     Local { handle: WorkspaceHandle },
-    /// Proxy mode: routes through hub RPC.
+    /// Hub-proxied mode: routes through the existing Hub RPC harness.
     Proxy { client: WorkspaceClient },
+    /// Authenticated SSH-worker mode. This has no Hub `ToolHarness`; RPCs and
+    /// tools use the worker protocol and retain binding/epoch authority.
+    Ssh {
+        client: SshWorkspaceClient,
+        post_tool_effects:
+            Arc<parking_lot::Mutex<HashMap<SshPostToolHookKey, SshPostToolHookEffects>>>,
+    },
+}
+
+/// Effects are scoped to the immutable remote binding, remote session, and
+/// actor tool-call id. A worker connection may serve multiple bindings, so a
+/// raw call id alone is never safe ownership.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct SshPostToolHookKey {
+    binding_id: String,
+    session_id: String,
+    call_id: String,
+}
+
+/// Terminal hook effects paired with the rendered-result decision made at the
+/// workspace boundary. The worker keeps the raw output for UI consumers; this
+/// flag tells the actor not to let its image/PDF renderer overwrite a remote
+/// replacement already installed in `ToolRunResult::prompt_text`.
+#[derive(Debug, Clone)]
+pub struct SshPostToolHookEffects {
+    pub outcome: SshPostToolHookOutcome,
+    pub output_replaced: bool,
+}
+
+/// Dynamic ToolBridge adapter for a tool that executes only on the
+/// authenticated SSH worker. Its schema is supplied from the worker's finalized
+/// registry, while its call path remains [`WorkspaceOps::call_tool_with_context`].
+#[derive(Clone)]
+struct RemoteWorkspaceTool {
+    workspace: WorkspaceOps,
+    session_id: String,
+    name: String,
+    description: String,
+}
+
+impl std::fmt::Debug for RemoteWorkspaceTool {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.debug_struct("RemoteWorkspaceTool")
+            .field("session_id", &self.session_id)
+            .field("name", &self.name)
+            .finish_non_exhaustive()
+    }
+}
+
+impl ToolMetadata for RemoteWorkspaceTool {
+    fn kind(&self) -> ToolKind {
+        // The worker remains the source of truth for an extension tool's
+        // operation category. Locally treating it as opaque avoids widening a
+        // remote capability based on a stale model-side schema.
+        ToolKind::Other
+    }
+
+    fn tool_namespace(&self) -> ToolNamespace {
+        ToolNamespace::MCP
+    }
+
+    fn description_template(&self) -> &str {
+        &self.description
+    }
+}
+
+impl xai_tool_runtime::Tool for RemoteWorkspaceTool {
+    type Args = serde_json::Value;
+    type Output = ToolOutput;
+
+    fn id(&self) -> xai_tool_protocol::ToolId {
+        xai_tool_protocol::ToolId::new(&self.name)
+            .expect("remote tool names are validated before registration")
+    }
+
+    fn description(
+        &self,
+        _ctx: &xai_tool_runtime::ListToolsContext,
+    ) -> xai_tool_types::ToolDescription {
+        xai_tool_types::ToolDescription::new(&self.name, &self.description)
+    }
+
+    async fn run(
+        &self,
+        ctx: xai_tool_runtime::ToolCallContext,
+        args: serde_json::Value,
+    ) -> Result<Self::Output, xai_tool_runtime::ToolError> {
+        self.workspace
+            .call_tool_with_context(&self.name, args, Some(&self.session_id), ctx)
+            .await
+            .map(|result| result.output)
+    }
 }
 impl WorkspaceOps {
     /// Extensions dispatch through the handle immediately.
@@ -1528,22 +1632,66 @@ impl WorkspaceOps {
             client: WorkspaceClient::with_connected_flag((*harness).clone(), connected),
         }
     }
-    /// Whether this handle routes through the server (proxy mode).
-    pub fn is_proxy(&self) -> bool {
-        matches!(self, Self::Proxy { .. })
+    /// Route workspace operations through an already authenticated SSH worker.
+    pub fn ssh(client: SshWorkspaceClient) -> Self {
+        Self::Ssh {
+            client,
+            post_tool_effects: Arc::new(parking_lot::Mutex::new(HashMap::new())),
+        }
     }
-    /// Access the underlying workspace RPC client (proxy mode only).
+    /// Whether this handle routes through any remote workspace server.
+    pub fn is_remote(&self) -> bool {
+        matches!(self, Self::Proxy { .. } | Self::Ssh { .. })
+    }
+    /// Whether this handle uses the SSH worker transport.
+    pub fn is_ssh(&self) -> bool {
+        matches!(self, Self::Ssh { .. })
+    }
+    /// Whether this handle routes through a remote server.
+    pub fn is_proxy(&self) -> bool {
+        self.is_remote()
+    }
+    /// Access the underlying Hub workspace RPC client (Hub proxy mode only).
     pub fn client(&self) -> Option<&WorkspaceClient> {
         match self {
             Self::Proxy { client } => Some(client),
-            Self::Local { .. } => None,
+            Self::Local { .. } | Self::Ssh { .. } => None,
         }
+    }
+    /// Access the authenticated SSH worker client (SSH mode only).
+    pub fn ssh_client(&self) -> Option<&SshWorkspaceClient> {
+        match self {
+            Self::Ssh { client, .. } => Some(client),
+            Self::Local { .. } | Self::Proxy { .. } => None,
+        }
+    }
+    /// Take terminal remote post-tool effects exactly once. The key includes
+    /// the active binding, so a same-named call on another remote root cannot
+    /// consume this session's effects.
+    pub async fn take_ssh_post_tool_hook_outcome(
+        &self,
+        session_id: &str,
+        call_id: &str,
+    ) -> Option<SshPostToolHookEffects> {
+        let Self::Ssh {
+            client,
+            post_tool_effects,
+        } = self
+        else {
+            return None;
+        };
+        let binding = client.binding().await;
+        post_tool_effects.lock().remove(&SshPostToolHookKey {
+            binding_id: binding.id,
+            session_id: session_id.to_owned(),
+            call_id: call_id.to_owned(),
+        })
     }
     /// Access the underlying workspace handle (local mode only).
     pub fn workspace_handle(&self) -> Option<&WorkspaceHandle> {
         match self {
             Self::Local { handle } => Some(handle),
-            Self::Proxy { .. } => None,
+            Self::Proxy { .. } | Self::Ssh { .. } => None,
         }
     }
     /// Create the workspace session and bind the agent's toolset for local mode, reusing the agent's hunk tracker so queries do not see a duplicate.
@@ -1607,6 +1755,99 @@ impl WorkspaceOps {
         };
         handle.drop_session_if_bound(session_id, bound)
     }
+    /// Fetch the trust-filtered remote project state before a shell actor is
+    /// constructed. Local/Hub callers retain their existing discovery paths.
+    pub async fn project_bootstrap(&self) -> WorkspaceResult<SshProjectBootstrap> {
+        let Self::Ssh { client, .. } = self else {
+            return Err(WorkspaceError::HubError(
+                "project bootstrap is available only for SSH workspaces".into(),
+            ));
+        };
+        let invocation = ssh_invocation(client, SshOperation::Read).await?;
+        let response = client
+            .rpc_raw(
+                invocation,
+                "workspace.project_bootstrap",
+                serde_json::json!({}),
+                None,
+            )
+            .await
+            .map_err(|error| WorkspaceError::HubError(error.to_string()))?;
+        serde_json::from_value(response.value)
+            .map_err(|error| WorkspaceError::HubError(format!("decode SSH project bootstrap: {error}")))
+    }
+
+    /// Fetch the finalized, worker-owned tool definitions for the bound SSH
+    /// session. These definitions are authoritative for remote MCP tools as
+    /// well as the normal workspace tool catalog.
+    pub async fn remote_tool_definitions(&self) -> WorkspaceResult<Vec<ToolDefinition>> {
+        let Self::Ssh { client, .. } = self else {
+            return Err(WorkspaceError::HubError(
+                "remote tool definitions are available only for SSH workspaces".into(),
+            ));
+        };
+        let invocation = ssh_invocation(client, SshOperation::Read).await?;
+        let response = client
+            .rpc_raw(
+                invocation.clone(),
+                "workspace.tool_definitions",
+                serde_json::json!({"session_id": invocation.session_id}),
+                None,
+            )
+            .await
+            .map_err(|error| WorkspaceError::HubError(error.to_string()))?;
+        serde_json::from_value(response.value).map_err(|error| {
+            WorkspaceError::HubError(format!("decode SSH worker tool definitions: {error}"))
+        })
+    }
+
+    /// Register the bound worker's tool catalog into an otherwise remote shell
+    /// bridge. Every resulting model call is sent back through the authenticated
+    /// worker; this never starts an MCP server locally.
+    pub async fn register_remote_tools(&self, bridge: &ToolBridge) -> WorkspaceResult<Vec<String>> {
+        let Self::Ssh { client, .. } = self else {
+            return Err(WorkspaceError::HubError(
+                "remote tool registration is available only for SSH workspaces".into(),
+            ));
+        };
+        let session_id = client.binding().await.session_id;
+        let definitions = self.remote_tool_definitions().await?;
+        let mut registered = Vec::with_capacity(definitions.len());
+        for definition in definitions {
+            let name = definition.function.name;
+            xai_tool_protocol::ToolId::new(&name).map_err(|error| {
+                WorkspaceError::Finalize(format!("invalid SSH worker tool name {name:?}: {error}"))
+            })?;
+            let description = definition
+                .function
+                .description
+                .unwrap_or_else(|| format!("Remote workspace tool {name}"));
+            // The bridge may already hold the local generic implementation
+            // under this public name. Remove it before the worker-owned
+            // adapter claims the name so an SSH project cannot accidentally
+            // dispatch one of its tools on the local machine.
+            bridge.unregister_tool_by_name(&name);
+            bridge
+                .register_mcp_tools(
+                    name.clone(),
+                    RemoteWorkspaceTool {
+                        workspace: self.clone(),
+                        session_id: session_id.clone(),
+                        name: name.clone(),
+                        description,
+                    },
+                    Some(definition.function.parameters),
+                )
+                .map_err(|error| {
+                    WorkspaceError::Finalize(format!(
+                        "register SSH worker tool {name:?} in local bridge: {error}"
+                    ))
+                })?;
+            registered.push(name);
+        }
+        Ok(registered)
+    }
+
     pub async fn on_before_turn(
         &self,
         session_id: &str,
@@ -1616,9 +1857,15 @@ impl WorkspaceOps {
             Self::Local { handle } => {
                 handle.on_before_turn(session_id, payload).await;
             }
-            Self::Proxy { .. } => {
-                tracing::debug!("on_before_turn called on Proxy WorkspaceOps (no-op)");
+            Self::Ssh { .. } => {
+                if let Err(error) = self
+                    .rpc_raw("workspace.on_before_turn", serde_json::json!({"payload": payload}))
+                    .await
+                {
+                    tracing::warn!(%session_id, %error, "forwarding SSH before_turn hook failed");
+                }
             }
+            Self::Proxy { .. } => {}
         }
     }
     pub async fn on_after_turn(
@@ -1630,37 +1877,218 @@ impl WorkspaceOps {
             Self::Local { handle } => {
                 handle.on_after_turn(session_id, payload).await;
             }
-            Self::Proxy { .. } => {
-                tracing::debug!("on_after_turn called on Proxy WorkspaceOps (no-op)");
+            Self::Ssh { .. } => {
+                if let Err(error) = self
+                    .rpc_raw("workspace.on_after_turn", serde_json::json!({"payload": payload}))
+                    .await
+                {
+                    tracing::warn!(%session_id, %error, "forwarding SSH after_turn hook failed");
+                }
             }
+            Self::Proxy { .. } => {}
         }
     }
-    pub async fn rpc_raw(&self, method: &str, params: Value) -> WorkspaceResult<Value> {
-        let client = match self {
-            Self::Proxy { client } => client,
-            Self::Local { .. } => {
-                return Err(WorkspaceError::HubError(
-                    "rpc not available in local mode".into(),
-                ));
-            }
-        };
-        client
-            .rpc_raw(method, params)
+    /// Hook transcripts belong to the local agent, not the remote filesystem.
+    /// Project hooks receive only the authenticated remote location; client
+    /// hooks retain the original envelope and its local transcript.
+    async fn remote_hook_value(
+        &self,
+        envelope: &xai_grok_hooks::event::HookEventEnvelope,
+    ) -> WorkspaceResult<Value> {
+        let client = self.ssh_client().ok_or_else(|| {
+            WorkspaceError::HubError("remote hooks require an SSH workspace".to_owned())
+        })?;
+        let binding = client.binding().await;
+        let mut value = serde_json::to_value(envelope)
+            .map_err(|error| WorkspaceError::HubError(format!("encode remote hook: {error}")))?;
+        let fields = value.as_object_mut().ok_or_else(|| {
+            WorkspaceError::HubError("remote hook envelope must be an object".to_owned())
+        })?;
+        fields.remove("transcriptPath");
+        fields.insert("sessionId".into(), binding.session_id.into());
+        fields.insert("cwd".into(), binding.cwd.into());
+        fields.insert("workspaceRoot".into(), binding.root.into());
+        Ok(value)
+    }
+
+
+    /// Dispatch an SSH project's passive lifecycle hook on the worker that owns
+    /// the authorized remote root. The shell still delivers client hooks; it
+    /// must not run remote project commands locally.
+    pub async fn dispatch_remote_observe_hook(
+        &self,
+        envelope: &xai_grok_hooks::event::HookEventEnvelope,
+    ) -> WorkspaceResult<()> {
+        let value = self.remote_hook_value(envelope).await?;
+        self.rpc_raw("workspace.dispatch_hook", serde_json::json!({"envelope": value}))
             .await
-            .map_err(|e| WorkspaceError::HubError(e.to_string()))
+            .map(|_| ())
+    }
+
+    /// Run an SSH project's prompt gate on its worker and return its decision.
+    /// Failed transport remains fail-open, matching local hook failure policy.
+    pub async fn dispatch_remote_prompt_hook(
+        &self,
+        envelope: &xai_grok_hooks::event::HookEventEnvelope,
+    ) -> WorkspaceResult<xai_grok_hooks::result::PromptDecision> {
+        let value = self.remote_hook_value(envelope).await?;
+        let response = self
+            .rpc_raw(
+                "workspace.dispatch_prompt_hook",
+                serde_json::json!({"envelope": value}),
+            )
+            .await?;
+        match response.get("decision").and_then(Value::as_str) {
+            Some("allow") => Ok(xai_grok_hooks::result::PromptDecision::Allow),
+            Some("block") => Ok(xai_grok_hooks::result::PromptDecision::Block {
+                reason: response
+                    .get("reason")
+                    .and_then(Value::as_str)
+                    .unwrap_or("remote project hook blocked the prompt")
+                    .to_owned(),
+                hook_name: response
+                    .get("hookName")
+                    .and_then(Value::as_str)
+                    .unwrap_or("remote project hook")
+                    .to_owned(),
+            }),
+            _ => Err(WorkspaceError::HubError(
+                "invalid remote prompt-hook response".to_owned(),
+            )),
+        }
+    }
+
+    /// Run the remote `Stop`/`SubagentStop` gate. `Some` carries feedback that
+    /// keeps the current turn running; `None` permits it to end.
+    pub async fn dispatch_remote_stop_hook(
+        &self,
+        envelope: &xai_grok_hooks::event::HookEventEnvelope,
+    ) -> WorkspaceResult<Option<String>> {
+        let value = self.remote_hook_value(envelope).await?;
+        let response = self
+            .rpc_raw(
+                "workspace.dispatch_stop_hook",
+                serde_json::json!({"envelope": value}),
+            )
+            .await?;
+        if response.get("continue").and_then(Value::as_bool) == Some(true) {
+            Ok(Some(
+                response
+                    .get("feedback")
+                    .and_then(Value::as_str)
+                    .unwrap_or("remote project Stop hook requested continuation")
+                    .to_owned(),
+            ))
+        } else {
+            Ok(None)
+        }
+    }
+
+    pub async fn remote_skills(
+        &self,
+    ) -> WorkspaceResult<Vec<xai_grok_tools::implementations::skills::types::SkillInfo>> {
+        let value = self
+            .rpc_raw("workspace.discover_skills", serde_json::json!({}))
+            .await?;
+        serde_json::from_value(value)
+            .map_err(|error| WorkspaceError::HubError(format!("decode remote skills: {error}")))
+    }
+
+    pub async fn remote_skill_content(&self, path: &str) -> WorkspaceResult<String> {
+        let value = self
+            .rpc_raw("workspace.skill_content", serde_json::json!({"path": path}))
+            .await?;
+        serde_json::from_value(value)
+            .map_err(|error| WorkspaceError::HubError(format!("decode remote skill content: {error}")))
+    }
+
+    pub async fn git_head_snapshot(&self) -> WorkspaceResult<crate::session::git::GitHeadSnapshot> {
+        if let Self::Local { handle } = self {
+            return Ok(crate::session::git::git_head_snapshot(handle.root_cwd()?).await);
+        }
+        let value = self.rpc_raw("workspace.git_head_snapshot", serde_json::json!({})).await?;
+        serde_json::from_value(value)
+            .map_err(|error| WorkspaceError::HubError(format!("decode Git head snapshot: {error}")))
+    }
+
+    /// Restore the persisted session HEAD at this workspace's own root, retaining
+    /// dirty state in a named stash. SSH dispatch requires Execute approval.
+    pub async fn checkout_session_commit(
+        &self,
+        target_sha: &str,
+        session_id: &str,
+    ) -> WorkspaceResult<crate::session::git::CheckoutSessionOutcome> {
+        if let Self::Local { handle } = self {
+            return Ok(crate::session::git::checkout_session_commit(
+                &handle.root_cwd()?,
+                target_sha,
+                true,
+                session_id,
+            )
+            .await);
+        }
+        let value = self
+            .rpc_raw(
+                "workspace.checkout_session_commit",
+                serde_json::json!({"target_sha": target_sha, "session_id": session_id}),
+            )
+            .await?;
+        serde_json::from_value(value)
+            .map_err(|error| WorkspaceError::HubError(format!("decode session checkout: {error}")))
+    }
+
+    pub async fn rpc_raw(&self, method: &str, params: Value) -> WorkspaceResult<Value> {
+        match self {
+            Self::Proxy { client } => client
+                .rpc_raw(method, params)
+                .await
+                .map_err(|e| WorkspaceError::HubError(e.to_string())),
+            Self::Ssh { client, .. } => {
+                let operation = crate::hub_server::workspace_rpc_operation(method);
+                let invocation = ssh_invocation(client, operation).await?;
+                let mutation_id = (operation != SshOperation::Read).then(|| invocation.call_id.clone());
+                client
+                    .rpc_raw(invocation, method, params, mutation_id)
+                    .await
+                    .map(|result| result.value)
+                    .map_err(|e| WorkspaceError::HubError(e.to_string()))
+            }
+            Self::Local { .. } => Err(WorkspaceError::HubError(
+                "rpc not available in local mode".into(),
+            )),
+        }
     }
     async fn rpc<R: WorkspaceRpc>(&self, req: &R) -> WorkspaceResult<R::Response> {
         let params = serde_json::to_value(req)
             .map_err(|e| WorkspaceError::HubError(format!("serialize failed: {e}")))?;
-        let terminal = self.rpc_raw(R::METHOD, params).await?;
-        let envelope: crate::rpc_envelope::RpcEnvelope<R::Response> =
-            serde_json::from_value(terminal)
-                .map_err(|e| WorkspaceError::HubError(format!("envelope parse failed: {e}")))?;
-        envelope
-            .into_result()
-            .map_err(crate::rpc_envelope::rpc_error_to_workspace)
+        match self {
+            Self::Ssh { client, .. } => {
+                let operation = crate::hub_server::workspace_rpc_operation(R::METHOD);
+                let invocation = ssh_invocation(client, operation).await?;
+                let mutation_id = (operation != SshOperation::Read).then(|| invocation.call_id.clone());
+                let raw = client
+                    .rpc_raw(invocation, R::METHOD, params, mutation_id)
+                    .await
+                    .map_err(|e| WorkspaceError::HubError(e.to_string()))?
+                    .value;
+                serde_json::from_value(raw)
+                    .map_err(|e| WorkspaceError::HubError(format!("response parse failed: {e}")))
+            }
+            Self::Proxy { .. } => {
+                let terminal = self.rpc_raw(R::METHOD, params).await?;
+                let envelope: crate::rpc_envelope::RpcEnvelope<R::Response> =
+                    serde_json::from_value(terminal)
+                        .map_err(|e| WorkspaceError::HubError(format!("envelope parse failed: {e}")))?;
+                envelope
+                    .into_result()
+                    .map_err(crate::rpc_envelope::rpc_error_to_workspace)
+            }
+            Self::Local { .. } => Err(WorkspaceError::HubError(
+                "rpc not available in local mode".into(),
+            )),
+        }
     }
-    /// Dispatch a typed operation in either local or proxy mode. The server handler owns session context, so `session_id` is only needed for local `execute()`.
+    /// Dispatch a typed operation in local, Hub-proxy, or authenticated SSH-worker mode.
     pub async fn dispatch<Op: WorkspaceOp>(
         &self,
         op: &Op,
@@ -1669,11 +2097,12 @@ impl WorkspaceOps {
         let mode = match self {
             Self::Local { .. } => "local",
             Self::Proxy { .. } => "proxy",
+            Self::Ssh { .. } => "ssh",
         };
         tracing::debug!(method = Op::METHOD, mode, "WorkspaceOps::dispatch");
         match self {
             Self::Local { handle } => op.execute(handle, session_id).await,
-            Self::Proxy { .. } => self.rpc(op).await,
+            Self::Proxy { .. } | Self::Ssh { .. } => self.rpc(op).await,
         }
     }
     pub async fn workspace_info(&self) -> WorkspaceResult<Value> {
@@ -1685,6 +2114,7 @@ impl WorkspaceOps {
         match self {
             Self::Local { .. } => Some(xai_grok_version::VERSION.to_owned()),
             Self::Proxy { client } => client.server_binary_version(),
+            Self::Ssh { .. } => None,
         }
     }
     /// **DEPRECATED**: Use [`Self::git_status_ext`] with `format: GitStatusFormat::Prompt` instead.
@@ -1819,8 +2249,289 @@ impl WorkspaceOps {
                     )
                 })
             }
+            Self::Ssh {
+                client,
+                post_tool_effects,
+            } => {
+                if !client.is_connected() {
+                    return Err(xai_tool_runtime::ToolError::network_error(
+                        "The SSH workspace worker connection was lost. Query the operation before retrying any mutation.",
+                    ));
+                }
+                let operation = ssh_tool_operation(name);
+                let call_id = ctx.call_id.to_string();
+                let invocation = ssh_invocation_with_call_id(client, operation, call_id.clone())
+                    .await
+                    .map_err(|error| {
+                        xai_tool_runtime::ToolError::custom(
+                            "ssh_worker_error",
+                            error.to_string(),
+                        )
+                    })?;
+                if let Some(session_id) = session_id
+                    && session_id != invocation.session_id
+                {
+                    return Err(xai_tool_runtime::ToolError::custom(
+                        "ssh_session_mismatch",
+                        "tool call session does not match the authenticated SSH binding",
+                    ));
+                }
+                let effect_key = SshPostToolHookKey {
+                    binding_id: invocation.binding_id.clone(),
+                    session_id: invocation.session_id.clone(),
+                    call_id,
+                };
+                let mutation_id =
+                    (operation != SshOperation::Read).then(|| ctx.call_id.to_string());
+                let response = match client
+                    .call_tool(invocation, name, args, mutation_id)
+                    .await
+                {
+                    Ok(response) => response,
+                    Err(SshClientError::Remote(error)) => {
+                        let message = format!("{}: {}", error.code, error.message);
+                        if let Some(outcome) = error.post_hook
+                            && has_remote_post_tool_effects(&outcome)
+                        {
+                            post_tool_effects.lock().insert(
+                                effect_key,
+                                SshPostToolHookEffects {
+                                    outcome,
+                                    output_replaced: false,
+                                },
+                            );
+                        }
+                        return Err(xai_tool_runtime::ToolError::custom(
+                            "ssh_worker_error",
+                            message,
+                        ));
+                    }
+                    Err(error) => {
+                        return Err(xai_tool_runtime::ToolError::custom(
+                            "ssh_worker_error",
+                            error.to_string(),
+                        ));
+                    }
+                };
+                let mut terminal_effect = response
+                    .operation
+                    .post_hook
+                    .filter(has_remote_post_tool_effects)
+                    .map(|outcome| SshPostToolHookEffects {
+                        outcome,
+                        output_replaced: false,
+                    });
+                if let Some(effect) = terminal_effect.as_ref() {
+                    post_tool_effects
+                        .lock()
+                        .insert(effect_key.clone(), effect.clone());
+                }
+                let mut tool_result =
+                    serde_json::from_value::<ToolRunResult>(response.value).map_err(|error| {
+                        xai_tool_runtime::ToolError::custom(
+                            "tool_result_deserialize",
+                            format!("tool result deserialization failed: {error}"),
+                        )
+                    })?;
+                if let Some(effect) = terminal_effect.as_mut()
+                    && apply_ssh_post_tool_outcome(&mut tool_result, &effect.outcome)
+                {
+                    effect.output_replaced = true;
+                    post_tool_effects.lock().insert(effect_key, effect.clone());
+                }
+                Ok(tool_result)
+            }
         }
     }
+}
+
+async fn ssh_invocation(
+    client: &SshWorkspaceClient,
+    operation: SshOperation,
+) -> WorkspaceResult<ResolvedSshInvocation> {
+    // A worker and its mutation records outlive the local agent process.
+    // A process-local counter would alias old operations after session resume.
+    ssh_invocation_with_call_id(client, operation, uuid::Uuid::now_v7().to_string()).await
+}
+
+async fn ssh_invocation_with_call_id(
+    client: &SshWorkspaceClient,
+    operation: SshOperation,
+    call_id: String,
+) -> WorkspaceResult<ResolvedSshInvocation> {
+    let binding = client.binding().await;
+    if binding.revoked {
+        return Err(WorkspaceError::HubError(
+            "SSH binding is revoked; choose or authorize a new target".into(),
+        ));
+    }
+    Ok(ResolvedSshInvocation {
+        binding_id: binding.id,
+        target_id: binding.target_id,
+        session_id: binding.session_id,
+        epoch: binding.epoch,
+        cwd: binding.cwd,
+        operation,
+        call_id,
+    })
+}
+
+fn has_remote_post_tool_effects(outcome: &SshPostToolHookOutcome) -> bool {
+    !outcome.pre_tool_context.is_empty()
+        || outcome.builtin_replacement.is_some()
+        || outcome.mcp_replacement.is_some()
+        || !outcome.additional_context.is_empty()
+        || !outcome.blocks.is_empty()
+}
+
+/// Apply a worker-owned post-tool output replacement at the prompt-ready
+/// boundary while keeping `ToolRunResult::output` unchanged for UI consumers.
+pub fn apply_ssh_post_tool_outcome(
+    result: &mut ToolRunResult,
+    outcome: &SshPostToolHookOutcome,
+) -> bool {
+    let replacement = if matches!(&result.output, ToolOutput::MCP(_)) {
+        match (&outcome.builtin_replacement, &outcome.mcp_replacement) {
+            (Some(builtin), Some(mcp)) if mcp.run_index > builtin.run_index => Some(mcp),
+            (Some(builtin), _) => Some(builtin),
+            (_, Some(mcp)) => Some(mcp),
+            (None, None) => None,
+        }
+    } else {
+        outcome.builtin_replacement.as_ref()
+    };
+    let Some(replacement) = replacement else {
+        return false;
+    };
+    let replacement = match remote_post_tool_replacement_text(replacement, &result.output) {
+        Ok(replacement) => replacement,
+        Err(error) => {
+            tracing::warn!(%error, "remote post-tool output replacement rejected");
+            return false;
+        }
+    };
+    let original = result.output.to_prompt_format();
+    result.prompt_text = if original.is_empty() {
+        if result.prompt_text.is_empty() {
+            replacement
+        } else {
+            format!("{replacement}\n\n{}", result.prompt_text)
+        }
+    } else if let Some(reminders) = result.prompt_text.strip_prefix(&original) {
+        format!("{replacement}{reminders}")
+    } else {
+        tracing::warn!(
+            "remote post-tool replacement: tool prompt did not start with its own output; dropping reminders"
+        );
+        replacement
+    };
+    true
+}
+
+fn remote_post_tool_replacement_text(
+    replacement: &SshPostToolReplacement,
+    output: &ToolOutput,
+) -> Result<String, String> {
+    if matches!(output, ToolOutput::MCP(_)) {
+        let text = match &replacement.value {
+            Value::String(text) => text.clone(),
+            structured => structured.to_string(),
+        };
+        return Ok(xai_grok_hooks::event::clip_text(
+            &text,
+            xai_grok_hooks::event::MAX_HOOK_OUTPUT_REPLACEMENT_CHARS,
+        ));
+    }
+    let candidate = serde_json::from_value::<ToolOutput>(replacement.value.clone())
+        .map_err(|error| format!("updatedToolOutput failed to parse: {error}"))?;
+    if std::mem::discriminant(&candidate) != std::mem::discriminant(output) {
+        return Err("updatedToolOutput does not match the tool's output shape".into());
+    }
+    Ok(xai_grok_hooks::event::clip_text(
+        &candidate.to_prompt_format(),
+        xai_grok_hooks::event::MAX_HOOK_OUTPUT_REPLACEMENT_CHARS,
+    ))
+}
+
+/// Translate the registry's intrinsic tool category into the SSH grant
+/// category. Unknown categories deliberately require execute authority.
+pub(crate) fn ssh_operation_for_tool_kind(kind: ToolKind) -> SshOperation {
+    match kind {
+        ToolKind::Read
+        | ToolKind::ListDir
+        | ToolKind::List
+        | ToolKind::Search
+        | ToolKind::Lsp
+        | ToolKind::BackgroundTaskAction
+        | ToolKind::WaitTasksAction
+        | ToolKind::Monitor
+        | ToolKind::MemorySearch
+        | ToolKind::MemoryGet => SshOperation::Read,
+        ToolKind::Edit
+        | ToolKind::Delete
+        | ToolKind::Write
+        | ToolKind::Move
+        | ToolKind::KillTaskAction => SshOperation::Write,
+        _ => SshOperation::Execute,
+    }
+}
+
+/// Baseline tools available to an SSH worker. The catalog deliberately includes
+/// both GrokBuild and OpenCode tool families so an authenticated remote session
+/// can run the same filesystem and command operations as a local workspace.
+pub(crate) fn ssh_worker_toolset() -> xai_grok_tools::registry::types::ToolServerConfig {
+    use xai_grok_tools::implementations::opencode::{
+        OpenCodeBashTool, OpenCodeEditTool, OpenCodeGlobTool, OpenCodeReadTool, OpenCodeSkillTool,
+        OpenCodeTodoWriteTool,
+    };
+    use xai_grok_tools::registry::types::ToolConfig;
+
+    // The daemon catalog already contains `OpenCode:write`; do not add it
+    // twice. It also exposes GrokBuild's `grep` client name, so retaining a
+    // second `OpenCode:grep` would make finalization reject the duplicate
+    // client-facing name. The remaining OpenCode tools have distinct names.
+    let mut toolset = WorkspaceHostKind::Daemon.default_toolset();
+    toolset.tools.extend([
+        ToolConfig::for_tool::<OpenCodeBashTool>(),
+        ToolConfig::for_tool::<OpenCodeReadTool>(),
+        ToolConfig::for_tool::<OpenCodeEditTool>(),
+        ToolConfig::for_tool::<OpenCodeGlobTool>(),
+        ToolConfig::for_tool::<OpenCodeTodoWriteTool>(),
+        ToolConfig::for_tool::<OpenCodeSkillTool>(),
+    ]);
+    toolset
+}
+
+fn ssh_tool_operation(name: &str) -> SshOperation {
+    static TOOL_OPERATIONS: LazyLock<HashMap<String, SshOperation>> = LazyLock::new(|| {
+        let mut operations = HashMap::new();
+        for tool in ssh_worker_toolset().tools {
+            let Some(kind) = tool.kind else {
+                continue;
+            };
+            let operation = ssh_operation_for_tool_kind(kind);
+            let registry_id = tool.id.clone();
+            let default_name = registry_id
+                .rsplit_once(':')
+                .map_or(registry_id.as_str(), |(_, id)| id);
+            operations.insert(
+                tool.resolve_client_name(default_name),
+                operation,
+            );
+            // The SSH wire accepts finalized client names and registry IDs.
+            // Classifying both here keeps the signed invocation aligned with the
+            // worker's canonicalization before it authorizes the call.
+            operations.insert(registry_id, operation);
+        }
+        operations
+    });
+    TOOL_OPERATIONS
+        .get(name)
+        .copied()
+        // A name not present in the worker's baseline catalog may be a custom
+        // tool. The worker makes the final decision; the caller must never
+        // pre-authorize an unknown tool as a read.
+        .unwrap_or(SshOperation::Execute)
 }
 #[cfg(any(test, feature = "test-support"))]
 impl WorkspaceOps {
@@ -1840,6 +2551,56 @@ impl WorkspaceOps {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ssh_worker_catalog_classifies_client_and_registry_tool_names() {
+        assert_eq!(
+            ssh_tool_operation("get_command_or_subagent_output"),
+            SshOperation::Read
+        );
+        assert_eq!(
+            ssh_tool_operation("kill_command_or_subagent"),
+            SshOperation::Write
+        );
+        assert_eq!(
+            ssh_tool_operation("GrokBuild:read_file"),
+            SshOperation::Read
+        );
+        assert_eq!(ssh_tool_operation("GrokBuild:grep"), SshOperation::Read);
+        assert_eq!(
+            ssh_tool_operation("GrokBuild:run_terminal_cmd"),
+            SshOperation::Execute
+        );
+        assert_eq!(ssh_tool_operation("OpenCode:write"), SshOperation::Write);
+        assert_eq!(ssh_tool_operation("OpenCode:edit"), SshOperation::Write);
+        assert_eq!(ssh_tool_operation("unregistered_custom_tool"), SshOperation::Execute);
+    }
+
+    #[test]
+    fn remote_post_tool_replacement_changes_only_model_prompt_output() {
+        let output = ToolOutput::Text("worker output".into());
+        let replacement = ToolOutput::Text("remote hook replacement".into());
+        let mut result = ToolRunResult {
+            output,
+            prompt_text: "worker output\n\n[existing reminder]".into(),
+            effective_tool_name: None,
+        };
+        let outcome = SshPostToolHookOutcome {
+            builtin_replacement: Some(SshPostToolReplacement {
+                value: serde_json::to_value(replacement).expect("serialize replacement"),
+                run_index: 0,
+            }),
+            ..SshPostToolHookOutcome::default()
+        };
+
+        assert!(apply_ssh_post_tool_outcome(&mut result, &outcome));
+
+        assert_eq!(result.output.to_prompt_format(), "worker output");
+        assert_eq!(
+            result.prompt_text,
+            "remote hook replacement\n\n[existing reminder]"
+        );
+    }
     /// The reported bug: every window's git queries ran against the workspace launch directory.
     /// `git_op_cwd` must return the per-session repo the client sends, and only fall back to the workspace root when none is given.
     #[tokio::test]

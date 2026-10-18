@@ -55,6 +55,17 @@ pub trait AgentRuntime {
     fn session_registry_client(&self) -> Option<SessionRegistryClient>;
 
     fn resolve_workspace_ops(&self) -> Result<xai_grok_workspace::WorkspaceOps, acp::Error>;
+    /// Resolve the workspace resident with a session rather than the process
+    /// launch workspace. SSH sessions have no local cwd to reconstruct.
+    fn workspace_ops_for_session(
+        &self,
+        session_id: &acp::SessionId,
+    ) -> Result<xai_grok_workspace::WorkspaceOps, acp::Error>;
+
+    /// The leader-owned SSH authority service. Extensions use it only for
+    /// explicit user-approved project transitions; model tools remain scoped
+    /// through their session's `WorkspaceOps`.
+    fn session_ssh(&self) -> Option<Arc<crate::ssh::SessionSsh>>;
 
     async fn background_foreground_command(&self, session_id: &str, tool_call_id: &str) -> bool;
 }

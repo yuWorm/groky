@@ -343,17 +343,23 @@ fn dispatch_dashboard_load_local_build(
     let resolved = cwd_hint
         .and_then(|cwd| {
             xai_grok_shell::session::resolve_local_session(&session_id, &cwd.to_string_lossy())
-                .map(|resolved_id| (resolved_id, cwd))
+                .map(|resolved_id| (resolved_id, Some(cwd)))
         })
         .or_else(|| {
-            xai_grok_shell::session::resolve_local_session_any_cwd(&session_id)
-                .map(|cwd| (session_id, std::path::PathBuf::from(cwd)))
+            xai_grok_shell::session::resolve_local_session_any_cwd(&session_id).map(
+                |storage_cwd| {
+                    (
+                        session_id,
+                        crate::app::session_startup::local_cwd_from_session_storage(&storage_cwd),
+                    )
+                },
+            )
         });
     let Some((resolved_id, resolved_cwd)) = resolved else {
         app.show_toast("Session not found locally");
         return vec![];
     };
-    dispatch_dashboard_load_session(app, resolved_id, Some(resolved_cwd))
+    dispatch_dashboard_load_session(app, resolved_id, resolved_cwd)
 }
 fn dispatch_dashboard_load_session(
     app: &mut AppView,

@@ -92,6 +92,8 @@ impl MemoryV2AccessSlot {
 /// Cloning is intentionally not derived; the spec lives behind an [`Arc`] and is shared by cloning that `Arc`.
 pub(crate) struct AgentRebuildSpec {
     pub working_directory: PathBuf,
+    /// Remote discovery remains authoritative across profile/model rebuilds.
+    pub ssh_workspace: Option<xai_grok_workspace::WorkspaceOps>,
     pub terminal_backend: Arc<dyn TerminalBackend>,
     pub fs_backend: Arc<dyn AsyncFileSystem>,
     pub tools_notification_handle: ToolNotificationHandle,
@@ -199,14 +201,18 @@ impl AgentRebuildSpec {
     #[deny(unused_variables)]
     async fn build_agent_inner(
         self: &Arc<Self>,
-        definition: AgentDefinition,
+        mut definition: AgentDefinition,
         system_prompt_label: String,
         persisted_skill_names: Option<std::collections::HashSet<String>>,
-        preloaded_skills: Option<Vec<xai_grok_tools::implementations::skills::types::SkillInfo>>,
+        mut preloaded_skills: Option<Vec<xai_grok_tools::implementations::skills::types::SkillInfo>>,
     ) -> Result<(Agent, std::time::Duration), AgentBuildError> {
+        // Select the pack before AgentBuilder applies the profile/session
+        // allowlist, denylist and capability ceiling, including on rebuilds.
+        crate::ssh::configure_default_tools(&mut definition);
         let build_phase_start = std::time::Instant::now();
         let Self {
             working_directory,
+            ssh_workspace,
             terminal_backend,
             fs_backend,
             tools_notification_handle,
@@ -299,6 +305,29 @@ impl AgentRebuildSpec {
             env.insert("GROK_SESSION_ID".to_string(), session_id_str.clone());
             Arc::new(env)
         };
+        if let Some(ops) = ssh_workspace {
+            definition.agents_md = false;
+            definition.discover_skills = false;
+            if preloaded_skills.is_none() {
+                preloaded_skills = Some(ops.remote_skills().await.map_err(|error| {
+                    AgentBuildError::InvalidConfig(format!("SSH skill discovery failed: {error}"))
+                })?);
+            }
+            if let Some(skills) = preloaded_skills.as_mut() {
+                for skill in skills.iter_mut().filter(|skill| {
+                    definition.skills.iter().any(|name| {
+                        name.eq_ignore_ascii_case(&skill.name)
+                            || name.eq_ignore_ascii_case(
+                                &xai_grok_tools::implementations::skills::skill::format_skill_name(skill),
+                            )
+                    })
+                }) {
+                    skill.body = Some(ops.remote_skill_content(&skill.path).await.map_err(|error| {
+                        AgentBuildError::InvalidConfig(format!("SSH skill preload failed: {error}"))
+                    })?);
+                }
+            }
+        }
         let presentation = latch_task_model_presentation(models_manager, task_model_policy).await;
         let mut builder = AgentBuilder::new(
             working_directory.clone(),
@@ -338,9 +367,10 @@ impl AgentRebuildSpec {
         .with_skills_config(skills_config.clone())
         .with_compat_config(*compat)
         .with_paths_config(paths_config.clone())
-        .with_project_trusted(crate::agent::folder_trust::project_scope_allowed(
-            working_directory,
-        ))
+        .with_project_trusted(
+            ssh_workspace.is_none()
+                && crate::agent::folder_trust::project_scope_allowed(working_directory),
+        )
         .with_context_window(*context_window_tokens)
         .with_mcp_max_output_bytes(
             crate::util::config::resolve_max_mcp_output_bytes_for_cwd(working_directory),
@@ -480,6 +510,7 @@ pub(crate) fn test_rebuild_spec_default() -> Arc<AgentRebuildSpec> {
     let (uq_tx, _uq_rx) = tokio::sync::mpsc::unbounded_channel();
     Arc::new(AgentRebuildSpec {
         working_directory: std::env::temp_dir(),
+        ssh_workspace: None,
         terminal_backend: Arc::new(
             xai_grok_tools::computer::local::LocalTerminalBackend::new_local(
                 xai_grok_tools::computer::local::SearchShadowConfig::default(),
@@ -574,6 +605,33 @@ mod legacy_tests {
             .and_then(|definition| definition.function.description)
             .expect("GrokBuild Task description should be present")
     }
+    #[tokio::test(flavor = "current_thread")]
+    async fn ssh_tools_respect_session_tool_restrictions_after_rebuild() {
+        tokio::task::LocalSet::new().run_until(async {
+            let root = tempfile::tempdir().unwrap();
+            let mut spec = test_rebuild_spec_default();
+            let owned = Arc::get_mut(&mut spec).unwrap();
+            owned.working_directory = root.path().to_owned();
+            owned.bridge_state_path = root.path().join("tool-state.json");
+            let mut definition = AgentDefinition::default_grok_build();
+            definition.agents_md = false;
+            definition.discover_skills = false;
+            let agent = spec.build_agent(definition.clone(), xai_grok_agent::DEFAULT_SYSTEM_PROMPT_LABEL)
+                .await.unwrap();
+            let exposed = |agent: &Agent| {
+                agent.tool_bridge().toolset().tool_definitions().into_iter()
+                    .map(|tool| tool.function.name).filter(|name| name.starts_with("ssh_"))
+                    .collect::<std::collections::BTreeSet<_>>()
+            };
+            assert!(exposed(&agent).contains("ssh_request_access"));
+            definition.session_tools_allowlist = Some(vec!["ssh_read".into(), "ssh_write".into()]);
+            definition.session_tools_denylist = Some(vec!["ssh_write".into()]);
+            let restricted = spec.build_agent(definition, xai_grok_agent::DEFAULT_SYSTEM_PROMPT_LABEL)
+                .await.unwrap();
+            assert_eq!(exposed(&restricted), ["ssh_read".to_owned()].into());
+        }).await;
+    }
+
     /// The `[toolset.web_search]` policy is authoritative on the backend-hosted path.
     /// Agent frontmatter is model-writable (`.grok/agents/*.md`), so a configured blocklist must survive a frontmatter allowlist.
     #[tokio::test(flavor = "current_thread")]

@@ -8,6 +8,7 @@ use crate::session::info::Info;
 use crate::session::storage::{CopySessionOptions, JsonlStorageAdapter};
 use crate::util::grok_home::grok_home;
 use agent_client_protocol as acp;
+use xai_grok_workspace_types::ssh::ProjectLocation;
 use std::io;
 
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
@@ -31,6 +32,12 @@ pub struct ForkSessionRequest {
     /// The original workspace directory this worktree session was spawned from.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_workspace_dir: Option<String>,
+    /// Source execution location. Absent means the legacy local `source_cwd`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_project_location: Option<ProjectLocation>,
+    /// Target execution location. Absent means the legacy local `new_cwd`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub new_project_location: Option<ProjectLocation>,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -52,6 +59,39 @@ fn generate_fork_session_id(_source_id: &str) -> String {
     uuid::Uuid::now_v7().to_string()
 }
 
+fn fork_project_locations<'a>(
+    source: Option<&'a ProjectLocation>,
+    target: Option<&'a ProjectLocation>,
+) -> io::Result<(Option<&'a ProjectLocation>, Option<&'a ProjectLocation>)> {
+    match (source, target) {
+        (None, None) => Ok((None, None)),
+        (
+            Some(ProjectLocation::Ssh {
+                target_id: source_target,
+                ..
+            }),
+            Some(ProjectLocation::Ssh {
+                target_id: target_target,
+                ..
+            }),
+        ) if source_target == target_target => Ok((source, target)),
+        (Some(ProjectLocation::Ssh { .. }), Some(ProjectLocation::Ssh { .. })) => Err(
+            io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "an SSH session fork cannot change targets",
+            ),
+        ),
+        (Some(_), Some(_)) => Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "fork project locations must both be SSH locations",
+        )),
+        _ => Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "SSH forks require both source and target project locations",
+        )),
+    }
+}
+
 pub async fn fork_session(
     request: ForkSessionRequest,
     agent_id: &str,
@@ -62,10 +102,30 @@ pub async fn fork_session(
     let root_dir = grok_home();
     let storage = JsonlStorageAdapter::with_root(root_dir.clone());
 
-    // Build source and target Info
-    let source_info = Info {
-        id: acp::SessionId::new(request.source_session_id.clone()),
-        cwd: request.source_cwd.clone(),
+    let (source_location, target_location) = fork_project_locations(
+        request.source_project_location.as_ref(),
+        request.new_project_location.as_ref(),
+    )?;
+
+    let source_display_cwd = source_location
+        .map(ProjectLocation::root)
+        .unwrap_or(request.source_cwd.as_str());
+    let target_display_cwd = target_location
+        .map(ProjectLocation::root)
+        .unwrap_or(request.new_cwd.as_str());
+    let is_ssh_project = source_location.is_some();
+
+    // SSH roots never become local cwd values: JSONL only receives their
+    // target-scoped opaque storage keys.
+    let source_info = match source_location {
+        Some(location) => xai_grok_shared::session::info_for_location(
+            acp::SessionId::new(request.source_session_id.clone()),
+            location,
+        ),
+        None => Info {
+            id: acp::SessionId::new(request.source_session_id.clone()),
+            cwd: request.source_cwd.clone(),
+        },
     };
 
     let new_session_id = request
@@ -73,9 +133,15 @@ pub async fn fork_session(
         .clone()
         .unwrap_or_else(|| generate_fork_session_id(&request.source_session_id));
 
-    let target_info = Info {
-        id: acp::SessionId::new(new_session_id.clone()),
-        cwd: request.new_cwd.clone(),
+    let target_info = match target_location {
+        Some(location) => xai_grok_shared::session::info_for_location(
+            acp::SessionId::new(new_session_id.clone()),
+            location,
+        ),
+        None => Info {
+            id: acp::SessionId::new(new_session_id.clone()),
+            cwd: request.new_cwd.clone(),
+        },
     };
 
     // Copy session data with parent tracking.
@@ -91,8 +157,12 @@ pub async fn fork_session(
         prompt_display_cwd: request
             .source_workspace_dir
             .clone()
-            .filter(|display| display != &request.new_cwd),
-        skip_cwd_transform: request.session_kind.as_deref() == Some("worktree"),
+            .or_else(|| {
+                (is_ssh_project && source_display_cwd != target_display_cwd)
+                    .then(|| source_display_cwd.to_owned())
+            }),
+        skip_cwd_transform: is_ssh_project || request.session_kind.as_deref() == Some("worktree"),
+        project_location: request.new_project_location.clone(),
         // Carry the parent's compaction segment archive into the fork so the child retains pre-compaction history
         // The live summary is already copied via chat_history.jsonl
         copy_compaction_segments: true,
@@ -107,10 +177,10 @@ pub async fn fork_session(
 
     let copy_ms = t0.elapsed().as_millis() as u64;
 
-    // Register the fork with the backend from a spawned task
-    // The local fork works without it: all fork state is in session files on disk, and the backend learns of the session when the task completes
-    // Spawning keeps the network round-trip (~200-400ms) off the critical path
-    if let Some(am) = auth_manager {
+    // SSH project history stays in the local target-scoped bucket. It is not
+    // registered as a cloud cwd, which would collapse a remote root back into
+    // a local-workspace identity.
+    if !is_ssh_project && let Some(am) = auth_manager {
         let sid = new_session_id.clone();
         let cwd = request.new_cwd.clone();
         let parent = request.source_session_id.clone();
@@ -155,7 +225,7 @@ pub async fn fork_session(
         chat_messages_copied: result.chat_messages_copied,
         updates_copied: result.updates_copied,
         plan_state_copied: result.plan_state_copied,
-        new_cwd: request.new_cwd,
+        new_cwd: target_display_cwd.to_owned(),
         parent_session_id: request.source_session_id,
         new_model_id: request.new_model_id,
     })
@@ -375,5 +445,26 @@ mod tests {
                 "wire sessionKind={wire:?}"
             );
         }
+    }
+
+    #[test]
+    fn ssh_fork_allows_an_approved_new_root_on_the_same_target_only() {
+        let source = ProjectLocation::Ssh {
+            target_id: "build-host".to_owned(),
+            root: "/srv/project".to_owned(),
+        };
+        let child = ProjectLocation::Ssh {
+            target_id: "build-host".to_owned(),
+            root: "/srv/worktrees/project-fork".to_owned(),
+        };
+        let other_target = ProjectLocation::Ssh {
+            target_id: "other-host".to_owned(),
+            root: "/srv/worktrees/project-fork".to_owned(),
+        };
+
+        assert!(fork_project_locations(Some(&source), Some(&child)).is_ok());
+        let error = fork_project_locations(Some(&source), Some(&other_target))
+            .expect_err("target changes require a fresh SSH grant");
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
     }
 }

@@ -169,6 +169,7 @@ use super::memory_state;
 use super::telemetry;
 #[path = "acp_session_impl/prompt_build.rs"]
 mod prompt_build;
+pub(crate) use prompt_build::conversation_has_project_instructions;
 use prompt_build::*;
 #[path = "acp_session_impl/prompt_offload.rs"]
 mod prompt_offload;

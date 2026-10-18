@@ -237,6 +237,9 @@ pub const RUNNER_ALWAYS_SET_ENV: &[&str] = &[
     "GROK_SESSION_ID",
     "GROK_WORKSPACE_ROOT",
     "CLAUDE_PROJECT_DIR",
+    // `PWD` is assigned by the runner after it enters the workspace, so it
+    // must survive config-load expansion as a runtime shell reference.
+    "PWD",
 ];
 
 pub fn expand_env_skipping_runner_vars(input: &str) -> String {

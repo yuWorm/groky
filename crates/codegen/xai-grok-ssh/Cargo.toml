@@ -1,0 +1,36 @@
+[package]
+license = "Apache-2.0"
+name = "xai-grok-ssh"
+version = "0.1.0"
+edition.workspace = true
+description = "Native SSH transport, authentication, and connection pooling for groky"
+
+[dependencies]
+async-trait = { workspace = true }
+base64 = { workspace = true }
+fs2 = { workspace = true }
+hmac = { workspace = true }
+keyring = { version = "3.6.3", default-features = false, features = ["apple-native", "windows-native", "linux-native"] }
+getrandom = "0.3"
+russh = "0.64.1"
+serde = { workspace = true, features = ["derive"] }
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["io-util", "macros", "net", "process", "sync", "time"] }
+whoami = { workspace = true }
+sha2 = { workspace = true }
+sha1 = { workspace = true }
+toml = { workspace = true }
+uuid = { workspace = true, features = ["v4"] }
+xai-grok-config = { workspace = true }
+xai-grok-workspace-types = { workspace = true }
+zeroize = "1"
+
+[dev-dependencies]
+tempfile = { workspace = true }
+
+[features]
+default = []
+default-bazel = []
+
+[lints]
+workspace = true

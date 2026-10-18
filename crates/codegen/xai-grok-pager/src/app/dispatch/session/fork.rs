@@ -290,6 +290,10 @@ fn build_fork_placeholder(
         },
         scrollback,
     );
+    agent.ssh_project_location = app
+        .agents
+        .get(&parent_id)
+        .and_then(|parent| parent.ssh_project_location.clone());
     let cmd = if worktree {
         AgentCommand::CreateWorktree
     } else {
@@ -388,24 +392,35 @@ pub(in crate::app::dispatch) fn handle_worktree_forked(
     let rename_entry = session_opens_as_chat(app, conversation_entry);
     if let Some(agent) = app.agents.get_mut(&agent_id) {
         supersede_open_reload_window(agent, agent_id, "WorktreeForked");
+        agent.pending_worktree_source_session_id = None;
+        agent.pending_worktree_child_session_id = None;
         agent.session.finish_command();
         agent.mark_turn_finished(TurnEnd::Aborted);
         agent.bind_session_id(session_id);
         agent.scrollback.begin_batch();
         agent.begin_replay_window();
         agent.session.restore_degree = restore_degree;
-        agent.session.cwd = session_cwd.clone();
+        let remote_worktree = agent.ssh_project_location.is_some();
+        if !remote_worktree {
+            agent.session.cwd = session_cwd.clone();
+        }
         agent.session.is_worktree = true;
         agent.current_branch = None;
         agent.main_repo = None;
         agent.is_worktree = true;
-        crate::git_info::populate_from_cwd_async(session_cwd.clone());
+        if !remote_worktree {
+            crate::git_info::populate_from_cwd_async(session_cwd.clone());
+        }
         app.restore_code = None;
-        agent.prompt.file_search.retarget(&session_cwd);
-        agent.scrollback.push_block(RenderBlock::system(format!(
-            "Worktree ready: {}",
-            worktree_path.display()
-        )));
+        if !remote_worktree {
+            agent.prompt.file_search.retarget(&session_cwd);
+        }
+        let worktree_label = if remote_worktree {
+            format!("Remote worktree ready: {}", worktree_path.display())
+        } else {
+            format!("Worktree ready: {}", worktree_path.display())
+        };
+        agent.scrollback.push_block(RenderBlock::system(worktree_label));
         if let Some(summary) = strategy_summary {
             agent.scrollback.push_block(RenderBlock::system(summary));
         }

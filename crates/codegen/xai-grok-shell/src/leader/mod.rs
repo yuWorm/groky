@@ -866,6 +866,12 @@ impl LeaderConnection {
     pub fn shutting_down_reason(&self) -> watch::Receiver<Option<protocol::ShutdownReason>> {
         self.client.shutting_down_reason()
     }
+
+    /// Subscribe to local-only SSH events such as host-key, password/MFA, and
+    /// remote operation approval prompts. They are not ACP/session replay data.
+    pub fn subscribe_ssh_events(&self) -> tokio::sync::broadcast::Receiver<crate::ssh::SshEvent> {
+        self.client.subscribe_ssh_events()
+    }
     /// Decompose this connection into raw channels.
     ///
     /// Useful for integration with other async code that needs direct channel access.

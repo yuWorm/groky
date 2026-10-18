@@ -318,6 +318,8 @@ pub(super) fn test_summary(
             id: acp::SessionId::new(session_id),
             cwd: cwd.to_string(),
         },
+        project_location: None,
+        ssh_state: None,
         agent_id: None,
         attempt_id: None,
         cwd_generation: 0,

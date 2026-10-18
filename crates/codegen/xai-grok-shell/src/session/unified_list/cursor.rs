@@ -223,6 +223,7 @@ mod tests {
             updated_at: ts.into(),
             created_at: "2026-01-01T00:00:00Z".into(),
             cwd: "/x".into(),
+            project_location: None,
             hostname: None,
             source: "local".into(),
             model_id: None,

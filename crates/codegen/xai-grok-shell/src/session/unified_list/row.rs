@@ -92,6 +92,7 @@ pub fn conversation_to_row(c: Conversation, reg: &FacetRegistry) -> UnifiedRow {
         updated_at: modify_time.as_deref().unwrap_or_default().to_owned(),
         created_at: create_time.unwrap_or_default(),
         cwd: String::new(),
+        project_location: None,
         hostname: None,
         source: "conversation".to_string(),
         model_id: None,

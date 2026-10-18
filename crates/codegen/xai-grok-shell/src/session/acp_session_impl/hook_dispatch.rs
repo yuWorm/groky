@@ -282,6 +282,15 @@ impl SessionActor {
         payload: xai_grok_hooks::event::HookPayload,
         prompt_id: Option<&str>,
     ) {
+        if self.workspace_ops.is_ssh() {
+            // Client callbacks are still local, but project hook commands must
+            // execute on the authorized worker that discovered their registry.
+            let envelope = self.fire_hook(event, prompt_id.map(str::to_owned), payload);
+            if let Err(error) = self.workspace_ops.dispatch_remote_observe_hook(&envelope).await {
+                tracing::warn!(%error, "forwarding remote project lifecycle hook failed");
+            }
+            return;
+        }
         if !self.may_have_hooks_for(event) {
             return;
         }
@@ -449,6 +458,17 @@ impl SessionActor {
         prompt_id: Option<&str>,
     ) -> xai_grok_hooks::result::PromptDecision {
         let event = xai_grok_hooks::event::HookEventName::UserPromptSubmit;
+        if self.workspace_ops.is_ssh() {
+            let envelope = self.fire_hook(event, prompt_id.map(str::to_owned), payload);
+            return self
+                .workspace_ops
+                .dispatch_remote_prompt_hook(&envelope)
+                .await
+                .unwrap_or_else(|error| {
+                    tracing::warn!(%error, "forwarding remote project prompt hook failed");
+                    xai_grok_hooks::result::PromptDecision::Allow
+                });
+        }
         if !self.may_have_hooks_for(event) {
             return xai_grok_hooks::result::PromptDecision::Allow;
         }

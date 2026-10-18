@@ -1,5 +1,32 @@
 use super::*;
 
+#[tokio::test]
+async fn git_head_snapshot_reports_linked_workspace_without_origin_credentials() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = dunce::canonicalize(temp.path()).unwrap();
+    let source = root.join("source");
+    let child = root.join("child");
+    let repo = Repository::init(&source).unwrap();
+    repo.remote("origin", "https://user:private-token@example.test/team/repo.git").unwrap();
+    let signature = git2::Signature::now("fixture", "fixture@example.test").unwrap();
+    let tree_id = repo.index().unwrap().write_tree().unwrap();
+    let tree = repo.find_tree(tree_id).unwrap();
+    let commit = repo.commit(Some("HEAD"), &signature, &signature, "initial", &tree, &[]).unwrap();
+    repo.worktree("child", &child, None).unwrap();
+
+    let snapshot = git_head_snapshot(child.clone()).await;
+    assert_eq!(snapshot.repo_root.as_deref().map(strip_trailing_test_separator), Some(child));
+    assert_eq!(snapshot.branch.as_deref(), Some("child"));
+    assert_eq!(snapshot.commit, Some(commit.to_string()));
+    assert!(snapshot.is_worktree);
+    assert_eq!(snapshot.main_root, Some(source));
+    assert_eq!(snapshot.origin_url.as_deref(), Some("https://example.test/team/repo.git"));
+}
+
+fn strip_trailing_test_separator(path: &Path) -> PathBuf {
+    path.components().collect()
+}
+
 #[test]
 fn strip_url_credentials_removes_token() {
     let url_with_token = "https://x-access-token:secret-token@github.com/xai-org/example.git";

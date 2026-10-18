@@ -653,6 +653,11 @@ pub(crate) async fn resolve_preloaded_skills(
             continue;
         };
 
+        if skill.body.is_some() {
+            result.push(skill.clone());
+            continue;
+        }
+
         match xai_grok_tools::implementations::skills::skill::load_skill_with_body(skill).await {
             Ok(loaded) => result.push(loaded),
             Err(e) => {
@@ -677,6 +682,21 @@ mod tests {
         MAX_BODY_PEEK_BYTES, MAX_SKILL_WALK_DEPTH, SkillParseError, extract_first_paragraph,
         is_valid_skill_name, normalize_skill_name, parse_skill_frontmatter,
     };
+
+    #[tokio::test]
+    async fn ssh_preloaded_skill_body_does_not_read_local_disk() {
+        let local = tempfile::tempdir().unwrap();
+        let path = local.path().join("SKILL.md");
+        fs::write(&path, "UNRELATED_LOCAL_SKILL").unwrap();
+        let discovered = vec![SkillInfo {
+            name: "remote-build".to_owned(),
+            path: path.to_string_lossy().into_owned(),
+            body: Some("AUTHORIZED_REMOTE_SKILL".to_owned()),
+            ..Default::default()
+        }];
+        let resolved = resolve_preloaded_skills(&["remote-build".to_owned()], &discovered).await;
+        assert_eq!(resolved[0].body.as_deref(), Some("AUTHORIZED_REMOTE_SKILL"));
+    }
 
     fn write_skill_md(dir: &Path, name: &str) {
         fs::create_dir_all(dir).unwrap();

@@ -645,6 +645,69 @@ pub enum Action {
     OpenVendorLogin {
         provider_id: Option<String>,
     },
+    /// Open the local SSH target and authorization manager. Works before provider login.
+    OpenSshManager,
+    /// Reload configured targets and current-session SSH grant/connection status.
+    RefreshSshTargets,
+    /// Save a manually configured SSH target; no credential material is included.
+    AddSshTarget(crate::views::ssh_modal::SshManualTargetDraft),
+    /// Acquire or retain a manual connection through the persistent local SSH service.
+    ConnectSshTarget { target_id: String },
+    /// Release the persistent manual connection hold for a target.
+    DisconnectSshTarget { target_id: String },
+    /// Ask the local SSH service to create a human-reviewable grant request.
+    RequestSshGrant {
+        target_id: String,
+        root: String,
+        capabilities: crate::views::ssh_modal::SshCapabilitiesView,
+        lifetime: crate::views::ssh_modal::SshGrantLifetime,
+        set_default: bool,
+    },
+    /// Authenticate a target selected for a pending agent request before rendering consent.
+    InspectSshGrantTarget {
+        request_id: String,
+        target_id: String,
+    },
+    /// Resolve a pending human SSH access request; the service independently verifies identity/root.
+    ApproveSshGrant {
+        request_id: String,
+        approved: bool,
+        target_id: Option<String>,
+        root: Option<String>,
+        capabilities: Option<crate::views::ssh_modal::SshCapabilitiesView>,
+        lifetime: crate::views::ssh_modal::SshGrantLifetime,
+        set_default: bool,
+    },
+    /// Select a granted target as this session's default for explicit `ssh_*` tools.
+    UseSshBinding { binding_id: String },
+    /// Locally revoke a grant and wait for the worker acknowledgement before displaying confirmation.
+    RevokeSshBinding { binding_id: String },
+    /// Open a local TUI session bound to an authorized remote workspace.
+    OpenSshProject {
+        target_id: String,
+        root: String,
+        /// Binding owned by the currently open source session.
+        binding_id: String,
+        capabilities: crate::views::ssh_modal::SshCapabilitiesView,
+    },
+    /// Begin interactive local consent for a `groky ssh open` project session that was pre-minted
+    /// before any authority is granted.
+    BeginSshProjectOpen(crate::app::cli::SshProjectOpen),
+    /// Resolve a local-only, per-operation remote worker approval.
+    ApproveSshOperation {
+        approval_id: String,
+        approved: bool,
+    },
+    /// Return a local-only authentication answer to the original client/channel.
+    SubmitSshAuthentication {
+        challenge_id: String,
+        connection_generation: u64,
+        target_id: String,
+        accept_host_key: Option<bool>,
+        remember: bool,
+        secret: Option<crate::views::ssh_modal::SshSecret>,
+        answers: Vec<crate::views::ssh_modal::SshSecret>,
+    },
     /// Submit a pasted vendor API key for probe + persist.
     SubmitVendorKey {
         provider_id: String,
@@ -2415,6 +2478,112 @@ pub enum Effect {
         terminal: crate::terminal::TerminalContext,
         request: crate::slash::command::DoctorRequest,
     },
+    /// Fetch target configuration plus local connection and session-grant state from SSH control.
+    SshListTargets {
+        session_id: Option<String>,
+        client_id: u64,
+    },
+    /// Persist a manually entered SSH target without credential material.
+    SshAddTarget {
+        session_id: Option<String>,
+        client_id: u64,
+        draft: crate::views::ssh_modal::SshManualTargetDraft,
+    },
+    /// Acquire a retained manual connection through the persistent local SSH service.
+    SshConnect {
+        target_id: String,
+        client_id: u64,
+    },
+    /// Release a retained manual connection through the persistent local SSH service.
+    SshDisconnect {
+        target_id: String,
+        client_id: u64,
+    },
+    /// Submit a user-created, session-scoped SSH grant request.
+    SshRequestGrant {
+        session_id: String,
+        client_id: u64,
+        target_id: String,
+        root: String,
+        capabilities: crate::views::ssh_modal::SshCapabilitiesView,
+        lifetime: crate::views::ssh_modal::SshGrantLifetime,
+        set_default: bool,
+    },
+    /// Authenticate a user-selected target for an agent request before consent is rendered.
+    SshInspectGrantTarget {
+        session_id: Option<String>,
+        request_id: String,
+        target_id: String,
+        client_id: u64,
+    },
+    /// Resolve a pending agent SSH grant request.
+    SshApproveGrant {
+        session_id: String,
+        request_id: String,
+        client_id: u64,
+        approved: bool,
+        target_id: Option<String>,
+        root: Option<String>,
+        capabilities: Option<crate::views::ssh_modal::SshCapabilitiesView>,
+        lifetime: crate::views::ssh_modal::SshGrantLifetime,
+        set_default: bool,
+    },
+    /// Set the explicit default SSH binding for the session.
+    SshUseBinding {
+        session_id: String,
+        binding_id: String,
+        client_id: u64,
+    },
+    /// Locally revoke an SSH binding and await worker acknowledgement.
+    SshRevokeBinding {
+        session_id: String,
+        binding_id: String,
+        client_id: u64,
+    },
+    /// Mint an inherited binding for a pre-minted SSH project session before `session/new`.
+    SshInheritBinding {
+        source_session_id: String,
+        source_binding_id: String,
+        project_session_id: String,
+        target_id: String,
+        root: String,
+        capabilities: crate::views::ssh_modal::SshCapabilitiesView,
+        client_id: u64,
+    },
+    /// Register an SSH project location, then request human consent for the pre-minted session.
+    SshBeginProjectGrant {
+        project: crate::app::cli::SshProjectOpen,
+        client_id: u64,
+    },
+    /// Start a local pager session whose remote workspace is bound solely through SSH metadata.
+    OpenSshProject {
+        agent_id: AgentId,
+        local_launch_cwd: std::path::PathBuf,
+        start: xai_grok_shell::project::SshProjectStart,
+        ssh_client_id: u64,
+    },
+    /// Deliver a host-key or secret answer through the local authenticated control channel.
+    SshSubmitAuthentication {
+        client_id: u64,
+        challenge_id: String,
+        connection_generation: u64,
+        accept_host_key: Option<bool>,
+        remember: bool,
+        secret: Option<crate::views::ssh_modal::SshSecret>,
+        answers: Vec<crate::views::ssh_modal::SshSecret>,
+    },
+    /// Deliver a local decision for one remote worker operation.
+    SshApproveOperation {
+        session_id: Option<String>,
+        client_id: u64,
+        approval_id: String,
+        approved: bool,
+    },
+    /// Wait for exactly one targeted SSH control event while the SSH manager is active.
+    SshAwaitEvent {
+        client_id: u64,
+        session_id: Option<String>,
+    },
     ApplyDoctorFix {
         target: DoctorFixTarget,
         plan: Box<crate::diagnostics::FixPlan>,
@@ -2493,7 +2662,8 @@ impl TaskResult {
             | TaskResult::SessionLoaded { .. }
             | TaskResult::WorktreeSessionCreated { .. }
             | TaskResult::WorktreeForked { .. } => true,
-            TaskResult::WithPinnedMemoryMode { result, .. } => result.ends_startup(),
+            TaskResult::WithPinnedMemoryMode { result, .. }
+            | TaskResult::WithSshProjectLocation { result, .. } => result.ends_startup(),
             _ => false,
         }
     }
@@ -2530,6 +2700,63 @@ pub enum WorkspaceWriteCompletion {
 #[derive(Debug)]
 #[allow(clippy::large_enum_variant)]
 pub enum TaskResult {
+    /// Local SSH target and grant status loaded without provider/model authentication.
+    SshTargetsLoaded {
+        session_id: Option<String>,
+        /// Identity allocated by the persistent local leader for this SSH-control client.
+        client_id: u64,
+        targets: Vec<crate::views::ssh_modal::SshTargetView>,
+        error: Option<String>,
+    },
+    /// A non-project local SSH control operation completed.
+    SshActionComplete {
+        session_id: Option<String>,
+        /// Identity allocated by the persistent local leader for this SSH-control client.
+        client_id: u64,
+        target_id: Option<String>,
+        message: Option<String>,
+        error: Option<String>,
+    },
+    /// A correlated local-control acknowledgement for a remote operation decision.
+    SshOperationApprovalComplete {
+        session_id: Option<String>,
+        /// Identity allocated by the persistent local leader for this SSH-control client.
+        client_id: u64,
+        approval_id: String,
+        error: Option<String>,
+    },
+    /// A targeted local SSH event; it is not a chat, ACP, or replay event.
+    SshControlEvent {
+        session_id: Option<String>,
+        /// Identity allocated by the persistent local leader for this SSH-control client.
+        client_id: u64,
+        event: xai_grok_shell::ssh::SshEvent,
+    },
+    /// The leader minted a binding owned by the pre-minted SSH project session.
+    SshProjectBindingInherited {
+        target_id: String,
+        root: String,
+        project_session_id: String,
+        binding: xai_grok_shell::ssh::SshBinding,
+        client_id: u64,
+    },
+    /// A persisted SSH project rule revalidated to a binding owned by the pre-minted session.
+    SshProjectGrantRestored {
+        target_id: String,
+        project_session_id: String,
+        binding: xai_grok_shell::ssh::SshBinding,
+        client_id: u64,
+    },
+
+
+    /// The pre-minted CLI SSH project could not register its exact remote location or request
+    /// the initial consent; no local session was created.
+    SshProjectOpenSetupFailed {
+        session_id: String,
+        client_id: u64,
+        target_id: String,
+        error: String,
+    },
     /// Third-party provider API-key login finished.
     VendorLoginComplete {
         provider_id: String,
@@ -2602,6 +2829,14 @@ pub enum TaskResult {
     WithPinnedMemoryMode {
         agent_id: AgentId,
         memory_mode: Option<xai_grok_shell::config::MemoryMode>,
+        result: Box<TaskResult>,
+    },
+    /// Session lifecycle result paired with the authoritative project location
+    /// from the shell. `None` deliberately clears stale SSH presentation state
+    /// for an ordinary local session.
+    WithSshProjectLocation {
+        agent_id: AgentId,
+        location: Option<crate::app::agent_view::SshProjectLocation>,
         result: Box<TaskResult>,
     },
     /// A `command` status line finished.

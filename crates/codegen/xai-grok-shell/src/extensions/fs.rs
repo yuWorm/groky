@@ -166,24 +166,76 @@ pub async fn handle(agent: &MvpAgent, args: &acp::ExtRequest) -> ExtResult {
     match args.method.as_ref() {
         "x.ai/fs/list" => {
             let req = parse_params::<FsListRequest>(args)?;
+            let ops = agent.workspace_ops_for_ext_request(args)?;
+            if ops.is_ssh() {
+                return to_ext_response(
+                    ops.dispatch(
+                        &xai_grok_workspace::file_system::FsListReq {
+                            path: req.path,
+                            cwd: None,
+                            depth: req.depth,
+                            limit: req.limit,
+                            offset: req.offset,
+                            include_hidden: req.include_hidden,
+                            follow_symlinks: req.follow_symlinks,
+                            respect_git_ignore: req.respect_git_ignore,
+                            include_globs: req.include_globs,
+                            exclude_globs: req.exclude_globs,
+                        },
+                        None,
+                    )
+                    .await
+                    .map_err(anyhow::Error::from),
+                );
+            }
             let path = resolve_path(agent, &req.path, req.session_id.as_ref())?;
             let (path, confine_root) = confine_local(agent, &path, req.session_id.as_ref()).await?;
             let params = req.to_params();
-            let result = fs::list(&path, &params, confine_root).await;
-            to_ext_response(result)
+            to_ext_response(fs::list(&path, &params, confine_root).await)
         }
         "x.ai/fs/exists" => {
             let req = parse_params::<FsExistsRequest>(args)?;
+            let ops = agent.workspace_ops_for_ext_request(args)?;
+            if ops.is_ssh() {
+                return to_ext_response(
+                    ops.dispatch(
+                        &xai_grok_workspace::file_system::FsExistsReq {
+                            path: req.path,
+                            cwd: None,
+                        },
+                        None,
+                    )
+                    .await
+                    .map_err(anyhow::Error::from),
+                );
+            }
             let path = resolve_path(agent, &req.path, req.session_id.as_ref())?;
             let (path, _) = match confine_local(agent, &path, req.session_id.as_ref()).await {
                 Ok(confined) => confined,
                 Err(_) => return to_ext_response(Ok(fs::FsExistsData { exists: false })),
             };
-            let result = fs::exists(&path).await;
-            to_ext_response(result)
+            to_ext_response(fs::exists(&path).await)
         }
         "x.ai/fs/read_file" => {
             let req = parse_params::<FsReadFileRequest>(args)?;
+            let ops = agent.workspace_ops_for_ext_request(args)?;
+            if ops.is_ssh() {
+                return to_ext_response(
+                    ops.dispatch(
+                        &xai_grok_workspace::file_system::FsReadFileReq {
+                            path: req.path,
+                            cwd: None,
+                            offset: req.offset,
+                            length: req.length,
+                            max_bytes: req.max_bytes as u64,
+                            encoding: req.encoding,
+                        },
+                        None,
+                    )
+                    .await
+                    .map_err(anyhow::Error::from),
+                );
+            }
             let max_lines = req.max_lines;
             let path_str = req.path.clone();
             let ranged = req.offset.is_some()
@@ -224,19 +276,51 @@ pub async fn handle(agent: &MvpAgent, args: &acp::ExtRequest) -> ExtResult {
         }
         "x.ai/fs/write_file" => {
             let req = parse_params::<FsWriteFileRequest>(args)?;
+            let ops = agent.workspace_ops_for_ext_request(args)?;
+            if ops.is_ssh() {
+                return to_ext_response(
+                    ops.dispatch(
+                        &xai_grok_workspace::file_system::FsWriteFileReq {
+                            path: req.path,
+                            cwd: None,
+                            content: req.content,
+                            create_dirs: req.create_dirs,
+                        },
+                        None,
+                    )
+                    .await
+                    .map(|_| Empty {})
+                    .map_err(anyhow::Error::from),
+                );
+            }
             let path = resolve_path(agent, &req.path, req.session_id.as_ref())?;
             let (path, _) = confine_local(agent, &path, req.session_id.as_ref()).await?;
-            let result = fs::write_file(&path, &req.content, req.create_dirs)
-                .await
-                .map(|_| Empty {});
-            to_ext_response(result)
+            to_ext_response(
+                fs::write_file(&path, &req.content, req.create_dirs)
+                    .await
+                    .map(|_| Empty {}),
+            )
         }
         "x.ai/fs/delete_file" => {
             let req = parse_params::<FsDeleteFileRequest>(args)?;
+            let ops = agent.workspace_ops_for_ext_request(args)?;
+            if ops.is_ssh() {
+                return to_ext_response(
+                    ops.dispatch(
+                        &xai_grok_workspace::file_system::FsDeleteFileReq {
+                            path: req.path,
+                            cwd: None,
+                        },
+                        None,
+                    )
+                    .await
+                    .map(|_| Empty {})
+                    .map_err(anyhow::Error::from),
+                );
+            }
             let path = resolve_path(agent, &req.path, req.session_id.as_ref())?;
             let (path, _) = confine_local(agent, &path, req.session_id.as_ref()).await?;
-            let result = fs::delete_file(&path).await.map(|_| Empty {});
-            to_ext_response(result)
+            to_ext_response(fs::delete_file(&path).await.map(|_| Empty {}))
         }
         _ => Err(acp::Error::method_not_found()),
     }

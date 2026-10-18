@@ -113,6 +113,26 @@ fn resolve_local_session_any_cwd_skips_stub_and_finds_real() {
 }
 
 #[test]
+fn ssh_session_uuid_resolves_to_storage_identity_not_remote_path() {
+    let tmp = TempDir::new().unwrap();
+    let root = tmp.path().join("sessions");
+    let location = xai_grok_workspace_types::ssh::ProjectLocation::Ssh {
+        target_id: "production".into(),
+        root: "/srv/project".into(),
+    };
+    let storage_cwd = xai_grok_shared::session::storage_cwd(&location);
+    let session_id = "remote-session";
+    let dir = root.join(&storage_cwd).join(session_id);
+    fs::create_dir_all(&dir).unwrap();
+    fs::write(dir.join("summary.json"), b"{}").unwrap();
+
+    assert_eq!(
+        resolve_local_session_any_cwd_in_root(session_id, &root).unwrap(),
+        Some(storage_cwd),
+    );
+}
+
+#[test]
 fn batch_resolver_loads_one_view_and_keeps_only_persisted_sessions() {
     let tmp = TempDir::new().unwrap();
     let root = tmp.path().join("sessions");

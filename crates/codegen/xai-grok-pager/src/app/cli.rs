@@ -138,6 +138,11 @@ See ~/.grok/README.md for more information.
     /// Disabled by default and enabled server-side per account; set `GROK_WORKSPACE_COMMAND=1` to enable it locally for testing.
     #[command(hide = true)]
     Workspace(WorkspaceMgmtArgs),
+    /// Manage SSH targets, connections, and remote projects without requiring Grok login.
+    Ssh(SshArgs),
+    /// Internal SSH workspace worker entry. Never starts a model or provider login flow.
+    #[command(hide = true)]
+    Worker(SshWorkerArgs),
     /// Open the Agent Dashboard view at startup.
     /// The dashboard shows every session, top-level and subagents.
     /// Disabled when `[dashboard].enabled = false` in `~/.grok/config.toml` or when the `GROK_AGENT_DASHBOARD=0` env var is set.
@@ -231,6 +236,103 @@ pub enum WorkspaceMgmtCommand {
         #[arg(long)]
         json: bool,
     },
+}
+/// Arguments for `groky ssh`.
+#[derive(Debug, clap::Args, Clone)]
+pub struct SshArgs {
+    #[command(subcommand)]
+    pub command: SshCommand,
+}
+/// SSH target and project commands.
+#[derive(Debug, Subcommand, Clone)]
+pub enum SshCommand {
+    /// List configured SSH targets and their effective source and status.
+    List {
+        /// Emit machine-readable JSON output.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Add a manually configured SSH target.
+    Add(SshAddArgs),
+    /// Establish and retain a manual connection through the local SSH service.
+    Connect {
+        /// Configured target id or OpenSSH host alias.
+        target: String,
+        /// Emit machine-readable JSON output.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Release the retained local SSH service connection for a target.
+    Disconnect {
+        /// Configured target id or OpenSSH host alias.
+        target: String,
+        /// Emit machine-readable JSON output.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Open a local Groky TUI bound to a remote workspace.
+    Open {
+        /// Configured target id or OpenSSH host alias.
+        target: String,
+        /// Remote project root to bind. This is not a local filesystem path.
+        #[arg(value_name = "REMOTE_ROOT")]
+        root: String,
+    },
+}
+/// Manual SSH target fields for `groky ssh add`.
+#[derive(Debug, clap::Args, Clone)]
+pub struct SshAddArgs {
+    /// SSH host name, address, or OpenSSH host alias.
+    #[arg(value_name = "HOST")]
+    pub host: String,
+    /// Stable target id. Defaults to a generated id.
+    #[arg(long)]
+    pub id: Option<String>,
+    /// User-visible target label. Defaults to the host.
+    #[arg(long)]
+    pub label: Option<String>,
+    /// SSH login user.
+    #[arg(long)]
+    pub user: Option<String>,
+    /// SSH port.
+    #[arg(long)]
+    pub port: Option<u16>,
+    /// Private key file; repeat to preserve OpenSSH identity-file order.
+    #[arg(long = "identity-file", value_hint = ValueHint::FilePath)]
+    pub identity_files: Vec<PathBuf>,
+    /// Reference to a saved SSH credential, never a raw secret.
+    #[arg(long)]
+    pub credential_ref: Option<String>,
+    /// Remote worker command, split with shell-like quoting.
+    #[arg(long, value_name = "COMMAND")]
+    pub worker_command: Option<String>,
+    /// Emit machine-readable JSON output.
+    #[arg(long)]
+    pub json: bool,
+}
+/// Hidden worker-mode arguments used by SSH transports.
+#[derive(Debug, clap::Args, Clone)]
+pub struct SshWorkerArgs {
+    /// Bridge SSH stdio to the user-private worker daemon.
+    #[arg(long, conflicts_with = "daemon")]
+    pub stdio: bool,
+    /// Run the user-private worker daemon instead of a stdio bridge.
+    #[arg(long, conflicts_with = "stdio")]
+    pub daemon: bool,
+    /// User-private IPC socket used with `--daemon`.
+    #[arg(long, value_hint = ValueHint::FilePath, requires = "daemon")]
+    pub socket: Option<PathBuf>,
+}
+
+/// Runtime-only handoff from `groky ssh open` into the local pager consent flow.
+///
+/// Clap never exposes this; the command dispatcher fills it only after resolving a configured
+/// target and pre-minting the session identity that will own the eventual binding.
+#[derive(Debug, Clone)]
+pub struct SshProjectOpen {
+    pub target_id: String,
+    pub root: String,
+    pub project_session_id: String,
 }
 #[derive(Debug, clap::Args, Clone)]
 pub struct WorkspaceStartArgs {
@@ -593,8 +695,8 @@ pub struct PagerArgs {
     #[arg(long = "worktree-ref", visible_alias = "ref", requires = "worktree")]
     pub worktree_ref: Option<String>,
     /// Restore the original session's repository snapshot when resuming.
-    /// Remote sessions require `--worktree` (never checks out into the current directory).
-    /// Without this flag, resume restores conversation only.
+    /// Hub and other non-SSH remote sessions require `--worktree` (never checks out into the current directory).
+    /// SSH projects restore only through their authorized remote root; with `--worktree`, the new child is restored and its source is unchanged.
     #[arg(long = "restore-code", requires = "resume_session")]
     pub restore_code: bool,
     /// Disable plan mode.
@@ -769,6 +871,9 @@ pub struct PagerArgs {
     /// Subcommand (e.g., `agent`).
     #[command(subcommand, next_display_order = 0)]
     pub command: Option<Command>,
+    /// Runtime-only SSH project startup request; never exposed as a CLI flag.
+    #[arg(skip)]
+    pub ssh_project_open: Option<SshProjectOpen>,
 }
 /// Outcome of resolving the startup sandbox profile for a (possibly resumed) session. See [`PagerArgs::startup_sandbox_profile`].
 #[derive(Debug, PartialEq, Eq)]

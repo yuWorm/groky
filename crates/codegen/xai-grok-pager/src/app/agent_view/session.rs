@@ -132,6 +132,7 @@ impl AgentView {
         let prompt = PromptWidget::new_with_cwd(&session.cwd);
         let mut view = Self {
             session,
+            ssh_project_location: None,
             session_binding_epoch: 0,
             scrollback,
             prompt,
@@ -329,6 +330,7 @@ impl AgentView {
             parked_feedback_trace_consents: Default::default(),
             agents_modal: None,
             vendor_login: None,
+            ssh_manager: None,
             persona_detail: None,
             btw_state: None,
             minimal_btw_lifecycle: None,
@@ -421,6 +423,8 @@ impl AgentView {
             minimal_cancel_hint_turn: None,
             pending_first_prompt: None,
             pending_fork_banner: None,
+            pending_worktree_source_session_id: None,
+            pending_worktree_child_session_id: None,
             load_failed: false,
             loading_placeholder_id: None,
             pending_recap_entry: None,

@@ -9,6 +9,54 @@ use xai_grok_login::PreferredAuthMethod;
 use crate::upload::trace::PromptMetadataParams;
 use xai_grok_tools::implementations::grok_build::task::backend::SubagentBackend;
 use xai_tty_utils::ProcessScope;
+
+/// Fails closed if a shell-side tool bypasses the remote [`WorkspaceOps`] path.
+/// Its root is a fixed sentinel, never the remote project root or local launch cwd.
+struct RemoteProjectFs;
+
+#[async_trait::async_trait]
+impl xai_grok_workspace::file_system::AsyncFileSystem for RemoteProjectFs {
+    fn root(&self) -> &std::path::Path {
+        std::path::Path::new("/")
+    }
+
+    async fn exists(
+        &self,
+        _path: &std::path::Path,
+    ) -> Result<bool, xai_grok_workspace::file_system::FsError> {
+        Err(xai_grok_workspace::file_system::FsError::Other(
+            "SSH project filesystem access must be routed through the remote workspace".to_owned(),
+        ))
+    }
+
+    async fn read_file(
+        &self,
+        _path: &std::path::Path,
+    ) -> Result<Vec<u8>, xai_grok_workspace::file_system::FsError> {
+        Err(xai_grok_workspace::file_system::FsError::Other(
+            "SSH project filesystem access must be routed through the remote workspace".to_owned(),
+        ))
+    }
+
+    async fn write_file(
+        &self,
+        _path: &std::path::Path,
+        _data: &[u8],
+    ) -> Result<(), xai_grok_workspace::file_system::FsError> {
+        Err(xai_grok_workspace::file_system::FsError::Other(
+            "SSH project filesystem access must be routed through the remote workspace".to_owned(),
+        ))
+    }
+
+    async fn delete_file(
+        &self,
+        _path: &std::path::Path,
+    ) -> Result<(), xai_grok_workspace::file_system::FsError> {
+        Err(xai_grok_workspace::file_system::FsError::Other(
+            "SSH project filesystem access must be routed through the remote workspace".to_owned(),
+        ))
+    }
+}
 struct SessionConfigInputs {
     model_id: acp::ModelId,
     effort_options: Vec<ReasoningEffortOption>,
@@ -1458,6 +1506,26 @@ impl MvpAgent {
         }
         Ok(ops)
     }
+    /// Resolve the workspace belonging to the session named by an ACP extension
+    /// request. A session-scoped extension must not fall back to the process
+    /// launch workspace: an SSH session's remote root has no local equivalent.
+    pub(crate) fn workspace_ops_for_ext_request(
+        &self,
+        args: &acp::ExtRequest,
+    ) -> Result<xai_grok_workspace::WorkspaceOps, acp::Error> {
+        let params: serde_json::Value = serde_json::from_str(args.params.get())
+            .map_err(|error| acp::Error::invalid_params().data(error.to_string()))?;
+        let Some(session_id) = params.get("sessionId").and_then(serde_json::Value::as_str) else {
+            return self.resolve_workspace_ops();
+        };
+        if session_id.is_empty() {
+            return Err(acp::Error::invalid_params().data("sessionId must not be empty"));
+        }
+        let id = acp::SessionId::new(session_id.to_owned());
+        self.resident_handle(&id)
+            .map(|handle| handle.workspace_ops)
+            .ok_or_else(|| acp::Error::invalid_params().data(format!("session not found: {session_id}")))
+    }
     /// Derive the current `AuthType` from auth method and auth manager state. Conceptually, `AuthType` describes *which authentication mechanism this session uses*, not *whether we currently have a live bearer*.
     /// Bearer liveness is tracked by the auth manager; the mechanism is fixed by `auth_method_id`.
     /// Returns `ApiKey` only when the auth method is BYOK (`xai.api_key`) or no auth method has been selected yet AND no live credential exists. The session-based clause is load-bearing. Without it, chat_state can get locked into `auth_type = ApiKey` and skip token refresh on later prompts.
@@ -2481,6 +2549,8 @@ impl MvpAgent {
             ),
             plugin_registry_initialized: std::cell::Cell::new(false),
             models_manager,
+            session_ssh: None,
+            session_ssh_client_id: None,
             chat_modes: {
                 let chat_modes = crate::agent::chat_modes::ChatModesManager::new(
                     auth_manager.clone(),
@@ -2596,6 +2666,18 @@ impl MvpAgent {
             xai_grok_login::credential_provider::wire_otel_deployment_key(dk.clone());
         }
         instance
+    }
+    /// Inject the host-owned SSH service before session requests begin.
+    ///
+    /// `client_id` is set only by an embedded interactive host. Persistent
+    /// leaders preserve per-request ownership and pass `None`.
+    pub fn set_session_ssh(
+        &mut self,
+        session_ssh: Arc<crate::ssh::SessionSsh>,
+        client_id: Option<u64>,
+    ) {
+        self.session_ssh = Some(session_ssh);
+        self.session_ssh_client_id = client_id;
     }
     /// Client disconnect: keep working sessions resident, idle-unload the rest (never destroy).
     pub(super) async fn handle_evict_sessions(
@@ -4239,6 +4321,8 @@ impl MvpAgent {
         let SessionSpawnOptions {
             session_info,
             cwd,
+            project_location,
+            workspace_ops: requested_workspace_ops,
             mcp_servers,
             initial_client_mcp_servers,
             mcp_meta_config_map,
@@ -4274,26 +4358,118 @@ impl MvpAgent {
         } = spec;
         let _timer = crate::instrumentation_timer!("session.spawn_and_register");
         reject_direct_hub_cloud_meta(session_meta)?;
+        let is_ssh_project = project_location.is_some();
+        let workspace_ops = match (is_ssh_project, requested_workspace_ops) {
+            (true, Some(ops)) if ops.is_ssh() => ops,
+            (true, _) => {
+                return Err(acp::Error::internal_error()
+                    .data("SSH project is missing its remote workspace transport"));
+            }
+            (false, Some(_)) => {
+                return Err(acp::Error::invalid_params()
+                    .data("remote workspace transport requires an SSH project location"));
+            }
+            (false, None) => self.resolve_workspace_ops().map_err(|_| {
+                acp::Error::internal_error().data(
+                    "Local workspace initialization failed; cannot create session. \
+                     Check that a Tokio runtime is available.",
+                )
+            })?,
+        };
+        // SSH project discovery belongs to the authenticated worker. Hydrate
+        // every shell-facing prompt/extension input before actor construction;
+        // the local launch cwd is never used to discover a remote project.
+        let ssh_bootstrap = if is_ssh_project {
+            Some(
+                workspace_ops
+                    .project_bootstrap()
+                    .await
+                    .map_err(|error| {
+                        acp::Error::internal_error()
+                            .data(format!("failed to hydrate SSH project: {error}"))
+                    })?,
+            )
+        } else {
+            None
+        };
+        let remote_agent_definition = ssh_bootstrap
+            .as_ref()
+            .and_then(|bootstrap| bootstrap.agent_definition.as_ref())
+            .map(|definition| {
+                xai_grok_agent::AgentDefinition::from_json(definition).map_err(|error| {
+                    acp::Error::invalid_params()
+                        .data(format!("invalid remote project agent definition: {error}"))
+                })
+            })
+            .transpose()?;
+        let remote_preloaded_skills = ssh_bootstrap
+            .as_ref()
+            .map(|bootstrap| {
+                serde_json::from_value::<
+                    Vec<xai_grok_tools::implementations::skills::types::SkillInfo>,
+                >(
+                    serde_json::to_value(&bootstrap.skills).map_err(|error| {
+                        acp::Error::internal_error()
+                            .data(format!("failed to encode remote project skills: {error}"))
+                    })?,
+                )
+                .map_err(|error| {
+                    acp::Error::invalid_params()
+                        .data(format!("invalid remote project skills: {error}"))
+                })
+            })
+            .transpose()?;
+        let remote_project_instructions = ssh_bootstrap
+            .as_ref()
+            .map(|bootstrap| {
+                serde_json::from_value::<Vec<xai_grok_agent::prompt::agents_md::AgentConfigFile>>(
+                    serde_json::to_value(&bootstrap.instructions).map_err(|error| {
+                        acp::Error::internal_error().data(format!(
+                            "failed to encode remote project instructions: {error}"
+                        ))
+                    })?,
+                )
+                .map(|files| xai_grok_agent::prompt::agents_md::format_agents_md_section(&files))
+                .map_err(|error| {
+                    acp::Error::invalid_params()
+                        .data(format!("invalid remote project instructions: {error}"))
+                })
+            })
+            .transpose()?
+            .flatten();
+        let _remote_hook_registry = if is_ssh_project {
+            Some(workspace_ops.hook_registry().await.map_err(|error| {
+                acp::Error::internal_error()
+                    .data(format!("failed to hydrate remote project hooks: {error}"))
+            })?)
+        } else {
+            None
+        };
         let spawn_remote_settings = self.cfg.borrow().remote_settings.clone();
-        let mut prefetch = match prefetch {
-            Some(prefetch) => prefetch,
-            None => {
+        let mut prefetch = if is_ssh_project {
+            crate::session::session_create_prefetch::SessionCreatePrefetch::ready(None)
+        } else {
+            prefetch.unwrap_or_else(|| {
                 crate::session::session_create_prefetch::SessionCreatePrefetch::launch_from_meta(
                     cwd.as_path(),
                     folder_trust::TrustScan::skipped(),
                     self.plugin_registry_handle.clone(),
                     session_meta,
                 )
-            }
+            })
         };
-        let project_env_trusted = prefetch
-            .resolve_trust(cwd.as_path(), spawn_remote_settings.as_ref());
-        let load_envrc = self.cfg.borrow().session.load_envrc.unwrap_or(true);
-        let envrc = envrc
-            .unwrap_or_else(|| xai_grok_workspace::envrc::spawn_envrc_load(
+        let project_env_trusted = (!is_ssh_project)
+            .then(|| prefetch.resolve_trust(cwd.as_path(), spawn_remote_settings.as_ref()))
+            .unwrap_or(false);
+        let envrc = if is_ssh_project {
+            None
+        } else {
+            let load_envrc = self.cfg.borrow().session.load_envrc.unwrap_or(true);
+            Some(envrc.unwrap_or_else(|| xai_grok_workspace::envrc::spawn_envrc_load(
                 cwd.as_path().to_path_buf(),
                 load_envrc && project_env_trusted,
-            ));
+            )))
+        };
         let use_acp_fs = client_fs_read && client_fs_write;
         let fs_notify_config = init
             .client_capabilities
@@ -4327,13 +4503,18 @@ impl MvpAgent {
                 }
                 Some(ClientFsConfig { fs, mode })
             });
-        let fs: Arc<dyn xai_grok_workspace::file_system::AsyncFileSystem> = if use_acp_fs {
+        let fs_notify_config = (!is_ssh_project)
+            .then_some(fs_notify_config)
+            .flatten();
+        let fs: Arc<dyn xai_grok_workspace::file_system::AsyncFileSystem> = if is_ssh_project {
+            Arc::new(RemoteProjectFs)
+        } else if use_acp_fs {
             let mut acp_fs = AcpSessionFs::new(
                 cwd.to_path_buf(),
                 session_info.id.clone(),
                 self.gateway.clone(),
             );
-            if let Some(ref display) = prompt_display_cwd {
+            if let Some(display) = &prompt_display_cwd {
                 acp_fs = acp_fs.with_display_cwd(std::path::PathBuf::from(display));
             }
             Arc::new(acp_fs)
@@ -4383,21 +4564,25 @@ impl MvpAgent {
             .and_then(|m| m.get("x.ai/bashOutputNoColor"))
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
-        let hunk_tracking_enabled = hunk_plan.enabled();
-        let (hunk_tracker_handle, hunk_event_rx) = match hunk_plan.actor_mode {
-            Some(mode) => {
-                let cancel = CancellationToken::new();
-                let (hunk_event_tx, hunk_event_rx) = tokio::sync::mpsc::unbounded_channel();
-                let handle = HunkTrackerActor::spawn(
-                    session_info.id.0.to_string(),
-                    cwd.as_path().to_path_buf(),
-                    hunk_event_tx,
-                    mode,
-                    cancel.clone(),
-                );
-                (handle, Some((hunk_event_rx, cancel)))
+        let hunk_tracking_enabled = !is_ssh_project && hunk_plan.enabled();
+        let (hunk_tracker_handle, hunk_event_rx) = if is_ssh_project {
+            (xai_hunk_tracker::HunkTrackerHandle::noop(), None)
+        } else {
+            match hunk_plan.actor_mode {
+                Some(mode) => {
+                    let cancel = CancellationToken::new();
+                    let (hunk_event_tx, hunk_event_rx) = tokio::sync::mpsc::unbounded_channel();
+                    let handle = HunkTrackerActor::spawn(
+                        session_info.id.0.to_string(),
+                        cwd.as_path().to_path_buf(),
+                        hunk_event_tx,
+                        mode,
+                        cancel.clone(),
+                    );
+                    (handle, Some((hunk_event_rx, cancel)))
+                }
+                None => (xai_hunk_tracker::HunkTrackerHandle::noop(), None),
             }
-            None => (xai_hunk_tracker::HunkTrackerHandle::noop(), None),
         };
         let has_xai_auth = self.auth_manager.current().is_some_and(|a| a.is_xai_auth());
         let loc_tracking_enabled = hunk_tracking_enabled && has_xai_auth
@@ -4446,37 +4631,43 @@ impl MvpAgent {
             _ => None,
         };
         let session_env_timer = crate::instrumentation_timer!("session.spawn_and_register.session_env");
-        let mut session_env = xai_grok_workspace::permission::claude_settings::load_claude_env_with_project(
-            cwd.as_path(),
-            project_env_trusted,
-        );
-        session_env.extend(envrc.join().await);
+        let mut session_env = if is_ssh_project {
+            Default::default()
+        } else {
+            xai_grok_workspace::permission::claude_settings::load_claude_env_with_project(
+                cwd.as_path(),
+                project_env_trusted,
+            )
+        };
+        if let Some(envrc) = envrc {
+            session_env.extend(envrc.join().await);
+        }
         drop(session_env_timer);
         if no_color {
             session_env.extend(crate::terminal::no_color_env());
         } else {
             session_env.extend(crate::terminal::color_env());
         }
+        let tool_cwd = if let Some(location) = project_location.as_ref() {
+            xai_grok_paths::AbsPathBuf::new(std::path::PathBuf::from(location.root()))
+                .map_err(|error| {
+                    acp::Error::invalid_params()
+                        .data(format!("SSH project root must be absolute: {error}"))
+                })?
+        } else {
+            cwd.clone()
+        };
         let mut tool_ctx = ToolContext::with_preloaded_env(
-                cwd.clone(),
-                Some(self.gateway.clone()),
-                Some(session_info.id.clone()),
-                fs,
-                terminal,
-                hunk_tracker_handle,
-                session_env,
-            )
+            tool_cwd,
+            Some(self.gateway.clone()),
+            Some(session_info.id.clone()),
+            fs,
+            terminal,
+            hunk_tracker_handle,
+            session_env,
+        )
             .with_hunk_tracking_enabled(hunk_tracking_enabled);
-        tool_ctx.process_scope = Some(ProcessScope::new());
-        let workspace_ops = self
-            .resolve_workspace_ops()
-            .map_err(|_| {
-                acp::Error::internal_error()
-                    .data(
-                        "Local workspace initialization failed; cannot create session. \
-                 Check that a Tokio runtime is available.",
-                    )
-            })?;
+        tool_ctx.process_scope = (!is_ssh_project).then(ProcessScope::new);
         tool_ctx.subagent_event_tx = Some(self.subagent_event_tx.event_sender().0);
         tool_ctx.subagent_coordinator_sender = Some(self.subagent_event_tx.clone());
         tool_ctx.synthetic_trace_tx = self
@@ -4484,7 +4675,7 @@ impl MvpAgent {
             .borrow()
             .synthetic_trace_tx
             .clone();
-        if let Some(ref shared) = tool_ctx.synthetic_trace_tx_shared {
+        if let Some(shared) = &tool_ctx.synthetic_trace_tx_shared {
             *shared.lock().unwrap_or_else(|e| e.into_inner()) = self
                 .subagent_presentation
                 .borrow()
@@ -4549,8 +4740,13 @@ impl MvpAgent {
             .or(persisted_agent_profile);
         let session_default_agent_profile = acp_agent_profile
             .as_ref()
-            .map(|d| d.name.clone());
-        let mut agent_definition = {
+            .or(remote_agent_definition.as_ref())
+            .map(|definition| definition.name.clone());
+        let mut agent_definition = if is_ssh_project {
+            acp_agent_profile
+                .or(remote_agent_definition)
+                .unwrap_or_else(xai_grok_agent::AgentDefinition::grok_build_plan)
+        } else {
             let cfg = self.cfg.borrow();
             Self::resolve_agent_definition(
                 cwd.as_path(),
@@ -4560,6 +4756,23 @@ impl MvpAgent {
                 model_agent_type,
             )
         };
+        let initialize_session = chat_history.is_empty();
+        if is_ssh_project {
+            // The remote snapshot is injected below. Suppress the builder's
+            // launch-cwd discovery so local AGENTS.md cannot leak into an SSH
+            // project prompt.
+            agent_definition.agents_md = false;
+            if !crate::session::acp_session::conversation_has_project_instructions(
+                &chat_history,
+            ) && let Some(instructions) = remote_project_instructions
+            {
+                let insert_at = chat_history.len().min(1);
+                chat_history.insert(
+                    insert_at,
+                    crate::sampling::ConversationItem::project_instructions(instructions),
+                );
+            }
+        }
         {
             let cfg = self.cfg.borrow();
             let overrides = &cfg.cli_agent_overrides;
@@ -4593,11 +4806,13 @@ impl MvpAgent {
             }
             xai_grok_agent::config::ModelOverride::Inherit => None,
         };
-        if let Some(template) = inherited_harness_template(
-            &agent_definition.user_message_template,
-            pinned_model.as_ref().map(|(_, e)| e.info().agent_type.as_str()),
-            cwd.as_path(),
-        ) {
+        if !is_ssh_project
+            && let Some(template) = inherited_harness_template(
+                &agent_definition.user_message_template,
+                pinned_model.as_ref().map(|(_, e)| e.info().agent_type.as_str()),
+                cwd.as_path(),
+            )
+        {
             tracing::info!(
                 agent = %agent_definition.name,
                 "Inheriting harness wire-format from the profile model's agent_type"
@@ -4671,7 +4886,7 @@ impl MvpAgent {
             .cfg
             .borrow()
             .is_feature_enabled(crate::agent::config::Feature::LspTools);
-        if lsp_tools_enabled && tool_ctx.lsp.is_none() {
+        if !is_ssh_project && lsp_tools_enabled && tool_ctx.lsp.is_none() {
             let snapshot = self.plugin_registry_handle.snapshot();
             let active: Vec<_> = snapshot
                 .iter()
@@ -4874,22 +5089,24 @@ impl MvpAgent {
                     Some(session_info.id.0.to_string()),
                 ),
             );
-            let agent_hook_registry_override = agent_definition
-                .hooks
-                .as_ref()
-                .and_then(|hooks_config| {
+            let agent_hook_registry_override = if is_ssh_project {
+                // Remote hooks execute in the worker through WorkspaceOps turn
+                // lifecycle RPCs, never through this local shell registry.
+                None
+            } else {
+                agent_definition.hooks.as_ref().and_then(|hooks_config| {
                     let hooks_val = hooks_config.as_value();
                     let (specs, errors) = xai_grok_hooks::config::parse_hooks_from_value_with_dir(
                         &hooks_val,
                         &format!(
-                        "{}{}",
-                        xai_grok_hooks::config::AGENT_HOOK_PREFIX,
-                        agent_definition.name
-                    ),
+                            "{}{}",
+                            xai_grok_hooks::config::AGENT_HOOK_PREFIX,
+                            agent_definition.name
+                        ),
                         std::path::Path::new(&session_info.cwd),
                     );
-                    for e in &errors {
-                        tracing::warn!(agent = %agent_definition.name, error = ?e, "agent hook parse error");
+                    for error in &errors {
+                        tracing::warn!(agent = %agent_definition.name, ?error, "agent hook parse error");
                     }
                     if specs.is_empty() {
                         return None;
@@ -4898,8 +5115,7 @@ impl MvpAgent {
                     let hooks_trusted = project_env_trusted;
                     let git_root = {
                         let _timer = crate::instrumentation_timer!("session.spawn_git_root");
-                        xai_grok_workspace::session::git::find_git_root_from_path(cwd)
-                            .ok()
+                        xai_grok_workspace::session::git::find_git_root_from_path(cwd).ok()
                     };
                     let (disk_registry, disk_errors) = {
                         let _timer = crate::instrumentation_timer!("session.spawn_hook_discovery");
@@ -4910,8 +5126,8 @@ impl MvpAgent {
                             xai_grok_hooks::trust::Trust::from_verdict(hooks_trusted),
                         )
                     };
-                    for e in &disk_errors {
-                        tracing::warn!(error = ?e, "hook loading error");
+                    for error in &disk_errors {
+                        tracing::warn!(?error, "hook loading error");
                     }
                     let mut merged = disk_registry;
                     if folder_trust::agent_inline_hooks_allowed(
@@ -4921,7 +5137,8 @@ impl MvpAgent {
                         merged.append_specs(specs);
                     }
                     Some(std::sync::Arc::new(merged))
-                });
+                })
+            };
             let reasoning_effort_to_persist = chat_history
                 .is_empty()
                 .then_some(sampling_config.reasoning_effort);
@@ -5006,7 +5223,7 @@ impl MvpAgent {
                     agent_definition,
                     session_default_agent_profile,
                     skills,
-                    None,
+                    remote_preloaded_skills,
                     compat,
                     paths_config,
                     incremental_bash_output,
@@ -5102,14 +5319,67 @@ impl MvpAgent {
             permission_events_rx,
             system_prompt: agent_system_prompt,
             toolset,
+            tool_bridge,
         } = init;
+        let ssh_client_id = self.ssh_control_client_id(session_meta);
+        if let (Some(service), Some(client_id)) = (self.session_ssh.as_ref(), ssh_client_id) {
+            // Embedded hosts seed every session so ordinary local sessions can
+            // use explicit SSH tools under the host's stable identity.
+            service
+                .seed_resources_for_client(&tool_bridge, session_info.id.0.to_string(), client_id)
+                .await;
+        }
+        if ssh_client_id.is_none() && is_ssh_project {
+            if let Some(service) = self.session_ssh.as_ref() {
+                service
+                    .seed_resources(&tool_bridge, session_info.id.0.to_string())
+                    .await;
+            }
+        }
+        if is_ssh_project {
+            let service = self.session_ssh.as_ref().ok_or_else(|| {
+                acp::Error::invalid_params()
+                    .data("SSH projects require a host-owned SSH service")
+            })?;
+            workspace_ops
+                .register_remote_tools(&tool_bridge)
+                .await
+                .map_err(|error| {
+                    acp::Error::internal_error()
+                        .data(format!("failed to register remote workspace tools: {error}"))
+                })?;
+            // Worker events outlive SSH-manager modal visibility. Route them
+            // through the normal session gateway so progress, task state and
+            // approvals remain observable after an SSH project opens.
+            let mut worker_events = service
+                .subscribe_session_events(session_info.id.0.to_string())
+                .await;
+            let gateway = self.gateway.clone();
+            tokio::task::spawn_local(async move {
+                loop {
+                    match worker_events.recv().await {
+                        Ok(event) => {
+                            let Ok(params) = serde_json::value::to_raw_value(&event) else {
+                                continue;
+                            };
+                            gateway.forward_fire_and_forget(acp::ExtNotification::new(
+                                "x.ai/ssh/worker_event",
+                                params.into(),
+                            ));
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                    }
+                }
+            });
+        }
         #[cfg(test)]
         super::test_hooks::pause_at(super::test_hooks::AttachPause::AfterSpawn).await;
         self.set_session_live_state(&session_info.id, SessionLiveState::IdleResident);
         self.ensure_session_supervisor();
         self.heap_profile_set_session_id(&session_info.id.0);
         self.push_roster_delta_upserted(&session_info.id);
-        if chat_history.is_empty() {
+        if initialize_session {
             let _timer = crate::instrumentation_timer!("session.system_prompt_inject");
             let system_prompt = build_spawn_system_prompt(
                 session_meta,
@@ -5172,13 +5442,15 @@ impl MvpAgent {
         if handle_display_cwd.is_some() {
             handle.display_cwd = handle_display_cwd;
         }
-        let source = if chat_history.is_empty() { "new" } else { "load" };
-        let _ = handle
-            .cmd_tx
-            .send(SessionCommand::DispatchSessionStartHook {
-                source: source.to_string(),
-            });
-        self.notify_session_cwd_for_watch(std::path::Path::new(&session_info.cwd));
+        if !is_ssh_project {
+            let source = if chat_history.is_empty() { "new" } else { "load" };
+            let _ = handle
+                .cmd_tx
+                .send(SessionCommand::DispatchSessionStartHook {
+                    source: source.to_string(),
+                });
+            self.notify_session_cwd_for_watch(std::path::Path::new(&session_info.cwd));
+        }
         self.activity.register_session(&session_info.id.0, &handle);
         let bind_cwd = handle.tool_context.cwd.clone();
         let bind_tracker = handle.hunk_tracker_handle.clone();
@@ -5206,14 +5478,16 @@ impl MvpAgent {
                 (self.install_resident(&session_info.id, handle, root_identity), None)
             }
         };
-        self.bind_accepted_install(
-            &workspace_ops,
-            &session_info.id,
-            bind_cwd.as_path(),
-            &bind_tracker,
-            &toolset,
-            install_id,
-        );
+        if !is_ssh_project {
+            self.bind_accepted_install(
+                &workspace_ops,
+                &session_info.id,
+                bind_cwd.as_path(),
+                &bind_tracker,
+                &toolset,
+                install_id,
+            );
+        }
         let mut stamp_guard = install_id
             .map(|install_id| PendingStampGuard::arm(
                 self,

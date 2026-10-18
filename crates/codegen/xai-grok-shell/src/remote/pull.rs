@@ -145,6 +145,8 @@ pub(crate) mod hydrate {
         });
         let mut summary = Summary {
             info: info.clone(),
+            project_location: None,
+            ssh_state: None,
             agent_id: remote_agent_id,
             // A pulled session is a new activation; mint attempt_id on cold spawn.
             attempt_id: None,
@@ -191,7 +193,9 @@ pub(crate) mod hydrate {
             last_turn_summary_prompt_id: None,
             last_recap: None,
         };
-        if let Some(identity) = crate::session::worktree::worktree_identity_for_cwd(&info.cwd) {
+        if !xai_grok_shared::session::is_ssh_storage_cwd(&info.cwd)
+            && let Some(identity) = crate::session::worktree::worktree_identity_for_cwd(&info.cwd)
+        {
             summary.stamp_worktree_identity(&identity);
         }
 

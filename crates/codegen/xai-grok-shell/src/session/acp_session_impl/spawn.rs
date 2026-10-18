@@ -1184,6 +1184,7 @@ pub(crate) async fn spawn_session_actor(
     let task_model_selection = LatchedTaskModelSelection::default();
     let rebuild_spec = std::sync::Arc::new(crate::session::agent_rebuild::AgentRebuildSpec {
         working_directory: tool_context.cwd.as_path().to_path_buf(),
+        ssh_workspace: workspace_ops.is_ssh().then(|| workspace_ops.clone()),
         terminal_backend: terminal_backend.clone(),
         fs_backend: fs_backend.clone(),
         tools_notification_handle: tools_notification_handle.clone(),
@@ -1302,7 +1303,7 @@ pub(crate) async fn spawn_session_actor(
         .as_ref()
         .map(|ctx| phase_region_under(SubagentSpawnPhase::ToolSetup, &ctx.parent));
     let (tool_setup_timer, tool_setup_step_span) = spawn_await_step!("tool_setup");
-    let (harness_metrics, scheduler_handle_for_handle, toolset) = async {
+    let (harness_metrics, scheduler_handle_for_handle, toolset, tool_bridge) = async {
         let reservations_for_bridge = task_completion_reservations.clone();
         agent
             .tool_bridge()
@@ -1389,8 +1390,9 @@ pub(crate) async fn spawn_session_actor(
                 >()
                 .cloned()
         };
-        let toolset = agent.tool_bridge().toolset();
-        (harness_metrics, scheduler_handle_for_handle, toolset)
+        let tool_bridge = agent.tool_bridge().clone();
+        let toolset = tool_bridge.toolset();
+        (harness_metrics, scheduler_handle_for_handle, toolset, tool_bridge)
     }
     .instrument(tool_setup_step_span)
     .await;
@@ -2500,6 +2502,7 @@ pub(crate) async fn spawn_session_actor(
             permission_events_rx,
             system_prompt,
             toolset,
+            tool_bridge,
         },
         session_done_rx,
     ))
@@ -2526,6 +2529,9 @@ pub(crate) struct SessionInitResult {
     pub(crate) system_prompt: String,
     /// The actor's toolset, for the installer to bind with [`bind_installed_toolset`].
     pub(crate) toolset: Arc<xai_grok_tools::registry::types::FinalizedToolset>,
+    /// The actor's bridge, used to insert session-scoped resources before the
+    /// handle is exposed to tool execution.
+    pub(crate) tool_bridge: Arc<xai_grok_tools::bridge::ToolBridge>,
 }
 /// Bind an installed actor's toolset to its workspace session so local `call_tool` dispatches through
 /// it. The installer calls this once it owns the id, so two installs racing for one id never both

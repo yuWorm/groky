@@ -39,6 +39,7 @@ pub struct InProcessAgent {
 pub async fn spawn_agent(
     mut to_agent: UnboundedReceiver<String>,
     from_agent: UnboundedSender<String>,
+    session_ssh: Option<(Arc<crate::ssh::SessionSsh>, Option<u64>)>,
 ) -> InProcessAgent {
     let (agent_in_read, mut agent_in_write) = simplex(SIMPLEX_BUF);
     let (agent_out_read, agent_out_write) = simplex(SIMPLEX_BUF);
@@ -61,16 +62,18 @@ pub async fn spawn_agent(
         .await
         .ok();
         let (gateway_tx, gateway_rx) = tokio::sync::mpsc::unbounded_channel();
-        let agent = Rc::new(
-            MvpAgent::new(
-                GatewaySender::new(gateway_tx),
-                &config,
-                auth_manager,
-                None,
-                boot,
-            )
-            .expect("valid agent config"),
-        );
+        let mut agent = MvpAgent::new(
+            GatewaySender::new(gateway_tx),
+            &config,
+            auth_manager,
+            None,
+            boot,
+        )
+        .expect("valid agent config");
+        if let Some((service, client_id)) = session_ssh {
+            agent.set_session_ssh(service, client_id);
+        }
+        let agent = Rc::new(agent);
         // A caller that stopped waiting has no way to hold the agent past the `LocalSet`, so do not start one
         if keepalive_tx.send(Rc::clone(&agent)).is_err() {
             return;

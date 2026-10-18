@@ -55,6 +55,13 @@ pub enum AuthStartMode {
     /// External provider (meta.external_provider == true); the browser opens automatically.
     Command,
 }
+/// The SSH authority of an embedded interactive agent. The pager holds this
+/// exact service so control requests share the agent's service state.
+pub(crate) struct EmbeddedSshControl {
+    pub(crate) service: std::sync::Arc<xai_grok_shell::ssh::SessionSsh>,
+    pub(crate) client_id: u64,
+}
+
 /// The pager's connection to an agent that is running but has not been set up yet.
 /// It holds the channel for sending requests to the agent, the channel for receiving its replies, the token that stops the agent, and the place the agent runs.
 /// `initialize_connection` sends `initialize` over these channels and returns the finished `AcpConnection`.
@@ -63,6 +70,7 @@ pub(in crate::acp) struct AgentEndpoint {
     pub(in crate::acp) rx: AcpClientRx,
     pub(in crate::acp) cancel: CancellationToken,
     pub(in crate::acp) location: AgentLocation,
+    pub(in crate::acp) embedded_ssh: Option<EmbeddedSshControl>,
 }
 /// Where an agent runs, and the one handle the pager keeps for it.
 pub(in crate::acp) enum AgentLocation {
@@ -73,11 +81,23 @@ pub(in crate::acp) enum AgentLocation {
 }
 impl From<spawn::SpawnedAgent> for AgentEndpoint {
     fn from(spawned: spawn::SpawnedAgent) -> Self {
+        let spawn::SpawnedAgent {
+            thread_handle,
+            channel,
+            cancel,
+            ssh_service,
+            ssh_client_id,
+            ..
+        } = spawned;
         AgentEndpoint {
-            tx: spawned.channel.tx,
-            rx: spawned.channel.rx,
-            cancel: spawned.cancel,
-            location: AgentLocation::Thread(spawned.thread_handle),
+            tx: channel.tx,
+            rx: channel.rx,
+            cancel,
+            location: AgentLocation::Thread(thread_handle),
+            embedded_ssh: ssh_client_id.map(|client_id| EmbeddedSshControl {
+                service: ssh_service,
+                client_id,
+            }),
         }
     }
 }
@@ -124,7 +144,11 @@ pub struct AcpConnection {
     /// In-process mode shares the agent's instance (single token cache); leader mode builds a dedicated one off the same local `auth.json`.
     /// Either way it resolves a fresh bearer per request via the refresh chain.
     pub auth_manager: std::sync::Arc<xai_grok_login::AuthManager>,
+    /// The in-process SSH authority when this actual ACP connection is embedded.
+    /// This is intentionally absent for leader connections.
+    pub(crate) embedded_ssh: Option<EmbeddedSshControl>,
 }
+
 /// CLI flags that affect agent configuration, threaded from PagerArgs.
 #[derive(Debug, Clone, Default)]
 pub struct ConnectFlags {
@@ -219,7 +243,13 @@ pub async fn connect(cancel: &CancellationToken, flags: ConnectFlags) -> Result<
         interactivity: Interactivity::Interactive,
     });
     let memory_config = agent_config.memory_config.clone();
-    let spawned = spawn::spawn_grok_shell(agent_config, cancel, memory_config).await?;
+    let spawned = spawn::spawn_grok_shell(
+        agent_config,
+        cancel,
+        memory_config,
+        Some(spawn::EMBEDDED_SSH_CLIENT_ID),
+    )
+    .await?;
     let auth_manager = spawned.auth_manager.clone();
     initialize_connection(AgentEndpoint::from(spawned), &flags, auth_manager).await
 }
@@ -235,6 +265,7 @@ pub(in crate::acp) async fn initialize_connection(
         rx,
         cancel,
         location,
+        embedded_ssh,
     } = endpoint;
     let (agent_thread, leader_status_rx) = match location {
         AgentLocation::Thread(thread) => (Some(thread), None),
@@ -275,6 +306,7 @@ pub(in crate::acp) async fn initialize_connection(
         session_recap_available: agent.session_recap_available,
         feedback_trace_offer: agent.feedback_trace_offer,
         auth_manager,
+        embedded_ssh,
     })
 }
 /// Connect to a leader process and return an `AcpConnection`. The leader provides the ACP transport via IPC (raw
@@ -356,6 +388,7 @@ pub async fn connect_via_leader(
         rx: bridge.channel.rx,
         cancel: bridge.cancel,
         location: AgentLocation::Leader(status_rx),
+        embedded_ssh: None,
     };
     initialize_connection(endpoint, &flags, auth_manager).await
 }

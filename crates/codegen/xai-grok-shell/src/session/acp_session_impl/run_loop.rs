@@ -381,10 +381,13 @@ pub(super) async fn run_session(
             }
         });
     }
-    let _workflow_watch = crate::config::watcher::ProjectDiscoveryWatcher::start(
-        std::path::Path::new(session.session_info.cwd.as_str()),
-        &crate::util::grok_home::grok_home(),
-    )
+    let _workflow_watch = (!session.workspace_ops.is_ssh()).then(|| {
+        crate::config::watcher::ProjectDiscoveryWatcher::start(
+            std::path::Path::new(session.session_info.cwd.as_str()),
+            &crate::util::grok_home::grok_home(),
+        )
+    })
+    .flatten()
     .map(|(mut watcher, mut changes)| {
         let session = session.clone();
         tokio::task::spawn_local(async move {
@@ -403,7 +406,10 @@ pub(super) async fn run_session(
             }
         })
     });
-    let _fs_watch: Option<fs_watch::FsWatchHandle> = if fs_watch_caps.needs_watcher() {
+    // A remote root may also exist locally; never subscribe to that unrelated tree.
+    let _fs_watch: Option<fs_watch::FsWatchHandle> = if fs_watch_caps.needs_watcher()
+        && !session.workspace_ops.is_ssh()
+    {
         let deps = fs_watch::FsWatchDeps::from_session(
             &session,
             fs_notify_config.clone(),
@@ -416,12 +422,13 @@ pub(super) async fn run_session(
             deps,
         )))
     } else {
-        tracing::debug!("fs-notify: skipped (no consumers)");
+        tracing::debug!("fs-notify: skipped (no local consumers)");
         None
     };
     {
         let s = session.clone();
-        tokio::task::spawn_local(async move { s.maybe_notify_git_branch().await });
+        // Merely loading history must not replace its saved restore point.
+        tokio::task::spawn_local(async move { s.maybe_notify_git_branch(false).await });
     }
     tokio::task::spawn_local(super::status_line::run_status_emitter(Arc::downgrade(
         &session,
@@ -1191,7 +1198,7 @@ pub(super) async fn run_session(
                             });
                         }
                         SessionCommand::ReloadPlugins { registry } => {
-                            if !session.startup_hints.is_subagent {
+                            if !session.startup_hints.is_subagent && !session.workspace_ops.is_ssh() {
                                 // Fan-outs rebuild without per-session `_meta.pluginDirs`; re-merge this session's own dirs before adopting
                                 let registry = session.preserve_session_plugin_dirs(registry);
                                 session.apply_plugin_registry_snapshot(registry).await;
@@ -1201,32 +1208,14 @@ pub(super) async fn run_session(
                             // Re-discover the session's project hooks on the now-flipped folder-trust verdict.
                             // Run INLINE on the serialized command loop (not a spawned task) like `ReloadPlugins` `reload_hooks_impl` mutates `hook_registry`.
                             // The file-header `await_holding_refcell_ref` allow assumes no concurrent mutation; spawning would race turn tasks.
-                            if !session.startup_hints.is_subagent {
+                            if !session.startup_hints.is_subagent && !session.workspace_ops.is_ssh() {
                                 let _ = session.reload_hooks_impl().await;
                             }
                         }
                         SessionCommand::RefreshSkillBaseline => {
                             let s = session.clone();
                             tokio::task::spawn_local(async move {
-                                let cwd = s.tool_context.cwd.as_path().to_string_lossy();
-                                let skills_config = crate::util::config::load_config().await.skills;
-                                let pr = s.plugin_registry.borrow().clone();
-                                let new_skills = xai_grok_agent::prompt::skills::list_skills_with_plugins(
-                                    Some(&cwd),
-                                    &skills_config,
-                                    pr.as_deref(),
-                                    s.rebuild_spec.compat,
-                                    crate::agent::folder_trust::project_scope_allowed(
-                                        s.tool_context.cwd.as_path(),
-                                    ),
-                                )
-                                .await;
-                                tracing::info!(skills = new_skills.len(), "refreshed skill baseline");
-                                let bridge = s.agent.borrow().tool_bridge().clone();
-                                bridge.update_skill_baseline(new_skills).await;
-                                if let Some(effects) = bridge.apply_pending_skill_update().await {
-                                    s.apply_skill_update_effects(effects).await;
-                                }
+                                s.reload_skills_from_disk().await;
                             });
                         }
                         SessionCommand::FlushMemory { respond_to } => {
@@ -1944,6 +1933,13 @@ pub(super) async fn run_session(
                                                     agent_type: None,
                                                 },
                                             );
+                                            // A freshly admitted SSH worker already executed
+                                            // the project SessionStart hook for this binding.
+                                            // Keep client callbacks local, but never replay the
+                                            // remote project registry from the actor.
+                                            if s.workspace_ops.is_ssh() {
+                                                return;
+                                            }
                                             let Some(registry) = s.hook_registry.borrow().clone()
                                             else {
                                                 return;

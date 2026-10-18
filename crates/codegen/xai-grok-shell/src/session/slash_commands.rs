@@ -1476,6 +1476,7 @@ pub(super) async fn build_skill_information_for_refs(
     parsed_skills: &[ParsedSkillRef],
     slash_skills: &[SkillInfo],
     session_id: &str,
+    ssh_workspace: Option<&xai_grok_workspace::WorkspaceOps>,
 ) -> Option<String> {
     use xai_grok_tools::implementations::skills::skill::{
         SkillRef, SubstitutionContext, apply_substitutions, build_skill_block,
@@ -1486,7 +1487,11 @@ pub(super) async fn build_skill_information_for_refs(
         let Some(info) = slash_skills.iter().find(|s| s.path == sk.skill_path) else {
             continue;
         };
-        match load_skill_content(info).await {
+        let content = match ssh_workspace {
+            Some(ops) => ops.remote_skill_content(&info.path).await.map_err(|error| error.to_string()),
+            None => load_skill_content(info).await,
+        };
+        match content {
             Ok(mut content) => {
                 if cap_skill_body(&mut content) {
                     tracing::info!(

@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use super::transport::LeaderStream;
 use tokio::io::{ReadHalf, WriteHalf};
-use tokio::sync::{Mutex, mpsc, oneshot, watch};
+use tokio::sync::{Mutex, broadcast, mpsc, oneshot, watch};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, trace, warn};
 
@@ -77,6 +77,7 @@ pub struct LeaderClient {
     /// Last `ShuttingDown` reason received from the server.
     /// `None` means no `ShuttingDown` message has arrived yet (unplanned disconnect or still connected).
     shutting_down_rx: watch::Receiver<Option<super::protocol::ShutdownReason>>,
+    ssh_events: broadcast::Sender<crate::ssh::SshEvent>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -115,6 +116,7 @@ impl LeaderClient {
         // Tracks the most recent ShuttingDown reason from the server; None means none has been seen
         let (shutting_down_tx, shutting_down_rx) =
             watch::channel::<Option<super::protocol::ShutdownReason>>(None);
+        let (ssh_events, _) = broadcast::channel(128);
         let (registration, _leader_ready_at_registration) = register(
             writer,
             reader,
@@ -127,6 +129,7 @@ impl LeaderClient {
             cancel.clone(),
             disconnect_tx,
             shutting_down_tx,
+            ssh_events.clone(),
         )
         .await?;
         debug!(
@@ -144,6 +147,7 @@ impl LeaderClient {
             cancel,
             disconnect_rx,
             shutting_down_rx,
+            ssh_events,
         })
     }
 
@@ -152,6 +156,12 @@ impl LeaderClient {
     /// Use this to distinguish e.g. `AutoUpdate` (safe to reconnect immediately) from `Manual` (may indicate a deliberate stop).
     pub fn shutting_down_reason(&self) -> watch::Receiver<Option<super::protocol::ShutdownReason>> {
         self.shutting_down_rx.clone()
+    }
+
+    /// Receives local-only SSH control/authentication events. These events
+    /// never enter ACP or model/session replay.
+    pub fn subscribe_ssh_events(&self) -> broadcast::Receiver<crate::ssh::SshEvent> {
+        self.ssh_events.subscribe()
     }
 
     /// Send an ACP message payload to the leader server.
@@ -316,6 +326,7 @@ async fn register(
     cancel: CancellationToken,
     disconnect_tx: watch::Sender<DisconnectReason>,
     shutting_down_tx: watch::Sender<Option<super::protocol::ShutdownReason>>,
+    ssh_events: broadcast::Sender<crate::ssh::SshEvent>,
 ) -> Result<(LeaderRegistration, bool), ClientError> {
     write_message(
         &mut writer,
@@ -405,6 +416,7 @@ async fn register(
     let cancel_read = cancel.clone();
     let disconnect_tx_read = disconnect_tx.clone();
     let pending_control_read = pending_control.clone();
+    let ssh_events_read = ssh_events.clone();
     tokio::spawn(async move {
         let reason = loop {
             tokio::select! {
@@ -421,6 +433,9 @@ async fn register(
                             if let Some(tx) = pending_control_read.lock().await.remove(&request_id) {
                                 let _ = tx.send(result);
                             }
+                        }
+                        Ok(ServerMessage::SshEvent { event }) => {
+                            let _ = ssh_events_read.send(event);
                         }
                         Ok(ServerMessage::Pong) => {
                             trace!("Received keepalive pong from server");

@@ -2801,6 +2801,10 @@ pub struct ResumeSessionInWorktreeResponse {
     pub worktree_path: String,
     /// Working directory inside the worktree, preserving any subdirectory offset from `source_cwd`.
     pub effective_cwd: String,
+    /// Execution location when the worktree lives on an SSH host. Its paths
+    /// must not be used as a local process cwd.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_location: Option<xai_grok_workspace_types::ssh::ProjectLocation>,
     pub remote_restored: bool,
     pub parent_session_id: String,
     pub chat_messages_copied: usize,

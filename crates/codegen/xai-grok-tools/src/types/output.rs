@@ -49,13 +49,22 @@ impl From<&str> for TextOutput {
 /// payloads, not bare primitives).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DynamicOutput {
+    /// Clean structured output for UI, persistence, and protocol consumers.
     pub value: serde_json::Value,
+    /// An adapter may supply a model-safe rendering without changing `value`.
+    /// This is used when a remote post-tool hook redacts or replaces output.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt_text: Option<String>,
 }
 impl From<serde_json::Value> for DynamicOutput {
     fn from(value: serde_json::Value) -> Self {
-        Self { value }
+        Self {
+            value,
+            prompt_text: None,
+        }
     }
 }
+impl xai_tool_runtime::ToolOutput for DynamicOutput {}
 /// Typed saved path for the media tools (`image_gen` / `video_gen` / `image_edit`), so consumers
 /// read it directly instead of scraping the prose. A struct (not a bare `PathBuf`) is required:
 /// `ToolOutput` is internally tagged and only accepts map payloads.
@@ -943,8 +952,11 @@ impl ToolOutput {
             }
             ToolOutput::UpdateGoal(o) => o.summary.clone(),
             ToolOutput::Workflow(o) => o.message.clone(),
-            ToolOutput::Dynamic(v) => serde_json::to_string_pretty(&v.value).unwrap_or_default(),
-            ToolOutput::Text(text) => text.text.clone(),
+            ToolOutput::Text(v) => v.text.clone(),
+            ToolOutput::Dynamic(v) => v
+                .prompt_text
+                .clone()
+                .unwrap_or_else(|| serde_json::to_string_pretty(&v.value).unwrap_or_default()),
             ToolOutput::ImageGen(m) => m.prompt_text("Image generated"),
             ToolOutput::ImageToVideo(m) => m.prompt_text("Video generated"),
             ToolOutput::ReferenceToVideo(m) => m.prompt_text("Video generated"),

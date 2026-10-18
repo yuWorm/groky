@@ -289,7 +289,7 @@ mod partition_rules_by_scope_tests {
 }
 /// True iff `conversation` already contains a project-instructions reminder (see [`is_project_instructions`]).
 /// `spawn_session_actor` uses this for idempotent AGENTS.md injection, so resumed sessions and forks don't duplicate the message.
-pub(super) fn conversation_has_project_instructions(conversation: &[ConversationItem]) -> bool {
+pub(crate) fn conversation_has_project_instructions(conversation: &[ConversationItem]) -> bool {
     conversation.iter().any(is_project_instructions)
 }
 /// A project-instructions (AGENTS.md) reminder is a `User` item tagged [`SyntheticReason::ProjectInstructions`], or a legacy untagged copy.

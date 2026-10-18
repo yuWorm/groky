@@ -918,6 +918,8 @@ pub struct CopySessionOptions {
     /// The original workspace directory this worktree session was spawned from.
     /// Propagated to the forked session's `Summary::source_workspace_dir`.
     pub source_workspace_dir: Option<String>,
+    /// SSH execution location for the fork target. Local forks retain `None`.
+    pub project_location: Option<xai_grok_workspace_types::ssh::ProjectLocation>,
 }
 
 impl Default for CopySessionOptions {
@@ -943,6 +945,7 @@ impl Default for CopySessionOptions {
             inherited_prefix_len: None,
             strip_reasoning: false,
             source_workspace_dir: None,
+            project_location: None,
         }
     }
 }
@@ -1167,6 +1170,19 @@ impl SessionFileSet {
 pub trait StorageAdapter: Send + Sync {
     /// Initialize a new session or load existing one
     async fn init_session(&self, info: &Info, model_id: acp::ModelId) -> io::Result<Summary>;
+
+    /// Record an SSH execution location for an opaque location-aware storage key.
+    /// Existing local summaries deliberately keep `None` and remain readable unchanged.
+    async fn set_project_location_if_absent(
+        &self,
+        _info: &Info,
+        _location: xai_grok_workspace_types::ssh::ProjectLocation,
+    ) -> io::Result<()> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "project-location persistence is unsupported",
+        ))
+    }
 
     /// Set the session title unconditionally (manual `/rename`); last write wins.
     /// Also marks the title manual (`Summary::title_is_manual`) so clients restore the prompt-border title on resume.

@@ -95,7 +95,9 @@ impl SessionActor {
     /// Dispatch the observe-only session-end `Stop`.
     /// It runs in stop-gate mode so exit code 2 parses as a block, but the decision is discarded (no turn left to continue).
     pub(crate) async fn dispatch_session_end_stop(&self, reason: &str) {
-        if self.startup_hints.is_subagent || !self.may_have_hooks_for(event::HookEventName::Stop) {
+        if self.startup_hints.is_subagent
+            || (!self.workspace_ops.is_ssh() && !self.may_have_hooks_for(event::HookEventName::Stop))
+        {
             return;
         }
         let envelope = self.fire_hook(
@@ -109,6 +111,12 @@ impl SessionActor {
                 session_crons: None,
             },
         );
+        if self.workspace_ops.is_ssh() {
+            if let Err(error) = self.workspace_ops.dispatch_remote_stop_hook(&envelope).await {
+                tracing::warn!(%error, "forwarding remote project session-end Stop hook failed");
+            }
+            return;
+        }
         let Some(registry) = self.hook_registry.borrow().clone() else {
             return;
         };
@@ -243,7 +251,7 @@ impl SessionActor {
         } else {
             event::HookEventName::Stop
         };
-        if !self.has_enabled_hooks_for(event) {
+        if !self.workspace_ops.is_ssh() && !self.has_enabled_hooks_for(event) {
             return StopGateDecision::AllowStop;
         }
         // At the cap no hook is consulted or notified for this forced stop, unlike the force-stop path below which still notifies observers
@@ -273,6 +281,45 @@ impl SessionActor {
         // The gate builds its envelope via `make_hook_envelope`, not the observe-notify `fire_hook`
         // Client hooks get the awaited `x.ai/hooks/run` request below, not a fire-and-forget event
         let envelope = self.make_hook_envelope(event, Some(prompt_id.to_string()), payload);
+        if self.workspace_ops.is_ssh() {
+            let client = self.run_stop_client_hooks(&envelope).await;
+            if let Some(prevent) = client.prevent_continuation.as_ref() {
+                commit_stop_report(claim, prompt_id);
+                self.announce_force_stop(&prevent).await;
+                return StopGateDecision::AllowStop;
+            }
+            let client_feedback = client.feedback();
+            let client_continues = client.wants_continuation();
+            match self.workspace_ops.dispatch_remote_stop_hook(&envelope).await {
+                Ok(Some(remote_feedback)) => {
+                    drop(claim);
+                    let feedback = if client_feedback.is_empty() {
+                        remote_feedback
+                    } else {
+                        format!("{remote_feedback}\n{client_feedback}")
+                    };
+                    self.announce_keep_working(&[], std::slice::from_ref(&feedback))
+                        .await;
+                    return StopGateDecision::KeepWorking { feedback };
+                }
+                Ok(None) if client_continues => {
+                    drop(claim);
+                    self.announce_keep_working(&client.blocks, &client.additional_context)
+                        .await;
+                    return StopGateDecision::KeepWorking {
+                        feedback: client_feedback,
+                    };
+                }
+                Ok(None) => {
+                    commit_stop_report(claim, prompt_id);
+                    return StopGateDecision::AllowStop;
+                }
+                Err(error) => {
+                    tracing::warn!(%error, "forwarding remote project Stop hook failed");
+                    return StopGateDecision::AllowStop;
+                }
+            }
+        }
 
         let mut result = dispatcher::StopDispatchResult::default();
         // Clone out of the RefCell before the awaits so no `Ref` is held across them

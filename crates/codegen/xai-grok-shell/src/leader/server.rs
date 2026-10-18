@@ -22,6 +22,7 @@ use crate::cpu_profile::{
     ShutdownStopDisposition,
 };
 use crate::leader::cursor_worker::{self, CursorWorkerControl};
+use crate::ssh::{SessionSsh, SshControlCommand, SshServiceError};
 use crate::leader::roster_merge::ExternalRoster;
 use agent_client_protocol::AGENT_METHOD_NAMES;
 use parking_lot::Mutex;
@@ -42,6 +43,7 @@ enum ServerEvent {
     Disconnected(ClientId),
     Registered(ClientId, ClientMode, ClientCapabilities, String),
     Message(ClientId, ClientMessage),
+    SshEvent(crate::ssh::SshEvent),
 }
 enum LeaderServerPoll {
     Cancelled,
@@ -171,6 +173,7 @@ pub struct LeaderServerControlState {
     pub metadata: LeaderServerMetadata,
     pub cpu_profile: Arc<Mutex<CpuProfileManager>>,
     pub workspace: Arc<WorkspaceControl>,
+    pub ssh: Arc<SessionSsh>,
     pub(crate) cursor_worker: Arc<CursorWorkerControl>,
 }
 impl LeaderServerControlState {
@@ -179,6 +182,7 @@ impl LeaderServerControlState {
             metadata,
             cpu_profile: Arc::new(Mutex::new(CpuProfileManager::new())),
             workspace: Arc::new(WorkspaceControl::new(None)),
+            ssh: Arc::new(SessionSsh::new(crate::util::grok_home::grok_home())),
             cursor_worker: Arc::new(CursorWorkerControl::new(
                 CursorWorkerConfig::default(),
                 None,
@@ -186,6 +190,13 @@ impl LeaderServerControlState {
                 ExternalRoster::new(),
             )),
         }
+    }
+
+    /// Replaces the standalone fallback with the single service owned by the
+    /// persistent leader runtime and injected into every MvpAgent session.
+    pub fn with_session_ssh(mut self, ssh: Arc<SessionSsh>) -> Self {
+        self.ssh = ssh;
+        self
     }
     pub(crate) fn with_default_hub_url(mut self, default_hub_url: Option<String>) -> Self {
         self.workspace = Arc::new(WorkspaceControl::new(default_hub_url));
@@ -1309,7 +1320,31 @@ fn handle_control_command(
         ControlCommand::RelaunchForUpdate { .. } => {
             unreachable!("RelaunchForUpdate must be handled asynchronously")
         }
+        ControlCommand::Ssh(_) => {
+            unreachable!("SSH control commands are handled asynchronously")
+        }
     }
+}
+
+fn ssh_control_error(error: SshServiceError) -> ControlError {
+    ControlError {
+        code: ControlErrorCode::InternalError,
+        message: error.to_string(),
+        details: None,
+    }
+}
+
+async fn handle_ssh_control(
+    control_state: LeaderServerControlState,
+    client_id: ClientId,
+    command: SshControlCommand,
+) -> Result<ControlPayload, ControlError> {
+    let reply = control_state
+        .ssh
+        .control(client_id.0, command)
+        .await
+        .map_err(ssh_control_error)?;
+    Ok(ControlPayload::Ssh(reply))
 }
 async fn handle_stop_cpu_profile(
     control_state: LeaderServerControlState,
@@ -1522,6 +1557,25 @@ pub async fn run_leader_server(
     let listener = LeaderListener::bind(&socket_path)?;
     info!("Leader server listening");
     let (event_tx, mut event_rx) = mpsc::unbounded_channel::<ServerEvent>();
+    let mut ssh_events = control_state.ssh.subscribe_events();
+    let ssh_event_tx = event_tx.clone();
+    let ssh_event_cancel = cancel.clone();
+    tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                _ = ssh_event_cancel.cancelled() => break,
+                event = ssh_events.recv() => match event {
+                    Ok(event) => {
+                        if ssh_event_tx.send(ServerEvent::SshEvent(event)).is_err() {
+                            break;
+                        }
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                },
+            }
+        }
+    });
     let mut clients: HashMap<ClientId, ClientState> = HashMap::new();
     let mut session_driver: HashMap<String, ClientId> = HashMap::new();
     let mut session_subscribers: HashMap<String, std::collections::HashSet<ClientId>> =
@@ -1588,6 +1642,51 @@ pub async fn run_leader_server(
                 Err(e) => error!(error = %e, "Accept failed"),
             },
             LeaderServerPoll::Event(event) => match event {
+                ServerEvent::SshEvent(event) => {
+                    if let crate::ssh::SshEvent::Worker(worker_event) = &event {
+                        if let Some(subscribers) = session_subscribers.get(&worker_event.session_id) {
+                            for id in subscribers {
+                                if let Some(client) = clients.get(id) {
+                                    let _ = client.tx.send(
+                                        ServerMessage::SshEvent {
+                                            event: event.clone(),
+                                        }
+                                        .into(),
+                                    );
+                                }
+                            }
+                        }
+                    } else {
+                        let target = match &event {
+                            crate::ssh::SshEvent::Authentication(prompt) => Some(ClientId(prompt.client_id)),
+                            crate::ssh::SshEvent::OperationApproval(approval) => {
+                                Some(ClientId(approval.client_id))
+                            }
+                            crate::ssh::SshEvent::GrantRequested(request) => request
+                                .client_id
+                                .map(ClientId)
+                                .or_else(|| session_driver.get(&request.session_id).copied())
+                                .or(last_active_client),
+                            _ => None,
+                        };
+                        if let Some(id) = target {
+                            if let Some(client) = clients.get(&id) {
+                                let _ = client
+                                    .tx
+                                    .send(ServerMessage::SshEvent { event }.into());
+                            }
+                        } else {
+                            for client in clients.values().filter(|client| client.registered) {
+                                let _ = client
+                                    .tx
+                                    .send(ServerMessage::SshEvent {
+                                        event: event.clone(),
+                                    }
+                                    .into());
+                            }
+                        }
+                    }
+                }
                 ServerEvent::Registered(id, mode, capabilities, client_type) => {
                     if let Some(client) = clients.get_mut(&id) {
                         client.mode = mode;
@@ -1763,6 +1862,9 @@ pub async fn run_leader_server(
                                         .cursor_worker
                                         .status(control_state.metadata.pid)
                                         .await
+                                }
+                                ControlCommand::Ssh(command) => {
+                                    handle_ssh_control(control_state, id, command).await
                                 }
                                 ControlCommand::RelaunchForUpdate { to_version } => {
                                     decide_relaunch_for_update(

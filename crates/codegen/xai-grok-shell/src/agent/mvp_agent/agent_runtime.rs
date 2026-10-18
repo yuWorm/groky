@@ -82,6 +82,21 @@ impl AgentRuntime for MvpAgent {
     fn resolve_workspace_ops(&self) -> Result<xai_grok_workspace::WorkspaceOps, acp::Error> {
         self.resolve_workspace_ops()
     }
+    fn workspace_ops_for_session(
+        &self,
+        session_id: &acp::SessionId,
+    ) -> Result<xai_grok_workspace::WorkspaceOps, acp::Error> {
+        self.resident_handle(session_id)
+            .map(|handle| handle.workspace_ops)
+            .ok_or_else(|| {
+                acp::Error::invalid_params()
+                    .data(format!("session not found: {}", session_id.0))
+            })
+    }
+
+    fn session_ssh(&self) -> Option<Arc<crate::ssh::SessionSsh>> {
+        self.session_ssh.clone()
+    }
 
     async fn background_foreground_command(&self, session_id: &str, tool_call_id: &str) -> bool {
         self.background_foreground_command(session_id, tool_call_id)

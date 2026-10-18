@@ -120,6 +120,8 @@ fn spawn_ctx(parent_cwd: PathBuf) -> SubagentSpawnContext {
         api_key_provider: None,
         image_description_model: "test-model".to_owned(),
         workspace_ops: xai_grok_workspace::WorkspaceOps::for_test(),
+        session_ssh_client_id: None,
+        session_ssh: None,
         auth_manager: Arc::new(xai_grok_login::AuthManager::new(
             std::path::Path::new("/tmp/nonexistent-grok-test"),
             xai_grok_login::GrokComConfig::default(),

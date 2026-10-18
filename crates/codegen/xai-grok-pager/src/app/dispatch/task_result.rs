@@ -495,18 +495,31 @@ fn maybe_auto_open_release_notes(app: &mut AppView) -> Vec<Effect> {
 }
 
 pub(super) fn dispatch_task_result(result: TaskResult, app: &mut AppView) -> Vec<Effect> {
-    let result = match result {
-        TaskResult::WithPinnedMemoryMode {
-            agent_id,
-            memory_mode,
-            result,
-        } => {
-            if let Some(agent) = app.agents.get_mut(&agent_id) {
-                agent.memory_mode = memory_mode;
+    let mut result = result;
+    let result = loop {
+        result = match result {
+            TaskResult::WithPinnedMemoryMode {
+                agent_id,
+                memory_mode,
+                result,
+            } => {
+                if let Some(agent) = app.agents.get_mut(&agent_id) {
+                    agent.memory_mode = memory_mode;
+                }
+                *result
             }
-            *result
-        }
-        result => result,
+            TaskResult::WithSshProjectLocation {
+                agent_id,
+                location,
+                result,
+            } => {
+                if let Some(agent) = app.agents.get_mut(&agent_id) {
+                    agent.ssh_project_location = location;
+                }
+                *result
+            }
+            result => break result,
+        };
     };
     if result.ends_startup() {
         app.finish_startup(xai_grok_telemetry::startup::StartupOutcome::Ok);
@@ -522,8 +535,153 @@ pub(super) fn dispatch_task_result(result: TaskResult, app: &mut AppView) -> Vec
         crate::app::workspace_sync::request(app);
     }
     match result {
-        TaskResult::WithPinnedMemoryMode { .. } => {
-            unreachable!("pinned memory mode wrapper is removed before task-result dispatch")
+        TaskResult::WithPinnedMemoryMode { .. } | TaskResult::WithSshProjectLocation { .. } => {
+            unreachable!("task-result wrappers are removed before task-result dispatch")
+        }
+        TaskResult::SshTargetsLoaded {
+            session_id,
+            client_id,
+            targets,
+            error,
+        } => {
+            app.ssh_client_id = client_id;
+            if let Some(manager) =
+                super::ssh::ssh_manager_for_target_list_session_mut(app, session_id.as_deref())
+            {
+                match error {
+                    Some(error) => manager.show_error(error),
+                    None => manager.set_targets(targets),
+                }
+            }
+            vec![]
+        }
+        TaskResult::SshProjectOpenSetupFailed {
+            session_id,
+            client_id,
+            target_id: _,
+            error,
+        } => {
+            app.ssh_client_id = client_id;
+            if let Some(manager) =
+                super::ssh::ssh_manager_for_session_mut(app, Some(session_id.as_str()))
+                && manager.session_id.as_deref() == Some(session_id.as_str())
+            {
+                manager.show_error(error);
+            }
+            if app.pending_ssh_project_open.as_ref().is_some_and(|project| {
+                project.project_session_id == session_id
+            }) {
+                app.pending_ssh_project_open = None;
+            }
+            vec![]
+        }
+        TaskResult::SshActionComplete {
+            session_id,
+            client_id,
+            target_id: _,
+            message,
+            error,
+        } => {
+            app.ssh_client_id = client_id;
+            let manager_session_id = if let Some(manager) = super::ssh::ssh_manager_mut(app)
+                && (session_id.is_none() || manager.session_id == session_id)
+            {
+                match error {
+                    Some(error) => manager.show_error(error),
+                    None => {
+                        if let Some(message) = message
+                            && (message
+                                != "SSH access revoked locally; waiting for worker confirmation."
+                                || !manager.has_worker_acknowledged_revocation())
+                        {
+                            manager.show_info(message);
+                        }
+                    }
+                }
+                manager.session_id.clone()
+            } else {
+                None
+            };
+            vec![Effect::SshListTargets {
+                session_id: session_id.or(manager_session_id),
+                client_id,
+            }]
+        }
+        TaskResult::SshOperationApprovalComplete {
+            session_id,
+            client_id,
+            approval_id,
+            error,
+        } => {
+            app.ssh_client_id = client_id;
+            let dismiss_transient = super::ssh::existing_ssh_manager_for_session_mut(
+                app,
+                session_id.as_deref(),
+            )
+            .is_some_and(|manager| manager.settle_operation_approval(&approval_id, error));
+            if dismiss_transient {
+                super::ssh::close_transient_ssh_manager_for_session(app, session_id.as_deref());
+                vec![]
+            } else {
+                vec![Effect::SshListTargets {
+                    session_id,
+                    client_id,
+                }]
+            }
+        }
+        TaskResult::SshControlEvent {
+            session_id,
+            client_id,
+            event,
+        } => {
+            app.ssh_client_id = client_id;
+            super::ssh::apply_ssh_control_event(app, session_id, event)
+        }
+        TaskResult::SshProjectBindingInherited {
+            target_id,
+            root,
+            project_session_id,
+            binding,
+            client_id,
+        } => {
+            app.ssh_client_id = client_id;
+            super::ssh::dispatch_inherited_ssh_project(
+                app,
+                target_id,
+                root,
+                project_session_id,
+                binding.id,
+            )
+        }
+        TaskResult::SshProjectGrantRestored {
+            target_id,
+            project_session_id,
+            binding,
+            client_id,
+        } => {
+            app.ssh_client_id = client_id;
+            let pending_matches = app.pending_ssh_project_open.as_ref().is_some_and(|project| {
+                project.project_session_id == project_session_id && project.target_id == target_id
+            });
+            if !pending_matches {
+                if let Some(manager) =
+                    super::ssh::ssh_manager_for_session_mut(app, Some(project_session_id.as_str()))
+                {
+                    manager.show_error(
+                        "Discarded an SSH project grant restore for a different pending project.",
+                    );
+                }
+                return vec![];
+            }
+            app.pending_ssh_project_open = None;
+            app.welcome_ssh_manager = None;
+            super::ssh::dispatch_inherited_ssh_project(
+                app,
+                binding.target_id.clone(),
+                binding.root.clone(),
+                project_session_id,
+                binding.id,
+            )
         }
         TaskResult::SessionCreated {
             agent_id,

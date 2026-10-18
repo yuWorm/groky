@@ -6,14 +6,16 @@ edition.workspace = true
 description = "Lightweight typed client for hub-proxied workspace.* RPCs (shared by xai-grok-shell proxy mode and other consumers)"
 
 [dependencies]
+async-trait = { workspace = true }
 semver = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
-tokio = { workspace = true, features = ["time"] }
+tokio = { workspace = true, features = ["io-util", "rt", "sync", "time"] }
 tracing = { workspace = true }
 xai-computer-hub-sdk = { workspace = true }
 xai-grok-workspace-types = { workspace = true }
+xai-grok-ssh = { path = "../xai-grok-ssh" }
 xai-tool-protocol = { workspace = true }
 xai-tool-runtime = { workspace = true }
 

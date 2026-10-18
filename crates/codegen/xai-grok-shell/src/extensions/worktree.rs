@@ -1,12 +1,14 @@
 //! Handler for x.ai/git/worktree/* extension methods.
 
+use anyhow::Context;
+
 use agent_client_protocol as acp;
 use xai_acp_lib::AcpAgentGatewaySender as GatewaySender;
 
 use crate::extensions::agent_runtime::AgentRuntime;
 use crate::extensions::worktree_seed;
 use crate::session::ExtMethodResult;
-use crate::session::persistence::LocalSessionResolutionKind;
+use crate::session::persistence::{LocalSessionResolutionKind, find_summary_by_session_id, persist_ssh_state};
 use crate::session::worktree::{
     ApplyWorktreeRequest, CreateWorktreeFromWorktreeRequest, CreateWorktreeRequest,
     CreateWorktreeResponse, RehydrateSessionRequest, RemoveWorktreeRequest,
@@ -14,6 +16,8 @@ use crate::session::worktree::{
     create_jj_workspace, create_worktree_async, create_worktree_from_worktree_async,
     rehydrate_session_in_worktree, resolve_session_repo_wide, resume_session_in_worktree,
 };
+use xai_grok_tools::types::output::ToolOutput;
+use xai_grok_workspace_types::ssh::ProjectLocation;
 use xai_grok_telemetry::instrument_task;
 use xai_grok_telemetry::region::Parent;
 use xai_grok_telemetry::session_ctx::spawn_local_in_session_ctx;
@@ -63,6 +67,348 @@ fn extract_creating(resp: &CreateWorktreeResponse) -> Option<(String, Option<Str
     } else {
         None
     }
+}
+
+fn shell_quote_remote_arg(argument: &str) -> anyhow::Result<String> {
+    if argument.as_bytes().contains(&0) {
+        anyhow::bail!("remote worktree argument contains a NUL byte");
+    }
+    Ok(format!("'{}'", argument.replace('\'', "'\"'\"'")))
+}
+
+fn canonical_remote_worktree_root(command_output: &[u8]) -> anyhow::Result<String> {
+    let root = std::str::from_utf8(command_output)
+        .context("remote worktree command returned non-UTF-8 canonical path")?
+        .lines()
+        .rev()
+        .find(|line| !line.is_empty())
+        .ok_or_else(|| anyhow::anyhow!("remote worktree command did not report its canonical path"))?;
+    if !root.starts_with('/') || root.as_bytes().contains(&0) {
+        anyhow::bail!("remote worktree command returned an invalid canonical path");
+    }
+    Ok(root.to_owned())
+}
+
+async fn run_remote_worktree_command(
+    ops: &xai_grok_workspace::WorkspaceOps,
+    session_id: &str,
+    command: String,
+) -> anyhow::Result<String> {
+    let call_id = format!("ssh-worktree-{}", uuid::Uuid::now_v7());
+    let result = ops
+        .call_tool(
+            "GrokBuild:run_terminal_cmd",
+            serde_json::json!({
+                "command": command,
+                "description": "Create or inspect the requested remote Git worktree",
+            }),
+            &call_id,
+            Some(session_id),
+        )
+        .await
+        .map_err(|error| anyhow::anyhow!("remote worktree command was not completed: {error}"))?;
+    match result.output {
+        ToolOutput::Bash(output) if output.exit_code == 0 => {
+            String::from_utf8(output.output)
+                .context("remote worktree command returned non-UTF-8 output")
+        }
+        ToolOutput::Bash(output) => anyhow::bail!(
+            "remote worktree command failed with exit code {}: {}",
+            output.exit_code,
+            String::from_utf8_lossy(&output.output).trim()
+        ),
+        _ => anyhow::bail!("remote worktree command did not return terminal output"),
+    }
+}
+
+async fn resume_ssh_session_in_worktree(
+    agent: &dyn AgentRuntime,
+    fallback_ops: &xai_grok_workspace::WorkspaceOps,
+    req: &ResumeSessionInWorktreeRequest,
+    worktree_type_default: crate::util::config::WorktreeType,
+    grove_worktree: bool,
+    grove_gate_source: &'static str,
+    agent_id: &str,
+) -> anyhow::Result<xai_grok_workspace::worktree::ResumeSessionInWorktreeResponse> {
+    let source_summary = find_summary_by_session_id(&req.session_id).ok_or_else(|| {
+        anyhow::anyhow!(
+            "SSH session {} has no persisted project location; it cannot be resumed into a worktree",
+            req.session_id
+        )
+    })?;
+    let source_location = source_summary.project_location.ok_or_else(|| {
+        anyhow::anyhow!(
+            "session {} is a legacy local history, not an SSH project session",
+            req.session_id
+        )
+    })?;
+    let ProjectLocation::Ssh {
+        target_id: source_target_id,
+        root: source_root,
+    } = &source_location
+    else {
+        anyhow::bail!("session {} is not an SSH project session", req.session_id);
+    };
+
+    let source_ops = agent
+        .workspace_ops_for_session(&acp::SessionId::new(req.session_id.clone()))
+        .unwrap_or_else(|_| fallback_ops.clone());
+    let source_client = source_ops.ssh_client().ok_or_else(|| {
+        anyhow::anyhow!("SSH worktree resume requires the source session's remote workspace")
+    })?;
+    let source_binding = source_client.binding().await;
+    if source_binding.session_id != req.session_id
+        || source_binding.target_id != *source_target_id
+        || source_binding.root != *source_root
+    {
+        anyhow::bail!(
+            "SSH worktree resume requires the source session's exact approved project binding"
+        );
+    }
+    if !source_binding.capabilities.execute {
+        anyhow::bail!(
+            "SSH worktree resume requires Execute capability on the source project binding"
+        );
+    }
+    if !source_root.starts_with('/') || source_root.as_bytes().contains(&0) {
+        anyhow::bail!("SSH worktree resume requires an absolute canonical remote project root");
+    }
+
+    let new_session_id = uuid::Uuid::now_v7().to_string();
+    let worktree_request = CreateWorktreeFromWorktreeRequest {
+        source_worktree_path: source_root.clone(),
+        new_session_id: new_session_id.clone(),
+        copy_mode: if req.git_ref.is_some() {
+            crate::session::worktree::WorktreeCopyMode::Clean
+        } else {
+            req.copy_mode
+        },
+        git_ref: req.git_ref.clone(),
+        worktree_type: Some(req.worktree_type.unwrap_or(worktree_type_default.into())),
+        label: None,
+        grove_worktree: Some(grove_worktree),
+        grove_gate_source: Some(grove_gate_source.to_owned()),
+        cancellation_token: None,
+        resolved_dest_path: None,
+        resolved_source_git_root: None,
+    };
+    // Use the worker's existing worktree implementation so Dirty/Clean,
+    // standalone/linked and the selected Git ref retain their normal semantics.
+    let created = source_ops
+        .dispatch(
+            &xai_grok_workspace::workspace_ops::CreateWorktreeFromWorktreeSyncReq {
+                inner: worktree_request.into_wire(),
+            },
+            Some(&req.session_id),
+        )
+        .await
+        .map_err(|error| anyhow::anyhow!("remote worktree creation failed: {error}"))?;
+    let worktree_path = created.worktree_path;
+    if !worktree_path.starts_with('/') || worktree_path.as_bytes().contains(&0) {
+        anyhow::bail!("remote worktree creation returned a non-absolute destination");
+    }
+    let destination = shell_quote_remote_arg(&worktree_path)?;
+    let inspect_command = format!("cd -- {destination} && pwd -P");
+    let command_output = run_remote_worktree_command(&source_ops, &req.session_id, inspect_command)
+        .await
+        .map_err(|error| {
+            anyhow::anyhow!(
+                "remote worktree at {worktree_path} may already exist; original session {} was left unchanged: {error}",
+                req.session_id
+            )
+        })?;
+    let canonical_root = canonical_remote_worktree_root(command_output.as_bytes()).map_err(|error| {
+        anyhow::anyhow!(
+            "remote worktree at {worktree_path} was created but its canonical root could not be confirmed; original session {} was left unchanged: {error}",
+            req.session_id
+        )
+    })?;
+    let child_location = ProjectLocation::Ssh {
+        target_id: source_target_id.clone(),
+        root: canonical_root.clone(),
+    };
+    let service = agent.session_ssh().ok_or_else(|| {
+        anyhow::anyhow!(
+            "remote worktree at {canonical_root} was created but SSH approval is unavailable; original session {} was left unchanged",
+            req.session_id
+        )
+    })?;
+    let approval_client_id = service
+        .interaction_client_id(&source_binding.id)
+        .await
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "remote worktree at {canonical_root} was created but its source SSH interaction owner is no longer connected; original session {} was left unchanged",
+                req.session_id
+            )
+        })?;
+    service
+        .register_project_location(&new_session_id, None, &child_location)
+        .await
+        .map_err(|error| {
+            anyhow::anyhow!(
+                "remote worktree at {canonical_root} was created but its child project registration failed; original session {} was left unchanged: {error}",
+                req.session_id
+            )
+        })?;
+    let mut events = service.subscribe_events();
+    let grant = service
+        .request_worktree_grant(
+            new_session_id.clone(),
+            &source_binding,
+            canonical_root.clone(),
+            approval_client_id,
+        )
+        .await
+        .map_err(|error| {
+            anyhow::anyhow!(
+                "remote worktree at {canonical_root} was created but the new-root approval request failed; original session {} was left unchanged: {error}",
+                req.session_id
+            )
+        })?;
+    let (approved, approved_binding) = tokio::time::timeout(
+        std::time::Duration::from_secs(300),
+        async {
+            loop {
+                match events.recv().await {
+                    Ok(crate::ssh::SshEvent::GrantResolved {
+                        request_id,
+                        approved,
+                        binding,
+                    }) if request_id == grant.id => return Ok((approved, binding)),
+                    Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                        anyhow::bail!("SSH grant approval stream closed")
+                    }
+                }
+            }
+        },
+    )
+    .await
+    .map_err(|_| {
+        anyhow::anyhow!(
+            "remote worktree at {canonical_root} was created and left in place because approval for its new root timed out; original session {} was left unchanged",
+            req.session_id
+        )
+    })?
+    .map_err(|error| {
+        anyhow::anyhow!(
+            "remote worktree at {canonical_root} was created and left in place because its new-root approval did not complete; original session {} was left unchanged: {error}",
+            req.session_id
+        )
+    })?;
+    if !approved {
+        anyhow::bail!(
+            "remote worktree at {canonical_root} was created and left in place because its new-root approval was declined; original session {} was left unchanged",
+            req.session_id
+        );
+    }
+    let approved_binding = approved_binding.ok_or_else(|| {
+        anyhow::anyhow!(
+            "remote worktree at {canonical_root} was created and left in place because approval returned no binding; original session {} was left unchanged",
+            req.session_id
+        )
+    })?;
+    if approved_binding.target_id != *source_target_id || approved_binding.root != canonical_root {
+        anyhow::bail!(
+            "remote worktree at {canonical_root} was created and left in place because approval did not grant its exact new root; original session {} was left unchanged",
+            req.session_id
+        );
+    }
+    service
+        .use_binding(&new_session_id, &approved_binding.id)
+        .await
+        .map_err(|error| {
+            anyhow::anyhow!(
+                "remote worktree at {canonical_root} was created and approved but its child binding could not be selected; original session {} was left unchanged: {error}",
+                req.session_id
+            )
+        })?;
+    let mut restore = crate::session::worktree::WorktreeRestoreDecision {
+        code_restored: false,
+        restore_summary: None,
+        restore_degree: None,
+    };
+    if req.restore_code.unwrap_or(agent.restore_code())
+        && let Some(target_sha) = source_summary.head_commit.as_deref()
+    {
+        let child_client = service
+            .project_workspace_client(&new_session_id, &approved_binding.id, Some(approval_client_id))
+            .await
+            .map_err(|error| anyhow::anyhow!("opening SSH worktree for code restore failed: {error}"))?;
+        let child_ops = xai_grok_workspace::WorkspaceOps::ssh(child_client);
+        let outcome = child_ops
+            .checkout_session_commit(target_sha, &new_session_id)
+            .await
+            .map_err(|error| {
+                anyhow::anyhow!(
+                    "remote worktree at {canonical_root} was created and approved but code restore failed; it was left in place and original session {} was left unchanged: {error}",
+                    req.session_id
+                )
+            })?;
+        let kind = if outcome.checked_out {
+            xai_grok_workspace::session::git::RestoreKind::RegistryOff
+        } else {
+            xai_grok_workspace::session::git::RestoreKind::CheckoutFailed
+        };
+        restore = crate::session::worktree::build_worktree_restore_outcome(
+            Some(target_sha),
+            &outcome,
+            kind,
+        );
+    }
+
+    let fork = crate::session::fork::fork_session(
+        crate::session::fork::ForkSessionRequest {
+            source_session_id: req.session_id.clone(),
+            source_cwd: source_root.clone(),
+            new_cwd: canonical_root.clone(),
+            new_session_id: Some(new_session_id.clone()),
+            session_kind: Some("worktree".to_owned()),
+            source_workspace_dir: Some(source_root.clone()),
+            source_project_location: Some(source_location.clone()),
+            new_project_location: Some(child_location.clone()),
+            ..Default::default()
+        },
+        agent_id,
+        Some(agent.auth_manager().clone()),
+    )
+    .await
+    .map_err(|error| {
+        anyhow::anyhow!(
+            "remote worktree at {canonical_root} was created and approved but the session fork failed; it was left in place and original session {} was left unchanged: {error}",
+            req.session_id
+        )
+    })?;
+    let child_info = xai_grok_shared::session::info_for_location(
+        acp::SessionId::new(fork.new_session_id.clone()),
+        &child_location,
+    );
+    service
+        .register_project_location(&fork.new_session_id, Some(child_info.clone()), &child_location)
+        .await
+        .map_err(|error| anyhow::anyhow!("registering SSH worktree session failed: {error}"))?;
+    persist_ssh_state(
+        &child_info,
+        service.snapshot_session(&fork.new_session_id).await,
+    )
+    .await
+    .map_err(|error| anyhow::anyhow!("persisting SSH worktree session state failed: {error}"))?;
+
+    Ok(xai_grok_workspace::worktree::ResumeSessionInWorktreeResponse {
+        session_id: fork.new_session_id,
+        worktree_path: canonical_root.clone(),
+        effective_cwd: canonical_root,
+        project_location: Some(child_location),
+        remote_restored: false,
+        parent_session_id: req.session_id.clone(),
+        chat_messages_copied: fork.chat_messages_copied,
+        updates_copied: fork.updates_copied,
+        code_restored: restore.code_restored,
+        restore_summary: restore.restore_summary,
+        restore_degree: restore.restore_degree,
+        strategy: created.strategy,
+    })
 }
 
 // ── ACP request types for worktree management ──────────────────────────────────────────────────
@@ -194,8 +540,8 @@ pub async fn handle(
                 .dispatch(&req, None)
                 .await
                 .map_err(|e| acp::Error::internal_error().data(e.to_string()))?;
-            // Post-dispatch: spawn async task for Creating variant.
-            if let Ok(resp) = serde_json::from_value::<CreateWorktreeResponse>(result.clone())
+            if !ops.is_ssh()
+                && let Ok(resp) = serde_json::from_value::<CreateWorktreeResponse>(result.clone())
                 && let Some((path, source_git_root)) = extract_creating(&resp)
             {
                 req.worktree_path = Some(path);
@@ -246,6 +592,18 @@ pub async fn handle(
                 worktree_type_default,
                 req.worktree_type.unwrap_or(worktree_type_default.into()),
             );
+            if ops.is_ssh() {
+                let response = ops
+                    .dispatch(
+                        &xai_grok_workspace::workspace_ops::CreateWorktreeFromWorktreeSyncReq {
+                            inner: req.into_wire(),
+                        },
+                        None,
+                    )
+                    .await
+                    .map_err(|e| acp::Error::internal_error().data(e.to_string()))?;
+                return to_response(Ok(response));
+            }
             let result = ops
                 .dispatch(
                     &xai_grok_workspace::workspace_ops::PrepareWorktreeFromWorktreeReq {
@@ -300,6 +658,21 @@ pub async fn handle(
             }
             req.grove_gate_source =
                 Some(apply_grove_worktree_flag(agent, &mut req.grove_worktree).into());
+            if ops.is_ssh() {
+                let created = ops
+                    .dispatch(
+                        &xai_grok_workspace::workspace_ops::CreateWorktreeFromWorktreeSyncReq {
+                            inner: req.into_wire(),
+                        },
+                        None,
+                    )
+                    .await
+                    .map_err(|e| acp::Error::internal_error().data(e.to_string()))?;
+                return to_response(Ok(SeededForkResponse {
+                    created,
+                    branch: None,
+                }));
+            }
 
             // Nested clones keep libgit2; Grove dest is the fallback on partialclone.
             let source_path = std::path::Path::new(&req.source_worktree_path);
@@ -377,6 +750,27 @@ pub async fn handle(
             let registry_client = agent.session_registry_client();
             let agent_id = xai_grok_telemetry::id::agent_id();
 
+            let source_ops = agent
+                .workspace_ops_for_session(&acp::SessionId::new(req.session_id.clone()))
+                .unwrap_or_else(|_| ops.clone());
+            let source_is_ssh = source_ops.is_ssh()
+                || find_summary_by_session_id(&req.session_id).is_some_and(|summary| {
+                    matches!(summary.project_location, Some(ProjectLocation::Ssh { .. }))
+                });
+            if source_is_ssh {
+                return to_response(
+                    resume_ssh_session_in_worktree(
+                        agent,
+                        &source_ops,
+                        &req,
+                        worktree_type_default,
+                        grove_worktree,
+                        grove_gate_source,
+                        &agent_id,
+                    )
+                    .await,
+                );
+            }
             to_response(
                 resume_session_in_worktree(
                     &req,
@@ -394,6 +788,11 @@ pub async fn handle(
         }
         // ── Repo-wide session resolution ─────────────────────────────────
         "x.ai/session/resolve_local_for_worktree_resume" => {
+            if ops.is_ssh() {
+                return Err(acp::Error::invalid_params().data(
+                    "local worktree-session resolution is unavailable for an SSH project",
+                ));
+            }
             let req =
                 serde_json::from_str::<ResolveLocalForWorktreeResumeRequest>(args.params.get())?;
             let result = resolve_session_repo_wide(&req.session_id, std::path::Path::new(&req.cwd));
@@ -851,5 +1250,23 @@ mod tests {
         assert!(!json.contains("resolvedSessionId"));
         assert!(!json.contains("resolvedCwd"));
         assert!(!json.contains("resolutionKind"));
+    }
+
+    #[test]
+    fn remote_worktree_command_quotes_each_path_without_local_path_resolution() {
+        assert_eq!(
+            shell_quote_remote_arg("/srv/a b/'quoted'").unwrap(),
+            "'/srv/a b/'\"'\"'quoted'\"'\"''"
+        );
+        assert!(shell_quote_remote_arg("/srv/\0bad").is_err());
+    }
+
+    #[test]
+    fn remote_worktree_resume_accepts_only_remote_absolute_canonical_output() {
+        assert_eq!(
+            canonical_remote_worktree_root(b"remote diagnostic\n/srv/worktrees/fork\n").unwrap(),
+            "/srv/worktrees/fork"
+        );
+        assert!(canonical_remote_worktree_root(b"relative/path\n").is_err());
     }
 }

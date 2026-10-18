@@ -1392,10 +1392,25 @@ impl AgentView {
             }),
             dropdown_open,
         );
-        let location_path = self.location_path().to_string_lossy();
-        let location_path = crate::views::session_title::sanitize_display_text(&location_path);
-        let short =
-            crate::util::display_location_path(std::path::Path::new(location_path.as_ref()));
+        let (short, is_ssh_project) = match self.ssh_project_location.as_ref() {
+            Some(project) => (
+                format!(
+                    "ssh {} {}",
+                    crate::views::session_title::sanitize_display_text(&project.target_id),
+                    crate::views::session_title::sanitize_display_text(&project.root),
+                ),
+                true,
+            ),
+            None => {
+                let location_path = self.location_path().to_string_lossy();
+                let location_path =
+                    crate::views::session_title::sanitize_display_text(&location_path);
+                (
+                    crate::util::display_location_path(std::path::Path::new(location_path.as_ref())),
+                    false,
+                )
+            }
+        };
         let left_budget = areas
             .values()
             .map(|r| r.x)
@@ -1410,22 +1425,22 @@ impl AgentView {
         let location_budget = left_budget.saturating_sub(upgrade_reserve);
         use unicode_width::UnicodeWidthStr;
         let mut location: Vec<Span> = Vec::new();
-        let probe_local_git = true;
-        let lazy_git = probe_local_git
+        let lazy_git = (!is_ssh_project)
             .then(|| crate::git_info::cwd_git_info_lazy(&self.session.cwd))
             .flatten();
-        let branch = self
-            .current_branch
-            .clone()
+        let branch = (!is_ssh_project)
+            .then(|| self.current_branch.clone())
+            .flatten()
             .or_else(|| lazy_git.as_ref().and_then(|i| i.branch.clone()))
             .map(crate::views::location::branch_label);
         if let Some(branch) = branch {
             location.push(Span::styled(branch, dim));
             location.push(Span::styled(" ", bg));
         }
-        let show_worktree_label = self.is_worktree
-            || self.session.is_worktree
-            || lazy_git.as_ref().is_some_and(|i| i.is_worktree);
+        let show_worktree_label = !is_ssh_project
+            && (self.is_worktree
+                || self.session.is_worktree
+                || lazy_git.as_ref().is_some_and(|i| i.is_worktree));
         if show_worktree_label {
             location.push(crate::views::location::worktree_badge(&theme).patch_style(bg));
         }
@@ -3876,6 +3891,25 @@ impl AgentView {
             ShortcutsBar::new(&hints).render(layout.shortcuts, buf);
             self.pane_areas = layout.pane_areas();
             return (prompt_cursor_pos, prompt_post_flush);
+        }
+        if let Some(modal_state) = &mut self.ssh_manager {
+            let overlay_area = Rect {
+                x: area.x,
+                y: area.y,
+                width: area.width,
+                height: layout.shortcuts.y.saturating_sub(area.y).saturating_sub(1),
+            };
+            let compact = self.scrollback.appearance().prompt.compact;
+            let theme = Theme::current();
+            crate::views::ssh_modal::render_ssh_modal(
+                buf,
+                overlay_area,
+                modal_state,
+                compact,
+                &theme,
+            );
+            self.pane_areas = layout.pane_areas();
+            return (None, crate::terminal::overlay::clear().map(Into::into));
         }
         if let Some(ref mut modal_state) = self.vendor_login {
             let overlay_area = Rect {

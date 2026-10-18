@@ -101,6 +101,87 @@ API key 时，为每个 key 添加独立的自定义供应商。
 | Claude 订阅 | 按 `o` 打开官方 Settings → Usage，不直接用 OAuth 查询额度；网页实际显示的是浏览器当前登录的账号。 |
 | Generic | 选择兼容的平台类型后才能查询。 |
 
+### SSH 项目与显式 SSH 工具
+
+SSH 目标自动复用 `~/.ssh/config` 和系统 SSH 配置中的具体主机别名。
+**已连接不等于已授权**，连接成功不会自动给 agent 开放访问权限。
+
+```sh
+groky ssh list
+groky ssh add my-server --id dev --label "Development"
+groky ssh open dev /srv/project
+# 已有可用于非交互登录的认证方式时：
+groky ssh connect dev
+groky ssh disconnect dev
+```
+
+先在远端安装匹配版本的 `groky`。默认远端命令为 `groky worker --stdio`，
+需要在非交互 SSH 的 `PATH` 中可用；Git、ripgrep 及项目需要的工具也应在远端可用。
+不会静默部署 worker，远端也不需要 xAI 登录。可通过
+`--worker-command '/absolute/path/groky worker --stdio'` 指定绝对路径。
+
+会话内用 `/ssh`，Welcome 页按 `Ctrl+S` 打开管理界面。`Enter` 连接/断开，
+`g` 申请指定目录的授权，`u` 选择已授权的默认目标，`r` 撤权，`o` 打开远端项目。
+支持密码、带口令私钥、ssh-agent 和 keyboard-interactive。主机信任确认与访问授权
+分别处理。密码输入隐藏；只有主动选择记住时才使用系统凭据库，凭据库不可用时禁用
+记住选项，不回退到明文文件。`ssh connect` 是非交互命令；需要输入密码或确认主机时
+请使用 `/ssh`。
+
+两种执行方式：
+
+- **SSH 项目：** 普通文件、编辑、搜索、命令和 Git 操作在远端 workspace 执行。
+  项目指令、skills、hooks、MCP、LSP 跟随远端项目；TUI、模型请求、会话记录与供应商凭据留在本地。
+  远端 hooks 收到已验证的远端 cwd/root，不会收到本地会话记录路径。
+  指令与 skills 的发现范围限定在已授权根目录内，不加载父目录指令或指向根目录外的
+  符号链接；skill 正文及斜杠 skill 命令通过远端 worker 读取，不读取本机同名路径。
+- **任意会话中的显式 SSH 工具：** `ssh_read`、`ssh_write`、`ssh_edit`、
+  `ssh_search`、`ssh_run` 可指定 `target`，显式目标优先；省略时必须已有用户选定的
+  SSH 默认授权。这个默认值不会重定向普通本地工具。`ssh_targets` 只列当前会话的
+  授权；`ssh_request_access` 只能请求用户批准，不能自行授权。
+  `ssh_task_query`、`ssh_task_cancel` 只能操作所选授权范围内的任务。
+  查询时用 `task_id` 读取任务输出，用 `operation_id` 检查已记录的操作，两者都省略
+  则列出任务；这些 ID 不能交给本地任务工具使用。
+  agent/会话的工具白名单、黑名单与能力限制仍然生效；关闭默认工具注入的自定义
+  profile 保留其显式工具列表，不自动追加 SSH 工具。
+
+授权包含远端根目录及读/写/执行能力，默认只对当前会话有效；保存为项目规则需要
+主动选择，子 agent 只能继承已授权的子集。目标授权不会绕过具体操作审批。
+**run 的工作目录不是沙箱：** 命令仍拥有远端 SSH 用户的系统权限。
+撤权立即在本地阻止新调用；断线时显示远端确认待完成，收到 worker 确认后才算完成。
+已经启动的任务需要单独取消。
+
+无交互恢复可复用已有授权，但仍需可用的非交互 SSH 认证及普通工具权限。
+需要 SSH 交互时会立即失败；`--always-approve` 不会代替远端操作审批。
+
+SSH 恢复默认只恢复对话；加 `--restore-code` 后，请求批准在已验证的远端根目录
+检出会话保存的 Git HEAD。切换 HEAD 前先 stash 当前 tracked/untracked 改动，
+结果显示 stash 引用或保护失败原因。这里是 **HEAD 级恢复**，不是恢复历史暂存区、
+未暂存或未跟踪文件快照，也不会检出本机同名目录。
+使用 `--resume <会话ID> --worktree --restore-code` 时，原远端工作区保持不变；
+新 worktree 的根目录需要单独授权，恢复只作用于该子工作区。不加 `--restore-code`
+则保留普通 worktree 的复制行为。
+
+持久覆盖写入用户级 `~/.groky/config.toml`：
+
+```toml
+[ssh.targets.dev]
+host = "my-server" # 已有的 OpenSSH 别名
+label = "Development"
+user = "developer" # 可选覆盖
+worker_command = ["/usr/local/bin/groky", "worker", "--stdio"]
+```
+
+优先级为 groky 目标配置、用户 SSH 配置、系统 SSH 配置、默认值。匹配配置保留
+first-value-wins 语义，`IdentityFile` 累积；仓库配置不能覆盖连接身份或凭据。
+这不等于完整兼容 OpenSSH：生效但尚不支持的指令会明确报错，不会静默忽略，
+例如 `Match exec`、GSSAPI 认证、ControlMaster 和 agent 转发。
+
+连接池独立于单次工具调用，支持复用和持有。默认嵌入式 TUI 的连接池随该进程存活；
+使用 `groky --leader` 可与其他 leader 模式 TUI 及 `groky ssh connect` 的手动持有共享
+持久连接池，但授权仍按会话隔离。传输中断不会自动重放 write、edit 或 run。
+私有远端 worker 在 SSH channel 断开后继续持有任务；worker 自身退出时，未完成结果
+记为未知，不能据此认定远端没有产生副作用。
+
 ## 相对官方改了什么
 
 | 做了 | 没动 |

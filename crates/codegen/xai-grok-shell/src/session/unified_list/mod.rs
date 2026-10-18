@@ -574,6 +574,7 @@ mod tests {
             updated_at: updated_at.into(),
             created_at: "2026-01-01T00:00:00Z".into(),
             cwd: "/Users/me/xai".into(),
+            project_location: None,
             hostname: Some("devbox".into()),
             source: "local".into(),
             model_id: Some("grok-build".into()),

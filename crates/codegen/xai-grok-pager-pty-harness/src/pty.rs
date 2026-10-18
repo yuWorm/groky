@@ -125,6 +125,17 @@ impl PtyController {
         cwd: Option<&Path>,
         sandbox: Option<&TestSandbox>,
     ) -> Result<Self> {
+        // The child often runs in an ephemeral workspace, so a path such as
+        // `target/debug/groky` must be anchored before that cwd is applied.
+        // Keep a bare program name untouched so callers may still use PATH.
+        let executable = if binary.is_relative() && binary.components().count() > 1 {
+            std::env::current_dir()
+                .context("resolve current directory for relative PTY executable")?
+                .join(binary)
+        } else {
+            binary.to_path_buf()
+        };
+
         let pty_system = native_pty_system();
         let pair = pty_system.openpty(size)?;
 
@@ -133,7 +144,7 @@ impl PtyController {
         let child: Box<dyn portable_pty::Child + Send> = {
             let env_map = crate::pty_spawn::compute_child_env(sandbox, env);
             let dir = crate::pty_spawn::resolve_child_cwd(cwd, env_map.get(OsStr::new("HOME")))?;
-            let mut cmd = std::process::Command::new(binary);
+            let mut cmd = std::process::Command::new(&executable);
             cmd.args(args).env_clear().envs(&env_map).current_dir(dir);
             Box::new(crate::pty_spawn::spawn_pty_session_child(
                 cmd,
@@ -145,7 +156,7 @@ impl PtyController {
         // before enrollment; diagnostics preserve that downgrade.
         #[cfg(windows)]
         let child = {
-            let mut cmd = portable_pty::CommandBuilder::new(binary);
+            let mut cmd = portable_pty::CommandBuilder::new(&executable);
             for arg in args {
                 cmd.arg(*arg);
             }

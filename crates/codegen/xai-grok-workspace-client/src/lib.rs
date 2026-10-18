@@ -5,14 +5,18 @@
     unreachable_code,
     dead_code
 )]
-//! Typed client for hub-proxied `workspace.*` RPC methods, the single transport for the `workspace_rpc` channel.
-//! `WorkspaceOps` proxy mode and consumers that cannot depend on `xai-grok-workspace` both use it.
-//! Wire types live in `xai_grok_workspace_types::rpc`.
-//! This crate adds the connected-state latch, the generic [`WorkspaceClient::rpc`] core, and error mapping.
+//! Typed clients for remote `workspace.*` RPC methods.
+//!
+//! [`WorkspaceClient`] retains the existing Hub `workspace_rpc` transport.
+//! [`ssh::SshWorkspaceClient`] is the authenticated SSH-worker transport with
+//! binding/epoch authorization, streaming callbacks, approval control, and
+//! mutation lookup. Wire types live in `xai_grok_workspace_types::{rpc,ssh_wire}`.
 //!
 //! No deadline is imposed by default ([`WorkspaceClient::with_deadline`] opts in).
 //! That preserves the `WorkspaceOps::rpc_raw` behaviour where callers own their timeouts.
 #![deny(clippy::indexing_slicing)]
+
+pub mod ssh;
 use serde_json::Value;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};

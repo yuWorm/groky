@@ -60,6 +60,7 @@ pub mod rewind;
 pub mod screen_mode_switch;
 pub mod session_info;
 pub mod settings_cmd;
+pub mod ssh;
 pub mod share;
 pub mod sync_models_dev;
 pub mod tasks;
@@ -86,6 +87,7 @@ pub fn builtin_commands() -> Vec<Arc<dyn SlashCommand>> {
         // The rows the dropdown shows before it scrolls.
         Arc::new(tutorial::TutorialCommand),
         Arc::new(settings_cmd::SettingsCommand),
+        Arc::new(ssh::SshCommand),
         Arc::new(dashboard::DashboardCommand),
         Arc::new(workflows::WorkflowsCommand),
         Arc::new(plugin::PluginsCommand),

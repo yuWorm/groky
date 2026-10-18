@@ -342,6 +342,12 @@ impl SessionActor {
         }
         let new_agent_name = definition.name.clone();
         let previous_mcp_servers = self.agent.borrow().definition().mcp_servers.clone();
+        let ssh_resource = if self.workspace_ops.is_ssh() {
+            let bridge = self.agent.borrow().tool_bridge().clone();
+            bridge.read_resource::<crate::ssh::SessionSshResource>().await
+        } else {
+            None
+        };
         tracing::info!(
             session_id = %self.session_info.id.0,
             new_agent_type = %new_agent_name,
@@ -362,6 +368,19 @@ impl SessionActor {
                     "rebuild_agent: build failed for agent_type={new_agent_name}: {e}"
                 ))
             })?;
+        let new_bridge = new_agent.tool_bridge().clone();
+        if self.workspace_ops.is_ssh() {
+            self.workspace_ops
+                .register_remote_tools(&new_bridge)
+                .await
+                .map_err(|error| {
+                    acp::Error::internal_error()
+                        .data(format!("failed to register remote workspace tools after rebuild: {error}"))
+                })?;
+            if let Some(resource) = ssh_resource {
+                new_bridge.update_resource(resource).await;
+            }
+        }
         let new_system_prompt = new_agent.system_prompt().to_string();
         let mut new_prompt_context = new_agent.prompt_context().clone();
         new_prompt_context.normalize_for_persistence();

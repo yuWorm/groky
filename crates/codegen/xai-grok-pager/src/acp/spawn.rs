@@ -35,6 +35,10 @@ const UPLOAD_DRAIN_AT_CANCEL: Duration = Duration::from_secs(1);
 /// long detached archive build would otherwise hold `/quit` for its duration.
 const WORKER_RUNTIME_SHUTDOWN_GRACE: Duration = Duration::from_secs(2);
 
+/// Stable client identity for the sole interactive pager attached to an
+/// embedded agent. Headless agents intentionally have no SSH control client.
+pub(crate) const EMBEDDED_SSH_CLIENT_ID: u64 = 1;
+
 /// Cancels `token` unless disarmed. Held across the bootstrap join so a
 /// connect-timeout drop (which does not abort `spawn_blocking`) stops the worker.
 struct BootstrapCancelGuard {
@@ -115,6 +119,10 @@ pub struct SpawnedAgent {
     /// The agent's `AuthManager`, shared so pager-side consumers (e.g. the voice
     /// channel) resolve the same refreshing bearer as chat traffic.
     pub auth_manager: std::sync::Arc<AuthManager>,
+    /// The sole embedded SSH authority shared with this agent. It is retained for headless
+    /// workers too, but only an interactive pager assigns a local control identity.
+    pub ssh_service: std::sync::Arc<xai_grok_shell::ssh::SessionSsh>,
+    pub ssh_client_id: Option<u64>,
 }
 
 /// The single teardown mechanism for an in-process agent: cancels the worker and joins it on drop, so session
@@ -269,6 +277,7 @@ pub async fn spawn_grok_shell(
     agent_config: AgentConfig,
     cancel: &CancellationToken,
     memory_config: Option<xai_grok_shell::config::MemoryConfig>,
+    ssh_client_id: Option<u64>,
 ) -> Result<SpawnedAgent> {
     let auth_manager = boot_auth_manager(&grok_home(), &agent_config);
     // Pause token refreshes across system sleep so an OIDC refresh can't
@@ -326,6 +335,8 @@ pub async fn spawn_grok_shell(
     // Clone before `auth_manager` is moved into the agent closure below, so the
     // pager (voice channel) can share the same refreshing bearer.
     let auth_manager_for_pager = auth_manager.clone();
+    let ssh_service = std::sync::Arc::new(xai_grok_shell::ssh::SessionSsh::new(grok_home()));
+    let ssh_service_for_agent = std::sync::Arc::clone(&ssh_service);
 
     let skills_paths = agent_config.skills.paths.clone();
 
@@ -336,6 +347,7 @@ pub async fn spawn_grok_shell(
             let _t = xai_grok_telemetry::instrumentation::timer("startup.worker_spawn.agent_build");
             let mut agent =
                 MvpAgent::with_models(gateway, &agent_config, auth_manager, models_manager);
+            agent.set_session_ssh(ssh_service_for_agent, ssh_client_id);
             drop(_t);
             if let Some(mc) = memory_config {
                 agent.set_memory_config(mc);
@@ -356,6 +368,8 @@ pub async fn spawn_grok_shell(
         channel: acp_client,
         cancel: agent_cancel,
         auth_manager: auth_manager_for_pager,
+        ssh_service,
+        ssh_client_id,
     })
 }
 

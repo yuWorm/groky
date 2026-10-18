@@ -83,6 +83,7 @@ async fn handle_bridge_tool_success_multimodal_mcp_image_deferred_followup() {
                     model_id: "test-model",
                     tool_parsed_args: &parsed_args,
                     model_output_override: None,
+                    remote_output_replaced: false,
                 })
                 .await
                 .expect("bridge success");
@@ -123,7 +124,7 @@ async fn handle_bridge_tool_success_multimodal_mcp_image_deferred_followup() {
         .await;
 }
 #[tokio::test(flavor = "current_thread")]
-async fn handle_bridge_tool_success_replacement_drops_images_and_keeps_reminders() {
+async fn handle_bridge_tool_success_remote_replacement_drops_images_and_keeps_reminders() {
     let local = tokio::task::LocalSet::new();
     local
         .run_until(async {
@@ -137,9 +138,8 @@ async fn handle_bridge_tool_success_replacement_drops_images_and_keeps_reminders
                 .await;
             let payload = vision_ok_png_b64();
             let mut result = mcp_screenshot_result(&payload);
-            result.prompt_text = format!(
-                "{IMAGE_CONTENT_PLACEHOLDER}\n\n<system-reminder>\nturn reminder\n</system-reminder>"
-            );
+            result.prompt_text =
+                "[remote redacted]\n\n<system-reminder>\nturn reminder\n</system-reminder>".into();
             let parsed_args = serde_json::json!({});
             let followups = actor
                 .handle_bridge_tool_success(BridgeToolSuccess {
@@ -152,7 +152,8 @@ async fn handle_bridge_tool_success_replacement_drops_images_and_keeps_reminders
                     coercion_note: None,
                     model_id: "test-model",
                     tool_parsed_args: &parsed_args,
-                    model_output_override: Some("[redacted]".to_string()),
+                    model_output_override: None,
+                    remote_output_replaced: true,
                 })
                 .await
                 .expect("bridge success");
@@ -163,8 +164,8 @@ async fn handle_bridge_tool_success_replacement_drops_images_and_keeps_reminders
             let conv = actor.chat_state_handle.get_conversation().await;
             let text = last_tool_result_text(&conv);
             assert!(
-                text.starts_with("[redacted]"),
-                "the replacement is what the model reads: {text}"
+                text.starts_with("[remote redacted]"),
+                "the remote replacement is what the model reads: {text}"
             );
             assert!(
                 text.contains("turn reminder"),
@@ -279,6 +280,7 @@ async fn post_tool_use_replacement_reaches_model_original_stays_on_record() {
                     model_id: "test-model",
                     tool_parsed_args: &serde_json::json!({}),
                     model_output_override,
+                    remote_output_replaced: false,
                 })
                 .await
                 .expect("bridge success");

@@ -1493,12 +1493,19 @@ impl FinalizedToolset {
             version: tool.contract_version.clone(),
         })
     }
-    /// Client-facing name for a canonical registry ID, honoring name overrides.
+    /// Client-facing name for a registry ID, optionally namespace-qualified.
+    /// Honors client name overrides without confusing the namespace with the ID.
     pub fn tool_name_for_registry_id(&self, registry_id: &str) -> Option<String> {
+        let (namespace, id) = registry_id
+            .split_once(':')
+            .map_or((None, registry_id), |(namespace, id)| (Some(namespace), id));
         self.tools
             .read()
             .iter()
-            .find(|tool| tool.registry_id == registry_id)
+            .find(|tool| {
+                tool.registry_id == id
+                    && namespace.is_none_or(|namespace| tool.namespace == namespace)
+            })
             .map(|tool| tool.client_name.clone())
     }
     /// Map of client-facing tool name → snake_case [`ToolKind`] key.

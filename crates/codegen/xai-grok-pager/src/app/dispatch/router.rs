@@ -1277,6 +1277,86 @@ fn dispatch_inner(action: Action, app: &mut AppView) -> Vec<Effect> {
         Action::OpenVendorLogin { provider_id } => {
             super::vendor::dispatch_open_vendor_login(app, provider_id)
         }
+        Action::OpenSshManager => super::ssh::dispatch_open_ssh_manager(app),
+        Action::RefreshSshTargets => super::ssh::dispatch_refresh_ssh_targets(app),
+        Action::AddSshTarget(draft) => super::ssh::dispatch_add_ssh_target(app, draft),
+        Action::ConnectSshTarget { target_id } => {
+            super::ssh::dispatch_connect_ssh_target(app, target_id)
+        }
+        Action::DisconnectSshTarget { target_id } => {
+            super::ssh::dispatch_disconnect_ssh_target(app, target_id)
+        }
+        Action::RequestSshGrant {
+            target_id,
+            root,
+            capabilities,
+            lifetime,
+            set_default,
+        } => super::ssh::dispatch_request_ssh_grant(
+            app,
+            target_id,
+            root,
+            capabilities,
+            lifetime,
+            set_default,
+        ),
+        Action::InspectSshGrantTarget {
+            request_id,
+            target_id,
+        } => super::ssh::dispatch_inspect_ssh_grant_target(app, request_id, target_id),
+        Action::ApproveSshGrant {
+            request_id,
+            approved,
+            target_id,
+            root,
+            capabilities,
+            lifetime,
+            set_default,
+        } => super::ssh::dispatch_approve_ssh_grant(
+            app,
+            request_id,
+            approved,
+            target_id,
+            root,
+            capabilities,
+            lifetime,
+            set_default,
+        ),
+        Action::UseSshBinding { binding_id } => super::ssh::dispatch_use_ssh_binding(app, binding_id),
+        Action::RevokeSshBinding { binding_id } => {
+            super::ssh::dispatch_revoke_ssh_binding(app, binding_id)
+        }
+        Action::OpenSshProject {
+            target_id,
+            root,
+            binding_id,
+            capabilities,
+        } => super::ssh::dispatch_open_ssh_project(app, target_id, root, binding_id, capabilities),
+        Action::BeginSshProjectOpen(project) => {
+            super::ssh::dispatch_begin_ssh_project_open(app, project)
+        }
+        Action::ApproveSshOperation {
+            approval_id,
+            approved,
+        } => super::ssh::dispatch_approve_ssh_operation(app, approval_id, approved),
+        Action::SubmitSshAuthentication {
+            challenge_id,
+            connection_generation,
+            target_id,
+            accept_host_key,
+            remember,
+            secret,
+            answers,
+        } => super::ssh::dispatch_submit_ssh_authentication(
+            app,
+            challenge_id,
+            connection_generation,
+            target_id,
+            accept_host_key,
+            remember,
+            secret,
+            answers,
+        ),
         Action::SubmitVendorKey { provider_id, key } => {
             super::vendor::dispatch_submit_vendor_key(app, provider_id, key)
         }

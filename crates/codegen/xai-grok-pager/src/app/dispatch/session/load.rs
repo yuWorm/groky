@@ -419,12 +419,12 @@ pub(in crate::app::dispatch) fn dispatch_pick_session(
     if xai_grok_shell::session::resolve_local_session(&session_id, &local_cwd).is_some() {
         return dispatch_load_session(app, session_id, None, false);
     }
-    if let Some(original_cwd) = xai_grok_shell::session::resolve_local_session_any_cwd(&session_id)
+    if let Some(storage_cwd) = xai_grok_shell::session::resolve_local_session_any_cwd(&session_id)
     {
         return dispatch_load_session(
             app,
             session_id,
-            Some(std::path::PathBuf::from(original_cwd)),
+            crate::app::session_startup::local_cwd_from_session_storage(&storage_cwd),
             false,
         );
     }
@@ -1052,12 +1052,12 @@ pub(in crate::app::dispatch) fn dispatch_pick_content_session(
     if xai_grok_shell::session::resolve_local_session(&session_id, &local_cwd).is_some() {
         return dispatch_load_session(app, session_id, None, false);
     }
-    if let Some(original_cwd) = xai_grok_shell::session::resolve_local_session_any_cwd(&session_id)
+    if let Some(storage_cwd) = xai_grok_shell::session::resolve_local_session_any_cwd(&session_id)
     {
         return dispatch_load_session(
             app,
             session_id,
-            Some(std::path::PathBuf::from(original_cwd)),
+            crate::app::session_startup::local_cwd_from_session_storage(&storage_cwd),
             false,
         );
     }
@@ -1359,13 +1359,19 @@ pub(in crate::app::dispatch) fn handle_session_loaded(
             ));
         }
         effects.push(Effect::RegisterActiveSession {
-            session_id: hydrate_sid,
+            session_id: hydrate_sid.clone(),
             cwd: agent.session.cwd.display().to_string(),
         });
         notify_session_ready(&app.notification_service, agent);
         crate::memory_release::release_retained_memory("session-load-replay");
         note_peek_page_flip(app, agent_id, page_flip_entry);
         identity_rebind.apply(app);
+        effects.extend(
+            crate::app::dispatch::session::lifecycle::dispatch_loaded_session_in_worktree(
+                app,
+                &hydrate_sid,
+            ),
+        );
         return effects;
     }
     vec![]

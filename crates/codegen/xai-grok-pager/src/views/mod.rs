@@ -52,6 +52,7 @@ pub mod session_title;
 pub mod settings_modal;
 pub mod shortcuts_bar;
 pub mod shortcuts_help;
+pub mod ssh_modal;
 pub mod slash_dropdown;
 pub mod status_bar;
 pub mod status_line;

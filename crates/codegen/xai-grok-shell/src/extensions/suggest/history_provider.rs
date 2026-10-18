@@ -154,7 +154,7 @@ fn scan_cross_cwd_prompts() -> Vec<String> {
             break;
         }
 
-        let cwd = match crate::util::grok_home::decode_cwd_from_dirname(dir) {
+        let cwd = match xai_grok_shared::session::storage_cwd_from_dirname(dir) {
             Some(decoded) => decoded,
             None => continue,
         };

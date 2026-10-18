@@ -1049,6 +1049,14 @@ pub struct AppView {
     pub import_claude_modal: Option<crate::views::import_claude_modal::ImportClaudeModalState>,
     /// Provider login modal on Welcome (no session yet).
     pub(crate) welcome_vendor_login: Option<crate::views::vendor_login_modal::VendorLoginState>,
+    /// SSH manager available before provider/model authentication.
+    pub(crate) welcome_ssh_manager: Option<crate::views::ssh_modal::SshManagerState>,
+    /// Stable local-control identity for SSH authentication and consent events.
+    pub(crate) ssh_client_id: u64,
+    /// Exactly one local-control receiver owns this pager connection's SSH event stream.
+    pub(crate) ssh_event_consumer_active: bool,
+    /// A pre-minted CLI SSH project waiting for explicit local grant consent.
+    pub(crate) pending_ssh_project_open: Option<crate::app::cli::SshProjectOpen>,
     /// Doc viewer overlay for the welcome screen (release notes via Ctrl+L).
     pub welcome_doc_viewer: Option<crate::views::modal::ActiveModal>,
     /// Whether the pager uses fullscreen (alt-screen) or inline mode.
@@ -1567,6 +1575,10 @@ impl AppView {
             has_claude_import: false,
             import_claude_modal: None,
             welcome_vendor_login: None,
+            welcome_ssh_manager: None,
+            ssh_client_id: rand::random(),
+            ssh_event_consumer_active: false,
+            pending_ssh_project_open: None,
             welcome_doc_viewer: None,
             screen_mode: ScreenMode::Inline,
             pending_screen_mode_switch: None,
@@ -2330,7 +2342,19 @@ impl AppView {
         );
         #[cfg(feature = "local-workspace")]
         let session_picker_open = self.session_picker_entries.is_some() || sp_loading;
-        if matches!(self.active_view, ActiveView::Welcome) && self.welcome_vendor_login.is_some() {
+        // The document viewer is painted over welcome modals, so it owns input until dismissed.
+        // Otherwise an asynchronously opened changelog can visibly cover the SSH or vendor card
+        // while Escape is delivered to the covered card instead.
+        if matches!(self.active_view, ActiveView::Welcome)
+            && self.welcome_doc_viewer.is_none()
+            && self.welcome_ssh_manager.is_some()
+        {
+            return crate::app::dispatch::ssh::handle_welcome_ssh_input(self, ev);
+        }
+        if matches!(self.active_view, ActiveView::Welcome)
+            && self.welcome_doc_viewer.is_none()
+            && self.welcome_vendor_login.is_some()
+        {
             return crate::app::dispatch::vendor::handle_welcome_vendor_login_input(self, ev);
         }
         let outcome = match self.active_view {
@@ -3567,6 +3591,9 @@ fn handle_welcome_input(ev: &Event, ctx: &mut WelcomeInputCtx<'_>) -> InputOutco
         if key.kind == KeyEventKind::Release {
             return InputOutcome::Unchanged;
         }
+        if key!('s', CONTROL).matches(key) {
+            return InputOutcome::Action(Action::OpenSshManager);
+        }
         if ctx.has_pending_update && key!('u', CONTROL).matches(key) {
             return InputOutcome::Action(Action::QuitForUpdate);
         }
@@ -4562,6 +4589,16 @@ impl AppView {
                                     compact,
                                 );
                             }
+                            if let Some(modal_state) = self.welcome_ssh_manager.as_mut() {
+                                let theme = crate::theme::Theme::current();
+                                crate::views::ssh_modal::render_ssh_modal(
+                                    f.buffer_mut(),
+                                    view_area,
+                                    modal_state,
+                                    compact,
+                                    &theme,
+                                );
+                            }
                             if let Some(dialog) = self.new_worktree_dialog.as_ref() {
                                 crate::views::new_worktree_dialog::render_new_worktree_dialog(
                                     view_area,
@@ -5056,6 +5093,7 @@ impl AppView {
         matches!(self.active_view, ActiveView::Agent(id) if self.agents.get(&id).is_some_and(|a| a.extensions_modal.is_some() || a.active_modal.is_some()))
             || self.import_claude_modal.is_some()
             || self.welcome_vendor_login.is_some()
+            || self.welcome_ssh_manager.is_some()
             || self.new_worktree_dialog.is_some()
             || self.welcome_doc_viewer.is_some()
             || self.tutorial.is_some()

@@ -1,4 +1,4 @@
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 pub const MAX_PAYLOAD_SIZE: usize = 128 * 1024;
 
@@ -253,14 +253,14 @@ pub fn clip_reason(reason: &str) -> String {
     clip_text(reason, MAX_REASON_CHARS)
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum SubagentStopPhase {
     Gate,
     Observe,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct StopBackgroundTask {
     pub id: String,
@@ -274,7 +274,7 @@ pub struct StopBackgroundTask {
     pub agent_type: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct StopSessionCron {
     pub id: String,
@@ -283,7 +283,7 @@ pub struct StopSessionCron {
     pub prompt: String,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum BackgroundTaskType {
     Shell,
@@ -298,6 +298,7 @@ pub enum BackgroundTaskType {
     PartialEq,
     Eq,
     Serialize,
+    Deserialize,
     strum::AsRefStr,
     strum::IntoStaticStr,
     strum::EnumIter,
@@ -320,6 +321,7 @@ pub enum StopFailureKind {
     PartialEq,
     Eq,
     Serialize,
+    Deserialize,
     strum::AsRefStr,
     strum::IntoStaticStr,
     strum::EnumIter,
@@ -335,7 +337,7 @@ pub enum StopCancelledReason {
     Unknown,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CancelledBy {
     User,
@@ -354,7 +356,7 @@ impl StopCancelledReason {
         }
     }
 }
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct HookEventEnvelope {
     pub hook_event_name: HookEventName,
@@ -407,7 +409,7 @@ impl HookEventEnvelope {
     }
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum HookPayload {
     SessionStart {

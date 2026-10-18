@@ -129,6 +129,138 @@ impl AgentView {
             mouse.row,
         ))
     }
+    pub(super) fn handle_ssh_manager_key(&mut self, key: &KeyEvent) -> InputOutcome {
+        let outcome = {
+            let Some(state) = &mut self.ssh_manager else {
+                return InputOutcome::Unchanged;
+            };
+            crate::views::ssh_modal::handle_ssh_key(state, key)
+        };
+        self.map_ssh_modal_outcome(outcome)
+    }
+
+    pub(super) fn handle_ssh_manager_paste(&mut self, text: &str) -> InputOutcome {
+        let outcome = {
+            let Some(state) = &mut self.ssh_manager else {
+                return InputOutcome::Unchanged;
+            };
+            crate::views::ssh_modal::handle_ssh_paste(state, text)
+        };
+        self.map_ssh_modal_outcome(outcome)
+    }
+
+    pub(super) fn handle_ssh_manager_mouse(&mut self, mouse: &MouseEvent) -> InputOutcome {
+        let outcome = {
+            let Some(state) = &mut self.ssh_manager else {
+                return InputOutcome::Unchanged;
+            };
+            crate::views::ssh_modal::handle_ssh_mouse(state, mouse)
+        };
+        self.map_ssh_modal_outcome(outcome)
+    }
+
+    fn map_ssh_modal_outcome(
+        &mut self,
+        outcome: crate::views::ssh_modal::SshModalOutcome,
+    ) -> InputOutcome {
+        use crate::views::ssh_modal::SshModalOutcome;
+
+        match outcome {
+            SshModalOutcome::Close => {
+                self.ssh_manager = None;
+                InputOutcome::Changed
+            }
+            SshModalOutcome::Changed => InputOutcome::Changed,
+            SshModalOutcome::Unchanged => InputOutcome::Unchanged,
+            SshModalOutcome::Refresh => InputOutcome::Action(Action::RefreshSshTargets),
+            SshModalOutcome::AddTarget(draft) => InputOutcome::Action(Action::AddSshTarget(draft)),
+            SshModalOutcome::Connect { target_id } => {
+                InputOutcome::Action(Action::ConnectSshTarget { target_id })
+            }
+            SshModalOutcome::Disconnect { target_id } => {
+                InputOutcome::Action(Action::DisconnectSshTarget { target_id })
+            }
+            SshModalOutcome::RequestGrant {
+                target_id,
+                root,
+                capabilities,
+                lifetime,
+                set_default,
+            } => InputOutcome::Action(Action::RequestSshGrant {
+                target_id,
+                root,
+                capabilities,
+                lifetime,
+                set_default,
+            }),
+            SshModalOutcome::ApproveGrant {
+                request_id,
+                approved,
+                target_id,
+                root,
+                capabilities,
+                lifetime,
+                set_default,
+            } => InputOutcome::Action(Action::ApproveSshGrant {
+                request_id,
+                approved,
+                target_id,
+                root,
+                capabilities,
+                lifetime,
+                set_default,
+            }),
+            SshModalOutcome::InspectGrantTarget {
+                request_id,
+                target_id,
+            } => InputOutcome::Action(Action::InspectSshGrantTarget {
+                request_id,
+                target_id,
+            }),
+            SshModalOutcome::UseBinding { binding_id } => {
+                InputOutcome::Action(Action::UseSshBinding { binding_id })
+            }
+            SshModalOutcome::RevokeBinding { binding_id } => {
+                InputOutcome::Action(Action::RevokeSshBinding { binding_id })
+            }
+            SshModalOutcome::OpenProject {
+                target_id,
+                root,
+                binding_id,
+                capabilities,
+            } => InputOutcome::Action(Action::OpenSshProject {
+                target_id,
+                root,
+                binding_id,
+                capabilities,
+            }),
+            SshModalOutcome::ApproveOperation {
+                approval_id,
+                approved,
+            } => InputOutcome::Action(Action::ApproveSshOperation {
+                approval_id,
+                approved,
+            }),
+            SshModalOutcome::AnswerAuthentication {
+                challenge_id,
+                connection_generation,
+                target_id,
+                accept_host_key,
+                remember,
+                secret,
+                answers,
+            } => InputOutcome::Action(Action::SubmitSshAuthentication {
+                challenge_id,
+                connection_generation,
+                target_id,
+                accept_host_key,
+                remember,
+                secret,
+                answers,
+            }),
+    }
+    }
+
 
     /// The sole feedback-open guard for already-present blocking surfaces.
     /// `None` means nothing on this view owns input ahead of the modal; the dispatcher still checks session and screen mode.

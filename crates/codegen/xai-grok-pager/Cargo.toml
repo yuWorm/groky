@@ -78,6 +78,7 @@ tokio-util = { workspace = true, features = ["compat"] }
 tempfile = { workspace = true, optional = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
+zeroize = "1"
 
 # Binary hardening: compile-time string obfuscation.
 # (cryptify / rustls / semver / tikv-jemallocator moved to the composition-root
@@ -116,6 +117,7 @@ xai-grok-voice = { path = "../xai-grok-voice", default-features = false, feature
 xai-grok-login = { workspace = true }
 xai-grok-cloud-config = { workspace = true }
 xai-grok-shell = { path = "../xai-grok-shell", default-features = false }
+xai-grok-ssh = { workspace = true }
 # The status-line contract: the config the user writes and the payload the
 # agent sends. A leaf crate rather than the agent's, so the client reads it
 # from upstream of the crate that fills it in.

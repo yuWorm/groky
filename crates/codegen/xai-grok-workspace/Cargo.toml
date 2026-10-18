@@ -26,7 +26,9 @@ strum = { workspace = true }
 tokio = { workspace = true, features = [
     "fs",
     "io-std",
+    "io-util",
     "macros",
+    "net",
     "process",
     "rt",
     "rt-multi-thread",

@@ -62,6 +62,7 @@ reqwest-middleware = { workspace = true }
 serde = { workspace = true }
 serde_ignored = "0.1"
 serde_json = { workspace = true, features = ["preserve_order"] }
+schemars = { workspace = true }
 thiserror = { workspace = true }
 clap = { workspace = true }
 toml = { workspace = true, features = ["preserve_order"] }
@@ -86,6 +87,7 @@ obfstr = { workspace = true }
 tokio-util = { workspace = true, features = ["compat", "rt"] }
 tokio-retry = { workspace = true }
 uuid = { workspace = true, features = ["v4", "v5", "v7"] }
+zeroize = "1"
 xai-acp-lib = { workspace = true }
 axum = { workspace = true, features = ["ws", "multipart"] }
 backon = { workspace = true }
@@ -150,9 +152,12 @@ xai-grok-session-search = { workspace = true }
 xai-token-estimation = { workspace = true }
 xai-grok-sampling-types = { path = "../xai-grok-sampling-types" }
 xai-grok-tools = { path = "../xai-grok-tools" }
+xai-grok-workspace = { workspace = true }
+xai-grok-workspace-client = { path = "../xai-grok-workspace-client" }
+xai-grok-workspace-types = { path = "../xai-grok-workspace-types" }
+xai-grok-ssh = { path = "../xai-grok-ssh" }
 xai-tty-utils = { workspace = true }
 xai-workflow = { path = "../xai-workflow" }
-xai-grok-workspace = { workspace = true }
 # Backs the compatibility-only `xai_grok_shell::foreign_sessions` re-export.
 xai-grok-foreign-sessions = { workspace = true }
 xai-grok-subagent-resolution = { path = "../xai-grok-subagent-resolution" }

@@ -432,6 +432,34 @@ pub(crate) fn parse_session_memory_mode(
         .cloned()
         .and_then(|value| serde_json::from_value(value).ok())
 }
+/// Decode the shell's authoritative project-location wire into pager display
+/// state. This value is never used as a local filesystem path.
+pub(crate) fn parse_ssh_project_location_value(
+    value: Option<&serde_json::Value>,
+) -> Option<crate::app::agent_view::SshProjectLocation> {
+    let value = value?;
+    if value.get("type").and_then(serde_json::Value::as_str)? != "ssh" {
+        return None;
+    }
+    let data = value.get("data")?;
+    let target_id = data.get("target_id").and_then(serde_json::Value::as_str)?;
+    let root = data.get("root").and_then(serde_json::Value::as_str)?;
+    if target_id.trim().is_empty() || root.trim().is_empty() {
+        return None;
+    }
+    Some(crate::app::agent_view::SshProjectLocation {
+        target_id: target_id.to_owned(),
+        root: root.to_owned(),
+    })
+}
+/// Read the authoritative SSH project identity from an ACP session response.
+pub(crate) fn parse_ssh_project_location_meta(
+    resp_meta: Option<&acp::Meta>,
+) -> Option<crate::app::agent_view::SshProjectLocation> {
+    parse_ssh_project_location_value(
+        resp_meta.and_then(|meta| meta.get(xai_grok_shell::project::PROJECT_LOCATION_META_KEY)),
+    )
+}
 /// Whether `raw` is (or wraps) a disk-full / ENOSPC failure.
 pub(crate) fn is_disk_full_error(raw: &str) -> bool {
     raw.contains(xai_fast_worktree::OUT_OF_DISK_CONTEXT)

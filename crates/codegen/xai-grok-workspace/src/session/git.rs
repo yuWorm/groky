@@ -493,6 +493,41 @@ pub struct PersistedGitMetadata {
     pub head_commit: Option<String>,
     pub head_branch: Option<String>,
 }
+
+/// Repository state read on the host that owns the workspace.
+#[derive(Debug, Default, serde::Serialize, serde::Deserialize)]
+pub struct GitHeadSnapshot {
+    pub repo_root: Option<PathBuf>,
+    pub branch: Option<String>,
+    pub commit: Option<String>,
+    pub is_worktree: bool,
+    pub main_root: Option<PathBuf>,
+    pub origin_url: Option<String>,
+}
+
+pub async fn git_head_snapshot(cwd: PathBuf) -> GitHeadSnapshot {
+    tokio::task::spawn_blocking(move || {
+        let Ok(repo) = Repository::discover(cwd) else {
+            return GitHeadSnapshot::default();
+        };
+        let common_dir = repo.commondir();
+        let is_worktree = repo.path() != common_dir;
+        let head = head_reference(&repo);
+        GitHeadSnapshot {
+            repo_root: repo.workdir().map(Path::to_path_buf),
+            branch: head.as_ref().and_then(|head| {
+                head.shorthand().filter(|name| *name != "HEAD").map(str::to_owned)
+            }),
+            commit: head.as_ref().and_then(|head| head.target()).map(|oid| oid.to_string()),
+            is_worktree,
+            main_root: is_worktree.then(|| common_dir.parent().map(Path::to_path_buf)).flatten(),
+            origin_url: repo.find_remote("origin").ok()
+                .and_then(|origin| origin.url().map(strip_url_credentials)),
+        }
+    })
+    .await
+    .unwrap_or_default()
+}
 /// Resolve session-persistence git metadata: worktree root, HEAD, and deduplicated, credential-stripped remotes.
 /// Reads refs and config only, via the repo's commondir so linked worktrees resolve like the main repo.
 pub fn resolve_persisted_session_git_metadata_sync(cwd: &Path) -> PersistedGitMetadata {
@@ -2027,7 +2062,7 @@ pub fn should_warn_registry_disabled(is_jj: bool, registry_present: bool) -> boo
 }
 /// Outcome of a [`checkout_session_commit`] call. `checked_out: true` means HEAD is at the requested commit after this call returned.
 /// That includes the no-op early-return where HEAD was already at the target.
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Default, Clone, serde::Serialize, serde::Deserialize)]
 pub struct CheckoutSessionOutcome {
     pub checked_out: bool,
     pub stash_ref: Option<String>,

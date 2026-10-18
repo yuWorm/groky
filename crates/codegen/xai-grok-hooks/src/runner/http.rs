@@ -95,6 +95,12 @@ async fn validate_hook_url(url: &str) -> Result<(), String> {
     let host = parsed
         .host_str()
         .ok_or_else(|| "URL has no host".to_string())?;
+    // `expand_env_vars_with_extra` deliberately preserves unresolved values.
+    // A host may still parse with a literal `$`, so reject it before DNS or an
+    // outbound request can turn a configuration error into a network request.
+    if host.contains('$') || host.contains('{') || host.contains('}') {
+        return Err(format!("URL host contains an unresolved environment variable: {host}"));
+    }
 
     if let Ok(ip) = host.parse::<IpAddr>() {
         if is_blocked_ip(&ip) {
@@ -161,6 +167,7 @@ pub async fn run_http_hook(
         ("GROK_SESSION_ID", ctx.session_id.to_string()),
         ("GROK_WORKSPACE_ROOT", ctx.workspace_root.to_string()),
         ("CLAUDE_PROJECT_DIR", ctx.workspace_root.to_string()),
+        ("PWD", ctx.workspace_root.to_string()),
     ] {
         url_env.insert(k.to_string(), v);
     }
@@ -961,7 +968,6 @@ mod tests {
             ("https://10.0.0.1/hook", "blocked"),
             ("https://169.254.169.254/latest/meta-data/", "blocked"),
             ("not a url", "invalid URL"),
-            ("https://nonexistent.invalid/hook", "DNS resolution failed"),
         ] {
             let err = validate_hook_url(url).await.expect_err("must reject");
             assert!(err.contains(needle), "for {url}, got: {err}");

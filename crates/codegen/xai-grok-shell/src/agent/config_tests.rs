@@ -5967,6 +5967,37 @@ fn config_accepts_all_known_sections() {
         "false positive on valid config: {unused:?}"
     );
 }
+
+#[test]
+fn ssh_targets_are_accepted_as_opaque_user_global_records() {
+    let target_config = r#"
+        [ssh.targets.fixture-key]
+        label = "Fixture key"
+        host = "fixture-key"
+        user = "fixture"
+        port = 2222
+        identity_files = ["~/.ssh/fixture-key"]
+        credential_ref = "keychain:ssh/fixture-key"
+        worker_command = ["groky", "worker", "--stdio"]
+    "#;
+    let raw: toml::Value = toml::from_str(target_config).expect("parse SSH target config");
+    Config::new_from_toml_cfg(&raw).expect("opaque SSH targets must not fail agent config load");
+    assert!(
+        unused_keys_from_toml(target_config).is_empty(),
+        "persisted SSH target fields must not be reported as generic config typos"
+    );
+
+    let unused = unused_keys_from_toml(
+        r#"
+            [ssh]
+            misspelled_section_setting = true
+        "#,
+    );
+    assert!(
+        unused.iter().any(|key| key == "ssh.misspelled_section_setting"),
+        "unknown SSH siblings must retain normal serde_ignored diagnostics: {unused:?}"
+    );
+}
 #[test]
 fn config_accepts_compact_permission_section() {
     let unused = unused_keys_from_toml(

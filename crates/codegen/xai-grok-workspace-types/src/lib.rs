@@ -15,6 +15,7 @@
 //! - [`events`]: pub/sub events ([`WorkspaceEvent`]) plus the [`EventLag`] backpressure signal.
 //!   The EventBus only carries external state the workspace observed; there is no `SessionEvent` enum.
 //! - [`rpc`]: canonical wire types for the hub-proxied `workspace.*` RPC dispatch (trait, envelope, hub tool ids, per-method types).
+//! - [`ssh`] / [`ssh_wire`]: credential-free SSH binding authority and bounded worker frames.
 //! - [`types`]: supporting structs/enums referenced from requests, chunks, and events.
 //!   Many of these are minimal placeholders; the final shapes will land when the corresponding subsystems are extracted into the new workspace crate.
 //!
@@ -60,6 +61,8 @@ pub mod metadata;
 pub mod request;
 pub mod requests;
 pub mod rpc;
+pub mod ssh;
+pub mod ssh_wire;
 pub mod types;
 
 /// StartSession env whose value is the dest-less `grok-files` remount

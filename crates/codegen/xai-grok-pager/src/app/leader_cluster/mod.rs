@@ -372,6 +372,7 @@ impl PagerLeaderCluster {
             // A reconnecting client evicts strictly-older leaders, and "evict" here would signal THIS test process
             leader_binary_version: xai_grok_version::VERSION.to_string(),
         });
+        let agent_ssh = Arc::clone(&control_state.ssh);
         let sock_for_server = self.sock_path.clone();
         let cancel_for_server = cancel.clone();
         let client_count_for_server = self.client_count.clone();
@@ -395,7 +396,12 @@ impl PagerLeaderCluster {
             .await;
         }));
 
-        let agent = xai_grok_shell::leader::in_process::spawn_agent(acp_rx, response_tx).await;
+        let agent = xai_grok_shell::leader::in_process::spawn_agent(
+            acp_rx,
+            response_tx,
+            Some((agent_ssh, None)),
+        )
+        .await;
         generation_tasks.extend(agent.tasks);
         self.agent_keepalives.borrow_mut().push(agent.keepalive);
         self.generation_tasks = generation_tasks;

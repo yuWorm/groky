@@ -103,6 +103,10 @@ pub struct SkillManager {
     /// Current working directory (canonicalized).
     pub cwd: Option<PathBuf>,
 
+    /// Optional host-enforced canonical boundary for dynamically discovered
+    /// skills. Unlike cwd, this also rejects symlinks resolving outside it.
+    pub discovery_root: Option<PathBuf>,
+
     pending: Option<PendingKind>,
 
     has_pending_discovery: bool,
@@ -495,7 +499,14 @@ impl SkillManager {
     pub fn add_discovered(&mut self, skills: Vec<SkillInfo>) -> bool {
         let mut any_new = false;
         for skill in skills {
-            let canonical = canonical_path(&skill.path);
+            let canonical = if let Some(root) = &self.discovery_root {
+                match dunce::canonicalize(&skill.path) {
+                    Ok(path) if path.starts_with(root) => path,
+                    _ => continue,
+                }
+            } else {
+                canonical_path(&skill.path)
+            };
             if self.discovered_canonical_paths.contains(&canonical) {
                 continue;
             }

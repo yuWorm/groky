@@ -40,6 +40,39 @@ async fn seed_skills(actor: &SessionActor, names: &[&str]) {
         .await;
 }
 #[tokio::test(flavor = "current_thread")]
+async fn ssh_project_initialization_keeps_instructions_and_announces_skills() {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let (gateway_tx, _) =
+                tokio::sync::mpsc::unbounded_channel::<xai_acp_lib::AcpClientMessage>();
+            let (persistence_tx, _) = tokio::sync::mpsc::unbounded_channel::<PersistenceMsg>();
+            let actor = create_test_actor(0, 256_000, 85, gateway_tx, persistence_tx).await;
+            seed_skills(&actor, &["remote-build"]).await;
+            actor.chat_state_handle.replace_conversation(vec![
+                ConversationItem::project_instructions("authorized remote instructions"),
+            ]);
+            actor.initialize("base agent instructions".to_owned()).await;
+            let conversation = actor.chat_state_handle.get_conversation().await;
+            assert!(matches!(
+                conversation.first(),
+                Some(ConversationItem::System(system)) if system.content.as_ref() == "base agent instructions"
+            ));
+            let instructions = conversation.iter().filter(|item| is_project_instructions(item))
+                .collect::<Vec<_>>();
+            assert_eq!(instructions.len(), 1);
+            assert_eq!(instructions[0].text_content(), "authorized remote instructions");
+            assert!(conversation.iter().any(|item| {
+                matches!(
+                    item,
+                    ConversationItem::User(user)
+                        if user.synthetic_reason == xai_grok_sampling_types::SyntheticReason::SystemReminder
+                ) && item.text_content().contains("Does remote-build things.")
+            }));
+        })
+        .await;
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn usage_categories_include_skills_and_mcp_with_counts() {
     let local = tokio::task::LocalSet::new();
     local

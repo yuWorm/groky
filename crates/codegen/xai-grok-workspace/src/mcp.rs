@@ -17,7 +17,7 @@ use xai_computer_hub_sdk::ToolServerHandler;
 use xai_grok_mcp::rmcp;
 use xai_grok_mcp::servers::{
     InitClaimGuard, LivenessCheck, MCP_TOOL_NAME_DELIMITER, McpClient, McpClientTimeoutOverrides,
-    McpSpawnCtx, OauthInteractivity, SharedMcpState, call_tool_cancel_aware,
+    McpSpawnCtx, McpTool, OauthInteractivity, SharedMcpState, call_tool_cancel_aware,
     parse_mcp_qualified_name,
 };
 use xai_tool_protocol::{SessionId, ToolId};
@@ -1013,6 +1013,102 @@ pub(crate) async fn install_and_advertise_qualified(
             },
         )
         .await;
+    }
+    Ok(())
+}
+
+/// Install configured MCP servers into a non-Hub session and register their
+/// discovered tools in that session's finalized toolset. Hub publication is a
+/// transport concern; direct local callers still need the real MCP handlers.
+pub(crate) async fn install_and_register_local_qualified(
+    session: &WorkspaceSession,
+    toolset: &xai_grok_tools::registry::types::FinalizedToolset,
+    started: Vec<StartedMcpServer>,
+    life: u64,
+) -> WorkspaceResult<()> {
+    let mcp_state = Arc::clone(&session.mcp_state);
+    let mut advertised = 0usize;
+    let registrations: Vec<(String, Vec<xai_grok_mcp::servers::McpToolRegistration>)> = started
+        .iter()
+        .map(|server| {
+            let registrations = server
+                .bridge
+                .bridge
+                .handlers()
+                .iter()
+                .filter_map(|handler| {
+                    let description = handler.description();
+                    let server_name = description
+                        .namespace
+                        .clone()
+                        .unwrap_or_else(|| server.name.clone());
+                    McpTool::new(
+                        handler.tool_id().as_str().to_owned(),
+                        description.description,
+                        server_name,
+                        Arc::clone(&mcp_state),
+                        handler.input_schema().unwrap_or_else(|| {
+                            serde_json::json!({"type": "object", "properties": {}})
+                        }),
+                        None,
+                    )
+                    .into_registration()
+                    .map_err(|error| {
+                        tracing::warn!(server = %server.name, %error, "skipping invalid local MCP tool")
+                    })
+                    .ok()
+                })
+                .filter(|_| {
+                    if advertised >= MAX_ADVERTISED_MCP_TOOLS {
+                        false
+                    } else {
+                        advertised += 1;
+                        true
+                    }
+                })
+                .collect();
+            (server.name.clone(), registrations)
+        })
+        .collect();
+    let installed = install_servers(session, started, life).await?;
+    // Registration is synchronous, so keep it in the same life-gated binding
+    // critical section as ownership. A stop/rebind cannot leave a stale tool
+    // registration behind or remove a newer life’s registration.
+    let mut binding = session.mcp_binding.lock().await;
+    if session.mcp_epoch.load(std::sync::atomic::Ordering::SeqCst) != life {
+        return Ok(());
+    }
+    let Some(active) = binding.active_mut() else {
+        return Ok(());
+    };
+    for (server, registrations) in registrations
+        .into_iter()
+        .filter(|(server, _)| installed.contains(server))
+    {
+        let mut owned = Vec::new();
+        for registration in registrations {
+            let name = registration.name.clone();
+            match toolset.register_tool(
+                name.clone(),
+                registration.tool,
+                Some(registration.input_schema),
+            ) {
+                Ok(()) => {
+                    if let Ok(tool_id) = ToolId::new(&name) {
+                        owned.push(tool_id);
+                    }
+                }
+                Err(error) => tracing::warn!(
+                    server = %server,
+                    tool = %name,
+                    %error,
+                    "failed to register local MCP tool"
+                ),
+            }
+        }
+        if let Some(server) = active.servers.get_mut(&server) {
+            server.tool_ids = owned;
+        }
     }
     Ok(())
 }

@@ -710,6 +710,67 @@ pub struct ShellEnvironmentPolicyKnownKeys {
     pub set: Option<toml::Value>,
     pub include_only: Option<toml::Value>,
 }
+/// `[ssh]` is accepted by the normal global configuration loader solely so
+/// persisted target records do not become unrelated-config warnings. Target
+/// parsing, persistence, and resolution deliberately stay in `xai-grok-ssh`,
+/// which reads only the user-global config and never an effective/project
+/// configuration.
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(default)]
+pub struct SshConfig {
+    /// Target records are opaque here. Consuming rather than deserializing their
+    /// contents prevents this broad agent config from retaining credential-adjacent
+    /// data or accidentally becoming an SSH authority.
+    #[serde(default)]
+    pub targets: SshTargets,
+}
+
+/// Marker for target records consumed by the global configuration schema.
+#[derive(Clone, Debug, Default)]
+pub struct SshTargets;
+
+impl<'de> Deserialize<'de> for SshTargets {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        deserializer.deserialize_any(Self)
+    }
+}
+
+impl<'de> serde::de::Visitor<'de> for SshTargets {
+    type Value = Self;
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+        formatter.write_str("SSH target configuration")
+    }
+
+    fn visit_bool<E>(self, _: bool) -> Result<Self, E> { Ok(self) }
+    fn visit_i64<E>(self, _: i64) -> Result<Self, E> { Ok(self) }
+    fn visit_u64<E>(self, _: u64) -> Result<Self, E> { Ok(self) }
+    fn visit_f64<E>(self, _: f64) -> Result<Self, E> { Ok(self) }
+    fn visit_str<E>(self, _: &str) -> Result<Self, E> { Ok(self) }
+    fn visit_unit<E>(self) -> Result<Self, E> { Ok(self) }
+
+    fn visit_seq<A>(self, mut values: A) -> Result<Self, A::Error>
+    where
+        A: serde::de::SeqAccess<'de>,
+    {
+        while values.next_element::<Self>()?.is_some() {}
+        Ok(self)
+    }
+
+    fn visit_map<A>(self, mut values: A) -> Result<Self, A::Error>
+    where
+        A: serde::de::MapAccess<'de>,
+    {
+        // Consume values without retaining them. IgnoredAny would instead tell
+        // serde_ignored that these intentionally opaque keys are config typos.
+        while values.next_entry::<Self, Self>()?.is_some() {}
+        Ok(self)
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Config {
     pub features: Features,
@@ -760,6 +821,11 @@ pub struct Config {
     /// Written by the client via `config_toml_edit`; absorbed so it isn't flagged as an unrecognized key.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hints: Option<toml::Value>,
+    /// `[ssh.targets]` remains user-global target data; it is opaque to the
+    /// generic agent config so project/effective config cannot become an SSH
+    /// identity or routing authority.
+    #[serde(default, skip_serializing)]
+    pub ssh: SshConfig,
     #[serde(default)]
     pub ui: UiConfig,
     #[serde(default)]
@@ -1139,6 +1205,7 @@ impl Default for Config {
             auth_providers: IndexMap::new(),
             model_providers: IndexMap::new(),
             hints: None,
+            ssh: SshConfig::default(),
             ui: UiConfig::default(),
             toolset: ShellToolsetConfig::default(),
             shell_environment_policy: ShellEnvironmentPolicyKnownKeys::default(),

@@ -201,8 +201,19 @@ impl TurnEndCapture {
         {
             tracing::warn!("Failed to send CopyFile command, skipping session state upload");
         }
+        let remote_ops = handle.workspace_ops.is_ssh().then(|| handle.workspace_ops.clone());
         let git_sample = tokio_util::task::AbortOnDropHandle::new(tokio::spawn(async move {
-            sample_git_head(&head_cwd).await
+            if let Some(ops) = remote_ops {
+                match tokio::time::timeout(GIT_TIMEOUT, ops.git_head_snapshot()).await {
+                    Ok(Ok(snapshot)) => (
+                        snapshot.commit.map_or(GitRead::Empty, GitRead::Value),
+                        snapshot.branch,
+                    ),
+                    _ => (GitRead::Failed, None),
+                }
+            } else {
+                sample_git_head(&head_cwd).await
+            }
         }));
         Self {
             registry_claim,

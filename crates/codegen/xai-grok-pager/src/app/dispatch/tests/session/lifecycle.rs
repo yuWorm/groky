@@ -354,6 +354,45 @@ fn new_worktree_session_creates_agent_and_returns_effect() {
     ));
 }
 #[test]
+fn cold_worktree_resume_waits_for_its_exact_loaded_source() {
+    let mut app = test_app_git();
+    app.deferred_startup.session =
+        Some(crate::app::session_startup::DeferredSessionStartup::Load {
+            session_id: "source-session".into(),
+            session_cwd: None,
+            chat_kind: false,
+        });
+    app.deferred_startup.worktree = true;
+    app.deferred_startup.worktree_label = Some("remote-child".into());
+
+    assert!(
+        crate::app::dispatch::session::lifecycle::dispatch_loaded_session_in_worktree(
+            &mut app,
+            &acp::SessionId::new("other-session"),
+        )
+        .is_empty(),
+        "a different loaded session must not consume the staged remote worktree"
+    );
+    let effects =
+        crate::app::dispatch::session::lifecycle::dispatch_loaded_session_in_worktree(
+            &mut app,
+            &acp::SessionId::new("source-session"),
+        );
+    assert!(matches!(
+        effects.as_slice(),
+        [Effect::CreateWorktreeSession {
+            load_session_id: Some(session_id),
+            label: Some(label),
+            ..
+        }] if session_id == "source-session" && label == "remote-child"
+    ));
+    assert!(
+        !app.deferred_startup.worktree && app.deferred_startup.session.is_none(),
+        "only the matching loaded source consumes the one-shot worktree startup intent"
+    );
+}
+
+#[test]
 fn worktree_session_created_sets_session_and_cwd() {
     let mut app = test_app_git();
     dispatch(

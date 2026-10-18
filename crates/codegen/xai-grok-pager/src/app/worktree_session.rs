@@ -9,11 +9,12 @@ use xai_acp_lib::{AcpAgentTx, acp_send};
 use xai_grok_workspace::session::git::RestoreDegree;
 
 use super::effects::{
-    acp_send_bounded, parse_worktree_restore_payload, parse_worktree_strategy_summary,
-    sanitize_user_error,
+    acp_send_bounded, parse_ssh_project_location_value, parse_worktree_restore_payload,
+    parse_worktree_strategy_summary, sanitize_user_error,
 };
 use super::session_startup::worktree_session_cwd;
 use super::session_title_resolve::worktree_resume_failure_message;
+use crate::app::agent_view::SshProjectLocation;
 
 pub(crate) const CREATE_METHOD: &str = "x.ai/git/worktree/create_from_worktree_sync";
 pub(crate) const RESUME_METHOD: &str = "x.ai/git/worktree/resume_session";
@@ -91,7 +92,11 @@ pub(crate) struct ResumedWorktree {
     /// The agent may fork a local session into the worktree under a new id.
     pub session_id: String,
     pub worktree_root: PathBuf,
+    /// Local ACP cwd to retain while loading the child. SSH worktree responses
+    /// replace their remote path with the source launch cwd here.
     pub session_cwd: PathBuf,
+    /// Typed remote identity when the server created the worktree over SSH.
+    pub ssh_project_location: Option<SshProjectLocation>,
     pub code_restored: bool,
     pub restore_summary: Option<String>,
     pub restore_degree: Option<RestoreDegree>,
@@ -204,11 +209,17 @@ pub(crate) fn parse_resume_response(
         session_id,
         worktree_root,
         session_cwd,
+        ssh_project_location: parse_ssh_project_location_value(result.get("projectLocation")),
         code_restored,
         restore_summary,
         restore_degree,
         strategy_summary: parse_worktree_strategy_summary(&result),
     })
+}
+fn retain_local_source_cwd_for_ssh(resumed: &mut ResumedWorktree, source_cwd: &Path) {
+    if resumed.ssh_project_location.is_some() {
+        resumed.session_cwd = source_cwd.to_path_buf();
+    }
 }
 
 fn create_failure(detail: &str) -> WorktreeRpcError {
@@ -279,7 +290,9 @@ pub(crate) async fn resume_session_into_worktree(
             return Err(fail(&e.to_string()));
         }
     };
-    parse_resume_response(resp.0.get(), session_id).map_err(|d| fail(&d))
+    let mut resumed = parse_resume_response(resp.0.get(), session_id).map_err(|d| fail(&d))?;
+    retain_local_source_cwd_for_ssh(&mut resumed, source_cwd);
+    Ok(resumed)
 }
 
 /// Append the worktree location to a failure that happened after the worktree was created, so
@@ -387,18 +400,33 @@ mod tests {
 
     #[test]
     fn resume_response_adopts_agent_session_id_and_effective_cwd() {
-        let raw = r#"{"result":{"sessionId":"forked","worktreePath":"/wt/z","effectiveCwd":"/wt/z/sub","codeRestored":true,"restoreSummary":"3 files"}}"#;
+        let raw = r#"{"result":{"sessionId":"forked","worktreePath":"/wt/z","effectiveCwd":"/wt/z/sub","codeRestored":true,"restoreSummary":"3 files","projectLocation":{"type":"ssh","data":{"target_id":"build-host","root":"/srv/worktrees/project"}}}}"#;
         let resumed = parse_resume_response(raw, "orig").unwrap();
         assert_eq!(resumed.session_id, "forked");
         assert_eq!(resumed.worktree_root, PathBuf::from("/wt/z"));
         assert_eq!(resumed.session_cwd, PathBuf::from("/wt/z/sub"));
+        assert_eq!(
+            resumed.ssh_project_location,
+            Some(SshProjectLocation {
+                target_id: "build-host".to_owned(),
+                root: "/srv/worktrees/project".to_owned(),
+            })
+        );
         assert!(resumed.code_restored);
         assert_eq!(resumed.restore_summary.as_deref(), Some("3 files"));
 
         let minimal = parse_resume_response(r#"{"worktreePath":"/wt/z"}"#, "orig").unwrap();
         assert_eq!(minimal.session_id, "orig");
         assert_eq!(minimal.session_cwd, PathBuf::from("/wt/z"));
+        assert!(minimal.ssh_project_location.is_none());
         assert!(!minimal.code_restored);
+    }
+    #[test]
+    fn ssh_resume_retains_local_source_cwd_for_following_acp_load() {
+        let raw = r#"{"worktreePath":"/remote/worktree","projectLocation":{"type":"ssh","data":{"target_id":"build-host","root":"/remote/worktree"}}}"#;
+        let mut resumed = parse_resume_response(raw, "orig").unwrap();
+        retain_local_source_cwd_for_ssh(&mut resumed, Path::new("/Users/test/project"));
+        assert_eq!(resumed.session_cwd, PathBuf::from("/Users/test/project"));
     }
 
     #[test]
