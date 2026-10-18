@@ -4010,6 +4010,59 @@ fn bg_deferred_for_input(id: &str, input: serde_json::Value) -> bool {
     tracker.handle_update(update, &meta(), &mut sb);
     tracker.bg_deferred_tools.contains_key(id)
 }
+#[test]
+fn ssh_background_handle_is_not_lost_to_local_task_deferral() {
+    let mut sb = ScrollbackState::new();
+    let mut tracker = AcpUpdateTracker::new();
+    let id = "ssh-background";
+    let call = acp::ToolCall::new(acp::ToolCallId::new(Arc::from(id)), "ssh_run")
+        .kind(acp::ToolKind::Other)
+        .status(acp::ToolCallStatus::Pending)
+        .raw_input(Some(serde_json::json!({
+            "command": "sleep 30",
+            "is_background": true
+        })))
+        .meta(Some(
+            serde_json::json!({"x.ai/tool": {"name": "ssh_run"}})
+                .as_object()
+                .unwrap()
+                .clone(),
+        ));
+    tracker.handle_update(acp::SessionUpdate::ToolCall(call), &meta(), &mut sb);
+    tracker.handle_update(
+        acp::SessionUpdate::ToolCallUpdate(acp::ToolCallUpdate::new(
+            acp::ToolCallId::new(Arc::from(id)),
+            acp::ToolCallUpdateFields::new()
+                .kind(Some(acp::ToolKind::Execute))
+                .title(Some("SSH `sleep 30`".into()))
+                .raw_input(Some(serde_json::json!({
+                    "variant": "Dynamic",
+                    "command": "sleep 30",
+                    "is_background": true
+                }))),
+        )),
+        &meta(),
+        &mut sb,
+    );
+    assert!(!tracker.bg_deferred_tools.contains_key(id));
+    tracker.handle_update(
+        acp::SessionUpdate::ToolCallUpdate(acp::ToolCallUpdate::new(
+            acp::ToolCallId::new(Arc::from(id)),
+            acp::ToolCallUpdateFields::new()
+                .kind(Some(acp::ToolKind::Other))
+                .status(Some(acp::ToolCallStatus::Completed))
+                .title(Some("SSH task ssh-native-owned: running".into())),
+        )),
+        &meta(),
+        &mut sb,
+    );
+    assert!(!tracker.pending_tools.contains_key(id));
+    let RenderBlock::ToolCall(ToolCallBlock::Other(result)) = &sb.get(0).unwrap().block else {
+        panic!("remote task handle must replace the pending command block");
+    };
+    assert_eq!(result.name, "SSH task ssh-native-owned: running");
+}
+
 /// The tracker defers `block_until_ms: 0` the same way as `is_background: true`.
 /// A positive `block_until_ms` stays a foreground call.
 #[test]

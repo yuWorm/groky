@@ -11,7 +11,6 @@ mod connection;
 mod credentials;
 mod known_hosts;
 
-pub use async_trait::async_trait;
 pub use auth::{
     ConfigurationDiagnostic, ConfigurationDiagnosticKind, HostKeyDecision, HostKeyPrompt,
     HostKeyStatus, Interaction, InteractionError, KeyboardInteractivePrompt,
@@ -25,5 +24,6 @@ pub use config::{
 };
 pub use connection::{
     BoxedSshStream, ConnectionFailure, ConnectionLease, ConnectionManager, ConnectionPhase,
-    ConnectionStatus, SshStream,
+    ConnectionStatus, SftpConnection, SshCommand, SshCommandEvent, SshStream,
 };
+pub use russh_sftp as sftp;

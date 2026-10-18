@@ -1,5 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Weak};
 use std::time::Duration;
 
@@ -79,6 +80,8 @@ pub enum SshServiceError {
     Transport(String),
     #[error("SSH worker: {0}")]
     Worker(String),
+    #[error("SSH native operation: {0}")]
+    Native(String),
     #[error("SSH worker: {message}")]
     WorkerHook {
         message: String,
@@ -138,6 +141,7 @@ struct SessionSshInner {
     sessions: RwLock<HashMap<String, SessionState>>,
     resolution_claims: std::sync::Mutex<HashSet<String>>,
     workers: Mutex<HashMap<String, Arc<WorkerConnection>>>,
+    native_operations: super::native_tasks::NativeOperations,
     worker_locks: Mutex<HashMap<String, Arc<Mutex<()>>>>,
     manual_holds: Mutex<HashMap<String, ConnectionLease>>,
     auth_waiters: Mutex<HashMap<String, PendingAuthentication>>,
@@ -177,6 +181,16 @@ impl SessionState {
 #[derive(Clone)]
 struct GrantRecord {
     persisted: PersistedSshGrant,
+    revoked: Arc<AtomicBool>,
+}
+
+impl GrantRecord {
+    fn new(persisted: PersistedSshGrant) -> Self {
+        Self {
+            revoked: Arc::new(AtomicBool::new(persisted.binding.revoked)),
+            persisted,
+        }
+    }
 }
 
 struct WorkerConnection {
@@ -220,8 +234,7 @@ struct ProjectSshRule {
 
 impl ProjectSshRule {
     fn owns(&self, location: &ProjectLocation) -> bool {
-        self.owner_location == *location
-            || self.canonical_owner_location.as_ref() == Some(location)
+        self.owner_location == *location || self.canonical_owner_location.as_ref() == Some(location)
     }
 }
 
@@ -274,6 +287,7 @@ impl SessionSsh {
                 sessions: RwLock::new(HashMap::new()),
                 resolution_claims: std::sync::Mutex::new(HashSet::new()),
                 workers: Mutex::new(HashMap::new()),
+                native_operations: Default::default(),
                 worker_locks: Mutex::new(HashMap::new()),
                 manual_holds: Mutex::new(HashMap::new()),
                 auth_waiters: Mutex::new(HashMap::new()),
@@ -401,7 +415,9 @@ impl SessionSsh {
                         requires_revalidation: true,
                         scope: SshGrantScope::ProjectRule,
                         revoke_status: None,
+                        worker_bound: false,
                     },
+                    revoked: Arc::new(AtomicBool::new(false)),
                 },
             );
         }
@@ -694,11 +710,14 @@ impl SessionSsh {
                     .await?;
                 Ok(SshControlReply::ProjectLocationRegistered)
             }
-            SshControlCommand::RestoreProjectGrant { session_id, location } => {
-                Ok(SshControlReply::ProjectGrantRestored {
-                    binding: self.restore_project_grant(&session_id, &location, client_id).await?,
-                })
-            }
+            SshControlCommand::RestoreProjectGrant {
+                session_id,
+                location,
+            } => Ok(SshControlReply::ProjectGrantRestored {
+                binding: self
+                    .restore_project_grant(&session_id, &location, client_id)
+                    .await?,
+            }),
             SshControlCommand::UseBinding {
                 session_id,
                 binding_id,
@@ -794,7 +813,10 @@ impl SessionSsh {
         let mut grants = HashMap::new();
         for mut persisted in state.grants {
             persisted.requires_revalidation = !persisted.binding.revoked;
-            grants.insert(persisted.binding.id.clone(), GrantRecord { persisted });
+            if persisted.binding.revoked && !persisted.worker_bound {
+                persisted.revoke_status = Some(SshGrantStatus::RevokedConfirmed);
+            }
+            grants.insert(persisted.binding.id.clone(), GrantRecord::new(persisted));
         }
         let pending_requests = state
             .pending_requests
@@ -805,7 +827,13 @@ impl SessionSsh {
                 (request.id.clone(), request)
             })
             .collect();
-        self.inner.sessions.write().await.insert(
+        let mut sessions = self.inner.sessions.write().await;
+        if let Some(previous) = sessions.get(&session_id) {
+            for grant in previous.grants.values() {
+                grant.revoked.store(true, Ordering::Release);
+            }
+        }
+        sessions.insert(
             session_id,
             SessionState {
                 grants,
@@ -938,8 +966,8 @@ impl SessionSsh {
         Ok(updated)
     }
 
-    /// Human-only grant completion. Identity, canonical root, and final binding
-    /// are captured from real native/worker handshakes rather than from the UI.
+    /// Human-only grant completion. Identity and canonical root are inspected
+    /// over native SSH/SFTP; granting authority never deploys or starts a worker.
     pub async fn approve_grant(
         &self,
         decision: SshGrantDecision,
@@ -980,27 +1008,27 @@ impl SessionSsh {
                 return Err(SshServiceError::IdentityChanged);
             }
         }
-        let proposed = SshBinding {
+        let canonical_root = super::native_files::canonical_root(&lease, &root)
+            .await
+            .map_err(SshServiceError::Native)?;
+        let binding = SshBinding {
             id: Uuid::now_v7().to_string(),
             session_id: request.session_id.clone(),
             target_id,
             identity,
-            root: root.clone(),
-            cwd: root,
+            root: canonical_root.clone(),
+            cwd: canonical_root,
             capabilities,
             epoch: 1,
             revoked: false,
         };
-        let worker = self
-            .open_worker(lease, proposed, Some(decision.client_id))
-            .await?;
-        let binding = worker.binding.clone();
         let persisted = PersistedSshGrant {
             binding: binding.clone(),
             parent_binding_id: None,
             requires_revalidation: false,
             scope: decision.scope,
             revoke_status: None,
+            worker_bound: false,
         };
         {
             let mut sessions = self.inner.sessions.write().await;
@@ -1015,29 +1043,15 @@ impl SessionSsh {
             }
             candidate
                 .grants
-                .insert(binding.id.clone(), GrantRecord { persisted });
-            if let Err(error) = self
-                .persist_grant_state(
-                    &request.session_id,
-                    &candidate,
-                    &binding,
-                    decision.scope,
-                    decision.make_default,
-                )
-                .await
-            {
-                let client = worker.client.clone();
-                let rejected = binding.clone();
-                tokio::spawn(async move {
-                    let _ = client.revoke(&rejected.id, rejected.epoch + 1).await;
-                });
-                return Err(error);
-            }
-            self.inner
-                .workers
-                .lock()
-                .await
-                .insert(binding.id.clone(), Arc::new(worker));
+                .insert(binding.id.clone(), GrantRecord::new(persisted));
+            self.persist_grant_state(
+                &request.session_id,
+                &candidate,
+                &binding,
+                decision.scope,
+                decision.make_default,
+            )
+            .await?;
             *state = candidate;
         }
         let _ = self.inner.events.send(SshEvent::GrantResolved {
@@ -1102,18 +1116,42 @@ impl SessionSsh {
             }
             affected
         };
+        let mut pending = false;
         for (affected_session_id, binding, _) in &affected {
-            let _ = self.inner.events.send(SshEvent::BindingRevoked {
-                session_id: affected_session_id.clone(),
-                binding_id: binding.id.clone(),
-                status: RevokeStatus::LocalPending,
-            });
-            self.spawn_revoke_ack(affected_session_id.clone(), binding.clone());
+            let needs_ack = self
+                .inner
+                .sessions
+                .read()
+                .await
+                .get(affected_session_id)
+                .and_then(|state| state.grants.get(&binding.id))
+                .is_some_and(|record| {
+                    record.persisted.revoke_status == Some(SshGrantStatus::RevokedLocalPending)
+                });
+            if needs_ack {
+                pending = true;
+                let _ = self.inner.events.send(SshEvent::BindingRevoked {
+                    session_id: affected_session_id.clone(),
+                    binding_id: binding.id.clone(),
+                    status: RevokeStatus::LocalPending,
+                });
+                self.spawn_revoke_ack(affected_session_id.clone(), binding.clone());
+            } else {
+                let _ = self.inner.events.send(SshEvent::BindingRevoked {
+                    session_id: affected_session_id.clone(),
+                    binding_id: binding.id.clone(),
+                    status: RevokeStatus::Confirmed,
+                });
+            }
         }
         if let Some(error) = persistence_error {
             return Err(error);
         }
-        Ok(RevokeStatus::LocalPending)
+        Ok(if pending {
+            RevokeStatus::LocalPending
+        } else {
+            RevokeStatus::Confirmed
+        })
     }
 
     /// Child sessions receive only selected strict subsets. The parent binding
@@ -1170,6 +1208,7 @@ impl SessionSsh {
                 requires_revalidation: true,
                 scope: SshGrantScope::CurrentSession,
                 revoke_status: None,
+                worker_bound: false,
             });
         }
         let bindings = inherited
@@ -1189,7 +1228,7 @@ impl SessionSsh {
         for grant in inherited {
             candidate
                 .grants
-                .insert(grant.binding.id.clone(), GrantRecord { persisted: grant });
+                .insert(grant.binding.id.clone(), GrantRecord::new(grant));
         }
         self.persist_state(&child_session_id, &candidate).await?;
         *child = candidate;
@@ -1318,10 +1357,134 @@ impl SessionSsh {
         })
     }
 
+    /// Explicit tools always use native SSH/SFTP, including inside SSH projects.
+    /// The worker path is reserved for project workspace operations.
+    pub async fn dispatch(
+        &self,
+        request: SshDispatchRequest,
+        client_id: Option<u64>,
+    ) -> Result<SshDispatchResult, SshServiceError> {
+        let expected = match request.tool_name.as_str() {
+            "GrokBuild:read_file" | "GrokBuild:grep" => SshOperation::Read,
+            "OpenCode:write" | "OpenCode:edit" => SshOperation::Write,
+            "GrokBuild:run_terminal_cmd" => SshOperation::Execute,
+            _ => {
+                return Err(SshServiceError::Native(
+                    "unsupported explicit SSH tool".into(),
+                ));
+            }
+        };
+        if request.invocation.operation != expected {
+            return Err(SshServiceError::CapabilityDenied);
+        }
+        let binding = self.binding_for_invocation(&request.invocation).await?;
+        let lease = self
+            .acquire(&binding.target_id, client_id, client_id.is_some())
+            .await?;
+        if lease.identity() != &binding.identity {
+            return Err(SshServiceError::IdentityChanged);
+        }
+        let cwd = super::native_files::validate_cwd(&lease, &binding, &request.invocation.cwd)
+            .await
+            .map_err(SshServiceError::Native)?;
+        self.mark_revalidated(&binding.session_id, &binding.id)
+            .await;
+        let revoked = {
+            let sessions = self.inner.sessions.read().await;
+            sessions
+                .get(&binding.session_id)
+                .and_then(|state| state.grants.get(&binding.id))
+                .ok_or_else(|| SshServiceError::UnknownBinding(binding.id.clone()))?
+                .revoked
+                .clone()
+        };
+        self.binding_for_invocation(&request.invocation).await?;
+        let operation = self
+            .inner
+            .native_operations
+            .reserve(&request)
+            .await
+            .map_err(SshServiceError::Native)?;
+        let callbacks: Arc<dyn SshClientCallbacks> = Arc::new(WorkerCallbacks {
+            service: Arc::downgrade(&self.inner),
+            client_id,
+            session_id: binding.session_id.clone(),
+            binding_id: binding.id.clone(),
+        });
+        let mut completion_guard = operation.guard(callbacks.clone());
+        let mut effects_started = false;
+        let result = async {
+            if expected != SshOperation::Read {
+                let approved = callbacks.approve(SshApprovalRequest {
+                    approval_id: Uuid::now_v7().to_string(), operation_id: operation.id.clone(),
+                    binding_id: binding.id.clone(), session_id: binding.session_id.clone(),
+                    operation: expected, title: format!("SSH {}", request.tool_name),
+                    detail: serde_json::json!({
+                        "target_id": binding.target_id, "identity": binding.identity,
+                        "root": binding.root, "cwd": cwd, "tool": request.tool_name, "args": request.args,
+                    }),
+                }).await;
+                if approved != SshApprovalDecision::Approve {
+                    return Err(SshServiceError::Native("operation denied by user".into()));
+                }
+            }
+            self.binding_for_invocation(&request.invocation).await?;
+            if revoked.load(Ordering::Acquire) {
+                return Err(SshServiceError::RevokedBinding(binding.id.clone()));
+            }
+            if expected == SshOperation::Execute {
+                let args: xai_grok_tools::implementations::grok_build::bash::BashToolInput =
+                    serde_json::from_value(request.args).map_err(|error| SshServiceError::Native(error.to_string()))?;
+                let command = format!("cd -- {} && exec sh -c {}",
+                    super::native_tasks::shell_quote(&cwd).map_err(SshServiceError::Native)?,
+                    super::native_tasks::shell_quote(&args.command).map_err(SshServiceError::Native)?);
+                effects_started = true;
+                let channel = lease.exec_command(&command).await?;
+                return Ok(operation.clone().run(channel, args, callbacks.clone()).await);
+            }
+            effects_started = expected != SshOperation::Read;
+            let mut result = super::native_files::execute(
+                &lease, &binding, &request.invocation, &request.tool_name, request.args,
+                &|| !revoked.load(Ordering::Acquire),
+            ).await.map_err(SshServiceError::Native)?;
+            attach_remote_scope(&mut result.output, &request.invocation, &operation.id);
+            result.prompt_text = render_ssh_dispatch_prompt(result.prompt_text, None, &request.invocation, &operation.id);
+            Ok(result)
+        }.await;
+        if expected != SshOperation::Execute || result.is_err() {
+            operation
+                .finish(
+                    result.as_ref().cloned().map_err(ToString::to_string),
+                    effects_started,
+                    callbacks.as_ref(),
+                )
+                .await;
+        }
+        completion_guard.disarm();
+        result.map_err(|error| {
+            if effects_started {
+                SshServiceError::Native(format!(
+                    "{error}. Operation {} on binding {} may have reached the remote host; query it with ssh_task_query using that binding and operation_id. Do not replay the mutation.",
+                    operation.id, binding.id,
+                ))
+            } else { error }
+        })
+    }
+
+    async fn worker_bound(&self, binding: &SshBinding) -> bool {
+        self.inner
+            .sessions
+            .read()
+            .await
+            .get(&binding.session_id)
+            .and_then(|state| state.grants.get(&binding.id))
+            .is_some_and(|record| record.persisted.worker_bound)
+    }
+
     /// Rechecks local authority immediately before remote dispatch. The worker
     /// repeats the epoch/root/capability check before side effects; there is no
     /// local filesystem or shell fallback and no mutation retry path.
-    pub async fn dispatch(
+    async fn dispatch_worker(
         &self,
         request: SshDispatchRequest,
         client_id: Option<u64>,
@@ -1383,6 +1546,16 @@ impl SessionSsh {
         client_id: Option<u64>,
     ) -> Result<Option<SshDispatchResult>, SshServiceError> {
         let binding = self.resolve_binding(session_id, target).await?;
+        if operation_id.starts_with("ssh-native-") {
+            return Ok(self
+                .inner
+                .native_operations
+                .query(&binding, operation_id)
+                .await);
+        }
+        if !self.worker_bound(&binding).await {
+            return Ok(None);
+        }
         let worker = self.ensure_worker(&binding, client_id).await?;
         let operation = worker
             .client
@@ -1393,8 +1566,8 @@ impl SessionSsh {
             .transpose()
     }
 
-    /// Retrieve the actual output for one remote background task through the
-    /// authorized worker. The task-output tool itself verifies session ownership.
+    /// Read only output owned by this binding/session. Native task output is
+    /// local accounting; project-worker task output remains worker-authorized.
     pub async fn query_task_output(
         &self,
         session_id: &str,
@@ -1403,10 +1576,27 @@ impl SessionSsh {
         call_id: impl Into<String>,
         client_id: Option<u64>,
     ) -> Result<SshDispatchResult, SshServiceError> {
+        if task_id.starts_with("ssh-native-") {
+            let binding = self.resolve_binding(session_id, target).await?;
+            return self
+                .inner
+                .native_operations
+                .query(&binding, &task_id)
+                .await
+                .ok_or_else(|| {
+                    SshServiceError::Native("SSH task not found for this binding/session".into())
+                });
+        }
         let invocation = self
             .resolve_invocation(session_id, target, None, SshOperation::Read, call_id)
             .await?;
-        self.dispatch(
+        let binding = self.binding_for_invocation(&invocation).await?;
+        if !self.worker_bound(&binding).await {
+            return Err(SshServiceError::Native(
+                "SSH task not found for this binding/session".into(),
+            ));
+        }
+        self.dispatch_worker(
             SshDispatchRequest {
                 invocation,
                 tool_name: "get_command_or_subagent_output".into(),
@@ -1425,12 +1615,12 @@ impl SessionSsh {
         client_id: Option<u64>,
     ) -> Result<Vec<SshTaskRecord>, SshServiceError> {
         let binding = self.resolve_binding(session_id, target).await?;
-        let worker = self.ensure_worker(&binding, client_id).await?;
-        worker
-            .client
-            .tasks(&binding.id, session_id)
-            .await
-            .map_err(Into::into)
+        let mut tasks = self.inner.native_operations.list(&binding).await;
+        if self.worker_bound(&binding).await {
+            let worker = self.ensure_worker(&binding, client_id).await?;
+            tasks.extend(worker.client.tasks(&binding.id, session_id).await?);
+        }
+        Ok(tasks)
     }
 
     pub async fn cancel_task(
@@ -1441,10 +1631,31 @@ impl SessionSsh {
         call_id: impl Into<String>,
         client_id: Option<u64>,
     ) -> Result<SshCancellation, SshServiceError> {
+        if task_reference.starts_with("ssh-native-") {
+            // Revocation prevents new work, not stopping an already-owned
+            // command. An explicit revoked binding id may only cancel locally
+            // tracked commands through their existing channel.
+            let binding = match self.resolve_binding(session_id, target).await {
+                Ok(binding) => binding,
+                Err(SshServiceError::RevokedBinding(id)) => self.binding(session_id, &id).await?,
+                Err(error) => return Err(error),
+            };
+            return self
+                .inner
+                .native_operations
+                .cancel(&binding, &task_reference)
+                .await
+                .map_err(SshServiceError::Native);
+        }
         let invocation = self
             .resolve_invocation(session_id, target, None, SshOperation::Read, call_id)
             .await?;
         let binding = self.binding_for_invocation(&invocation).await?;
+        if !self.worker_bound(&binding).await {
+            return Err(SshServiceError::Native(
+                "SSH task not found for this binding/session".into(),
+            ));
+        }
         let worker = self.ensure_worker(&binding, client_id).await?;
         self.binding_for_invocation(&invocation).await?;
         worker
@@ -1550,6 +1761,7 @@ impl SessionSsh {
                 for record in state.grants.values() {
                     let persisted = &record.persisted;
                     if persisted.binding.revoked
+                        && persisted.worker_bound
                         && persisted.revoke_status == Some(SshGrantStatus::RevokedLocalPending)
                         && persisted.binding.target_id == target_id
                         && &persisted.binding.identity == identity
@@ -1802,16 +2014,60 @@ impl SessionSsh {
         if lease.identity() != &binding.identity {
             return Err(SshServiceError::IdentityChanged);
         }
+        // Persist before sending authority: even an interrupted handshake might
+        // have bound the remote worker and needs a remote revoke tombstone.
+        {
+            let mut sessions = self.inner.sessions.write().await;
+            let state = sessions
+                .get_mut(&binding.session_id)
+                .ok_or_else(|| SshServiceError::UnknownBinding(binding.id.clone()))?;
+            let mut candidate = state.clone();
+            let record = candidate
+                .grants
+                .get_mut(&binding.id)
+                .ok_or_else(|| SshServiceError::UnknownBinding(binding.id.clone()))?;
+            if record.persisted.binding.revoked || record.persisted.binding.epoch != binding.epoch {
+                return Err(SshServiceError::StaleInvocation);
+            }
+            record.persisted.worker_bound = true;
+            self.persist_state(&binding.session_id, &candidate).await?;
+            *state = candidate;
+        }
         let worker = self.open_worker(lease, binding.clone(), client_id).await?;
         if worker.binding.root != binding.root || worker.binding.cwd != binding.cwd {
             return Err(SshServiceError::CanonicalRootChanged);
         }
         let worker = Arc::new(worker);
+        let sessions = self.inner.sessions.read().await;
+        let current = sessions
+            .get(&binding.session_id)
+            .and_then(|state| state.grants.get(&binding.id))
+            .map(|record| record.persisted.binding.clone());
+        if current.as_ref() != Some(binding)
+            || current.as_ref().is_some_and(|binding| binding.revoked)
+        {
+            drop(sessions);
+            let epoch = current
+                .as_ref()
+                .map_or(binding.epoch.saturating_add(1), |current| {
+                    current.epoch.max(binding.epoch.saturating_add(1))
+                });
+            let acknowledged = matches!(worker.client.revoke(&binding.id, epoch).await,
+                Ok(ack) if ack.binding_id == binding.id && ack.epoch == epoch);
+            if acknowledged {
+                if let Some(current) = current.filter(|current| current.revoked) {
+                    self.confirm_revoke_ack(&current.session_id, &current)
+                        .await?;
+                }
+            }
+            return Err(SshServiceError::StaleInvocation);
+        }
         self.inner
             .workers
             .lock()
             .await
             .insert(binding.id.clone(), worker.clone());
+        drop(sessions);
         self.mark_revalidated(&binding.session_id, &binding.id)
             .await;
         Ok(worker)
@@ -1924,6 +2180,17 @@ impl SessionSsh {
     fn spawn_revoke_ack(&self, session_id: String, binding: SshBinding) {
         let service = self.clone();
         tokio::spawn(async move {
+            let binding_lock = service
+                .inner
+                .worker_locks
+                .lock()
+                .await
+                .get(&binding.id)
+                .cloned();
+            let _guard = match &binding_lock {
+                Some(lock) => Some(lock.lock().await),
+                None => None,
+            };
             let worker = service.inner.workers.lock().await.get(&binding.id).cloned();
             let Some(worker) = worker else {
                 return;
@@ -2285,12 +2552,16 @@ fn revoke_authority_tree(
             let Some(record) = state.grants.get_mut(&current) else {
                 continue;
             };
-            if record.persisted.binding.revoked {
-                continue;
+            record.revoked.store(true, Ordering::Release);
+            if !record.persisted.binding.revoked {
+                record.persisted.binding.revoked = true;
+                record.persisted.binding.epoch = record.persisted.binding.epoch.saturating_add(1);
+                record.persisted.revoke_status = Some(if record.persisted.worker_bound {
+                    SshGrantStatus::RevokedLocalPending
+                } else {
+                    SshGrantStatus::RevokedConfirmed
+                });
             }
-            record.persisted.binding.revoked = true;
-            record.persisted.binding.epoch = record.persisted.binding.epoch.saturating_add(1);
-            record.persisted.revoke_status = Some(SshGrantStatus::RevokedLocalPending);
             if state.default_binding_id.as_deref() == Some(current.as_str()) {
                 state.default_binding_id = None;
             }
@@ -2498,7 +2769,7 @@ fn render_operation_query(
     })
 }
 
-fn render_ssh_dispatch_prompt(
+pub(super) fn render_ssh_dispatch_prompt(
     mut prompt_text: String,
     output: Option<&ToolOutput>,
     invocation: &ResolvedSshInvocation,
@@ -2535,7 +2806,10 @@ fn append_model_note(prompt_text: &mut String, note: &str) {
     prompt_text.push_str(note);
 }
 
-fn remote_scope(invocation: &ResolvedSshInvocation, operation_id: &str) -> serde_json::Value {
+pub(super) fn remote_scope(
+    invocation: &ResolvedSshInvocation,
+    operation_id: &str,
+) -> serde_json::Value {
     serde_json::json!({
         "binding_id": &invocation.binding_id,
         "target_id": &invocation.target_id,
@@ -2925,31 +3199,59 @@ mod tests {
             target_id: "target".into(),
             root: "/canonical/repo".into(),
         };
-        service.register_project_location("original", None, &raw).await.unwrap();
+        service
+            .register_project_location("original", None, &raw)
+            .await
+            .unwrap();
         let granted = binding("original-binding", "original", "/canonical/repo");
-        service.persist_grant_state(
-            "original", &SessionState::default(), &granted, SshGrantScope::ProjectRule, true,
-        ).await.unwrap();
+        service
+            .persist_grant_state(
+                "original",
+                &SessionState::default(),
+                &granted,
+                SshGrantScope::ProjectRule,
+                true,
+            )
+            .await
+            .unwrap();
 
         let restored = SessionSsh::new(home.path().to_owned());
         for (session_id, location) in [("raw-open", &raw), ("resumed", &canonical)] {
-            restored.restore_project_rules(session_id, location).await.unwrap();
-            let invocation = restored.resolve_invocation(
-                session_id, None, None, SshOperation::Read, "read",
-            ).await.unwrap();
+            restored
+                .restore_project_rules(session_id, location)
+                .await
+                .unwrap();
+            let invocation = restored
+                .resolve_invocation(session_id, None, None, SshOperation::Read, "read")
+                .await
+                .unwrap();
             assert_eq!(invocation.cwd, "/canonical/repo");
         }
-        restored.restore_project_rules(
-            "other-project",
-            &ProjectLocation::Ssh { target_id: "target".into(), root: "/elsewhere".into() },
-        ).await.unwrap();
+        restored
+            .restore_project_rules(
+                "other-project",
+                &ProjectLocation::Ssh {
+                    target_id: "target".into(),
+                    root: "/elsewhere".into(),
+                },
+            )
+            .await
+            .unwrap();
         assert!(restored.list_targets("other-project").await.is_empty());
 
-        restored.remove_project_rule("resumed", &granted).await.unwrap();
+        restored
+            .remove_project_rule("resumed", &granted)
+            .await
+            .unwrap();
         let after_revoke = SessionSsh::new(home.path().to_owned());
-        after_revoke.restore_project_rules("reopened", &raw).await.unwrap();
+        after_revoke
+            .restore_project_rules("reopened", &raw)
+            .await
+            .unwrap();
         assert!(matches!(
-            after_revoke.resolve_invocation("reopened", None, None, SshOperation::Read, "read").await,
+            after_revoke
+                .resolve_invocation("reopened", None, None, SshOperation::Read, "read")
+                .await,
             Err(SshServiceError::NoDefaultBinding)
         ));
     }
@@ -3042,7 +3344,9 @@ mod tests {
                                 requires_revalidation: false,
                                 scope: SshGrantScope::CurrentSession,
                                 revoke_status: None,
+                                worker_bound: false,
                             },
+                            revoked: Arc::new(AtomicBool::new(false)),
                         },
                     )]),
                     default_binding_id: Some("parent".into()),
@@ -3061,7 +3365,9 @@ mod tests {
                                 requires_revalidation: true,
                                 scope: SshGrantScope::CurrentSession,
                                 revoke_status: None,
+                                worker_bound: false,
                             },
+                            revoked: Arc::new(AtomicBool::new(false)),
                         },
                     )]),
                     default_binding_id: Some("child".into()),
@@ -3081,5 +3387,133 @@ mod tests {
             );
             assert_eq!(state.default_binding_id, None);
         }
+    }
+
+    #[tokio::test]
+    async fn native_ssh_revoke_is_offline_and_invalidates_child_inflight_authority() {
+        let home = tempfile::tempdir().unwrap();
+        let service = SessionSsh::new(home.path().to_owned());
+        let parent = binding("native-parent", "parent-session", "/repo");
+        service
+            .restore_session(
+                "parent-session",
+                PersistedSshState {
+                    grants: vec![PersistedSshGrant {
+                        binding: parent.clone(),
+                        parent_binding_id: None,
+                        requires_revalidation: true,
+                        scope: SshGrantScope::CurrentSession,
+                        revoke_status: None,
+                        worker_bound: false,
+                    }],
+                    default_binding_id: Some(parent.id.clone()),
+                    pending_requests: vec![],
+                },
+            )
+            .await;
+        let children = service
+            .inherit_session(
+                "parent-session",
+                "child-session",
+                &[parent.id.clone()],
+                SshCapabilities::read_only(),
+            )
+            .await
+            .unwrap();
+        let token = service.inner.sessions.read().await["child-session"].grants[&children[0].id]
+            .revoked
+            .clone();
+        assert!(!token.load(Ordering::Acquire));
+        assert_eq!(
+            service
+                .revoke_binding("parent-session", &parent.id)
+                .await
+                .unwrap(),
+            RevokeStatus::Confirmed
+        );
+        assert!(token.load(Ordering::Acquire));
+        for session in ["parent-session", "child-session"] {
+            let state = service.snapshot_session(session).await;
+            assert!(state.default_binding_id.is_none());
+            assert!(state.grants.iter().all(|grant| grant.binding.revoked
+                && grant.revoke_status == Some(SshGrantStatus::RevokedConfirmed)));
+        }
+    }
+
+    #[tokio::test]
+    async fn pre_native_ssh_grant_still_requires_remote_revoke_confirmation() {
+        let home = tempfile::tempdir().unwrap();
+        let service = SessionSsh::new(home.path().to_owned());
+        let legacy: PersistedSshGrant = serde_json::from_value(serde_json::json!({
+            "binding": binding("legacy", "legacy-session", "/repo"),
+            "scope": "current_session"
+        }))
+        .unwrap();
+        service
+            .restore_session(
+                "legacy-session",
+                PersistedSshState {
+                    grants: vec![legacy],
+                    default_binding_id: Some("legacy".into()),
+                    pending_requests: vec![],
+                },
+            )
+            .await;
+        assert_eq!(
+            service
+                .revoke_binding("legacy-session", "legacy")
+                .await
+                .unwrap(),
+            RevokeStatus::LocalPending
+        );
+        assert_eq!(
+            service
+                .revoke_binding("legacy-session", "legacy")
+                .await
+                .unwrap(),
+            RevokeStatus::LocalPending
+        );
+        let restored = service.snapshot_session("legacy-session").await;
+        assert_eq!(
+            restored.grants[0].revoke_status,
+            Some(SshGrantStatus::RevokedLocalPending)
+        );
+    }
+
+    #[tokio::test]
+    async fn native_ssh_pending_revoke_recovers_locally_without_worker_authority() {
+        let home = tempfile::tempdir().unwrap();
+        let service = SessionSsh::new(home.path().to_owned());
+        let mut revoked = binding("native-recovery", "recovery", "/repo");
+        revoked.revoked = true;
+        revoked.epoch = 2;
+        service
+            .restore_session(
+                "recovery",
+                PersistedSshState {
+                    grants: vec![PersistedSshGrant {
+                        binding: revoked,
+                        parent_binding_id: None,
+                        requires_revalidation: false,
+                        scope: SshGrantScope::CurrentSession,
+                        revoke_status: Some(SshGrantStatus::RevokedLocalPending),
+                        worker_bound: false,
+                    }],
+                    default_binding_id: None,
+                    pending_requests: vec![],
+                },
+            )
+            .await;
+        assert_eq!(
+            service
+                .revoke_binding("recovery", "native-recovery")
+                .await
+                .unwrap(),
+            RevokeStatus::Confirmed
+        );
+        assert_eq!(
+            service.snapshot_session("recovery").await.grants[0].revoke_status,
+            Some(SshGrantStatus::RevokedConfirmed)
+        );
     }
 }

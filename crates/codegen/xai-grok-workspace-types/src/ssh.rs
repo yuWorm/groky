@@ -84,7 +84,7 @@ pub struct SshBinding {
     pub session_id: String,
     pub target_id: String,
     pub identity: SshHostIdentity,
-    /// Canonical root on the remote host; resolved by the worker.
+    /// Canonical root on the remote host, verified over SFTP or by the project worker.
     pub root: String,
     pub cwd: String,
     pub capabilities: SshCapabilities,

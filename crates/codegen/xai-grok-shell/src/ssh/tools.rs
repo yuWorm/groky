@@ -46,7 +46,12 @@ pub(crate) fn configure_default_tools(definition: &mut xai_grok_agent::AgentDefi
         (&SshTaskCancelTool).into(),
     ];
     for tool in tools {
-        if !definition.tool_config.tools.iter().any(|existing| existing.id == tool.id) {
+        if !definition
+            .tool_config
+            .tools
+            .iter()
+            .any(|existing| existing.id == tool.id)
+        {
             definition.tool_config.tools.push(tool);
         }
     }
@@ -121,10 +126,50 @@ macro_rules! remote_input {
     };
 }
 
-remote_input!(
-    SshReadInput,
-    xai_grok_tools::implementations::grok_build::read_file::ReadFileInput
-);
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
+pub(super) struct SshTextReadArgs {
+    /// Remote UTF-8 text file, absolute or relative to the granted cwd.
+    pub target_file: String,
+    /// One-based starting line; a negative value reads relative to the end.
+    #[serde(
+        default,
+        deserialize_with = "xai_grok_tools::types::schema::deserialize_lenient_i64"
+    )]
+    pub offset: Option<i64>,
+    /// Maximum number of lines returned.
+    #[serde(default)]
+    pub limit: Option<usize>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
+pub(super) struct SshCommandArgs {
+    /// Shell command executed as the SSH user. The cwd is not a sandbox.
+    pub command: String,
+    pub description: String,
+    /// Foreground execution timeout in milliseconds, at most 300000.
+    /// Zero starts a background task. Default: 120000.
+    #[serde(
+        default,
+        deserialize_with = "xai_grok_tools::types::schema::deserialize_lenient_u64"
+    )]
+    pub timeout: Option<u64>,
+    /// Return a task id immediately. Query or cancel on the same binding.
+    /// State is held by this local service, not a remote daemon.
+    #[serde(
+        default,
+        deserialize_with = "xai_grok_tools::types::schema::deserialize_lenient_bool"
+    )]
+    pub is_background: bool,
+    /// Wait this many milliseconds before returning a background task id.
+    /// Overrides is_background/timeout; does not impose an execution deadline.
+    #[serde(
+        default,
+        deserialize_with = "xai_grok_tools::types::schema::deserialize_lenient_u64"
+    )]
+    pub block_until_ms: Option<u64>,
+}
+
+remote_input!(SshReadInput, SshTextReadArgs);
 remote_input!(
     SshWriteInput,
     xai_grok_tools::implementations::opencode::write::WriteInput
@@ -137,10 +182,7 @@ remote_input!(
     SshSearchInput,
     xai_grok_tools::implementations::grok_build::grep::GrepSearchInput
 );
-remote_input!(
-    SshRunInput,
-    xai_grok_tools::implementations::grok_build::bash::BashToolInput
-);
+remote_input!(SshRunInput, SshCommandArgs);
 
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
 pub(super) struct SshTaskQueryInput {
@@ -242,8 +284,35 @@ macro_rules! forwarding_tool {
                     } else {
                         xai_tool_protocol::ToolScope::Write
                     }),
+                    streaming: matches!($operation, SshOperation::Execute).then(|| xai_tool_protocol::StreamingSpec {
+                        subkind: "bash_output_chunk".into(),
+                        max_delta_bytes: Some(64 * 1024),
+                    }),
                     ..Default::default()
                 }
+            }
+
+            async fn execute(
+                &self,
+                ctx: xai_tool_runtime::ToolCallContext,
+                input: $input,
+            ) -> xai_tool_runtime::ToolStream<Self::Output> {
+                if !matches!($operation, SshOperation::Execute) {
+                    return xai_tool_runtime::terminal_only(self.run(ctx, input).await);
+                }
+                let resource = match session_resource(&ctx).await {
+                    Ok(resource) => resource,
+                    Err(error) => return xai_tool_runtime::terminal_only(Err(error)),
+                };
+                let events = resource.service.subscribe_session_events(&resource.session_id).await;
+                let call_id = ctx.call_id.to_string();
+                let notifications = match xai_grok_tools::types::tool_metadata::shared_resources(&ctx) {
+                    Ok(resources) => resources.lock().await
+                        .get::<xai_grok_tools::types::resources::NotificationHandle>()
+                        .map(|handle| handle.0.clone()),
+                    Err(_) => None,
+                };
+                command_stream(async move { $tool.run(ctx, input).await }, events, call_id, notifications)
             }
 
             async fn run(
@@ -296,7 +365,7 @@ forwarding_tool!(
     SshOperation::Read,
     "GrokBuild:read_file",
     true,
-    "Read a remote file using the complete workspace read schema. The target must already be granted for this SSH session."
+    "Read a remote UTF-8 text file over SFTP, without a remote groky worker. The target must already be granted for this session. Paths and symlinks must remain inside the granted root. Use an SSH project for document/image decoding."
 );
 forwarding_tool!(
     SshWriteTool,
@@ -306,7 +375,7 @@ forwarding_tool!(
     SshOperation::Write,
     "OpenCode:write",
     false,
-    "Write a remote file using the complete workspace write schema. SSH grant access is only a capability ceiling; the remote operation still requests ordinary user approval."
+    "Write a remote UTF-8 file over SFTP without a worker. SSH access is a capability ceiling; this operation still requires user approval. The destination must remain inside the granted root."
 );
 forwarding_tool!(
     SshEditTool,
@@ -316,7 +385,7 @@ forwarding_tool!(
     SshOperation::Write,
     "OpenCode:edit",
     false,
-    "Edit a remote file using the complete workspace edit schema. SSH grant access does not bypass normal remote operation approval."
+    "Edit a remote UTF-8 file over SFTP without a worker. Requires user approval, an unambiguous text match unless replaceAll is set, and an unchanged file before committing the replacement."
 );
 forwarding_tool!(
     SshSearchTool,
@@ -326,7 +395,7 @@ forwarding_tool!(
     SshOperation::Read,
     "GrokBuild:grep",
     true,
-    "Search remote workspace content using the complete remote grep schema."
+    "Search remote files using ripgrep through SSH without a worker. Requires read authorization and rg installed remotely. Search does not follow symlinks outside the granted root."
 );
 forwarding_tool!(
     SshRunTool,
@@ -336,7 +405,7 @@ forwarding_tool!(
     SshOperation::Execute,
     "GrokBuild:run_terminal_cmd",
     false,
-    "Run a remote command through the complete workspace command schema. SSH execution grants do not bypass per-command approval."
+    "Run a command through native SSH exec without a worker. Requires execution authorization and per-command user approval. Streams stdout/stderr and records the exit status. Background tasks are tracked by this local service; after connection loss the remote outcome is unknown, not automatically retried. The cwd is not a sandbox."
 );
 
 #[derive(Debug, Default)]
@@ -556,7 +625,7 @@ pub(super) struct SshTaskCancelTool;
 metadata!(
     SshTaskCancelTool,
     xai_grok_tools::types::tool::ToolKind::KillTaskAction,
-    "Cancel a remote task by its task_id from ssh_task_query on the selected SSH binding and session. Terminal tasks are confirmed only after remote termination; non-task operation references report pending cancellation and never close a shared SSH connection."
+    "Request cancellation of a task owned by the selected SSH binding and session. Native tasks receive an SSH signal; cancellation is confirmed only by a remote exit, otherwise remains pending or unknown. Never closes other tasks or a shared SSH connection."
 );
 
 impl Tool for SshTaskCancelTool {
@@ -630,30 +699,144 @@ fn service_error(error: super::SshServiceError) -> xai_tool_runtime::ToolError {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+struct CommandProgress<F> {
+    terminal: std::pin::Pin<Box<F>>,
+    events: tokio::sync::broadcast::Receiver<super::SshSessionWorkerEvent>,
+    call_id: String,
+    operation: Option<String>,
+    total: usize,
+    gap: bool,
+    truncated: bool,
+    done: bool,
+    notifications: Option<xai_grok_tools::notification::types::ToolNotificationHandle>,
+    output: Vec<u8>,
+    command: String,
+    cwd: std::path::PathBuf,
+}
 
-    #[test]
-    fn explicit_ssh_read_uses_remote_post_hook_prompt_without_leaking_clean_output() {
-        let output = dispatch_output(super::super::SshDispatchResult {
-            output: serde_json::json!({
-                "type": "read_file",
-                "content": "ORIGINAL_REMOTE_CONTENT_20261016",
-            }),
-            prompt_text: "REMOTE_POST_REPLACEMENT_20261016".into(),
-        });
-        let prompt =
-            xai_grok_tools::types::output::ToolOutput::Dynamic(output.clone()).to_prompt_format();
-
-        assert_eq!(prompt, "REMOTE_POST_REPLACEMENT_20261016");
-        assert!(
-            !prompt.contains("ORIGINAL_REMOTE_CONTENT_20261016"),
-            "the model-facing explicit SSH output must not retain the replaced raw content"
-        );
-        assert_eq!(
-            output.value["content"], "ORIGINAL_REMOTE_CONTENT_20261016",
-            "clean remote output remains available to UI consumers"
-        );
+impl<F> CommandProgress<F> {
+    fn notification_base(&self) -> xai_grok_tools::notification::types::BashNotificationBase {
+        xai_grok_tools::notification::types::BashNotificationBase {
+            tool_call_id: self.call_id.clone(),
+            command: self.command.clone(),
+            output: self.output.clone(),
+            total_bytes: self.total,
+            truncated: self.truncated || self.gap,
+            cwd: self.cwd.clone(),
+        }
     }
+
+    fn finish(
+        &mut self,
+        result: &Result<xai_grok_tools::types::output::DynamicOutput, xai_tool_runtime::ToolError>,
+    ) {
+        self.done = true;
+        let Some(exit_code) = result
+            .as_ref()
+            .ok()
+            .and_then(|output| output.value.get("exit_code"))
+            .and_then(|value| value.as_i64())
+            .and_then(|code| i32::try_from(code).ok())
+        else {
+            return;
+        };
+        if let Some(notifications) = &self.notifications {
+            notifications.send_complete(
+                xai_grok_tools::notification::types::BashExecutionComplete {
+                    base: self.notification_base(),
+                    exit_code: Some(exit_code),
+                    signal: None,
+                },
+            );
+        }
+    }
+}
+
+fn command_stream<F>(
+    terminal: F,
+    events: tokio::sync::broadcast::Receiver<super::SshSessionWorkerEvent>,
+    call_id: String,
+    notifications: Option<xai_grok_tools::notification::types::ToolNotificationHandle>,
+) -> xai_tool_runtime::ToolStream<xai_grok_tools::types::output::DynamicOutput>
+where
+    F: Future<
+            Output = Result<
+                xai_grok_tools::types::output::DynamicOutput,
+                xai_tool_runtime::ToolError,
+            >,
+        > + Send
+        + 'static,
+{
+    let state = CommandProgress {
+        terminal: Box::pin(terminal),
+        events,
+        call_id,
+        operation: None,
+        total: 0,
+        gap: false,
+        truncated: false,
+        done: false,
+        notifications,
+        output: Vec::new(),
+        command: String::new(),
+        cwd: Default::default(),
+    };
+    Box::pin(futures::stream::unfold(state, |mut state| async move {
+        if state.done {
+            return None;
+        }
+        loop {
+            tokio::select! {
+                biased;
+                // A noisy background process must not starve its task handle.
+                result = &mut state.terminal => {
+                    state.finish(&result);
+                    return Some((xai_tool_runtime::ToolStreamItem::Terminal(result), state));
+                }
+                event = state.events.recv() => {
+                    use xai_grok_workspace_types::ssh_wire::SshWorkerEvent;
+                    match event {
+                        Ok(event) => match event.event {
+                            SshWorkerEvent::Operation(record) if record.mutation_id.as_deref() == Some(state.call_id.as_str()) => {
+                                state.operation = Some(record.operation_id);
+                            }
+                            SshWorkerEvent::ToolProgress { operation_id, progress }
+                                if state.operation.as_deref() == Some(operation_id.as_str()) => {
+                                if let Some(text) = progress.body.get("text").and_then(|value| value.as_str()) {
+                                    state.total = state.total.saturating_add(text.len());
+                                    let available = (64 * 1024usize).saturating_sub(state.output.len());
+                                    state.output.extend(text.as_bytes().iter().take(available));
+                                    state.truncated |= text.len() > available;
+                                    if state.command.is_empty() {
+                                        state.command = progress.body.get("command").and_then(|v| v.as_str()).unwrap_or("ssh_run").to_owned();
+                                        state.cwd = progress.body.get("cwd").and_then(|v| v.as_str()).unwrap_or_default().into();
+                                    }
+                                    if let Some(notifications) = &state.notifications {
+                                        notifications.send_output_chunk(xai_grok_tools::notification::types::BashOutputChunk {
+                                            base: state.notification_base(),
+                                        });
+                                    }
+                                    let progress = xai_tool_runtime::ToolProgress::Custom {
+                                        subkind: "bash_output_chunk".into(),
+                                        payload: serde_json::json!({
+                                            "delta": text, "total_bytes": state.total,
+                                            "truncated": state.truncated || state.gap, "gap": state.gap,
+                                        }),
+                                    };
+                                    return Some((xai_tool_runtime::ToolStreamItem::Progress(progress), state));
+                                }
+                            }
+                            _ => {}
+                        },
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => { state.gap = true; },
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                            let result = (&mut state.terminal).await;
+                            state.finish(&result);
+                            return Some((xai_tool_runtime::ToolStreamItem::Terminal(result), state));
+                        }
+                    }
+                }
+            }
+        }
+    }))
 }

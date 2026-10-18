@@ -5,6 +5,8 @@
 mod control;
 mod control_client;
 mod model;
+mod native_files;
+mod native_tasks;
 mod service;
 mod tools;
 
@@ -19,8 +21,8 @@ pub use model::{
     SshTargetStatus,
 };
 pub use service::{SessionSsh, SessionSshResource, SshServiceError};
-pub use tools::register_tool_pack;
 pub(crate) use tools::configure_default_tools;
+pub use tools::register_tool_pack;
 pub use xai_grok_workspace_types::ssh::{
     ProjectLocation, ResolvedSshInvocation, SshBinding, SshCapabilities, SshHostIdentity,
     SshOperation,

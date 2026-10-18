@@ -81,6 +81,14 @@ pub struct PersistedSshGrant {
     pub scope: SshGrantScope,
     #[serde(default)]
     pub revoke_status: Option<SshGrantStatus>,
+    /// Whether this authority has been sent to a project worker. Old saved
+    /// grants were always worker-backed and must still revoke remotely.
+    #[serde(default = "legacy_worker_bound")]
+    pub worker_bound: bool,
+}
+
+fn legacy_worker_bound() -> bool {
+    true
 }
 
 /// Per-session SSH state supplied to normal session persistence. It is safe to

@@ -2545,6 +2545,14 @@ fn task_ids_from_raw_input(raw: &serde_json::Value) -> Vec<String> {
 /// True when an execute tool call asked to run in the background.
 /// Scrollback skips these; the `x.ai/task_backgrounded` notification adds a `BgTask` block for them.
 fn is_bg_tool(tc: &acp::ToolCall) -> bool {
+    // Native SSH tasks return their own handles and never emit local
+    // x.ai/task_backgrounded notifications. Keep consuming their final update.
+    if matches!(
+        canonical_tool_name(tc),
+        Some("ssh_run" | "GrokBuild:ssh_run")
+    ) {
+        return false;
+    }
     let looks_like_execute =
         tc.kind == acp::ToolKind::Execute || is_execute_tool_function_name(&tc.title);
     if !looks_like_execute {

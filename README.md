@@ -127,11 +127,16 @@ groky ssh connect dev
 groky ssh disconnect dev
 ```
 
-Install a matching `groky` binary on the remote machine first. The default remote
-command is `groky worker --stdio`; it must be available in the noninteractive SSH
-`PATH`, along with the tools your project needs (including Git and ripgrep).
-groky does not silently install a worker or require an xAI login on that host.
-Use `--worker-command '/absolute/path/groky worker --stdio'` when needed.
+**Explicit SSH tools do not require remote groky or a worker.** They use the
+authenticated native SSH connection, SFTP for files, and POSIX shell execution.
+The SSH server must enable SFTP; search additionally requires remote `rg`.
+
+**Only SSH projects require a matching remote `groky` binary.** Their default
+command is `groky worker --stdio`, available in the noninteractive SSH `PATH`,
+along with Git, ripgrep and the project's tools. Use
+`--worker-command '/absolute/path/groky worker --stdio'` when needed. groky does
+not silently install a worker or require an xAI login on that host. Model requests
+and provider credentials stay local in both modes.
 
 Open `/ssh` in a session, or press `Ctrl+S` on Welcome, to manage targets. `Enter`
 connects/disconnects, `g` requests a root-scoped grant, `u` selects an authorized
@@ -157,6 +162,13 @@ There are two execution modes:
   otherwise a user-selected SSH default is required. This default never redirects
   ordinary local tools. `ssh_targets` lists only the current session's grants;
   `ssh_request_access` asks the user for a grant rather than granting itself access.
+  These tools stay workerless even inside an SSH project; they do not load remote
+  project instructions, skills or hooks. File reads support UTF-8 text and line
+  ranges, not image/PDF decoding. Read output and existing-file write/edit
+  snapshots are bounded. Replacing an existing file requires the SFTP
+  `posix-rename@openssh.com` extension; unsupported servers fail before writing.
+  Edits recheck the original bytes before atomic replacement, but this is not a
+  cross-client compare-and-swap against concurrent writers.
   `ssh_task_query` and `ssh_task_cancel` operate within the selected binding.
   Query with `task_id` to read task output, with `operation_id` to inspect a
   recorded operation, or neither to list tasks; these IDs are not local task IDs.
@@ -167,9 +179,11 @@ Grants specify a remote root and read/write/execute capabilities. They are
 session-scoped unless the user explicitly saves a project rule; subagents inherit
 only an authorized subset. A grant does not bypass operation approval. **A run
 working directory is not a sandbox:** commands run with the remote SSH user's OS
-permissions. Revocation blocks new calls locally immediately; a disconnected
-worker remains “remote confirmation pending” until it acknowledges revocation.
-Already-running tasks require separate cancellation.
+permissions. Revocation blocks new calls locally immediately. A workerless-only
+grant needs no remote acknowledgement; a grant used by a project worker remains
+“remote confirmation pending” until that worker acknowledges revocation.
+Already-running tasks require separate cancellation. Workerless tasks can still
+be cancelled using their captured binding ID after its grant is revoked.
 
 Headless resume can reuse an existing grant with noninteractive SSH authentication
 and the normal tool permissions. Required SSH interaction fails promptly;
@@ -192,7 +206,7 @@ For persistent overrides, use the user-global `~/.groky/config.toml`:
 host = "my-server" # existing OpenSSH alias
 label = "Development"
 user = "developer" # optional override
-worker_command = ["/usr/local/bin/groky", "worker", "--stdio"]
+worker_command = ["/usr/local/bin/groky", "worker", "--stdio"] # SSH projects only
 ```
 
 Groky target overrides take precedence over user SSH config, then system SSH
@@ -206,10 +220,13 @@ Connections are pooled and held independently of individual tool calls.
 The default embedded TUI owns its pool for that process's lifetime. Start with
 `groky --leader` to share a persistent pool with other leader-backed TUIs and
 manual `groky ssh connect` holds; grants still belong to individual sessions.
-Transport loss does not automatically replay writes, edits or commands. The
-private remote worker retains tasks across SSH channel disconnects; if the worker
-itself exits, unfinished results are unknown, not proof that side effects did not
-occur.
+Transport loss does not automatically replay writes, edits or commands.
+Workerless task IDs and bounded stdout/stderr history belong to the local service,
+not a remote daemon; use `ssh_task_query` rather than expecting a completion
+wakeup. A disconnect before a confirmed exit produces an unknown outcome, and the
+process may still be running. Cancellation is a request, not proof of termination.
+SSH project workers retain their own tasks across channel disconnects; if the
+worker itself exits, unfinished outcomes are also unknown.
 
 ## What this fork changes
 

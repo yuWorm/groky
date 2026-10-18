@@ -346,6 +346,12 @@ pub enum SshError {
     Proxy,
     #[error("the SSH connection is disconnected")]
     Disconnected,
+    #[error("the SSH server rejected a channel request")]
+    ChannelRequestRejected,
+    #[error("the SSH server did not answer a channel request")]
+    ChannelRequestTimeout,
+    #[error("the SSH signal name is invalid")]
+    InvalidSignal,
     #[error("SSH credential store is unavailable")]
     CredentialStoreUnavailable,
     #[error("SSH transport failed")]

@@ -12,15 +12,15 @@ use russh::client::{self, Handler, KeyboardInteractiveAuthResponse};
 use russh::keys::{
     Algorithm, PrivateKeyWithHashAlg, PublicKeyOrCertificate, agent::client::AgentClient,
 };
-use russh::{Channel, ChannelMsg, ChannelReadHalf, ChannelStream, Disconnect, Preferred};
+use russh::{Channel, ChannelMsg, ChannelReadHalf, ChannelStream, Disconnect, Preferred, Sig};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::borrow::Cow;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::convert::TryFrom;
 use std::fs;
-use std::future::Future;
 use std::io::{self, Read};
+use std::ops::Deref;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::process::Stdio;
@@ -36,6 +36,9 @@ use xai_grok_workspace_types::ssh::SshHostIdentity;
 use zeroize::Zeroizing;
 
 const IDLE_DISCONNECT_AFTER: Duration = Duration::from_secs(5 * 60);
+const CHANNEL_REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
+const MAX_INITIAL_COMMAND_EVENTS: usize = 16;
+const MAX_INITIAL_COMMAND_BYTES: usize = 64 * 1024;
 
 /// A read/write SSH channel stream. It is intentionally opaque so users cannot
 /// reach the underlying russh handle or credentials.
@@ -44,6 +47,256 @@ impl<T: AsyncRead + AsyncWrite + Send + Unpin> SshStream for T {}
 
 /// A real bidirectional SSH channel, suitable for the remote workspace wire.
 pub type BoxedSshStream = Pin<Box<dyn SshStream>>;
+
+/// An output or termination event emitted by a raw SSH exec channel.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SshCommandEvent {
+    Stdout(Vec<u8>),
+    Stderr(Vec<u8>),
+    ExitStatus(u32),
+    ExitSignal(String),
+}
+
+/// A pooled SFTP session that keeps its native SSH connection in use.
+pub struct SftpConnection {
+    session: russh_sftp::client::SftpSession,
+    atomic_replace: AsyncMutex<AtomicReplaceState>,
+    entry: Arc<ConnectionEntry>,
+    generation: u64,
+    _use_guard: EntryUse,
+}
+
+enum AtomicReplaceState {
+    Uninitialized,
+    Unsupported,
+    Ready(SftpAtomicReplaceSession),
+}
+
+struct SftpAtomicReplaceSession {
+    session: russh_sftp::client::RawSftpSession,
+    _use_guard: EntryUse,
+}
+
+/// Owns a raw channel until it is either transferred to its long-lived user or
+/// closed. `russh::Channel` itself does not request close when dropped.
+struct ClosingChannel {
+    channel: Option<Channel<client::Msg>>,
+    use_guard: Option<EntryUse>,
+    runtime: tokio::runtime::Handle,
+    close_sent: AtomicBool,
+}
+
+impl ClosingChannel {
+    fn new(channel: Channel<client::Msg>, use_guard: EntryUse) -> Self {
+        Self {
+            channel: Some(channel),
+            use_guard: Some(use_guard),
+            runtime: tokio::runtime::Handle::current(),
+            close_sent: AtomicBool::new(false),
+        }
+    }
+
+    async fn close(&self) -> Result<(), SshError> {
+        if !self.close_sent.load(Ordering::Acquire) {
+            close_channel(self).await?;
+            self.close_sent.store(true, Ordering::Release);
+        }
+        Ok(())
+    }
+
+    fn into_stream_and_guard(mut self) -> (ChannelStream<client::Msg>, EntryUse) {
+        let channel = self
+            .channel
+            .take()
+            .expect("a guarded channel is present until it is transferred");
+        let use_guard = self
+            .use_guard
+            .take()
+            .expect("a guarded channel keeps its pool use until it is transferred");
+        (channel.into_stream(), use_guard)
+    }
+}
+
+impl Deref for ClosingChannel {
+    type Target = Channel<client::Msg>;
+
+    fn deref(&self) -> &Self::Target {
+        self.channel
+            .as_ref()
+            .expect("a guarded channel is present until it is transferred")
+    }
+}
+
+impl std::ops::DerefMut for ClosingChannel {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.channel
+            .as_mut()
+            .expect("a guarded channel is present until it is transferred")
+    }
+}
+
+impl Drop for ClosingChannel {
+    fn drop(&mut self) {
+        if self.close_sent.load(Ordering::Acquire) {
+            return;
+        }
+        let Some(channel) = self.channel.take() else {
+            return;
+        };
+        let Some(use_guard) = self.use_guard.take() else {
+            return;
+        };
+        self.runtime.spawn(async move {
+            let _ = close_channel(&channel).await;
+            drop(channel);
+            drop(use_guard);
+        });
+    }
+}
+
+impl std::fmt::Debug for SftpConnection {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("SftpConnection")
+            .finish_non_exhaustive()
+    }
+}
+
+impl Deref for SftpConnection {
+    type Target = russh_sftp::client::SftpSession;
+
+    fn deref(&self) -> &Self::Target {
+        &self.session
+    }
+}
+
+impl SftpConnection {
+    /// Check whether this server offers `posix-rename@openssh.com` version 1.
+    pub async fn supports_atomic_replace(&self) -> Result<bool, russh_sftp::client::error::Error> {
+        let mut state = self.atomic_replace.lock().await;
+        self.ensure_atomic_replace_session(&mut state).await
+    }
+
+    /// Atomically replace an existing path with a completed temporary file.
+    ///
+    /// This only sends `posix-rename@openssh.com` after negotiated support
+    /// confirms that the server implements its overwrite semantics.
+    pub async fn atomic_replace(
+        &self,
+        from: String,
+        to: String,
+    ) -> Result<(), russh_sftp::client::error::Error> {
+        let payload = posix_rename_payload(&from, &to)?;
+        let mut state = self.atomic_replace.lock().await;
+        if !self.ensure_atomic_replace_session(&mut state).await? {
+            return Err(russh_sftp::client::error::Error::UnexpectedBehavior(
+                "the remote SFTP server does not support atomic replacement".to_owned(),
+            ));
+        }
+        let AtomicReplaceState::Ready(session) = &*state else {
+            unreachable!("a supported atomic replacement session is retained");
+        };
+        match session
+            .session
+            .extended("posix-rename@openssh.com", payload)
+            .await?
+        {
+            russh_sftp::protocol::Packet::Status(status)
+                if status.status_code == russh_sftp::protocol::StatusCode::Ok =>
+            {
+                Ok(())
+            }
+            russh_sftp::protocol::Packet::Status(status) => Err(status.into()),
+            _ => Err(russh_sftp::client::error::Error::UnexpectedPacket),
+        }
+    }
+
+    async fn ensure_atomic_replace_session(
+        &self,
+        state: &mut AtomicReplaceState,
+    ) -> Result<bool, russh_sftp::client::error::Error> {
+        match state {
+            AtomicReplaceState::Ready(_) => return Ok(true),
+            AtomicReplaceState::Unsupported => return Ok(false),
+            AtomicReplaceState::Uninitialized => {}
+        }
+        *state = match open_atomic_replace_session(&self.entry, self.generation)
+            .await
+            .map_err(sftp_channel_error)?
+        {
+            Some(session) => AtomicReplaceState::Ready(session),
+            None => AtomicReplaceState::Unsupported,
+        };
+        Ok(matches!(&*state, AtomicReplaceState::Ready(_)))
+    }
+}
+
+/// A generation-bound raw SSH exec channel.
+pub struct SshCommand {
+    channel: ClosingChannel,
+    entry: Arc<ConnectionEntry>,
+    generation: u64,
+    pending: VecDeque<SshCommandEvent>,
+    finished: bool,
+}
+
+impl std::fmt::Debug for SshCommand {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("SshCommand")
+            .field("generation", &self.generation)
+            .field("finished", &self.finished)
+            .finish_non_exhaustive()
+    }
+}
+
+impl SshCommand {
+    /// Return the next stdout, stderr, or termination event from the remote
+    /// command. A channel which closes without an exit result is disconnected.
+    pub async fn next_event(&mut self) -> Result<Option<SshCommandEvent>, SshError> {
+        loop {
+            if !generation_is_current(&self.entry, self.generation) {
+                return Err(SshError::Disconnected);
+            }
+            if let Some(event) = self.pending.pop_front() {
+                return Ok(Some(event));
+            }
+
+            let Some(message) = self.channel.wait().await else {
+                return command_channel_closed(self.finished);
+            };
+            if !generation_is_current(&self.entry, self.generation) {
+                return Err(SshError::Disconnected);
+            }
+            if matches!(message, ChannelMsg::Close) {
+                return command_channel_closed(self.finished);
+            }
+            if let Some(event) = command_event(message, &mut self.finished)? {
+                return Ok(Some(event));
+            }
+        }
+    }
+
+    /// Send an SSH signal to the remote command without recreating its channel.
+    pub async fn signal(&self, signal: &str) -> Result<(), SshError> {
+        if !generation_is_current(&self.entry, self.generation) {
+            return Err(SshError::Disconnected);
+        }
+        let signal = signal_from_name(signal)?;
+        timeout(CHANNEL_REQUEST_TIMEOUT, self.channel.signal(signal))
+            .await
+            .map_err(|_| SshError::ChannelRequestTimeout)?
+            .map_err(|_| SshError::Transport)
+    }
+
+    /// Request closure of the live remote channel without recreating it.
+    pub async fn close(&self) -> Result<(), SshError> {
+        if !generation_is_current(&self.entry, self.generation) {
+            return Err(SshError::Disconnected);
+        }
+        self.channel.close().await
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -309,6 +562,192 @@ impl ConnectionLease {
             _use_guard: EntryUse::new(Arc::clone(&self.entry)),
         }))
     }
+    /// Open an SFTP subsystem on this connection. The returned session retains
+    /// a pool guard until it is dropped.
+    pub async fn open_sftp(&self) -> Result<SftpConnection, SshError> {
+        let channel = open_sftp_channel(&self.entry, self.generation).await?;
+        let (stream, use_guard) = channel.into_stream_and_guard();
+        let session = timeout(
+            CHANNEL_REQUEST_TIMEOUT,
+            russh_sftp::client::SftpSession::new(stream),
+        )
+        .await
+        .map_err(|_| SshError::ChannelRequestTimeout)?
+        .map_err(|_| SshError::Transport)?;
+        if !generation_is_current(&self.entry, self.generation) {
+            return Err(SshError::Disconnected);
+        }
+        Ok(SftpConnection {
+            session,
+            atomic_replace: AsyncMutex::new(AtomicReplaceState::Uninitialized),
+            entry: Arc::clone(&self.entry),
+            generation: self.generation,
+            _use_guard: use_guard,
+        })
+    }
+
+    /// Start a raw SSH exec channel and stream its protocol events directly.
+    /// The request is accepted before this method returns.
+    pub async fn exec_command(&self, command: &str) -> Result<SshCommand, SshError> {
+        let mut channel = open_session_channel(&self.entry, self.generation, true).await?;
+        if let Err(error) = send_exec_request(&channel, command).await {
+            let _ = channel.close().await;
+            return Err(error);
+        }
+        let (pending, finished) = match await_command_acceptance(&mut channel).await {
+            Ok(result) => result,
+            Err(error) => {
+                let _ = channel.close().await;
+                return Err(error);
+            }
+        };
+        if !generation_is_current(&self.entry, self.generation) {
+            let _ = channel.close().await;
+            return Err(SshError::Disconnected);
+        }
+        Ok(SshCommand {
+            channel,
+            entry: Arc::clone(&self.entry),
+            generation: self.generation,
+            pending,
+            finished,
+        })
+    }
+}
+
+async fn open_sftp_channel(
+    entry: &Arc<ConnectionEntry>,
+    generation: u64,
+) -> Result<ClosingChannel, SshError> {
+    let mut channel = open_session_channel(entry, generation, false).await?;
+    if let Err(error) = send_subsystem_request(&channel).await {
+        let _ = channel.close().await;
+        return Err(error);
+    }
+    if let Err(error) = await_subsystem_acceptance(&mut channel).await {
+        let _ = channel.close().await;
+        return Err(error);
+    }
+    if !generation_is_current(entry, generation) {
+        let _ = channel.close().await;
+        return Err(SshError::Disconnected);
+    }
+    Ok(channel)
+}
+
+async fn open_session_channel(
+    entry: &Arc<ConnectionEntry>,
+    generation: u64,
+    send_environment: bool,
+) -> Result<ClosingChannel, SshError> {
+    if !generation_is_current(entry, generation) {
+        return Err(SshError::Disconnected);
+    }
+
+    let mut transport_guard = entry.transport.lock().await;
+    let Some(transport) = transport_guard.as_mut() else {
+        return Err(SshError::Disconnected);
+    };
+    if entry.generation.load(Ordering::Acquire) != generation || transport.generation != generation
+    {
+        return Err(SshError::Disconnected);
+    }
+    if transport.handle.is_closed() {
+        entry.mark_disconnected();
+        return Err(SshError::Disconnected);
+    }
+
+    let channel = timeout(
+        CHANNEL_REQUEST_TIMEOUT,
+        transport.handle.channel_open_session(),
+    )
+    .await
+    .map_err(|_| SshError::ChannelRequestTimeout)?
+    .map_err(|_| SshError::Transport)?;
+    let channel = ClosingChannel::new(channel, EntryUse::new(Arc::clone(entry)));
+    let environment_result = if send_environment {
+        timeout(
+            CHANNEL_REQUEST_TIMEOUT,
+            apply_send_environment(&channel, &transport.send_env),
+        )
+        .await
+        .map_err(|_| SshError::ChannelRequestTimeout)?
+    } else {
+        Ok(())
+    };
+    drop(transport_guard);
+    if let Err(error) = environment_result {
+        let _ = channel.close().await;
+        return Err(error);
+    }
+    if !generation_is_current(entry, generation) {
+        let _ = channel.close().await;
+        return Err(SshError::Disconnected);
+    }
+    Ok(channel)
+}
+
+async fn open_atomic_replace_session(
+    entry: &Arc<ConnectionEntry>,
+    generation: u64,
+) -> Result<Option<SftpAtomicReplaceSession>, SshError> {
+    let channel = open_sftp_channel(entry, generation).await?;
+    let (stream, use_guard) = channel.into_stream_and_guard();
+    let session = russh_sftp::client::RawSftpSession::new(stream);
+    let version = timeout(CHANNEL_REQUEST_TIMEOUT, session.init())
+        .await
+        .map_err(|_| SshError::ChannelRequestTimeout)?
+        .map_err(|_| SshError::Transport)?;
+    if !generation_is_current(entry, generation) {
+        return Err(SshError::Disconnected);
+    }
+    if version
+        .extensions
+        .get("posix-rename@openssh.com")
+        .is_some_and(|version| version == "1")
+    {
+        Ok(Some(SftpAtomicReplaceSession {
+            session,
+            _use_guard: use_guard,
+        }))
+    } else {
+        Ok(None)
+    }
+}
+
+fn sftp_channel_error(error: SshError) -> russh_sftp::client::error::Error {
+    match error {
+        SshError::ChannelRequestTimeout => russh_sftp::client::error::Error::Timeout,
+        SshError::Disconnected => russh_sftp::client::error::Error::UnexpectedBehavior(
+            "the SSH connection was disconnected while opening SFTP".to_owned(),
+        ),
+        _ => russh_sftp::client::error::Error::UnexpectedBehavior(
+            "the SSH transport could not open an SFTP channel".to_owned(),
+        ),
+    }
+}
+
+fn posix_rename_payload(from: &str, to: &str) -> Result<Vec<u8>, russh_sftp::client::error::Error> {
+    let capacity = from
+        .len()
+        .checked_add(to.len())
+        .and_then(|length| length.checked_add(8))
+        .ok_or_else(|| {
+            russh_sftp::client::error::Error::Limited(
+                "atomic rename paths exceed the SFTP packet size".to_owned(),
+            )
+        })?;
+    let mut payload = Vec::with_capacity(capacity);
+    for path in [from, to] {
+        let length = u32::try_from(path.len()).map_err(|_| {
+            russh_sftp::client::error::Error::Limited(
+                "an atomic rename path exceeds the SFTP packet size".to_owned(),
+            )
+        })?;
+        payload.extend_from_slice(&length.to_be_bytes());
+        payload.extend_from_slice(path.as_bytes());
+    }
+    Ok(payload)
 }
 
 async fn apply_send_environment(
@@ -330,6 +769,176 @@ async fn apply_send_environment(
             .map_err(|_| SshError::Transport)?;
     }
     Ok(())
+}
+
+fn generation_is_current(entry: &ConnectionEntry, generation: u64) -> bool {
+    entry.generation.load(Ordering::Acquire) == generation
+        && entry.phase() == ConnectionPhase::Connected
+}
+
+fn command_channel_closed(finished: bool) -> Result<Option<SshCommandEvent>, SshError> {
+    if finished {
+        Ok(None)
+    } else {
+        Err(SshError::Disconnected)
+    }
+}
+
+fn command_event(
+    message: ChannelMsg,
+    finished: &mut bool,
+) -> Result<Option<SshCommandEvent>, SshError> {
+    match message {
+        ChannelMsg::Data { data } => Ok(Some(SshCommandEvent::Stdout(data.to_vec()))),
+        ChannelMsg::ExtendedData { data, .. } => Ok(Some(SshCommandEvent::Stderr(data.to_vec()))),
+        ChannelMsg::ExitStatus { exit_status } => {
+            *finished = true;
+            Ok(Some(SshCommandEvent::ExitStatus(exit_status)))
+        }
+        ChannelMsg::ExitSignal { signal_name, .. } => {
+            *finished = true;
+            Ok(Some(SshCommandEvent::ExitSignal(signal_name_to_string(
+                signal_name,
+            ))))
+        }
+        ChannelMsg::Failure | ChannelMsg::OpenFailure(_) => Err(SshError::ChannelRequestRejected),
+        // EOF closes stdout, not the command: an exit-status request may follow.
+        ChannelMsg::Eof => Ok(None),
+        ChannelMsg::Close => command_channel_closed(*finished),
+        _ => Ok(None),
+    }
+}
+
+fn queue_initial_command_event(
+    pending: &mut VecDeque<SshCommandEvent>,
+    pending_bytes: &mut usize,
+    event: SshCommandEvent,
+) -> Result<(), SshError> {
+    let event_bytes = match &event {
+        SshCommandEvent::Stdout(data) | SshCommandEvent::Stderr(data) => data.len(),
+        SshCommandEvent::ExitStatus(_) | SshCommandEvent::ExitSignal(_) => 0,
+    };
+    if pending.len() >= MAX_INITIAL_COMMAND_EVENTS
+        || *pending_bytes > MAX_INITIAL_COMMAND_BYTES.saturating_sub(event_bytes)
+    {
+        return Err(SshError::Transport);
+    }
+    *pending_bytes += event_bytes;
+    pending.push_back(event);
+    Ok(())
+}
+
+async fn await_subsystem_acceptance(channel: &mut Channel<client::Msg>) -> Result<(), SshError> {
+    timeout(CHANNEL_REQUEST_TIMEOUT, async {
+        loop {
+            let Some(message) = channel.wait().await else {
+                return Err(SshError::Disconnected);
+            };
+            match message {
+                ChannelMsg::Success => return Ok(()),
+                ChannelMsg::Failure | ChannelMsg::OpenFailure(_) => {
+                    return Err(SshError::ChannelRequestRejected);
+                }
+                ChannelMsg::Eof | ChannelMsg::Close => return Err(SshError::Disconnected),
+                ChannelMsg::WindowAdjusted { .. } | ChannelMsg::XonXoff { .. } => continue,
+                _ => return Err(SshError::Transport),
+            }
+        }
+    })
+    .await
+    .map_err(|_| SshError::ChannelRequestTimeout)?
+}
+
+async fn await_command_acceptance(
+    channel: &mut Channel<client::Msg>,
+) -> Result<(VecDeque<SshCommandEvent>, bool), SshError> {
+    timeout(CHANNEL_REQUEST_TIMEOUT, async {
+        let mut pending = VecDeque::new();
+        let mut pending_bytes = 0;
+        let mut finished = false;
+        loop {
+            let Some(message) = channel.wait().await else {
+                return Err(SshError::Disconnected);
+            };
+            if matches!(&message, ChannelMsg::Success) {
+                return Ok((pending, finished));
+            }
+            if let Some(event) = command_event(message, &mut finished)? {
+                queue_initial_command_event(&mut pending, &mut pending_bytes, event)?;
+            }
+        }
+    })
+    .await
+    .map_err(|_| SshError::ChannelRequestTimeout)?
+}
+
+async fn send_subsystem_request(channel: &Channel<client::Msg>) -> Result<(), SshError> {
+    timeout(
+        CHANNEL_REQUEST_TIMEOUT,
+        channel.request_subsystem(true, "sftp"),
+    )
+    .await
+    .map_err(|_| SshError::ChannelRequestTimeout)?
+    .map_err(|_| SshError::Transport)
+}
+
+async fn send_exec_request(channel: &Channel<client::Msg>, command: &str) -> Result<(), SshError> {
+    timeout(CHANNEL_REQUEST_TIMEOUT, channel.exec(true, command))
+        .await
+        .map_err(|_| SshError::ChannelRequestTimeout)?
+        .map_err(|_| SshError::Transport)
+}
+
+async fn close_channel(channel: &Channel<client::Msg>) -> Result<(), SshError> {
+    timeout(CHANNEL_REQUEST_TIMEOUT, channel.close())
+        .await
+        .map_err(|_| SshError::ChannelRequestTimeout)?
+        .map_err(|_| SshError::Transport)
+}
+
+fn signal_from_name(signal: &str) -> Result<Sig, SshError> {
+    let name = signal.strip_prefix("SIG").unwrap_or(signal);
+    if name.is_empty()
+        || name.len() > 64
+        || !name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'+'))
+    {
+        return Err(SshError::InvalidSignal);
+    }
+    Ok(match name {
+        "ABRT" => Sig::ABRT,
+        "ALRM" => Sig::ALRM,
+        "FPE" => Sig::FPE,
+        "HUP" => Sig::HUP,
+        "ILL" => Sig::ILL,
+        "INT" => Sig::INT,
+        "KILL" => Sig::KILL,
+        "PIPE" => Sig::PIPE,
+        "QUIT" => Sig::QUIT,
+        "SEGV" => Sig::SEGV,
+        "TERM" => Sig::TERM,
+        "USR1" => Sig::USR1,
+        _ => Sig::Custom(name.to_owned()),
+    })
+}
+
+fn signal_name_to_string(signal: Sig) -> String {
+    match signal {
+        Sig::ABRT => "ABRT".to_owned(),
+        Sig::ALRM => "ALRM".to_owned(),
+        Sig::FPE => "FPE".to_owned(),
+        Sig::HUP => "HUP".to_owned(),
+        Sig::ILL => "ILL".to_owned(),
+        Sig::INT => "INT".to_owned(),
+        Sig::KILL => "KILL".to_owned(),
+        Sig::PIPE => "PIPE".to_owned(),
+        Sig::QUIT => "QUIT".to_owned(),
+        Sig::SEGV => "SEGV".to_owned(),
+        Sig::TERM => "TERM".to_owned(),
+        Sig::USR1 => "USR1".to_owned(),
+        Sig::Custom(name) => name,
+    }
 }
 
 struct ManagerInner {
@@ -2041,13 +2650,17 @@ fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 mod tests {
     use super::{
         ConnectionEntry, ConnectionFailure, ConnectionSecurityKey, EntryState, FileRevision,
-        MaterialKey, failure_category, failure_error, lock, preferred_algorithms,
+        MAX_INITIAL_COMMAND_BYTES, MAX_INITIAL_COMMAND_EVENTS, MaterialKey, SshCommandEvent,
+        command_event, failure_category, failure_error, lock, posix_rename_payload,
+        preferred_algorithms, queue_initial_command_event,
     };
     use crate::auth::{InteractionError, SshError};
     use crate::config::{
         AgentConfig, AlgorithmRequirements, AuthMethod, ConfigValueSource, HostKeyPolicy,
         KnownHostsConfig, ResolvedConfigProvenance, ResolvedSshConfig, SshConfigSource, SshTarget,
     };
+    use russh::ChannelMsg;
+    use std::collections::VecDeque;
     use std::fs;
     use std::sync::Arc;
     use std::sync::atomic::Ordering;
@@ -2220,5 +2833,107 @@ mod tests {
         let directory = tempdir().expect("temporary directory");
         let missing = MaterialKey::from_path(directory.path().join("missing"));
         assert!(matches!(missing.revision, FileRevision::Missing));
+    }
+
+    #[test]
+    fn raw_command_closing_without_exit_is_disconnected() {
+        let mut finished = false;
+        assert!(matches!(
+            command_event(ChannelMsg::Close, &mut finished),
+            Err(SshError::Disconnected)
+        ));
+        assert!(!finished);
+    }
+
+    #[test]
+    fn raw_command_exit_status_is_a_terminal_event() {
+        let mut finished = false;
+        let event = command_event(ChannelMsg::ExitStatus { exit_status: 23 }, &mut finished)
+            .expect("exit status is a valid command event");
+        assert_eq!(event, Some(SshCommandEvent::ExitStatus(23)));
+        assert!(finished);
+    }
+
+    #[test]
+    fn raw_command_queues_initial_exit_status_before_following_close() {
+        let mut finished = false;
+        let mut pending = VecDeque::new();
+        let mut pending_bytes = 0;
+        let event = command_event(ChannelMsg::ExitStatus { exit_status: 0 }, &mut finished)
+            .expect("exit status is a valid command event")
+            .expect("exit status must be delivered");
+        queue_initial_command_event(&mut pending, &mut pending_bytes, event)
+            .expect("terminal event fits the initial queue");
+
+        assert_eq!(pending.pop_front(), Some(SshCommandEvent::ExitStatus(0)));
+        assert_eq!(
+            command_event(ChannelMsg::Close, &mut finished).unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn posix_rename_payload_encodes_two_sftp_strings() {
+        assert_eq!(
+            posix_rename_payload("/tmp/new", "/tmp/old").unwrap(),
+            b"\0\0\0\x08/tmp/new\0\0\0\x08/tmp/old".to_vec()
+        );
+    }
+
+    #[test]
+    fn raw_command_stdout_eof_can_precede_exit_status() {
+        let mut finished = false;
+        assert_eq!(command_event(ChannelMsg::Eof, &mut finished).unwrap(), None);
+        assert!(!finished);
+        assert_eq!(
+            command_event(ChannelMsg::ExitStatus { exit_status: 7 }, &mut finished).unwrap(),
+            Some(SshCommandEvent::ExitStatus(7)),
+        );
+        assert_eq!(
+            command_event(ChannelMsg::Close, &mut finished).unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn raw_command_preacceptance_buffer_is_bounded() {
+        let mut pending = VecDeque::new();
+        let mut pending_bytes = 0;
+        for _ in 0..MAX_INITIAL_COMMAND_EVENTS {
+            queue_initial_command_event(
+                &mut pending,
+                &mut pending_bytes,
+                SshCommandEvent::ExitStatus(0),
+            )
+            .expect("event is within the bounded queue");
+        }
+        assert!(matches!(
+            queue_initial_command_event(
+                &mut pending,
+                &mut pending_bytes,
+                SshCommandEvent::ExitStatus(0),
+            ),
+            Err(SshError::Transport)
+        ));
+    }
+
+    #[test]
+    fn raw_command_preacceptance_bytes_are_bounded() {
+        let mut pending = VecDeque::new();
+        let mut pending_bytes = 0;
+        queue_initial_command_event(
+            &mut pending,
+            &mut pending_bytes,
+            SshCommandEvent::Stdout(vec![0; MAX_INITIAL_COMMAND_BYTES]),
+        )
+        .expect("event fills the bounded byte budget");
+        assert!(matches!(
+            queue_initial_command_event(
+                &mut pending,
+                &mut pending_bytes,
+                SshCommandEvent::Stdout(vec![0]),
+            ),
+            Err(SshError::Transport)
+        ));
     }
 }

@@ -1113,10 +1113,7 @@ impl SessionActor {
             let remote_hook_call_id = prepared.tool_call_id.0.as_ref().to_owned();
             let remote_post_hook = self
                 .workspace_ops
-                .take_ssh_post_tool_hook_outcome(
-                    &self.session_info.id.0,
-                    &remote_hook_call_id,
-                )
+                .take_ssh_post_tool_hook_outcome(&self.session_info.id.0, &remote_hook_call_id)
                 .await;
             let remote_hook_outcome = remote_post_hook.as_ref().map(|effects| &effects.outcome);
             let remote_output_replaced = remote_post_hook
@@ -2610,6 +2607,17 @@ impl SessionActor {
                     vec![],
                 )
             }
+            ToolInput::Dynamic(args) if matches!(wire_name, "ssh_run" | "GrokBuild:ssh_run") => (
+                format!(
+                    "SSH `{}`",
+                    args.get("command")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or_default()
+                ),
+                acp::ToolKind::Execute,
+                vec![],
+                vec![],
+            ),
             ToolInput::Dynamic(_) => (
                 "Dynamic tool call".to_string(),
                 acp::ToolKind::Other,
@@ -3102,9 +3110,13 @@ impl SessionActor {
             state.mcp_tool_meta.get(effective_tool_name).cloned()
         };
         tool_layer_images.extend(drain_tool_layer_extracted_images(&mut result.output));
-        if let Some(mut tool_update) =
-            acp_tool_update(&result.output, call_id, path_rewriter.as_ref(), tool_meta)
-        {
+        let tool_update = match (&result.output, effective_tool_name) {
+            (ToolsToolOutput::Dynamic(output), "ssh_run" | "GrokBuild:ssh_run") => {
+                Some(ssh_command_update(output, call_id, tool_parsed_args))
+            }
+            _ => acp_tool_update(&result.output, call_id, path_rewriter.as_ref(), tool_meta),
+        };
+        if let Some(mut tool_update) = tool_update {
             if tool_update.fields.status == Some(acp::ToolCallStatus::Failed) {
                 tracing::error!(
                     session_id = %self.session_info.id.0,
@@ -3453,6 +3465,127 @@ fn execute_tool_call_parts(
             acp::TextContent::new(description.unwrap_or_default().to_string()),
         ))],
     )
+}
+
+/// UI-only projection: keep the native result and its SSH scope intact for the
+/// model. Only a confirmed exit can be rendered as a completed Bash result.
+fn ssh_command_update(
+    output: &xai_grok_tools::types::output::DynamicOutput,
+    call_id: &str,
+    args: &serde_json::Value,
+) -> acp::ToolCallUpdate {
+    use xai_grok_tools::types::output::{BashOutput, ToolOutput};
+    let value = &output.value;
+    let state = value
+        .get("state")
+        .and_then(|v| v.as_str())
+        .unwrap_or("unknown");
+    let text = output
+        .prompt_text
+        .clone()
+        .unwrap_or_else(|| value.to_string());
+    let status = if matches!(state, "failed" | "cancelled" | "unknown") {
+        acp::ToolCallStatus::Failed
+    } else {
+        acp::ToolCallStatus::Completed
+    };
+    let mut fields = acp::ToolCallUpdateFields::new()
+        .status(Some(status))
+        .content(Some(vec![acp::ToolCallContent::from(
+            acp::ContentBlock::Text(acp::TextContent::new(text.clone())),
+        )]));
+    if let Some(exit_code) = value
+        .get("exit_code")
+        .and_then(|v| v.as_u64())
+        .and_then(|code| i32::try_from(code).ok())
+    {
+        let stdout = value
+            .get("stdout")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default();
+        let stderr = value
+            .get("stderr")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default();
+        let mut bytes = Vec::with_capacity(stdout.len() + stderr.len());
+        bytes.extend_from_slice(stdout.as_bytes());
+        bytes.extend_from_slice(stderr.as_bytes());
+        let total_bytes = bytes.len();
+        let bash = BashOutput {
+            output: bytes,
+            output_for_prompt: text,
+            exit_code,
+            command: args
+                .get("command")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_owned(),
+            description: args
+                .get("description")
+                .and_then(|v| v.as_str())
+                .map(str::to_owned),
+            current_dir: value
+                .pointer("/_ssh/cwd")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_owned(),
+            truncated: value
+                .get("truncated")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false),
+            signal: None,
+            timed_out: false,
+            output_file: String::new(),
+            total_bytes,
+            output_delta: None,
+            was_bare_echo: false,
+        };
+        let mut raw = serde_json::to_value(ToolOutput::Bash(bash)).expect("Bash output serializes");
+        raw.as_object_mut()
+            .expect("Bash output is an object")
+            .insert("_ssh".into(), value["_ssh"].clone());
+        fields = fields
+            .kind(Some(acp::ToolKind::Execute))
+            .raw_output(Some(raw));
+    } else {
+        // The tool invocation returned, not necessarily the remote process.
+        let task_id = value
+            .get("task_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default();
+        fields = fields
+            .kind(Some(acp::ToolKind::Other))
+            .title(Some(format!("SSH task {task_id}: {state}")))
+            .raw_output(serde_json::to_value(ToolOutput::Dynamic(output.clone())).ok());
+    }
+    acp::ToolCallUpdate::new(acp::ToolCallId::new(Arc::from(call_id)), fields)
+}
+
+#[cfg(test)]
+mod ssh_command_update_tests {
+    use super::*;
+    use xai_grok_tools::types::output::{DynamicOutput, ToolOutput};
+
+    #[test]
+    fn ssh_command_without_exit_never_invents_a_successful_process_exit() {
+        for (state, status) in [
+            ("running", acp::ToolCallStatus::Completed),
+            ("unknown", acp::ToolCallStatus::Failed),
+            ("cancelled", acp::ToolCallStatus::Failed),
+        ] {
+            let output = DynamicOutput {
+                value: json!({"state":state,"exit_code":null,"task_id":"ssh-native-pending"}),
+                prompt_text: None,
+            };
+            let update = ssh_command_update(&output, "remote-call", &json!({}));
+            assert_eq!(update.fields.status, Some(status));
+            assert_eq!(update.fields.kind, Some(acp::ToolKind::Other));
+            assert!(matches!(
+                serde_json::from_value::<ToolOutput>(update.fields.raw_output.unwrap()).unwrap(),
+                ToolOutput::Dynamic(_)
+            ));
+        }
+    }
 }
 #[cfg(test)]
 mod execute_tool_call_parts_tests {

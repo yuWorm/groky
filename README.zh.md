@@ -115,10 +115,14 @@ groky ssh connect dev
 groky ssh disconnect dev
 ```
 
-先在远端安装匹配版本的 `groky`。默认远端命令为 `groky worker --stdio`，
-需要在非交互 SSH 的 `PATH` 中可用；Git、ripgrep 及项目需要的工具也应在远端可用。
-不会静默部署 worker，远端也不需要 xAI 登录。可通过
-`--worker-command '/absolute/path/groky worker --stdio'` 指定绝对路径。
+**显式 SSH 工具不需要在远端安装 groky 或 worker。** 它们直接复用已认证的原生
+SSH 连接，通过 SFTP 操作文件、通过 POSIX shell 执行命令。SSH 服务端需启用 SFTP；
+搜索还需要远端 `rg`。
+
+**只有 SSH 项目需要匹配版本的远端 groky。** 默认命令为 `groky worker --stdio`，
+需在非交互 SSH 的 `PATH` 中可用；Git、ripgrep 及项目所需工具也应在远端可用。
+可通过 `--worker-command '/absolute/path/groky worker --stdio'` 指定绝对路径。
+不会静默部署 worker，远端也不需要 xAI 登录；两种模式的模型请求和供应商凭据都留在本地。
 
 会话内用 `/ssh`，Welcome 页按 `Ctrl+S` 打开管理界面。`Enter` 连接/断开，
 `g` 申请指定目录的授权，`u` 选择已授权的默认目标，`r` 撤权，`o` 打开远端项目。
@@ -138,6 +142,10 @@ groky ssh disconnect dev
   `ssh_search`、`ssh_run` 可指定 `target`，显式目标优先；省略时必须已有用户选定的
   SSH 默认授权。这个默认值不会重定向普通本地工具。`ssh_targets` 只列当前会话的
   授权；`ssh_request_access` 只能请求用户批准，不能自行授权。
+  即使在 SSH 项目内，这些显式工具也不启动 worker，不加载远端项目指令、skills 或 hooks。
+  文件读取支持 UTF-8 文本及行范围，不解码图片/PDF；读取输出以及覆盖/编辑已有文件时的
+  原文快照有大小上限。覆盖已有文件要求 SFTP 支持 `posix-rename@openssh.com`，
+  不支持时在写入前报错。编辑会在原子替换前复核原文，但不能提供跨客户端的并发 CAS 保证。
   `ssh_task_query`、`ssh_task_cancel` 只能操作所选授权范围内的任务。
   查询时用 `task_id` 读取任务输出，用 `operation_id` 检查已记录的操作，两者都省略
   则列出任务；这些 ID 不能交给本地任务工具使用。
@@ -147,8 +155,9 @@ groky ssh disconnect dev
 授权包含远端根目录及读/写/执行能力，默认只对当前会话有效；保存为项目规则需要
 主动选择，子 agent 只能继承已授权的子集。目标授权不会绕过具体操作审批。
 **run 的工作目录不是沙箱：** 命令仍拥有远端 SSH 用户的系统权限。
-撤权立即在本地阻止新调用；断线时显示远端确认待完成，收到 worker 确认后才算完成。
-已经启动的任务需要单独取消。
+撤权立即在本地阻止新调用。仅用于无 worker 工具的授权无需远端确认；曾交给项目 worker
+的授权仍需 worker 确认，断线时显示远端确认待完成。已经启动的任务需要单独取消，
+无 worker 任务在撤权后仍可用任务记录中的原授权 ID 取消。
 
 无交互恢复可复用已有授权，但仍需可用的非交互 SSH 认证及普通工具权限。
 需要 SSH 交互时会立即失败；`--always-approve` 不会代替远端操作审批。
@@ -168,7 +177,7 @@ SSH 恢复默认只恢复对话；加 `--restore-code` 后，请求批准在已�
 host = "my-server" # 已有的 OpenSSH 别名
 label = "Development"
 user = "developer" # 可选覆盖
-worker_command = ["/usr/local/bin/groky", "worker", "--stdio"]
+worker_command = ["/usr/local/bin/groky", "worker", "--stdio"] # 仅 SSH 项目需要
 ```
 
 优先级为 groky 目标配置、用户 SSH 配置、系统 SSH 配置、默认值。匹配配置保留
@@ -179,8 +188,11 @@ first-value-wins 语义，`IdentityFile` 累积；仓库配置不能覆盖连接
 连接池独立于单次工具调用，支持复用和持有。默认嵌入式 TUI 的连接池随该进程存活；
 使用 `groky --leader` 可与其他 leader 模式 TUI 及 `groky ssh connect` 的手动持有共享
 持久连接池，但授权仍按会话隔离。传输中断不会自动重放 write、edit 或 run。
-私有远端 worker 在 SSH channel 断开后继续持有任务；worker 自身退出时，未完成结果
-记为未知，不能据此认定远端没有产生副作用。
+无 worker 任务的 ID 和有界 stdout/stderr 历史由本地服务持有，不由远端守护进程持有；
+应使用 `ssh_task_query` 查询，不承诺完成后自动唤醒。未确认退出就断线时，结果记为未知，
+远端进程可能仍在运行；发送取消请求不等于已确认终止。
+SSH 项目的 worker 则继续跨 channel 断线持有自己的任务；worker 自身退出时，
+未完成结果同样记为未知，不能据此认定远端没有产生副作用。
 
 ## 相对官方改了什么
 
