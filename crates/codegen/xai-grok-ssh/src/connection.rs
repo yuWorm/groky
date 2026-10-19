@@ -1273,7 +1273,7 @@ enum EntryState {
     },
     Failed {
         failure: ConnectionFailure,
-        configuration: Option<ConfigurationDiagnostic>,
+        error: SshError,
     },
 }
 
@@ -1318,18 +1318,11 @@ impl ConnectionEntry {
             }
             Err(error) => {
                 let failure = failure_category(&error);
-                let configuration = match error {
-                    SshError::ConfigurationDiagnostic(diagnostic) => Some(diagnostic),
-                    _ => None,
-                };
                 let mut state = lock(&self.state);
                 if self.generation.load(Ordering::Acquire) == generation
                     && matches!(*state, EntryState::Connecting)
                 {
-                    *state = EntryState::Failed {
-                        failure,
-                        configuration,
-                    };
+                    *state = EntryState::Failed { failure, error };
                 }
             }
         }
@@ -1346,14 +1339,7 @@ impl ConnectionEntry {
                 EntryState::Connected { identity } => {
                     return Ok((self.generation.load(Ordering::Acquire), identity));
                 }
-                EntryState::Failed {
-                    failure,
-                    configuration,
-                } => {
-                    return Err(configuration
-                        .map(SshError::ConfigurationDiagnostic)
-                        .unwrap_or_else(|| failure_error(failure)));
-                }
+                EntryState::Failed { error, .. } => return Err(error),
                 EntryState::Disconnected => return Err(SshError::Disconnected),
                 EntryState::Connecting => notified.await,
             }
@@ -2600,7 +2586,9 @@ fn failure_category(error: &SshError) -> ConnectionFailure {
         | SshError::AgentAuthenticationFailed
         | SshError::PrivateKey => ConnectionFailure::Authentication,
         SshError::UnknownHostKey => ConnectionFailure::HostKeyUnknown,
-        SshError::ChangedHostKey => ConnectionFailure::HostKeyChanged,
+        SshError::ChangedHostKey | SshError::HostKeyReplacement(_) => {
+            ConnectionFailure::HostKeyChanged
+        }
         SshError::RevokedHostKey => ConnectionFailure::HostKeyRevoked,
         SshError::HostKeyRejected => ConnectionFailure::HostKeyRejected,
         SshError::Interaction(InteractionError::Cancelled) => {
@@ -2619,27 +2607,6 @@ fn failure_category(error: &SshError) -> ConnectionFailure {
     }
 }
 
-fn failure_error(failure: ConnectionFailure) -> SshError {
-    match failure {
-        ConnectionFailure::Authentication => SshError::AuthenticationFailed,
-        ConnectionFailure::HostKeyUnknown => SshError::UnknownHostKey,
-        ConnectionFailure::HostKeyChanged => SshError::ChangedHostKey,
-        ConnectionFailure::HostKeyRevoked => SshError::RevokedHostKey,
-        ConnectionFailure::HostKeyRejected => SshError::HostKeyRejected,
-        ConnectionFailure::InteractionCancelled => {
-            SshError::Interaction(InteractionError::Cancelled)
-        }
-        ConnectionFailure::InteractionUnavailable => {
-            SshError::Interaction(InteractionError::Unavailable)
-        }
-        ConnectionFailure::Configuration => SshError::Configuration,
-        ConnectionFailure::Algorithms => SshError::UnsupportedAlgorithms,
-        ConnectionFailure::Proxy => SshError::Proxy,
-        ConnectionFailure::CredentialStore => SshError::CredentialStoreUnavailable,
-        ConnectionFailure::Transport => SshError::Transport,
-    }
-}
-
 fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     mutex
         .lock()
@@ -2651,10 +2618,10 @@ mod tests {
     use super::{
         ConnectionEntry, ConnectionFailure, ConnectionSecurityKey, EntryState, FileRevision,
         MAX_INITIAL_COMMAND_BYTES, MAX_INITIAL_COMMAND_EVENTS, MaterialKey, SshCommandEvent,
-        command_event, failure_category, failure_error, lock, posix_rename_payload,
-        preferred_algorithms, queue_initial_command_event,
+        command_event, failure_category, lock, posix_rename_payload, preferred_algorithms,
+        queue_initial_command_event,
     };
-    use crate::auth::{InteractionError, SshError};
+    use crate::auth::SshError;
     use crate::config::{
         AgentConfig, AlgorithmRequirements, AuthMethod, ConfigValueSource, HostKeyPolicy,
         KnownHostsConfig, ResolvedConfigProvenance, ResolvedSshConfig, SshConfigSource, SshTarget,
@@ -2819,14 +2786,29 @@ mod tests {
         assert!(macs.contains(&"hmac-sha2-512-etm@openssh.com"));
     }
 
-    #[test]
-    fn unavailable_interaction_survives_pooled_failure_caching() {
-        let failure = failure_category(&SshError::Interaction(InteractionError::Unavailable));
-        assert_eq!(failure, ConnectionFailure::InteractionUnavailable);
-        assert!(matches!(
-            failure_error(failure),
-            SshError::Interaction(InteractionError::Unavailable)
-        ));
+    #[tokio::test]
+    async fn pooled_failure_preserves_host_key_replacement_detail() {
+        let entry = ConnectionEntry::new();
+        let error = SshError::HostKeyReplacement(
+            "known_hosts changed while confirmation was pending".to_owned(),
+        );
+        *lock(&entry.state) = EntryState::Failed {
+            failure: failure_category(&error),
+            error,
+        };
+
+        let observed = entry
+            .wait_connected()
+            .await
+            .expect_err("pooled failure must preserve its SSH error");
+        assert_eq!(
+            failure_category(&observed),
+            ConnectionFailure::HostKeyChanged
+        );
+        assert_eq!(
+            observed.to_string(),
+            "SSH host key replacement could not be completed safely: known_hosts changed while confirmation was pending"
+        );
     }
     #[test]
     fn file_revisions_record_missing_material() {

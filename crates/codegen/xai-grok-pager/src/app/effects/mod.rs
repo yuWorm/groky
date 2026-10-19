@@ -916,7 +916,7 @@ pub(crate) fn execute(
             client_id,
             challenge_id,
             connection_generation,
-            accept_host_key,
+            host_key_decision,
             remember,
             secret,
             answers,
@@ -927,12 +927,8 @@ pub(crate) fn execute(
                     client_id,
                     connection_generation,
                     challenge_id,
-                    accepted: accept_host_key,
-                    host_key_decision: match accept_host_key {
-                        Some(true) => Some(xai_grok_shell::ssh::SshHostKeyDecision::TrustOnce),
-                        Some(false) => Some(xai_grok_shell::ssh::SshHostKeyDecision::Reject),
-                        None => None,
-                    },
+                    accepted: None,
+                    host_key_decision,
                     remember,
                     secret: secret.map(crate::views::ssh_modal::SshSecret::into_bytes),
                     answers: answers

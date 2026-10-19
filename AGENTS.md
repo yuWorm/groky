@@ -26,3 +26,5 @@ Voice: `**Lead** rest.` Lead is the noun the user already knows (`/default`, `Re
 
 Next groky version after `v0.1.25`.
 
+- **SSH host trust** correctly isolates known_hosts ports and key algorithms, and offers explicit changed-key replacement with old/new fingerprints, backups and safeguards against ambiguous records.
+- **SSH diagnostics** provide a wrapped, scrollable full-error view and readable host-key details instead of clipping failures to one status line.

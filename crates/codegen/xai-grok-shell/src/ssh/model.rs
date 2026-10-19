@@ -244,6 +244,8 @@ pub enum SshAuthPromptDetail {
         algorithm: String,
         fingerprint: String,
         status: String,
+        previous_keys: Vec<String>,
+        can_replace: bool,
     },
     Secret {
         username: String,
@@ -279,6 +281,7 @@ pub enum SshHostKeyDecision {
     Reject,
     TrustOnce,
     TrustAndStore,
+    ReplaceAndStore,
 }
 
 /// Secret responses are intentionally not serializable or Debug. They stay on

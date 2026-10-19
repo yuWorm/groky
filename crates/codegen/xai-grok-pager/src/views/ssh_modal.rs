@@ -235,6 +235,8 @@ pub enum SshAuthKind {
         algorithm: String,
         fingerprint: String,
         status: String,
+        previous_keys: Vec<String>,
+        can_replace: bool,
     },
     Password {
         username: String,
@@ -426,6 +428,10 @@ pub struct SshAuthCard {
     pub kind: SshAuthKind,
     answers: Vec<SecretEditor>,
     active_answer: usize,
+    /// Top wrapped line visible in an authentication card with more content than its viewport.
+    scroll_offset: usize,
+    /// Render-derived upper bound for [`Self::scroll_offset`].
+    max_scroll_offset: usize,
     pub remember: bool,
     pub error: Option<String>,
 }
@@ -450,6 +456,8 @@ impl SshAuthCard {
             kind,
             answers: (0..answer_count).map(|_| SecretEditor::default()).collect(),
             active_answer: 0,
+            scroll_offset: 0,
+            max_scroll_offset: 0,
             error: None,
         }
     }
@@ -509,6 +517,8 @@ impl std::fmt::Debug for SshAuthCard {
             .field("kind", &self.kind)
             .field("answer_count", &self.answers.len())
             .field("active_answer", &self.active_answer)
+            .field("scroll_offset", &self.scroll_offset)
+            .field("max_scroll_offset", &self.max_scroll_offset)
             .field("remember", &self.remember)
             .field("error", &self.error)
             .finish()
@@ -720,6 +730,26 @@ pub enum SshOperationApprovalOrigin {
     TransientEvent,
 }
 
+/// Full, wrapped SSH diagnostic retained separately from the one-line manager status.
+///
+/// Keeping this page local to the manager means opening or leaving it never changes the selected
+/// target or consumes a pending SSH authentication challenge.
+struct SshDiagnosticCard {
+    message: String,
+    scroll_offset: usize,
+    max_scroll_offset: usize,
+}
+
+impl SshDiagnosticCard {
+    fn new(message: String) -> Self {
+        Self {
+            message,
+            scroll_offset: 0,
+            max_scroll_offset: 0,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct SubmittedOperationApproval {
     approval_id: String,
@@ -733,6 +763,7 @@ enum SshModalPage {
     Grant(SshGrantCard),
     OperationApproval(SshOperationApprovalCard),
     Authentication(SshAuthCard),
+    Diagnostic(SshDiagnosticCard),
 }
 
 /// Manager state usable from Welcome and from a running session.
@@ -1142,6 +1173,14 @@ impl SshManagerState {
         })
     }
 
+    fn open_error_diagnostic(&mut self) -> bool {
+        let Some((message, true)) = self.message.as_ref() else {
+            return false;
+        };
+        self.page = SshModalPage::Diagnostic(SshDiagnosticCard::new(message.clone()));
+        true
+    }
+
     pub fn show_error(&mut self, error: impl Into<String>) {
         self.message = Some((error.into(), true));
     }
@@ -1212,7 +1251,7 @@ pub enum SshModalOutcome {
         challenge_id: String,
         connection_generation: u64,
         target_id: String,
-        accept_host_key: Option<bool>,
+        host_key_decision: Option<xai_grok_shell::ssh::SshHostKeyDecision>,
         remember: bool,
         secret: Option<SshSecret>,
         answers: Vec<SshSecret>,
@@ -1251,6 +1290,11 @@ const MANAGER_SHORTCUTS: &[Shortcut<'static>] = &[
         id: 0,
     },
     Shortcut {
+        label: "d diagnostic",
+        clickable: false,
+        id: 0,
+    },
+    Shortcut {
         label: "o open project",
         clickable: false,
         id: 0,
@@ -1280,6 +1324,91 @@ const OPERATION_APPROVAL_SHORTCUTS: &[Shortcut<'static>] = &[
     },
     Shortcut {
         label: "Esc deny",
+        clickable: false,
+        id: 0,
+    },
+];
+
+const AUTHENTICATION_SHORTCUTS: &[Shortcut<'static>] = &[
+    Shortcut {
+        label: "Enter submit",
+        clickable: false,
+        id: 0,
+    },
+    Shortcut {
+        label: "PgUp/PgDn scroll",
+        clickable: false,
+        id: 0,
+    },
+    Shortcut {
+        label: "Esc cancel",
+        clickable: false,
+        id: 0,
+    },
+];
+
+const UNKNOWN_HOST_KEY_SHORTCUTS: &[Shortcut<'static>] = &[
+    Shortcut {
+        label: "y trust once",
+        clickable: false,
+        id: 0,
+    },
+    Shortcut {
+        label: "s trust and save",
+        clickable: false,
+        id: 0,
+    },
+    Shortcut {
+        label: "n/Esc reject",
+        clickable: false,
+        id: 0,
+    },
+];
+
+const REPLACE_HOST_KEY_SHORTCUTS: &[Shortcut<'static>] = &[
+    Shortcut {
+        label: "r replace and save",
+        clickable: false,
+        id: 0,
+    },
+    Shortcut {
+        label: "n/Esc reject",
+        clickable: false,
+        id: 0,
+    },
+    Shortcut {
+        label: "↑/↓ inspect",
+        clickable: false,
+        id: 0,
+    },
+];
+
+const MANUAL_HOST_KEY_REMEDIATION_SHORTCUTS: &[Shortcut<'static>] = &[
+    Shortcut {
+        label: "manual known_hosts remediation",
+        clickable: false,
+        id: 0,
+    },
+    Shortcut {
+        label: "n/Esc reject",
+        clickable: false,
+        id: 0,
+    },
+    Shortcut {
+        label: "↑/↓ inspect",
+        clickable: false,
+        id: 0,
+    },
+];
+
+const DIAGNOSTIC_SHORTCUTS: &[Shortcut<'static>] = &[
+    Shortcut {
+        label: "↑/↓ or PgUp/PgDn scroll",
+        clickable: false,
+        id: 0,
+    },
+    Shortcut {
+        label: "Esc back",
         clickable: false,
         id: 0,
     },
@@ -1375,21 +1504,26 @@ pub fn render_ssh_modal(
         SshModalPage::OperationApproval(_) => {
             ("SSH operation approval", OPERATION_APPROVAL_SHORTCUTS)
         }
-        SshModalPage::Authentication(card) => (
-            card.kind.title(),
-            &[
-                Shortcut {
-                    label: "Enter submit",
-                    clickable: false,
-                    id: 0,
+        SshModalPage::Authentication(card) => match &card.kind {
+            SshAuthKind::HostKey {
+                status,
+                previous_keys,
+                can_replace,
+                ..
+            } if changed_host_key(status, previous_keys) => (
+                "SSH host key changed",
+                if *can_replace {
+                    REPLACE_HOST_KEY_SHORTCUTS
+                } else {
+                    MANUAL_HOST_KEY_REMEDIATION_SHORTCUTS
                 },
-                Shortcut {
-                    label: "Esc cancel",
-                    clickable: false,
-                    id: 0,
-                },
-            ],
-        ),
+            ),
+            SshAuthKind::HostKey { .. } => {
+                ("SSH host key confirmation", UNKNOWN_HOST_KEY_SHORTCUTS)
+            }
+            _ => (card.kind.title(), AUTHENTICATION_SHORTCUTS),
+        },
+        SshModalPage::Diagnostic(_) => ("SSH diagnostic", DIAGNOSTIC_SHORTCUTS),
     };
     let config = window_config(title, compact, shortcuts);
     let areas = modal_window::render_modal_window(buf, area, &mut state.window, &config, theme)?;
@@ -1402,6 +1536,7 @@ pub fn render_ssh_modal(
             render_operation_approval(buf, content, card, theme)
         }
         SshModalPage::Authentication(card) => render_authentication(buf, content, card, theme),
+        SshModalPage::Diagnostic(card) => render_diagnostic(buf, content, card, theme),
     }
     None
 }
@@ -1480,6 +1615,73 @@ fn render_manager(buf: &mut Buffer, area: Rect, state: &SshManagerState, theme: 
         );
     }
     render_message(buf, area, state.message.as_ref(), theme);
+}
+
+fn render_diagnostic(buf: &mut Buffer, area: Rect, card: &mut SshDiagnosticCard, theme: &Theme) {
+    if area.height == 0 {
+        return;
+    }
+    let mut lines = Vec::new();
+    append_wrapped_authentication_line(
+        &mut lines,
+        "Full SSH diagnostic:",
+        AuthenticationLineTone::Warning,
+        area.width as usize,
+    );
+    append_wrapped_authentication_line(
+        &mut lines,
+        "",
+        AuthenticationLineTone::Normal,
+        area.width as usize,
+    );
+    append_wrapped_authentication_line(
+        &mut lines,
+        &card.message,
+        AuthenticationLineTone::Error,
+        area.width as usize,
+    );
+    let height = area.height as usize;
+    let body_height = if lines.len() > height && height > 1 {
+        height - 1
+    } else {
+        height
+    };
+    card.max_scroll_offset = lines.len().saturating_sub(body_height);
+    card.scroll_offset = card.scroll_offset.min(card.max_scroll_offset);
+    for (index, (line, tone)) in lines
+        .iter()
+        .skip(card.scroll_offset)
+        .take(body_height)
+        .enumerate()
+    {
+        let style = match tone {
+            AuthenticationLineTone::Normal => Style::default().fg(theme.text_secondary),
+            AuthenticationLineTone::Muted => Style::default().fg(theme.gray),
+            AuthenticationLineTone::Warning | AuthenticationLineTone::Error => Style::default()
+                .fg(theme.accent_error)
+                .add_modifier(Modifier::BOLD),
+        };
+        buf.set_stringn(
+            area.x,
+            area.y.saturating_add(index as u16),
+            line,
+            area.width as usize,
+            style,
+        );
+    }
+    if card.max_scroll_offset > 0 && height > 1 {
+        buf.set_stringn(
+            area.x,
+            area.bottom().saturating_sub(1),
+            format!(
+                "Diagnostic {} of {} · ↑/↓ or PgUp/PgDn scroll",
+                card.scroll_offset + 1,
+                card.max_scroll_offset + 1
+            ),
+            area.width as usize,
+            Style::default().fg(theme.gray),
+        );
+    }
 }
 
 fn render_add(buf: &mut Buffer, area: Rect, form: &SshManualTargetForm, theme: &Theme) {
@@ -1680,7 +1882,46 @@ fn operation_approval_lines(card: &SshOperationApprovalCard, width: usize) -> Ve
     lines
 }
 
-fn render_authentication(buf: &mut Buffer, area: Rect, card: &SshAuthCard, theme: &Theme) {
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum AuthenticationLineTone {
+    Normal,
+    Muted,
+    Warning,
+    Error,
+}
+
+fn append_wrapped_authentication_line(
+    lines: &mut Vec<(String, AuthenticationLineTone)>,
+    text: &str,
+    tone: AuthenticationLineTone,
+    width: usize,
+) {
+    let options = textwrap::Options::new(width.max(1))
+        .break_words(true)
+        .wrap_algorithm(textwrap::WrapAlgorithm::FirstFit);
+    if text.is_empty() {
+        lines.push((String::new(), tone));
+        return;
+    }
+    for paragraph in text.split('\n') {
+        if paragraph.is_empty() {
+            lines.push((String::new(), tone));
+        } else {
+            lines.extend(
+                textwrap::wrap(paragraph, &options)
+                    .into_iter()
+                    .map(|line| (line.into_owned(), tone)),
+            );
+        }
+    }
+}
+
+fn changed_host_key(status: &str, previous_keys: &[String]) -> bool {
+    status.eq_ignore_ascii_case("changed") || !previous_keys.is_empty()
+}
+
+fn authentication_lines(card: &SshAuthCard, width: usize) -> Vec<(String, AuthenticationLineTone)> {
+    let mut lines = Vec::new();
     match &card.kind {
         SshAuthKind::HostKey {
             hostname,
@@ -1688,28 +1929,99 @@ fn render_authentication(buf: &mut Buffer, area: Rect, card: &SshAuthCard, theme
             algorithm,
             fingerprint,
             status,
+            previous_keys,
+            can_replace,
         } => {
-            let lines = [
-                format!("Target: {}", card.target_id),
-                format!("Host: {hostname}:{port}"),
-                format!("Algorithm: {algorithm}"),
-                format!("Fingerprint: {fingerprint}"),
-                format!("Status: {status}"),
-                "Trust this host key?  y trust  |  n reject".into(),
-            ];
-            for (index, line) in lines.iter().enumerate() {
-                let y = area.y + index as u16;
-                if y >= area.bottom() {
-                    break;
-                }
-                let style = if line.starts_with("Trust") {
-                    Style::default()
-                        .fg(theme.accent_error)
-                        .add_modifier(Modifier::BOLD)
+            let changed = changed_host_key(status, previous_keys);
+            append_wrapped_authentication_line(
+                &mut lines,
+                &format!("Target: {}", card.target_id),
+                AuthenticationLineTone::Normal,
+                width,
+            );
+            append_wrapped_authentication_line(
+                &mut lines,
+                &format!("Endpoint: {hostname}:{port}"),
+                AuthenticationLineTone::Normal,
+                width,
+            );
+            append_wrapped_authentication_line(
+                &mut lines,
+                &format!("Presented key: {algorithm} {fingerprint}"),
+                AuthenticationLineTone::Normal,
+                width,
+            );
+            append_wrapped_authentication_line(
+                &mut lines,
+                &format!("Host key status: {status}"),
+                if changed {
+                    AuthenticationLineTone::Warning
                 } else {
-                    Style::default().fg(theme.text_secondary)
-                };
-                buf.set_stringn(area.x, y, line, area.width as usize, style);
+                    AuthenticationLineTone::Muted
+                },
+                width,
+            );
+            append_wrapped_authentication_line(
+                &mut lines,
+                "",
+                AuthenticationLineTone::Normal,
+                width,
+            );
+            if changed {
+                append_wrapped_authentication_line(
+                    &mut lines,
+                    "WARNING: This endpoint presented a changed host key.",
+                    AuthenticationLineTone::Warning,
+                    width,
+                );
+                append_wrapped_authentication_line(
+                    &mut lines,
+                    "An attacker could be impersonating this host. Verify the new fingerprint out of band before replacing a stored key.",
+                    AuthenticationLineTone::Warning,
+                    width,
+                );
+                append_wrapped_authentication_line(
+                    &mut lines,
+                    "Previously stored key record(s):",
+                    AuthenticationLineTone::Muted,
+                    width,
+                );
+                for previous_key in previous_keys {
+                    append_wrapped_authentication_line(
+                        &mut lines,
+                        &format!("• {previous_key}"),
+                        AuthenticationLineTone::Normal,
+                        width,
+                    );
+                }
+                if *can_replace {
+                    append_wrapped_authentication_line(
+                        &mut lines,
+                        "Press r to replace the stored key and save the new key. n or Esc rejects.",
+                        AuthenticationLineTone::Warning,
+                        width,
+                    );
+                } else {
+                    append_wrapped_authentication_line(
+                        &mut lines,
+                        "Automatic replacement is unavailable. After verifying it, update or remove the listed known_hosts record manually, then reconnect. n or Esc rejects.",
+                        AuthenticationLineTone::Warning,
+                        width,
+                    );
+                }
+            } else {
+                append_wrapped_authentication_line(
+                    &mut lines,
+                    "Unknown host key. Verify its fingerprint out of band before trusting it.",
+                    AuthenticationLineTone::Warning,
+                    width,
+                );
+                append_wrapped_authentication_line(
+                    &mut lines,
+                    "y trusts once · s trusts and saves · n or Esc rejects",
+                    AuthenticationLineTone::Warning,
+                    width,
+                );
             }
         }
         SshAuthKind::Password {
@@ -1718,47 +2030,50 @@ fn render_authentication(buf: &mut Buffer, area: Rect, card: &SshAuthCard, theme
         | SshAuthKind::PrivateKeyPassphrase {
             username, message, ..
         } => {
-            buf.set_stringn(
-                area.x,
-                area.y,
-                format!("Target: {}", card.target_id),
-                area.width as usize,
-                Style::default().fg(theme.text_secondary),
+            append_wrapped_authentication_line(
+                &mut lines,
+                &format!("Target: {}", card.target_id),
+                AuthenticationLineTone::Normal,
+                width,
             );
-            buf.set_stringn(
-                area.x,
-                area.y.saturating_add(1),
-                format!("User: {username}"),
-                area.width as usize,
-                Style::default().fg(theme.text_secondary),
+            append_wrapped_authentication_line(
+                &mut lines,
+                &format!("User: {username}"),
+                AuthenticationLineTone::Normal,
+                width,
             );
-            buf.set_stringn(
-                area.x,
-                area.y.saturating_add(2),
+            append_wrapped_authentication_line(
+                &mut lines,
                 message,
-                area.width as usize,
-                Style::default().fg(theme.text_secondary),
+                AuthenticationLineTone::Muted,
+                width,
             );
-            render_masked_answer(
-                buf,
-                area.x,
-                area.y.saturating_add(4),
-                area.width,
-                card.answers.first(),
-                0 == card.active_answer,
-                theme,
+            append_wrapped_authentication_line(
+                &mut lines,
+                "",
+                AuthenticationLineTone::Normal,
+                width,
+            );
+            let bullets = card
+                .answers
+                .first()
+                .map(|answer| "•".repeat(answer.text().chars().count()))
+                .unwrap_or_default();
+            append_wrapped_authentication_line(
+                &mut lines,
+                &format!("› {bullets}"),
+                AuthenticationLineTone::Normal,
+                width,
             );
             if card.can_remember() {
-                let label = format!(
-                    "[{}] remember in system credential store  (Alt+r)",
-                    if card.remember { "x" } else { " " }
-                );
-                buf.set_stringn(
-                    area.x,
-                    area.y.saturating_add(6),
-                    label,
-                    area.width as usize,
-                    Style::default().fg(theme.text_secondary),
+                append_wrapped_authentication_line(
+                    &mut lines,
+                    &format!(
+                        "[{}] remember in system credential store  (Alt+r)",
+                        if card.remember { "x" } else { " " }
+                    ),
+                    AuthenticationLineTone::Muted,
+                    width,
                 );
             }
         }
@@ -1767,82 +2082,106 @@ fn render_authentication(buf: &mut Buffer, area: Rect, card: &SshAuthCard, theme
             instruction,
             prompts,
         } => {
-            buf.set_stringn(
-                area.x,
-                area.y,
+            append_wrapped_authentication_line(
+                &mut lines,
                 name,
-                area.width as usize,
-                Style::default().fg(theme.text_secondary),
+                AuthenticationLineTone::Normal,
+                width,
             );
-            buf.set_stringn(
-                area.x,
-                area.y.saturating_add(1),
+            append_wrapped_authentication_line(
+                &mut lines,
                 instruction,
-                area.width as usize,
-                Style::default().fg(theme.gray),
+                AuthenticationLineTone::Muted,
+                width,
             );
             for (index, prompt) in prompts.iter().enumerate() {
-                let y = area.y.saturating_add(3 + index as u16 * 2);
-                if y >= area.bottom() {
-                    break;
-                }
-                buf.set_stringn(
-                    area.x,
-                    y,
+                append_wrapped_authentication_line(
+                    &mut lines,
                     prompt,
-                    area.width as usize,
-                    Style::default().fg(theme.text_secondary),
+                    AuthenticationLineTone::Normal,
+                    width,
                 );
-                render_masked_answer(
-                    buf,
-                    area.x,
-                    y.saturating_add(1),
-                    area.width,
-                    card.answers.get(index),
-                    index == card.active_answer,
-                    theme,
+                let bullets = card
+                    .answers
+                    .get(index)
+                    .map(|answer| "•".repeat(answer.text().chars().count()))
+                    .unwrap_or_default();
+                append_wrapped_authentication_line(
+                    &mut lines,
+                    &format!(
+                        "{} {bullets}",
+                        if index == card.active_answer {
+                            "›"
+                        } else {
+                            " "
+                        }
+                    ),
+                    AuthenticationLineTone::Normal,
+                    width,
                 );
             }
         }
     }
     if let Some(error) = card.error.as_deref() {
+        append_wrapped_authentication_line(&mut lines, "", AuthenticationLineTone::Error, width);
+        append_wrapped_authentication_line(
+            &mut lines,
+            &format!("Authentication error: {error}"),
+            AuthenticationLineTone::Error,
+            width,
+        );
+    }
+    lines
+}
+
+fn render_authentication(buf: &mut Buffer, area: Rect, card: &mut SshAuthCard, theme: &Theme) {
+    if area.height == 0 {
+        return;
+    }
+    let lines = authentication_lines(card, area.width as usize);
+    let height = area.height as usize;
+    let body_height = if lines.len() > height && height > 1 {
+        height - 1
+    } else {
+        height
+    };
+    card.max_scroll_offset = lines.len().saturating_sub(body_height);
+    card.scroll_offset = card.scroll_offset.min(card.max_scroll_offset);
+    for (index, (line, tone)) in lines
+        .iter()
+        .skip(card.scroll_offset)
+        .take(body_height)
+        .enumerate()
+    {
+        let style = match tone {
+            AuthenticationLineTone::Normal => Style::default().fg(theme.text_secondary),
+            AuthenticationLineTone::Muted => Style::default().fg(theme.gray),
+            AuthenticationLineTone::Warning | AuthenticationLineTone::Error => Style::default()
+                .fg(theme.accent_error)
+                .add_modifier(Modifier::BOLD),
+        };
+        buf.set_stringn(
+            area.x,
+            area.y.saturating_add(index as u16),
+            line,
+            area.width as usize,
+            style,
+        );
+    }
+    if card.max_scroll_offset > 0 && height > 1 {
+        let position = format!(
+            "Details {} of {} · ↑/↓ or PgUp/PgDn scroll",
+            card.scroll_offset + 1,
+            card.max_scroll_offset + 1
+        );
         buf.set_stringn(
             area.x,
             area.bottom().saturating_sub(1),
-            error,
+            position,
             area.width as usize,
-            Style::default().fg(theme.accent_error),
+            Style::default().fg(theme.gray),
         );
     }
-}
-
-fn render_masked_answer(
-    buf: &mut Buffer,
-    x: u16,
-    y: u16,
-    width: u16,
-    editor: Option<&SecretEditor>,
-    focused: bool,
-    theme: &Theme,
-) {
-    let Some(editor) = editor else {
-        return;
-    };
-    let bullets = "•".repeat(editor.text().chars().count());
-    let prefix = if focused { "› " } else { "  " };
-    buf.set_stringn(
-        x,
-        y,
-        format!("{prefix}{bullets}"),
-        width as usize,
-        if focused {
-            Style::default()
-                .fg(theme.accent_user)
-                .add_modifier(Modifier::BOLD)
-        } else {
-            Style::default().fg(theme.text_secondary)
-        },
-    );
 }
 
 fn render_message(buf: &mut Buffer, area: Rect, message: Option<&(String, bool)>, theme: &Theme) {
@@ -1850,14 +2189,16 @@ fn render_message(buf: &mut Buffer, area: Rect, message: Option<&(String, bool)>
         return;
     };
     let y = area.bottom().saturating_sub(1);
-    let style = if *error {
-        Style::default().fg(theme.accent_error)
+    let (summary, style) = if *error {
+        (
+            "SSH error — press d to inspect the full diagnostic",
+            Style::default().fg(theme.accent_error),
+        )
     } else {
-        Style::default().fg(theme.text_secondary)
+        (text.as_str(), Style::default().fg(theme.text_secondary))
     };
-    buf.set_stringn(area.x, y, text, area.width as usize, style);
+    buf.set_stringn(area.x, y, summary, area.width as usize, style);
 }
-
 /// Handle a key while the SSH modal has focus.
 pub fn handle_ssh_key(state: &mut SshManagerState, key: &KeyEvent) -> SshModalOutcome {
     let config = window_config("SSH", false, &[]);
@@ -1875,8 +2216,12 @@ pub fn handle_ssh_key(state: &mut SshManagerState, key: &KeyEvent) -> SshModalOu
         SshModalPage::Grant(card) => handle_grant_key(card, key),
         SshModalPage::OperationApproval(card) => handle_operation_approval_key(card, key),
         SshModalPage::Authentication(card) => handle_authentication_key(card, key),
+        SshModalPage::Diagnostic(card) => handle_diagnostic_key(card, key),
         SshModalPage::Manager => unreachable!("manager handled before borrowing modal page"),
     };
+    if matches!(&outcome, SshModalOutcome::AnswerAuthentication { .. }) {
+        state.return_to_manager();
+    }
     outcome
 }
 
@@ -1890,25 +2235,50 @@ pub fn handle_ssh_paste(state: &mut SshManagerState, text: &str) -> SshModalOutc
             .answer_mut()
             .map(|answer| answer.insert_paste(text))
             .unwrap_or(LineEditOutcome::Unhandled),
-        SshModalPage::Manager | SshModalPage::OperationApproval(_) => {
+        SshModalPage::Manager
+        | SshModalPage::OperationApproval(_)
+        | SshModalPage::Diagnostic(_) => {
             return SshModalOutcome::Unchanged;
         }
     };
     line_outcome(outcome)
 }
 
-/// Mouse handling is limited to modal chrome; operational actions remain keyboard-confirmed so a
-/// stale row map can never connect, grant, or revoke the wrong target.
+/// Mouse handling is limited to modal chrome and scrolling review surfaces; operational actions
+/// remain keyboard-confirmed so a stale row map can never connect, grant, or revoke the wrong target.
 pub fn handle_ssh_mouse(state: &mut SshManagerState, mouse: &MouseEvent) -> SshModalOutcome {
     match modal_window::handle_modal_mouse(&mut state.window, mouse.kind, mouse.column, mouse.row) {
-        ModalWindowOutcome::CloseRequested => close_current_page(state),
-        ModalWindowOutcome::Handled => SshModalOutcome::Changed,
-        _ => SshModalOutcome::Unchanged,
+        ModalWindowOutcome::CloseRequested => return close_current_page(state),
+        ModalWindowOutcome::Handled => return SshModalOutcome::Changed,
+        ModalWindowOutcome::Unhandled => {}
+        _ => return SshModalOutcome::Unchanged,
     }
+    let delta = match mouse.kind {
+        crossterm::event::MouseEventKind::ScrollUp => Some(-3isize),
+        crossterm::event::MouseEventKind::ScrollDown => Some(3isize),
+        _ => None,
+    };
+    let Some(delta) = delta else {
+        return SshModalOutcome::Unchanged;
+    };
+    let (scroll, max_scroll_offset) = match &mut state.page {
+        SshModalPage::Authentication(card) => (&mut card.scroll_offset, card.max_scroll_offset),
+        SshModalPage::Diagnostic(card) => (&mut card.scroll_offset, card.max_scroll_offset),
+        _ => return SshModalOutcome::Unchanged,
+    };
+    *scroll = if delta.is_negative() {
+        scroll.saturating_sub(delta.unsigned_abs())
+    } else {
+        scroll.saturating_add(delta as usize).min(max_scroll_offset)
+    };
+    SshModalOutcome::Changed
 }
 
 fn close_current_page(state: &mut SshManagerState) -> SshModalOutcome {
-    if matches!(&state.page, SshModalPage::Add(_)) {
+    if matches!(
+        &state.page,
+        SshModalPage::Add(_) | SshModalPage::Diagnostic(_)
+    ) {
         state.return_to_manager();
         return SshModalOutcome::Changed;
     }
@@ -1916,13 +2286,15 @@ fn close_current_page(state: &mut SshManagerState) -> SshModalOutcome {
         let challenge_id = card.challenge_id.clone();
         let connection_generation = card.connection_generation;
         let target_id = card.target_id.clone();
-        let accept_host_key = matches!(&card.kind, SshAuthKind::HostKey { .. }).then_some(false);
+        let host_key_decision = matches!(&card.kind, SshAuthKind::HostKey { .. })
+            .then_some(xai_grok_shell::ssh::SshHostKeyDecision::Reject);
         card.clear_answers();
+        state.return_to_manager();
         return SshModalOutcome::AnswerAuthentication {
             challenge_id,
             connection_generation,
             target_id,
-            accept_host_key,
+            host_key_decision,
             remember: false,
             secret: None,
             answers: Vec::new(),
@@ -1959,6 +2331,7 @@ fn close_current_page(state: &mut SshManagerState) -> SshModalOutcome {
             unreachable!("authentication answers were cleared before read-only match")
         }
         SshModalPage::Add(_) => unreachable!("add page returned before read-only match"),
+        SshModalPage::Diagnostic(_) => unreachable!("diagnostic returned before read-only match"),
     }
 }
 
@@ -1978,6 +2351,13 @@ fn handle_manager_key(state: &mut SshManagerState, key: &KeyEvent) -> SshModalOu
         KeyCode::Char('a') if key.modifiers.is_empty() => {
             state.page = SshModalPage::Add(Default::default());
             SshModalOutcome::Changed
+        }
+        KeyCode::Char('d') if key.modifiers.is_empty() => {
+            if state.open_error_diagnostic() {
+                SshModalOutcome::Changed
+            } else {
+                SshModalOutcome::Unchanged
+            }
         }
         KeyCode::Char('r') if key.modifiers.is_empty() && state.selected_target().is_none() => {
             SshModalOutcome::Refresh
@@ -2217,31 +2597,88 @@ fn handle_operation_approval_key(
     }
 }
 
+fn scroll_key(
+    scroll_offset: &mut usize,
+    max_scroll_offset: usize,
+    key: &KeyEvent,
+    vim_navigation: bool,
+) -> bool {
+    let next = match key.code {
+        KeyCode::Up | KeyCode::Char('k') if vim_navigation && key.modifiers.is_empty() => {
+            scroll_offset.saturating_sub(1)
+        }
+        KeyCode::Down | KeyCode::Char('j') if vim_navigation && key.modifiers.is_empty() => {
+            scroll_offset.saturating_add(1)
+        }
+        KeyCode::PageUp => scroll_offset.saturating_sub(8),
+        KeyCode::PageDown => scroll_offset.saturating_add(8),
+        KeyCode::Home if vim_navigation => 0,
+        KeyCode::End if vim_navigation => max_scroll_offset,
+        _ => return false,
+    };
+    *scroll_offset = next.min(max_scroll_offset);
+    true
+}
+
+fn host_key_outcome(
+    card: &SshAuthCard,
+    host_key_decision: xai_grok_shell::ssh::SshHostKeyDecision,
+) -> SshModalOutcome {
+    SshModalOutcome::AnswerAuthentication {
+        challenge_id: card.challenge_id.clone(),
+        connection_generation: card.connection_generation,
+        target_id: card.target_id.clone(),
+        host_key_decision: Some(host_key_decision),
+        remember: false,
+        secret: None,
+        answers: Vec::new(),
+    }
+}
+
+fn handle_diagnostic_key(card: &mut SshDiagnosticCard, key: &KeyEvent) -> SshModalOutcome {
+    if scroll_key(&mut card.scroll_offset, card.max_scroll_offset, key, true) {
+        SshModalOutcome::Changed
+    } else {
+        SshModalOutcome::Unchanged
+    }
+}
+
 fn handle_authentication_key(card: &mut SshAuthCard, key: &KeyEvent) -> SshModalOutcome {
-    if matches!(&card.kind, SshAuthKind::HostKey { .. }) {
+    let host_key = match &card.kind {
+        SshAuthKind::HostKey {
+            status,
+            previous_keys,
+            can_replace,
+            ..
+        } => Some((changed_host_key(status, previous_keys), *can_replace)),
+        _ => None,
+    };
+    if let Some((changed, can_replace)) = host_key {
+        if scroll_key(&mut card.scroll_offset, card.max_scroll_offset, key, true) {
+            return SshModalOutcome::Changed;
+        }
         return match key.code {
-            KeyCode::Char('y') if key.modifiers.is_empty() => {
-                SshModalOutcome::AnswerAuthentication {
-                    challenge_id: card.challenge_id.clone(),
-                    connection_generation: card.connection_generation,
-                    target_id: card.target_id.clone(),
-                    accept_host_key: Some(true),
-                    remember: false,
-                    secret: None,
-                    answers: Vec::new(),
-                }
+            KeyCode::Char('r') if changed && can_replace && key.modifiers.is_empty() => {
+                host_key_outcome(
+                    card,
+                    xai_grok_shell::ssh::SshHostKeyDecision::ReplaceAndStore,
+                )
             }
-            KeyCode::Char('n') | KeyCode::Esc => SshModalOutcome::AnswerAuthentication {
-                challenge_id: card.challenge_id.clone(),
-                connection_generation: card.connection_generation,
-                target_id: card.target_id.clone(),
-                accept_host_key: Some(false),
-                remember: false,
-                secret: None,
-                answers: Vec::new(),
-            },
+            KeyCode::Char('y') if !changed && key.modifiers.is_empty() => {
+                host_key_outcome(card, xai_grok_shell::ssh::SshHostKeyDecision::TrustOnce)
+            }
+            KeyCode::Char('s') if !changed && key.modifiers.is_empty() => {
+                host_key_outcome(card, xai_grok_shell::ssh::SshHostKeyDecision::TrustAndStore)
+            }
+            KeyCode::Char('n') if key.modifiers.is_empty() => {
+                host_key_outcome(card, xai_grok_shell::ssh::SshHostKeyDecision::Reject)
+            }
+            KeyCode::Esc => host_key_outcome(card, xai_grok_shell::ssh::SshHostKeyDecision::Reject),
             _ => SshModalOutcome::Unchanged,
         };
+    }
+    if scroll_key(&mut card.scroll_offset, card.max_scroll_offset, key, false) {
+        return SshModalOutcome::Changed;
     }
     match key.code {
         KeyCode::Esc => {
@@ -2253,7 +2690,7 @@ fn handle_authentication_key(card: &mut SshAuthCard, key: &KeyEvent) -> SshModal
                 challenge_id,
                 connection_generation,
                 target_id,
-                accept_host_key: None,
+                host_key_decision: None,
                 remember: false,
                 secret: None,
                 answers: Vec::new(),
@@ -2282,7 +2719,7 @@ fn handle_authentication_key(card: &mut SshAuthCard, key: &KeyEvent) -> SshModal
                 challenge_id: card.challenge_id.clone(),
                 connection_generation: card.connection_generation,
                 target_id: card.target_id.clone(),
-                accept_host_key: None,
+                host_key_decision: None,
                 remember: card.remember,
                 secret,
                 answers,
@@ -2294,7 +2731,6 @@ fn handle_authentication_key(card: &mut SshAuthCard, key: &KeyEvent) -> SshModal
             .unwrap_or(SshModalOutcome::Unchanged),
     }
 }
-
 fn line_outcome(outcome: LineEditOutcome) -> SshModalOutcome {
     match outcome {
         LineEditOutcome::TextChanged | LineEditOutcome::CursorChanged => SshModalOutcome::Changed,
@@ -2390,5 +2826,217 @@ mod tests {
                     && !card.submitting
                     && card.error.as_deref() == Some("local control unavailable")
         ));
+    }
+
+    fn key(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    fn host_key_card(status: &str, previous_keys: Vec<String>, can_replace: bool) -> SshAuthCard {
+        SshAuthCard::new(
+            "challenge-1".into(),
+            7,
+            "target-1".into(),
+            SshAuthKind::HostKey {
+                hostname: "build.example.test".into(),
+                port: 2222,
+                algorithm: "ssh-ed25519".into(),
+                fingerprint: "SHA256:new-fingerprint".into(),
+                status: status.into(),
+                previous_keys,
+                can_replace,
+            },
+        )
+    }
+
+    fn host_key_decision(outcome: SshModalOutcome) -> xai_grok_shell::ssh::SshHostKeyDecision {
+        match outcome {
+            SshModalOutcome::AnswerAuthentication {
+                host_key_decision: Some(decision),
+                ..
+            } => decision,
+            _ => panic!("expected a host-key decision"),
+        }
+    }
+
+    fn buffer_text(buffer: &Buffer) -> String {
+        (0..buffer.area.height)
+            .flat_map(|y| {
+                (0..buffer.area.width)
+                    .filter_map(move |x| buffer.cell((x, y)).map(|cell| cell.symbol().to_owned()))
+            })
+            .collect()
+    }
+
+    #[test]
+    fn changed_host_key_requires_explicit_replace_and_esc_rejects() {
+        let mut changed = host_key_card(
+            "changed",
+            vec!["SHA256:old-fingerprint ssh-ed25519 ~/.ssh/known_hosts line 37".into()],
+            true,
+        );
+        assert!(matches!(
+            handle_authentication_key(&mut changed, &key(KeyCode::Enter)),
+            SshModalOutcome::Unchanged
+        ));
+        assert!(matches!(
+            handle_authentication_key(&mut changed, &key(KeyCode::Char('y'))),
+            SshModalOutcome::Unchanged
+        ));
+        assert_eq!(
+            host_key_decision(handle_authentication_key(
+                &mut changed,
+                &key(KeyCode::Char('r'))
+            )),
+            xai_grok_shell::ssh::SshHostKeyDecision::ReplaceAndStore
+        );
+
+        let mut manual_remediation = host_key_card("changed", vec!["old record".into()], false);
+        assert!(matches!(
+            handle_authentication_key(&mut manual_remediation, &key(KeyCode::Char('r'))),
+            SshModalOutcome::Unchanged
+        ));
+
+        let mut state = SshManagerState::new(None);
+        state.show_authentication(host_key_card("changed", vec!["old record".into()], false));
+        assert_eq!(
+            host_key_decision(handle_ssh_key(&mut state, &key(KeyCode::Esc))),
+            xai_grok_shell::ssh::SshHostKeyDecision::Reject
+        );
+    }
+
+    #[test]
+    fn answered_host_key_closes_stale_card_and_exposes_connection_error() {
+        for answer in [KeyCode::Char('n'), KeyCode::Esc, KeyCode::Char('r')] {
+            let mut state = SshManagerState::new(None);
+            state.show_authentication(host_key_card("changed", vec!["old record".into()], true));
+            assert!(matches!(
+                handle_ssh_key(&mut state, &key(answer)),
+                SshModalOutcome::AnswerAuthentication { .. }
+            ));
+            assert!(
+                matches!(&state.page, SshModalPage::Manager),
+                "an answered challenge must not hide its connection result"
+            );
+            state.show_error("SSH host key was rejected");
+            assert!(matches!(
+                handle_ssh_key(&mut state, &key(KeyCode::Char('d'))),
+                SshModalOutcome::Changed
+            ));
+            assert!(matches!(&state.page, SshModalPage::Diagnostic(_)));
+        }
+    }
+
+    #[test]
+    fn unknown_host_key_keeps_once_and_store_choices_typed() {
+        let mut unknown = host_key_card("unknown", Vec::new(), false);
+        assert_eq!(
+            host_key_decision(handle_authentication_key(
+                &mut unknown,
+                &key(KeyCode::Char('y'))
+            )),
+            xai_grok_shell::ssh::SshHostKeyDecision::TrustOnce
+        );
+        assert_eq!(
+            host_key_decision(handle_authentication_key(
+                &mut unknown,
+                &key(KeyCode::Char('s'))
+            )),
+            xai_grok_shell::ssh::SshHostKeyDecision::TrustAndStore
+        );
+    }
+
+    #[test]
+    fn non_host_authentication_keeps_host_key_decision_empty() {
+        let mut card = SshAuthCard::new(
+            "challenge-2".into(),
+            8,
+            "target-1".into(),
+            SshAuthKind::Password {
+                username: "build".into(),
+                message: "Password required".into(),
+                allow_remember: true,
+            },
+        );
+        assert!(matches!(
+            handle_authentication_key(&mut card, &key(KeyCode::Esc)),
+            SshModalOutcome::AnswerAuthentication {
+                host_key_decision: None,
+                secret: None,
+                answers,
+                ..
+            } if answers.is_empty()
+        ));
+    }
+
+    #[test]
+    fn changed_host_key_records_remain_reachable_in_narrow_authentication_card() {
+        let mut card = host_key_card(
+            "changed",
+            vec![
+                "SHA256:old-fingerprint ssh-ed25519 ~/.ssh/known_hosts line 37".into(),
+                "SHA256:older-rsa ssh-rsa ~/.ssh/known_hosts line 38".into(),
+            ],
+            false,
+        );
+        let area = Rect::new(0, 0, 30, 4);
+        let theme = Theme::current();
+        let mut frames = String::new();
+        for _ in 0..256 {
+            let mut buffer = Buffer::empty(area);
+            render_authentication(&mut buffer, area, &mut card, &theme);
+            frames.push_str(&buffer_text(&buffer));
+            frames.push('\n');
+            if matches!(
+                handle_authentication_key(&mut card, &key(KeyCode::Down)),
+                SshModalOutcome::Unchanged
+            ) {
+                break;
+            }
+        }
+        assert!(frames.contains("SHA256:old-fingerprint"));
+        assert!(frames.contains("SHA256:older-rsa"));
+        assert!(frames.contains("line 37"));
+        assert!(frames.contains("line 38"));
+    }
+
+    #[test]
+    fn long_manager_error_opens_a_scrollable_diagnostic_without_changing_selection() {
+        let mut state = SshManagerState::new(None);
+        state.selected = 4;
+        state.show_error(
+            "SSH connection failed after authentication. \
+             The remote endpoint closed the tunnel while opening the workspace. \
+             Root cause: host certificate policy rejected the requested principal.",
+        );
+        assert!(matches!(
+            handle_manager_key(&mut state, &key(KeyCode::Char('d'))),
+            SshModalOutcome::Changed
+        ));
+        assert_eq!(state.selected, 4);
+        let SshModalPage::Diagnostic(card) = &mut state.page else {
+            panic!("manager error must open its diagnostic page");
+        };
+        let area = Rect::new(0, 0, 24, 4);
+        let theme = Theme::current();
+        let mut buffer = Buffer::empty(area);
+        render_diagnostic(&mut buffer, area, card, &theme);
+        assert!(card.max_scroll_offset > 0);
+        assert!(matches!(
+            handle_diagnostic_key(card, &key(KeyCode::End)),
+            SshModalOutcome::Changed
+        ));
+        let mut buffer = Buffer::empty(area);
+        render_diagnostic(&mut buffer, area, card, &theme);
+        assert!(
+            buffer_text(&buffer).contains("principal"),
+            "the diagnostic root cause must remain visible after scrolling"
+        );
+        assert!(matches!(
+            close_current_page(&mut state),
+            SshModalOutcome::Changed
+        ));
+        assert!(matches!(&state.page, SshModalPage::Manager));
+        assert_eq!(state.selected, 4);
     }
 }

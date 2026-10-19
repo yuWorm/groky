@@ -2241,6 +2241,8 @@ impl Interaction for LocalInteractionBridge {
                     algorithm: prompt.algorithm,
                     fingerprint: prompt.fingerprint,
                     status: format!("{:?}", prompt.status).to_lowercase(),
+                    previous_keys: prompt.previous_keys,
+                    can_replace: prompt.can_replace,
                 },
             },
         )
@@ -2252,6 +2254,7 @@ impl Interaction for LocalInteractionBridge {
             SshHostKeyDecision::Reject => Ok(HostKeyDecision::Reject),
             SshHostKeyDecision::TrustOnce => Ok(HostKeyDecision::TrustOnce),
             SshHostKeyDecision::TrustAndStore => Ok(HostKeyDecision::TrustAndStore),
+            SshHostKeyDecision::ReplaceAndStore => Ok(HostKeyDecision::ReplaceAndStore),
         }
     }
 
@@ -2918,6 +2921,8 @@ mod tests {
                 algorithm: "ssh-ed25519".into(),
                 fingerprint: "fingerprint".into(),
                 status: xai_grok_ssh::HostKeyStatus::Unknown,
+                previous_keys: Vec::new(),
+                can_replace: false,
             })
             .await
             .unwrap_err();

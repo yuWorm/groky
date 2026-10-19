@@ -111,10 +111,10 @@ pub struct KeyboardInteractivePrompt {
 #[serde(rename_all = "snake_case")]
 pub enum HostKeyStatus {
     Unknown,
+    Changed,
 }
 
-/// A host key not found in a trusted known_hosts file. A key that conflicts
-/// with an existing matching entry never reaches this callback: it fails hard.
+/// A host-key verification decision requested by the native SSH transport.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HostKeyPrompt {
     pub challenge_id: Uuid,
@@ -125,6 +125,11 @@ pub struct HostKeyPrompt {
     pub algorithm: String,
     pub fingerprint: String,
     pub status: HostKeyStatus,
+    /// Matching stale keys, formatted with their SHA-256 fingerprint,
+    /// algorithm, source file, and line number.
+    pub previous_keys: Vec<String>,
+    /// Whether this exact user-owned record can be safely replaced.
+    pub can_replace: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -133,6 +138,7 @@ pub enum HostKeyDecision {
     Reject,
     TrustOnce,
     TrustAndStore,
+    ReplaceAndStore,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
@@ -314,7 +320,7 @@ impl fmt::Display for ConfigurationDiagnostic {
 }
 
 /// Errors deliberately omit credential material and raw interactive responses.
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug, Clone, thiserror::Error)]
 pub enum SshError {
     #[error("SSH target configuration failed")]
     Configuration,
@@ -330,6 +336,8 @@ pub enum SshError {
     RevokedHostKey,
     #[error("SSH host key was rejected")]
     HostKeyRejected,
+    #[error("SSH host key replacement could not be completed safely: {0}")]
+    HostKeyReplacement(String),
     #[error("SSH authentication interaction failed: {0}")]
     Interaction(#[from] InteractionError),
     #[error("SSH authentication failed")]

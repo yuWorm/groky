@@ -153,6 +153,14 @@ unavailable, remembering is disabled rather than falling back to a plaintext fil
 `ssh connect` is noninteractive: use `/ssh` when authentication or host trust needs
 an answer.
 
+Known-host checks isolate each host/port and allow multiple key algorithms. If a
+stored key changes, `/ssh` shows the old and new fingerprints and record locations.
+Verify the new fingerprint independently before pressing `r` to replace and save.
+Replacement backs up the file to `.old` (or a numbered backup), preserves unrelated
+records, and refuses stale confirmations or ambiguous/global/wildcard records.
+Those records require manual review. In the target manager, `d` opens the full SSH
+error; long diagnostics and host-key details wrap and scroll.
+
 There are two execution modes:
 
 - **SSH project:** ordinary file, edit, search, command and Git operations use the
