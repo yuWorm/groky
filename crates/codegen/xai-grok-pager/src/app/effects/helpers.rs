@@ -26,6 +26,22 @@ const SESSION_RPC_SLACK: std::time::Duration = std::time::Duration::from_secs(50
 pub(super) fn session_rpc_timeout() -> std::time::Duration {
     SESSION_RPC_FLOOR.max(xai_grok_workspace::envrc::loader_budget() + SESSION_RPC_SLACK)
 }
+/// SSH startup also covers a remote download, user consent, local download and SFTP upload.
+/// Keep the outer RPC alive through those individually bounded steps and normal session setup.
+pub(super) fn ssh_session_rpc_timeout() -> std::time::Duration {
+    session_rpc_timeout() + std::time::Duration::from_secs(35 * 60)
+}
+
+pub(crate) fn resume_session_rpc_timeout(session_id: &str) -> std::time::Duration {
+    // This lookup chooses only a waiting budget, never remote authority or a local cwd.
+    if xai_grok_shell::session::resolve_local_session_any_cwd(session_id)
+        .is_some_and(|cwd| !std::path::Path::new(&cwd).is_absolute())
+    {
+        ssh_session_rpc_timeout()
+    } else {
+        session_rpc_timeout()
+    }
+}
 /// Why a bounded session RPC failed; `TimedOut` is observed at the deadline, not inferred later.
 #[derive(Debug)]
 pub(crate) enum SessionRpcError {
@@ -60,17 +76,17 @@ impl std::error::Error for SessionRpcError {
         }
     }
 }
-/// `acp_send` bounded by [`session_rpc_timeout`], returning a typed [`SessionRpcError`] on expiry.
+/// Bound one session RPC by its local or SSH startup budget.
 pub(crate) async fn acp_send_bounded<R, T>(
     request: T,
     tx: &tokio::sync::mpsc::UnboundedSender<R>,
     action: &str,
+    timeout: std::time::Duration,
 ) -> Result<T::Response, SessionRpcError>
 where
     T: xai_acp_lib::AcpRequest,
     R: From<xai_acp_lib::AcpArgs<T>> + std::fmt::Debug,
 {
-    let timeout = session_rpc_timeout();
     match tokio::time::timeout(timeout, acp_send(request, tx)).await {
         Ok(Ok(resp)) => Ok(resp),
         Ok(Err(e)) => Err(SessionRpcError::Rpc(e)),
@@ -473,6 +489,20 @@ pub(crate) fn sanitize_user_error(raw: &str) -> String {
     if is_disk_full_error(raw) {
         return xai_fast_worktree::ENOSPC_OS_MESSAGE.to_string();
     }
+    let mut result = sanitize_user_error_full(raw);
+    if let Some((boundary, _)) = result.char_indices().nth(200) {
+        let truncate_at = result[..boundary]
+            .char_indices()
+            .nth(180)
+            .map_or(boundary, |(offset, _)| offset);
+        result.truncate(truncate_at);
+        result.push_str("...");
+    }
+    result
+}
+
+/// Format a diagnostic without applying the toast length limit or dropping its cause.
+pub(super) fn sanitize_user_error_full(raw: &str) -> String {
     static REPLACEMENTS: &[(&str, &str)] = &[
         ("ACP error:", "error:"),
         ("ACP request failed:", "request failed:"),
@@ -486,10 +516,6 @@ pub(crate) fn sanitize_user_error(raw: &str) -> String {
     let mut result = xai_grok_shell::sampling::error::rewrite_service_names(raw);
     for (pattern, replacement) in REPLACEMENTS {
         result = result.replace(pattern, replacement);
-    }
-    if result.chars().count() > 200 {
-        let truncated: String = result.chars().take(180).collect();
-        result = format!("{truncated}...");
     }
     result
 }

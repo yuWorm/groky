@@ -136,17 +136,38 @@ groky ssh disconnect dev
 authenticated native SSH connection, SFTP for files, and POSIX shell execution.
 The SSH server must enable SFTP; search additionally requires remote `rg`.
 
-**Only SSH projects require a matching remote `groky` binary.** Their default
-command is `groky worker --stdio`, available in the noninteractive SSH `PATH`,
-along with Git, ripgrep and the project's tools. Use
-`--worker-command '/absolute/path/groky worker --stdio'` when needed. groky does
-not silently install a worker or require an xAI login on that host. Model requests
-and provider credentials stay local in both modes.
+**SSH projects manage their own matching remote worker.** On project open or
+resume, groky checks the remote OS/architecture and the worker's product/protocol
+version. A missing worker is installed automatically; after a local upgrade, the
+next open/resume installs that exact release, never an unrelated `latest` build.
+Supported worker platforms are Linux and macOS on x86_64 or aarch64.
+
+Installation first downloads the release and its required SHA-256 checksum on
+the remote host. If that fails, the TUI shows the full error and asks whether to
+download through **this computer's network** and upload over the authenticated
+SSH/SFTP connection. `Enter`/`y` or the footer button approves; `n`/`Esc` declines.
+Downloads/uploads and identity checks finish before the worker is published under
+`~/.groky/workers/<version>/<os>-<arch>/groky`. No sudo or system `PATH` change is
+needed. Versions remain side by side, with separate daemons; failed installation
+does not replace an existing worker or silently run an incompatible one.
+
+Development builds have no release download: same-platform hosts can receive
+the local executable after explicit approval, keyed by its SHA-256. For a different
+remote platform, use a published release or supply a matching cross-built worker.
+An explicit `--worker-command '/absolute/path/groky worker --stdio'` is user-managed:
+groky checks compatibility but never overwrites or automatically updates it.
+Git, ripgrep and the project's tools must still be available remotely. The worker
+does not need an xAI login; model requests and provider credentials remain local.
 
 Open `/ssh` in a session, or press `Ctrl+S` on Welcome, to manage targets. `Enter`
-connects/disconnects, `g` requests a root-scoped grant, `u` selects an authorized
-default, `r` revokes a grant, and `o` opens its remote project. Passwords, encrypted
-private keys, ssh-agent and keyboard-interactive authentication are supported.
+connects/disconnects, `g` requests a root-scoped grant, `u` selects the highlighted
+grant as default, `r` revokes only that grant, and `o` opens its remote project.
+Each active grant has its own row; revoking one reports any remaining grants.
+Without a grant, `u` and `o` guide you through authorization instead of failing.
+After approval, press the original action again. Target rows and footer actions are
+clickable; the wheel scrolls the list. Grant options support clicks, `Tab`/`Space`
+and the displayed `Alt` shortcuts; `PgUp`/`PgDn` inspect wrapped grant details.
+Passwords, encrypted private keys, ssh-agent and keyboard-interactive authentication are supported.
 Host trust and access grants are separate confirmations. Passwords are masked and
 remembered only by explicit opt-in to the OS credential store; if that store is
 unavailable, remembering is disabled rather than falling back to a plaintext file.
@@ -154,12 +175,22 @@ unavailable, remembering is disabled rather than falling back to a plaintext fil
 an answer.
 
 Known-host checks isolate each host/port and allow multiple key algorithms. If a
-stored key changes, `/ssh` shows the old and new fingerprints and record locations.
+stored key changes and `StrictHostKeyChecking` permits prompting (`ask`), `/ssh`
+shows the old and new fingerprints and record locations.
 Verify the new fingerprint independently before pressing `r` to replace and save.
 Replacement backs up the file to `.old` (or a numbered backup), preserves unrelated
 records, and refuses stale confirmations or ambiguous/global/wildcard records.
-Those records require manual review. In the target manager, `d` opens the full SSH
-error; long diagnostics and host-key details wrap and scroll.
+Those records require manual review. In the target manager, `d` opens the selected
+target's configuration, grant details and latest SSH error; long diagnostics and
+host-key details wrap and scroll. Unsupported forwarding directives are reported
+explicitly, not silently ignored: use system OpenSSH for forwarding, or scope those
+directives to a separate alias.
+Grant drafts can be cancelled locally with `Esc` or the close button. Grant and
+target-save failures open the full diagnostic automatically; `Esc` returns to the
+same form without discarding its fields. Target saves and project opens ignore
+repeated submissions while pending. Project startup failures return to the source
+manager with a diagnostic and allow retry. The remote worker uses a short, private
+per-user socket path so long home directories do not exceed Unix socket limits.
 
 There are two execution modes:
 
@@ -219,7 +250,8 @@ For persistent overrides, use the user-global `~/.groky/config.toml`:
 host = "my-server" # existing OpenSSH alias
 label = "Development"
 user = "developer" # optional override
-worker_command = ["/usr/local/bin/groky", "worker", "--stdio"] # SSH projects only
+# Optional, user-managed worker (disables managed installation and updates):
+# worker_command = ["/usr/local/bin/groky", "worker", "--stdio"]
 ```
 
 Groky target overrides take precedence over user SSH config, then system SSH

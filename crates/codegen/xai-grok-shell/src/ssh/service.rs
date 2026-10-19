@@ -33,7 +33,7 @@ use super::model::{
     SshDispatchRequest, SshDispatchResult, SshEvent, SshGrantDecision, SshGrantRequest,
     SshGrantScope, SshGrantStatus, SshHostKeyDecision, SshKeyboardInteractiveQuestion,
     SshOperationApproval, SshOperationApprovalDecision, SshSessionWorkerEvent, SshTargetAccess,
-    SshTargetStatus,
+    SshTargetStatus, SshWorkerInstallDecision, SshWorkerInstallProgress, SshWorkerInstallRequest,
 };
 
 const INTERACTION_TIMEOUT: Duration = Duration::from_secs(300);
@@ -76,6 +76,8 @@ pub enum SshServiceError {
     StaleAuthentication,
     #[error("SSH operation approval is stale or belongs to another client")]
     StaleOperationApproval,
+    #[error("SSH worker installation consent is stale or belongs to another client or grant")]
+    StaleWorkerInstall,
     #[error("SSH transport: {0}")]
     Transport(String),
     #[error("SSH worker: {0}")]
@@ -147,6 +149,7 @@ struct SessionSshInner {
     auth_waiters: Mutex<HashMap<String, PendingAuthentication>>,
     session_event_sinks: Mutex<HashMap<String, broadcast::Sender<SshSessionWorkerEvent>>>,
     approval_waiters: Mutex<HashMap<String, PendingOperationApproval>>,
+    worker_install_waiters: Mutex<HashMap<String, PendingWorkerInstall>>,
     project_registrations: RwLock<HashMap<String, ProjectRegistration>>,
     project_rules_path: PathBuf,
     project_rules: Mutex<ProjectRuleStore>,
@@ -194,6 +197,7 @@ impl GrantRecord {
 }
 
 struct WorkerConnection {
+    command: Vec<String>,
     binding: SshBinding,
     client: SshWorkspaceClient,
     client_id: Option<u64>,
@@ -209,6 +213,12 @@ struct PendingAuthentication {
 
 struct PendingOperationApproval {
     client_id: u64,
+    response: oneshot::Sender<bool>,
+}
+
+struct PendingWorkerInstall {
+    client_id: u64,
+    binding: SshBinding,
     response: oneshot::Sender<bool>,
 }
 #[derive(Clone)]
@@ -293,6 +303,7 @@ impl SessionSsh {
                 auth_waiters: Mutex::new(HashMap::new()),
                 session_event_sinks: Mutex::new(HashMap::new()),
                 approval_waiters: Mutex::new(HashMap::new()),
+                worker_install_waiters: Mutex::new(HashMap::new()),
                 project_registrations: RwLock::new(HashMap::new()),
                 project_rules_path,
                 project_rules: Mutex::new(project_rules),
@@ -416,6 +427,7 @@ impl SessionSsh {
                         scope: SshGrantScope::ProjectRule,
                         revoke_status: None,
                         worker_bound: false,
+                        worker_commands: Vec::new(),
                     },
                     revoked: Arc::new(AtomicBool::new(false)),
                 },
@@ -758,6 +770,13 @@ impl SessionSsh {
                 self.submit_operation_approval(decision).await?;
                 Ok(SshControlReply::OperationApprovalAccepted)
             }
+            SshControlCommand::SubmitWorkerInstall(decision) => {
+                if decision.client_id != client_id {
+                    return Err(SshServiceError::WrongClient);
+                }
+                self.submit_worker_install(decision).await?;
+                Ok(SshControlReply::WorkerInstallAccepted)
+            }
         }
     }
 
@@ -1029,6 +1048,7 @@ impl SessionSsh {
             scope: decision.scope,
             revoke_status: None,
             worker_bound: false,
+            worker_commands: Vec::new(),
         };
         {
             let mut sessions = self.inner.sessions.write().await;
@@ -1116,6 +1136,14 @@ impl SessionSsh {
             }
             affected
         };
+        {
+            let mut waiters = self.inner.worker_install_waiters.lock().await;
+            waiters.retain(|_, waiter| {
+                !affected.iter().any(|(session_id, binding, _)| {
+                    waiter.binding.session_id == *session_id && waiter.binding.id == binding.id
+                })
+            });
+        }
         let mut pending = false;
         for (affected_session_id, binding, _) in &affected {
             let needs_ack = self
@@ -1209,6 +1237,7 @@ impl SessionSsh {
                 scope: SshGrantScope::CurrentSession,
                 revoke_status: None,
                 worker_bound: false,
+                worker_commands: Vec::new(),
             });
         }
         let bindings = inherited
@@ -1766,7 +1795,11 @@ impl SessionSsh {
                         && persisted.binding.target_id == target_id
                         && &persisted.binding.identity == identity
                     {
-                        pending.push((session_id.clone(), persisted.binding.clone()));
+                        pending.push((
+                            session_id.clone(),
+                            persisted.binding.clone(),
+                            persisted.worker_commands.clone(),
+                        ));
                     }
                 }
             }
@@ -1775,44 +1808,70 @@ impl SessionSsh {
         if pending.is_empty() {
             return Ok(());
         }
-        let resolved = self
+        let configured = self
             .inner
             .targets
             .resolve(target_id)
-            .map_err(|error| SshServiceError::Configuration(error.to_string()))?;
-        let command = shell_command(&resolved.target.worker_command)?;
-
-        for (session_id, binding) in pending {
-            let acknowledged = match lease.exec(&command).await {
-                Ok(stream) => {
-                    match SshWorkspaceClient::revoke_tombstone(stream, binding.clone()).await {
-                        Ok(ack) => ack.binding_id == binding.id && ack.epoch == binding.epoch,
-                        Err(error) => {
-                            tracing::warn!(
-                                binding_id = %binding.id,
-                                target_id,
-                                error = %error,
-                                "SSH revocation tombstone acknowledgement remains pending"
-                            );
-                            false
-                        }
-                    }
-                }
-                Err(error) => {
-                    tracing::warn!(
-                        binding_id = %binding.id,
-                        target_id,
-                        error = %error,
-                        "SSH revocation tombstone bridge could not start"
-                    );
-                    false
-                }
-            };
+            .map_err(|error| SshServiceError::Configuration(error.to_string()))?
+            .target
+            .worker_command;
+        for (session_id, binding, mut commands) in pending {
+            if commands.is_empty()
+                || (!is_default_worker_command(&configured) && !commands.contains(&configured))
+            {
+                commands.push(configured.clone());
+            }
+            let acknowledged = self
+                .revoke_worker_commands(lease, &binding, &commands)
+                .await;
             if acknowledged {
                 self.confirm_revoke_ack(&session_id, &binding).await?;
             }
         }
         Ok(())
+    }
+
+    async fn revoke_worker_commands(
+        &self,
+        lease: &ConnectionLease,
+        binding: &SshBinding,
+        commands: &[Vec<String>],
+    ) -> bool {
+        let current = self.inner.workers.lock().await.get(&binding.id).cloned();
+        let mut all_acknowledged = !commands.is_empty();
+        for arguments in commands {
+            let acknowledgement = async {
+                if let Some(worker) = current
+                    .as_ref()
+                    .filter(|worker| worker.command == *arguments && worker.client.is_connected())
+                {
+                    return worker
+                        .client
+                        .revoke(&binding.id, binding.epoch)
+                        .await
+                        .map_err(SshServiceError::from);
+                }
+                let command = shell_command(arguments)?;
+                let stream = lease.exec(&command).await?;
+                SshWorkspaceClient::revoke_tombstone(stream, binding.clone())
+                    .await
+                    .map_err(SshServiceError::from)
+            }
+            .await;
+            match acknowledgement {
+                Ok(ack) if ack.binding_id == binding.id && ack.epoch == binding.epoch => {}
+                other => {
+                    all_acknowledged = false;
+                    tracing::warn!(
+                        binding_id = %binding.id,
+                        target_id = %binding.target_id,
+                        result = ?other,
+                        "SSH worker version revocation remains pending"
+                    );
+                }
+            }
+        }
+        all_acknowledged
     }
 
     pub async fn submit_auth_response(
@@ -1859,6 +1918,37 @@ impl SessionSsh {
             .response
             .send(decision.approved)
             .map_err(|_| SshServiceError::StaleOperationApproval)
+    }
+
+    async fn submit_worker_install(
+        &self,
+        decision: SshWorkerInstallDecision,
+    ) -> Result<(), SshServiceError> {
+        // Keep the grant read lock until the one-shot decision is sent: a concurrent
+        // revoke cannot turn an approved stale epoch into upload authority.
+        let sessions = self.inner.sessions.read().await;
+        let mut waiters = self.inner.worker_install_waiters.lock().await;
+        let waiter = waiters
+            .get(&decision.request_id)
+            .ok_or(SshServiceError::StaleWorkerInstall)?;
+        if waiter.client_id != decision.client_id
+            || waiter.binding.session_id != decision.session_id
+            || waiter.binding.id != decision.binding_id
+            || !sessions
+                .get(&decision.session_id)
+                .and_then(|state| state.grants.get(&decision.binding_id))
+                .is_some_and(|record| {
+                    !record.persisted.binding.revoked && record.persisted.binding == waiter.binding
+                })
+        {
+            return Err(SshServiceError::StaleWorkerInstall);
+        }
+        waiters
+            .remove(&decision.request_id)
+            .expect("the checked request remains locked")
+            .response
+            .send(decision.approved)
+            .map_err(|_| SshServiceError::StaleWorkerInstall)
     }
 
     async fn pending_request(&self, request_id: &str) -> Result<SshGrantRequest, SshServiceError> {
@@ -2014,25 +2104,6 @@ impl SessionSsh {
         if lease.identity() != &binding.identity {
             return Err(SshServiceError::IdentityChanged);
         }
-        // Persist before sending authority: even an interrupted handshake might
-        // have bound the remote worker and needs a remote revoke tombstone.
-        {
-            let mut sessions = self.inner.sessions.write().await;
-            let state = sessions
-                .get_mut(&binding.session_id)
-                .ok_or_else(|| SshServiceError::UnknownBinding(binding.id.clone()))?;
-            let mut candidate = state.clone();
-            let record = candidate
-                .grants
-                .get_mut(&binding.id)
-                .ok_or_else(|| SshServiceError::UnknownBinding(binding.id.clone()))?;
-            if record.persisted.binding.revoked || record.persisted.binding.epoch != binding.epoch {
-                return Err(SshServiceError::StaleInvocation);
-            }
-            record.persisted.worker_bound = true;
-            self.persist_state(&binding.session_id, &candidate).await?;
-            *state = candidate;
-        }
         let worker = self.open_worker(lease, binding.clone(), client_id).await?;
         if worker.binding.root != binding.root || worker.binding.cwd != binding.cwd {
             return Err(SshServiceError::CanonicalRootChanged);
@@ -2056,7 +2127,7 @@ impl SessionSsh {
                 Ok(ack) if ack.binding_id == binding.id && ack.epoch == epoch);
             if acknowledged {
                 if let Some(current) = current.filter(|current| current.revoked) {
-                    self.confirm_revoke_ack(&current.session_id, &current)
+                    self.sync_pending_revocations(&worker._lease, &current.target_id)
                         .await?;
                 }
             }
@@ -2084,7 +2155,52 @@ impl SessionSsh {
             .targets
             .resolve(&binding.target_id)
             .map_err(|error| SshServiceError::Configuration(error.to_string()))?;
-        let command = shell_command(&resolved.target.worker_command)?;
+        let managed = is_default_worker_command(&resolved.target.worker_command);
+        let command_args = if managed {
+            let interaction = WorkerInstallBridge {
+                service: Arc::downgrade(&self.inner),
+                client_id,
+                binding: binding.clone(),
+                request_id: Uuid::now_v7().to_string(),
+            };
+            let result =
+                super::worker_install::prepare_worker(&lease, &self.inner.home, &interaction).await;
+            drop(interaction);
+            result.map_err(SshServiceError::Worker)?
+        } else {
+            resolved.target.worker_command.clone()
+        };
+        // Record managed executables before sending authority. An interrupted handshake
+        // can still bind a daemon. Never copy potentially secret custom argv into session state.
+        {
+            let mut sessions = self.inner.sessions.write().await;
+            let state = sessions
+                .get_mut(&binding.session_id)
+                .ok_or_else(|| SshServiceError::UnknownBinding(binding.id.clone()))?;
+            let mut candidate = state.clone();
+            let record = candidate
+                .grants
+                .get_mut(&binding.id)
+                .ok_or_else(|| SshServiceError::UnknownBinding(binding.id.clone()))?;
+            if record.persisted.binding != binding || binding.revoked {
+                return Err(SshServiceError::StaleInvocation);
+            }
+            if managed {
+                if record.persisted.worker_bound && record.persisted.worker_commands.is_empty() {
+                    record
+                        .persisted
+                        .worker_commands
+                        .push(xai_grok_ssh::default_worker_command());
+                }
+                if !record.persisted.worker_commands.contains(&command_args) {
+                    record.persisted.worker_commands.push(command_args.clone());
+                }
+            }
+            record.persisted.worker_bound = true;
+            self.persist_state(&binding.session_id, &candidate).await?;
+            *state = candidate;
+        }
+        let command = shell_command(&command_args)?;
         let stream = lease.exec(&command).await?;
         let callbacks: Arc<dyn SshClientCallbacks> = Arc::new(WorkerCallbacks {
             service: Arc::downgrade(&self.inner),
@@ -2098,6 +2214,7 @@ impl SessionSsh {
             binding,
             client,
             client_id,
+            command: command_args,
             _lease: lease,
         })
     }
@@ -2195,14 +2312,169 @@ impl SessionSsh {
             let Some(worker) = worker else {
                 return;
             };
-            let acknowledged = matches!(
-                worker.client.revoke(&binding.id, binding.epoch).await,
-                Ok(ack) if ack.binding_id == binding.id && ack.epoch == binding.epoch
-            );
+            let mut commands = service
+                .inner
+                .sessions
+                .read()
+                .await
+                .get(&session_id)
+                .and_then(|state| state.grants.get(&binding.id))
+                .map(|record| record.persisted.worker_commands.clone())
+                .unwrap_or_default();
+            if !commands.contains(&worker.command) {
+                commands.push(worker.command.clone());
+            }
+            let acknowledged = service
+                .revoke_worker_commands(&worker._lease, &binding, &commands)
+                .await;
             if acknowledged {
                 let _ = service.confirm_revoke_ack(&session_id, &binding).await;
             }
         });
+    }
+}
+
+fn is_default_worker_command(command: &[String]) -> bool {
+    command
+        .iter()
+        .map(String::as_str)
+        .eq(xai_grok_ssh::DEFAULT_WORKER_COMMAND.iter().copied())
+}
+
+struct WorkerInstallBridge {
+    service: Weak<SessionSshInner>,
+    client_id: Option<u64>,
+    binding: SshBinding,
+    request_id: String,
+}
+
+impl WorkerInstallBridge {
+    fn send_progress(&self, message: Option<String>) {
+        let (Some(service), Some(client_id)) = (self.service.upgrade(), self.client_id) else {
+            return;
+        };
+        let _ = service
+            .events
+            .send(SshEvent::WorkerInstallProgress(SshWorkerInstallProgress {
+                client_id,
+                request_id: self.request_id.clone(),
+                session_id: self.binding.session_id.clone(),
+                binding_id: self.binding.id.clone(),
+                target_id: self.binding.target_id.clone(),
+                message,
+            }));
+    }
+}
+
+impl Drop for WorkerInstallBridge {
+    fn drop(&mut self) {
+        self.send_progress(None);
+        if let (Some(service), Ok(runtime)) = (
+            self.service.upgrade(),
+            tokio::runtime::Handle::try_current(),
+        ) {
+            let request_id = self.request_id.clone();
+            runtime.spawn(async move {
+                service
+                    .worker_install_waiters
+                    .lock()
+                    .await
+                    .remove(&request_id);
+            });
+        }
+    }
+}
+
+#[async_trait]
+impl super::worker_install::WorkerInstallInteraction for WorkerInstallBridge {
+    fn progress(&self, message: &str) {
+        self.send_progress(Some(message.to_owned()));
+    }
+
+    async fn approve_local_upload(
+        &self,
+        version: &str,
+        platform: &str,
+        remote_error: &str,
+    ) -> Result<bool, String> {
+        let service = self
+            .service
+            .upgrade()
+            .ok_or("SSH service closed during worker installation")?;
+        let client_id = self.client_id.ok_or_else(|| format!(
+            "Remote worker installation failed: {remote_error}. Local download/upload requires confirmation; open the project in the interactive SSH manager."
+        ))?;
+        let (response, receiver) = oneshot::channel();
+        {
+            let sessions = service.sessions.read().await;
+            if !sessions
+                .get(&self.binding.session_id)
+                .and_then(|state| state.grants.get(&self.binding.id))
+                .is_some_and(|record| {
+                    !record.persisted.binding.revoked && record.persisted.binding == self.binding
+                })
+            {
+                return Err("SSH grant changed during worker installation".into());
+            }
+            service.worker_install_waiters.lock().await.insert(
+                self.request_id.clone(),
+                PendingWorkerInstall {
+                    client_id,
+                    binding: self.binding.clone(),
+                    response,
+                },
+            );
+        }
+        if service
+            .events
+            .send(SshEvent::WorkerInstallRequested(SshWorkerInstallRequest {
+                client_id,
+                request_id: self.request_id.clone(),
+                session_id: self.binding.session_id.clone(),
+                binding_id: self.binding.id.clone(),
+                target_id: self.binding.target_id.clone(),
+                version: version.to_owned(),
+                platform: platform.to_owned(),
+                remote_error: remote_error.to_owned(),
+            }))
+            .is_err()
+        {
+            service
+                .worker_install_waiters
+                .lock()
+                .await
+                .remove(&self.request_id);
+            return Err(
+                "Worker installation needs confirmation, but no interactive SSH client is attached"
+                    .into(),
+            );
+        }
+        let decision = tokio::time::timeout(INTERACTION_TIMEOUT, receiver).await;
+        service
+            .worker_install_waiters
+            .lock()
+            .await
+            .remove(&self.request_id);
+        match decision {
+            Ok(Ok(approved)) => {
+                let sessions = service.sessions.read().await;
+                if !sessions
+                    .get(&self.binding.session_id)
+                    .and_then(|state| state.grants.get(&self.binding.id))
+                    .is_some_and(|record| {
+                        !record.persisted.binding.revoked
+                            && record.persisted.binding == self.binding
+                    })
+                {
+                    return Err(
+                        "SSH grant changed while waiting for worker installation consent".into(),
+                    );
+                }
+                Ok(approved)
+            }
+            Ok(Err(_)) => Err("SSH worker installation was cancelled".into()),
+            Err(_) => Err("Timed out waiting for local worker download/upload confirmation".into()),
+        }
     }
 }
 
@@ -2950,6 +3222,20 @@ mod tests {
             SshApprovalDecision::Deny
         );
         assert!(service.inner.approval_waiters.lock().await.is_empty());
+        use super::super::worker_install::WorkerInstallInteraction;
+        let installer = WorkerInstallBridge {
+            service: Arc::downgrade(&service.inner),
+            client_id: None,
+            binding: binding("binding", "session", "/remote/project"),
+            request_id: "install".into(),
+        };
+        assert!(
+            installer
+                .approve_local_upload("0.2.0", "linux-x86_64", "download failed")
+                .await
+                .is_err()
+        );
+        assert!(service.inner.worker_install_waiters.lock().await.is_empty());
     }
 
     fn binding(id: &str, session_id: &str, root: &str) -> SshBinding {
@@ -2969,6 +3255,148 @@ mod tests {
             epoch: 1,
             revoked: false,
         }
+    }
+
+    async fn worker_install_fixture() -> (tempfile::TempDir, SessionSsh, WorkerInstallBridge) {
+        let home = tempfile::tempdir().unwrap();
+        let service = SessionSsh::new(home.path().to_owned());
+        let granted = binding("binding", "session", "/remote/project");
+        service
+            .restore_session(
+                "session",
+                PersistedSshState {
+                    grants: vec![PersistedSshGrant {
+                        binding: granted.clone(),
+                        parent_binding_id: None,
+                        requires_revalidation: true,
+                        scope: SshGrantScope::CurrentSession,
+                        revoke_status: None,
+                        worker_bound: false,
+                        worker_commands: Vec::new(),
+                    }],
+                    ..Default::default()
+                },
+            )
+            .await;
+        let bridge = WorkerInstallBridge {
+            service: Arc::downgrade(&service.inner),
+            client_id: Some(7),
+            binding: granted,
+            request_id: "install".into(),
+        };
+        (home, service, bridge)
+    }
+
+    #[tokio::test]
+    async fn worker_upload_consent_rejects_foreign_owners_without_consuming_request() {
+        use super::super::worker_install::WorkerInstallInteraction;
+        let (_home, service, bridge) = worker_install_fixture().await;
+        let mut events = service.subscribe_events();
+        let pending = tokio::spawn(async move {
+            bridge
+                .approve_local_upload("0.2.0", "linux-aarch64", "download failed")
+                .await
+        });
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_secs(1), events.recv())
+                .await
+                .unwrap()
+                .unwrap(),
+            SshEvent::WorkerInstallRequested(_)
+        ));
+        let decision = SshWorkerInstallDecision {
+            client_id: 7,
+            request_id: "install".into(),
+            session_id: "session".into(),
+            binding_id: "binding".into(),
+            approved: true,
+        };
+        for foreign in [
+            SshWorkerInstallDecision {
+                client_id: 8,
+                ..decision.clone()
+            },
+            SshWorkerInstallDecision {
+                session_id: "other-session".into(),
+                ..decision.clone()
+            },
+            SshWorkerInstallDecision {
+                binding_id: "other-binding".into(),
+                ..decision.clone()
+            },
+        ] {
+            assert!(matches!(
+                service
+                    .control(
+                        foreign.client_id,
+                        SshControlCommand::SubmitWorkerInstall(foreign)
+                    )
+                    .await,
+                Err(SshServiceError::StaleWorkerInstall)
+            ));
+        }
+        service
+            .control(7, SshControlCommand::SubmitWorkerInstall(decision.clone()))
+            .await
+            .unwrap();
+        assert!(pending.await.unwrap().unwrap());
+        assert!(matches!(
+            service
+                .control(7, SshControlCommand::SubmitWorkerInstall(decision))
+                .await,
+            Err(SshServiceError::StaleWorkerInstall)
+        ));
+    }
+
+    #[tokio::test]
+    async fn revocation_cancels_pending_worker_upload_before_authority_is_sent() {
+        use super::super::worker_install::WorkerInstallInteraction;
+        let (_home, service, bridge) = worker_install_fixture().await;
+        let mut events = service.subscribe_events();
+        let pending = tokio::spawn(async move {
+            bridge
+                .approve_local_upload("0.2.0", "linux-aarch64", "download failed")
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(1), events.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            service.revoke_binding("session", "binding").await.unwrap(),
+            RevokeStatus::Confirmed
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), pending)
+                .await
+                .unwrap()
+                .unwrap()
+                .is_err()
+        );
+        let state = service.snapshot_session("session").await;
+        let grant = state
+            .grants
+            .iter()
+            .find(|grant| grant.binding.id == "binding")
+            .unwrap();
+        assert!(grant.binding.revoked);
+        assert!(!grant.worker_bound);
+        assert!(grant.worker_commands.is_empty());
+        assert!(matches!(
+            service
+                .control(
+                    7,
+                    SshControlCommand::SubmitWorkerInstall(SshWorkerInstallDecision {
+                        client_id: 7,
+                        request_id: "install".into(),
+                        session_id: "session".into(),
+                        binding_id: "binding".into(),
+                        approved: true,
+                    })
+                )
+                .await,
+            Err(SshServiceError::StaleWorkerInstall)
+        ));
     }
 
     #[test]
@@ -3350,6 +3778,7 @@ mod tests {
                                 scope: SshGrantScope::CurrentSession,
                                 revoke_status: None,
                                 worker_bound: false,
+                                worker_commands: Vec::new(),
                             },
                             revoked: Arc::new(AtomicBool::new(false)),
                         },
@@ -3371,6 +3800,7 @@ mod tests {
                                 scope: SshGrantScope::CurrentSession,
                                 revoke_status: None,
                                 worker_bound: false,
+                                worker_commands: Vec::new(),
                             },
                             revoked: Arc::new(AtomicBool::new(false)),
                         },
@@ -3410,6 +3840,7 @@ mod tests {
                         scope: SshGrantScope::CurrentSession,
                         revoke_status: None,
                         worker_bound: false,
+                        worker_commands: Vec::new(),
                     }],
                     default_binding_id: Some(parent.id.clone()),
                     pending_requests: vec![],
@@ -3503,6 +3934,7 @@ mod tests {
                         scope: SshGrantScope::CurrentSession,
                         revoke_status: Some(SshGrantStatus::RevokedLocalPending),
                         worker_bound: false,
+                        worker_commands: Vec::new(),
                     }],
                     default_binding_id: None,
                     pending_requests: vec![],

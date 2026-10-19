@@ -745,10 +745,38 @@ pub struct SshProjectLocation {
     pub(crate) root: String,
 }
 
+/// One exact managed-worker fallback tuple surfaced while an explicit SSH project resume loads.
+///
+/// Keeping the request tuple and its manager owner prevents duplicate/late events from
+/// recreating a confirmation after the transient overlay was dismissed or replaced.
+pub(crate) struct SshProjectResumeInstall {
+    pub(crate) client_id: u64,
+    pub(crate) request_id: String,
+    pub(crate) session_id: String,
+    pub(crate) binding_id: String,
+    pub(crate) target_id: String,
+    pub(crate) owner: crate::app::actions::SshManagerOwner,
+}
+
 pub struct AgentView {
     pub session: AgentSession,
     /// The authoritative remote identity for an SSH project, if this view owns one.
     pub(crate) ssh_project_location: Option<SshProjectLocation>,
+    /// The exact source manager that started this SSH project until session creation settles.
+    ///
+    /// Retaining the owner on the child lets a create failure return to the original diagnostic
+    /// instead of showing a toast underneath a different overlay.
+    pub(crate) ssh_project_open_owner: Option<crate::app::actions::SshManagerOwner>,
+    /// Pre-minted session currently bootstrapping through this child. Combined with the binding
+    /// below, it routes a managed-worker fallback to the original manager and never to whichever
+    /// session happens to be active.
+    pub(crate) ssh_project_open_session_id: Option<String>,
+    /// Binding whose worker bootstrap belongs to this SSH project.
+    pub(crate) ssh_project_binding_id: Option<String>,
+    /// Explicit session load awaiting enough SSH metadata to prove its remote project identity.
+    pub(crate) ssh_project_resume_pending_session_id: Option<String>,
+    /// Exact fallback created for the pending resume, if the worker requested one.
+    pub(crate) ssh_project_resume_install: Option<SshProjectResumeInstall>,
     pub(crate) session_binding_epoch: u32,
     pub scrollback: ScrollbackState,
     pub prompt: PromptWidget,

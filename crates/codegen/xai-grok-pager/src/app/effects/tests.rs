@@ -3208,3 +3208,31 @@ async fn hydrate_team_capability_adapter_maps_every_reply_to_the_asking_identity
                 .is_err()
         );
 }
+
+#[tokio::test(start_paused = true)]
+async fn ssh_worker_installation_outlives_local_session_deadline_without_losing_response() {
+    for ssh in [false, true] {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let meta = ssh.then(|| xai_grok_shell::project::SshProjectStart::new(
+            "fixture", "/srv/project", Some("binding".into()), None,
+        ).unwrap().session_meta());
+        let task = tokio::spawn(async move {
+            create_session_in_backend_rpc(
+                acp::NewSessionRequest::new(PathBuf::from("/local/launch")),
+                meta, &tx, "session startup",
+            ).await
+        });
+        let Some(xai_acp_lib::AcpAgentMessage::NewSession(args)) = rx.recv().await else {
+            panic!("expected session creation");
+        };
+        tokio::time::advance(helpers::session_rpc_timeout() + std::time::Duration::from_secs(1)).await;
+        tokio::task::yield_now().await;
+        if ssh {
+            assert!(!task.is_finished(), "an SSH install must not lose its response at the local deadline");
+            args.response_tx.send(Ok(acp::NewSessionResponse::new(acp::SessionId::new("remote-ready")))).unwrap();
+            assert_eq!(task.await.unwrap().unwrap().session_id.0.as_ref(), "remote-ready");
+        } else {
+            assert!(task.await.unwrap().unwrap_err().timed_out());
+        }
+    }
+}

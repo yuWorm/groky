@@ -1,7 +1,9 @@
 //! Local-only SSH manager dispatch and Welcome-screen input routing.
 
-use super::ctx::{active_agent_session_id, get_active_agent_mut};
-use crate::app::actions::{Action, Effect};
+use super::ctx::{
+    SwitchCause, active_agent_session_id, get_active_agent_mut, show_welcome, switch_to_agent,
+};
+use crate::app::actions::{Action, Effect, SshManagerOwner};
 use crate::app::app_view::{AppView, InputOutcome};
 use crate::views::ssh_modal::SshModalOutcome;
 
@@ -11,7 +13,13 @@ fn map_ssh_modal_outcome(outcome: SshModalOutcome) -> InputOutcome {
         SshModalOutcome::Changed => InputOutcome::Changed,
         SshModalOutcome::Unchanged => InputOutcome::Unchanged,
         SshModalOutcome::Refresh => InputOutcome::Action(Action::RefreshSshTargets),
-        SshModalOutcome::AddTarget(draft) => InputOutcome::Action(Action::AddSshTarget(draft)),
+        SshModalOutcome::AddTarget {
+            draft,
+            submission_id,
+        } => InputOutcome::Action(Action::AddSshTarget {
+            draft,
+            submission_id,
+        }),
         SshModalOutcome::Connect { target_id } => {
             InputOutcome::Action(Action::ConnectSshTarget { target_id })
         }
@@ -79,6 +87,17 @@ fn map_ssh_modal_outcome(outcome: SshModalOutcome) -> InputOutcome {
             approval_id,
             approved,
         }),
+        SshModalOutcome::ApproveWorkerInstall {
+            request_id,
+            session_id,
+            binding_id,
+            approved,
+        } => InputOutcome::Action(Action::ApproveSshWorkerInstall {
+            request_id,
+            session_id,
+            binding_id,
+            approved,
+        }),
         SshModalOutcome::AnswerAuthentication {
             challenge_id,
             connection_generation,
@@ -103,14 +122,366 @@ fn active_session_id(app: &AppView) -> Option<String> {
     active_agent_session_id(app).map(|session_id| session_id.to_string())
 }
 
-pub(super) fn ssh_manager_mut(
-    app: &mut AppView,
-) -> Option<&mut crate::views::ssh_modal::SshManagerState> {
-    let on_agent = get_active_agent_mut(app).is_some_and(|agent| agent.ssh_manager.is_some());
-    if on_agent {
-        return get_active_agent_mut(app).and_then(|agent| agent.ssh_manager.as_mut());
+/// Capture the currently visible SSH manager's stable identity for an asynchronous request.
+///
+/// A completion must use this exact owner rather than the active view when it returns: the user
+/// may switch sessions, dismiss the overlay, or open a replacement manager before then.
+pub(super) fn ssh_manager_owner(app: &AppView) -> Option<SshManagerOwner> {
+    if let crate::app::app_view::ActiveView::Agent(agent_id) = app.active_view
+        && let Some(manager) = app
+            .agents
+            .get(&agent_id)
+            .and_then(|agent| agent.ssh_manager.as_ref())
+    {
+        return Some(SshManagerOwner {
+            agent_id: Some(agent_id),
+            instance_id: manager.instance_id(),
+        });
     }
-    app.welcome_ssh_manager.as_mut()
+    app.welcome_ssh_manager
+        .as_ref()
+        .map(|manager| SshManagerOwner {
+            agent_id: None,
+            instance_id: manager.instance_id(),
+        })
+}
+
+/// Find the exact visible manager that initiated an asynchronous request. This deliberately
+/// never constructs an overlay: a late completion cannot reopen a manager the user dismissed.
+pub(super) fn ssh_manager_for_owner_mut(
+    app: &mut AppView,
+    owner: SshManagerOwner,
+) -> Option<&mut crate::views::ssh_modal::SshManagerState> {
+    let manager = match owner.agent_id {
+        Some(agent_id) => app
+            .agents
+            .get_mut(&agent_id)
+            .and_then(|agent| agent.ssh_manager.as_mut()),
+        None => app.welcome_ssh_manager.as_mut(),
+    }?;
+    (manager.instance_id() == owner.instance_id).then_some(manager)
+}
+
+/// Capture an exact owner for an already-present manager associated with `session_id`.
+///
+/// This is only used after an unsolicited global control event has deliberately materialized an
+/// approval surface. Ordinary async completions carry their initiating owner directly.
+pub(super) fn ssh_manager_owner_for_session(
+    app: &AppView,
+    session_id: Option<&str>,
+) -> Option<SshManagerOwner> {
+    if app
+        .welcome_ssh_manager
+        .as_ref()
+        .is_some_and(|manager| manager.session_id.as_deref() == session_id)
+    {
+        return app
+            .welcome_ssh_manager
+            .as_ref()
+            .map(|manager| SshManagerOwner {
+                agent_id: None,
+                instance_id: manager.instance_id(),
+            });
+    }
+    app.agents.iter().find_map(|(agent_id, agent)| {
+        agent
+            .ssh_manager
+            .as_ref()
+            .filter(|manager| manager.session_id.as_deref() == session_id)
+            .map(|manager| SshManagerOwner {
+                agent_id: Some(*agent_id),
+                instance_id: manager.instance_id(),
+            })
+    })
+}
+
+/// Find the exact manager entitled to answer a managed-worker fallback without creating an
+/// overlay. A child bootstrap may be active while its initiating manager belongs to a hidden
+/// source session; ordinary session prompts remain on their own manager.
+fn worker_install_owner_for_request(
+    app: &AppView,
+    session_id: &str,
+    binding_id: &str,
+    target_id: &str,
+) -> Option<SshManagerOwner> {
+    if app
+        .pending_ssh_project_open
+        .as_ref()
+        .is_some_and(|project| {
+            project.project_session_id.as_str() == session_id
+                && project.target_id.as_str() == target_id
+        })
+    {
+        return ssh_manager_owner_for_session(app, Some(session_id));
+    }
+    if let Some(owner) = app.agents.values().find_map(|agent| {
+        (agent.ssh_project_open_session_id.as_deref() == Some(session_id)
+            && agent.ssh_project_binding_id.as_deref() == Some(binding_id)
+            && agent
+                .ssh_project_location
+                .as_ref()
+                .is_some_and(|location| location.target_id.as_str() == target_id))
+        .then_some(agent.ssh_project_open_owner)
+        .flatten()
+    }) {
+        return Some(owner);
+    }
+    app.agents.iter().find_map(|(agent_id, agent)| {
+        let manager = agent.ssh_manager.as_ref()?;
+        (agent
+            .session
+            .session_id
+            .as_ref()
+            .is_some_and(|candidate| candidate.0.as_ref() == session_id)
+            && agent.ssh_project_binding_id.as_deref() == Some(binding_id)
+            && agent
+                .ssh_project_location
+                .as_ref()
+                .is_some_and(|location| location.target_id.as_str() == target_id)
+            && manager.session_id.as_deref() == Some(session_id))
+        .then_some(SshManagerOwner {
+            agent_id: Some(*agent_id),
+            instance_id: manager.instance_id(),
+        })
+    })
+}
+
+/// Surface a bootstrap fallback on its existing source only when the still-active child is the
+/// one that originated it. A user who has moved to any other session keeps that selection.
+fn focus_worker_install_source_from_active_child(
+    app: &mut AppView,
+    owner: SshManagerOwner,
+    session_id: &str,
+    binding_id: &str,
+    target_id: &str,
+) {
+    let crate::app::app_view::ActiveView::Agent(child_id) = app.active_view else {
+        return;
+    };
+    let child_matches = app.agents.get(&child_id).is_some_and(|agent| {
+        agent.ssh_project_open_owner == Some(owner)
+            && agent.ssh_project_open_session_id.as_deref() == Some(session_id)
+            && agent.ssh_project_binding_id.as_deref() == Some(binding_id)
+            && agent
+                .ssh_project_location
+                .as_ref()
+                .is_some_and(|location| location.target_id.as_str() == target_id)
+    });
+    if !child_matches {
+        return;
+    }
+    match owner.agent_id {
+        Some(source_id)
+            if app.agents.get(&source_id).is_some_and(|agent| {
+                agent
+                    .ssh_manager
+                    .as_ref()
+                    .is_some_and(|manager| manager.instance_id() == owner.instance_id)
+            }) =>
+        {
+            switch_to_agent(app, source_id, SwitchCause::Picker);
+        }
+        None if app
+            .welcome_ssh_manager
+            .as_ref()
+            .is_some_and(|manager| manager.instance_id() == owner.instance_id) =>
+        {
+            show_welcome(app);
+        }
+        Some(_) | None => {}
+    }
+}
+
+enum ResumeWorkerInstallRoute {
+    NotPending,
+    Displayed(SshManagerOwner),
+    ClosedOrReplaced,
+}
+
+fn resume_install_matches_request(
+    install: &crate::app::agent_view::SshProjectResumeInstall,
+    request: &xai_grok_shell::ssh::SshWorkerInstallRequest,
+) -> bool {
+    install.client_id == request.client_id
+        && install.request_id == request.request_id
+        && install.session_id == request.session_id
+        && install.binding_id == request.binding_id
+        && install.target_id == request.target_id
+}
+
+/// The load placeholder has not received remote location metadata yet, so this is the sole
+/// narrow exception that may materialize a manager from a worker event. Its explicit-load marker,
+/// session id, and replay placeholder make the event trustworthy; subsequent/late events reuse
+/// only the exact transient owner and can never recreate a dismissed replacement.
+fn show_resumed_worker_install_fallback(
+    app: &mut AppView,
+    request: &xai_grok_shell::ssh::SshWorkerInstallRequest,
+) -> ResumeWorkerInstallRoute {
+    let Some(agent_id) = app.agents.iter().find_map(|(agent_id, agent)| {
+        (agent.ssh_project_resume_pending_session_id.as_deref() == Some(request.session_id.as_str())
+            && agent.session.loading_replay
+            && agent.loading_placeholder_id.is_some()
+            && agent
+                .session
+                .session_id
+                .as_ref()
+                .is_some_and(|session_id| session_id.0.as_ref() == request.session_id.as_str()))
+        .then_some(*agent_id)
+    }) else {
+        return if app.agents.values().any(|agent| {
+            agent
+                .ssh_project_resume_install
+                .as_ref()
+                .is_some_and(|install| resume_install_matches_request(install, request))
+        }) {
+            ResumeWorkerInstallRoute::ClosedOrReplaced
+        } else {
+            ResumeWorkerInstallRoute::NotPending
+        };
+    };
+
+    if let Some(existing) = app
+        .agents
+        .get(&agent_id)
+        .and_then(|agent| agent.ssh_project_resume_install.as_ref())
+    {
+        let owner = existing.owner;
+        let request_matches = resume_install_matches_request(existing, request);
+        let owner_is_current = app.agents.get(&agent_id).is_some_and(|agent| {
+            agent
+                .ssh_manager
+                .as_ref()
+                .is_some_and(|manager| manager.instance_id() == owner.instance_id)
+        });
+        return if request_matches && owner_is_current {
+            ResumeWorkerInstallRoute::Displayed(owner)
+        } else {
+            ResumeWorkerInstallRoute::ClosedOrReplaced
+        };
+    }
+
+    let Some(agent) = app.agents.get_mut(&agent_id) else {
+        return ResumeWorkerInstallRoute::ClosedOrReplaced;
+    };
+    if agent.ssh_manager.is_none() {
+        agent.ssh_manager = Some(crate::views::ssh_modal::SshManagerState::new(Some(
+            request.session_id.clone(),
+        )));
+    }
+    let Some(manager) = agent.ssh_manager.as_mut() else {
+        return ResumeWorkerInstallRoute::ClosedOrReplaced;
+    };
+    if manager.session_id.as_deref() != Some(request.session_id.as_str()) {
+        return ResumeWorkerInstallRoute::ClosedOrReplaced;
+    }
+    manager.show_worker_install_fallback(request.clone());
+    let owner = SshManagerOwner {
+        agent_id: Some(agent_id),
+        instance_id: manager.instance_id(),
+    };
+    agent.ssh_project_resume_install =
+        Some(crate::app::agent_view::SshProjectResumeInstall {
+            client_id: request.client_id,
+            request_id: request.request_id.clone(),
+            session_id: request.session_id.clone(),
+            binding_id: request.binding_id.clone(),
+            target_id: request.target_id.clone(),
+            owner,
+        });
+    ResumeWorkerInstallRoute::Displayed(owner)
+}
+
+fn resumed_worker_install_owner(
+    app: &AppView,
+    client_id: u64,
+    request_id: &str,
+    session_id: &str,
+    binding_id: &str,
+    target_id: &str,
+) -> Option<SshManagerOwner> {
+    app.agents.values().find_map(|agent| {
+        let install = agent.ssh_project_resume_install.as_ref()?;
+        (install.client_id == client_id
+            && install.request_id == request_id
+            && install.session_id == session_id
+            && install.binding_id == binding_id
+            && install.target_id == target_id
+            && agent
+                .ssh_manager
+                .as_ref()
+                .is_some_and(|manager| manager.instance_id() == install.owner.instance_id))
+        .then_some(install.owner)
+    })
+}
+
+fn has_recorded_resumed_worker_install(
+    app: &AppView,
+    client_id: u64,
+    request_id: &str,
+    session_id: &str,
+    binding_id: &str,
+    target_id: &str,
+) -> bool {
+    app.agents.values().any(|agent| {
+        agent.ssh_project_resume_install.as_ref().is_some_and(|install| {
+            install.client_id == client_id
+                && install.request_id == request_id
+                && install.session_id == session_id
+                && install.binding_id == binding_id
+                && install.target_id == target_id
+        })
+    })
+}
+
+/// Close precisely the manager instance that produced a transient approval.
+///
+/// Unlike session lookup, this cannot close a manager reopened while the decision was in flight.
+pub(super) fn close_ssh_manager_for_owner(app: &mut AppView, owner: SshManagerOwner) {
+    match owner.agent_id {
+        Some(agent_id)
+            if app.agents.get(&agent_id).is_some_and(|agent| {
+                agent
+                    .ssh_manager
+                    .as_ref()
+                    .is_some_and(|manager| manager.instance_id() == owner.instance_id)
+            }) =>
+        {
+            if let Some(agent) = app.agents.get_mut(&agent_id) {
+                agent.ssh_manager = None;
+            }
+        }
+        None if app
+            .welcome_ssh_manager
+            .as_ref()
+            .is_some_and(|manager| manager.instance_id() == owner.instance_id) =>
+        {
+            app.welcome_ssh_manager = None;
+        }
+        Some(_) | None => {}
+    }
+}
+
+const DIRECT_SSH_GRANT_REPLY_CAP: usize = 32;
+
+fn remember_direct_ssh_grant_reply(app: &mut AppView, request_id: &str) {
+    if app
+        .direct_ssh_grant_replies
+        .iter()
+        .any(|seen| seen == request_id)
+    {
+        return;
+    }
+    app.direct_ssh_grant_replies
+        .push_back(request_id.to_owned());
+    while app.direct_ssh_grant_replies.len() > DIRECT_SSH_GRANT_REPLY_CAP {
+        app.direct_ssh_grant_replies.pop_front();
+    }
+}
+
+fn is_direct_ssh_grant_reply(app: &AppView, request_id: &str) -> bool {
+    app.direct_ssh_grant_replies
+        .iter()
+        .any(|seen| seen == request_id)
 }
 
 /// Events are session-scoped, not modal-scoped. When a normal project receives a local SSH
@@ -209,9 +580,10 @@ fn existing_ssh_manager_for_session<'a>(
     let session_id = session_id?;
     let active_child_id = match app.active_view {
         crate::app::app_view::ActiveView::Agent(agent_id)
-            if app.agents.get(&agent_id).is_some_and(|agent| {
-                active_worktree_child_matches_session(agent, session_id)
-            }) =>
+            if app
+                .agents
+                .get(&agent_id)
+                .is_some_and(|agent| active_worktree_child_matches_session(agent, session_id)) =>
         {
             Some(agent_id)
         }
@@ -280,96 +652,6 @@ pub(super) fn existing_ssh_manager_for_session_mut<'a>(
         .and_then(|agent| agent.ssh_manager.as_mut())
 }
 
-/// Find the manager awaiting target data for a session. A cold remote worktree's child session
-/// is pre-minted before its optimistic agent is bound, so normal session lookup cannot find it;
-/// its displayed grant retains the exact child ID until the user decides it.
-pub(super) fn ssh_manager_for_target_list_session_mut<'a>(
-    app: &'a mut AppView,
-    session_id: Option<&str>,
-) -> Option<&'a mut crate::views::ssh_modal::SshManagerState> {
-    if let Some(session_id) = session_id {
-        if app
-            .welcome_ssh_manager
-            .as_ref()
-            .is_some_and(|manager| manager.owns_pending_grant_session(session_id))
-        {
-            return app.welcome_ssh_manager.as_mut();
-        }
-        let owner_agent_id = app.agents.iter().find_map(|(agent_id, agent)| {
-            agent
-                .ssh_manager
-                .as_ref()
-                .is_some_and(|manager| manager.owns_pending_grant_session(session_id))
-                .then_some(*agent_id)
-        });
-        if let Some(agent_id) = owner_agent_id {
-            return app
-                .agents
-                .get_mut(&agent_id)
-                .and_then(|agent| agent.ssh_manager.as_mut());
-        }
-    }
-    ssh_manager_for_session_mut(app, session_id)
-}
-
-/// Remove only the exact transient manager that interrupted a session. An explicit manager or a
-/// newer approval never shares this path.
-pub(super) fn close_transient_ssh_manager_for_session(
-    app: &mut AppView,
-    session_id: Option<&str>,
-) {
-    if app
-        .welcome_ssh_manager
-        .as_ref()
-        .is_some_and(|manager| manager.session_id.as_deref() == session_id)
-    {
-        app.welcome_ssh_manager = None;
-        return;
-    }
-    let Some(session_id) = session_id else {
-        return;
-    };
-    let active_child_id = match app.active_view {
-        crate::app::app_view::ActiveView::Agent(agent_id)
-            if app.agents.get(&agent_id).is_some_and(|agent| {
-                active_worktree_child_matches_session(agent, session_id)
-                    && agent
-                        .ssh_manager
-                        .as_ref()
-                        .is_some_and(|manager| manager.session_id.as_deref() == Some(session_id))
-            }) =>
-        {
-            Some(agent_id)
-        }
-        _ => None,
-    };
-    if let Some(agent_id) = active_child_id {
-        if let Some(agent) = app.agents.get_mut(&agent_id) {
-            agent.ssh_manager = None;
-        }
-        return;
-    }
-    if let Some(agent) = app.agents.values_mut().find(|agent| {
-        agent
-            .session
-            .session_id
-            .as_ref()
-            .is_some_and(|candidate| candidate.0.as_ref() == session_id)
-    }) {
-        agent.ssh_manager = None;
-    }
-}
-
-fn session_or_show_error(app: &mut AppView) -> Option<String> {
-    let session_id = active_session_id(app);
-    if session_id.is_none()
-        && let Some(manager) = ssh_manager_mut(app)
-    {
-        manager.show_error("Open or create a session before granting SSH access.");
-    }
-    session_id
-}
-
 pub(super) fn dispatch_open_ssh_manager(app: &mut AppView) -> Vec<Effect> {
     let session_id = active_session_id(app);
     if let Some(agent) = get_active_agent_mut(app) {
@@ -381,6 +663,7 @@ pub(super) fn dispatch_open_ssh_manager(app: &mut AppView) -> Vec<Effect> {
             session_id.clone(),
         ));
     }
+    let owner = ssh_manager_owner(app).expect("the SSH manager was just installed");
     let mut effects = Vec::with_capacity(2);
     // One receiver owns this pager client's event stream for all sessions. It is deliberately
     // independent of overlay visibility and re-arms itself after every event.
@@ -394,6 +677,7 @@ pub(super) fn dispatch_open_ssh_manager(app: &mut AppView) -> Vec<Effect> {
     effects.push(Effect::SshListTargets {
         session_id,
         client_id: app.ssh_client_id,
+        owner,
     });
     effects
 }
@@ -407,6 +691,7 @@ pub(super) fn dispatch_begin_ssh_project_open(
     app.welcome_ssh_manager = Some(crate::views::ssh_modal::SshManagerState::new(Some(
         project.project_session_id.clone(),
     )));
+    let owner = ssh_manager_owner(app).expect("the CLI SSH manager was just installed");
     app.pending_ssh_project_open = Some(project.clone());
     let mut effects = Vec::with_capacity(3);
     if !app.ssh_event_consumer_active {
@@ -419,6 +704,7 @@ pub(super) fn dispatch_begin_ssh_project_open(
     effects.push(Effect::SshListTargets {
         session_id: Some(project.project_session_id.clone()),
         client_id: app.ssh_client_id,
+        owner,
     });
     effects.push(Effect::SshBeginProjectGrant {
         project,
@@ -428,40 +714,72 @@ pub(super) fn dispatch_begin_ssh_project_open(
 }
 
 pub(super) fn dispatch_refresh_ssh_targets(app: &mut AppView) -> Vec<Effect> {
+    let client_id = app.ssh_client_id;
+    let Some(owner) = ssh_manager_owner(app) else {
+        return vec![];
+    };
+    let Some(manager) = ssh_manager_for_owner_mut(app, owner) else {
+        return vec![];
+    };
     vec![Effect::SshListTargets {
-        session_id: active_session_id(app),
-        client_id: app.ssh_client_id,
+        session_id: manager.session_id.clone(),
+        client_id,
+        owner,
     }]
 }
 
 pub(super) fn dispatch_add_ssh_target(
     app: &mut AppView,
     draft: crate::views::ssh_modal::SshManualTargetDraft,
+    submission_id: u64,
 ) -> Vec<Effect> {
+    let client_id = app.ssh_client_id;
+    let Some(owner) = ssh_manager_owner(app) else {
+        return vec![];
+    };
+    let Some(manager) = ssh_manager_for_owner_mut(app, owner) else {
+        return vec![];
+    };
     vec![Effect::SshAddTarget {
-        session_id: active_session_id(app),
-        client_id: app.ssh_client_id,
+        session_id: manager.session_id.clone(),
+        client_id,
+        submission_id,
+        owner,
         draft,
     }]
 }
 
 pub(super) fn dispatch_connect_ssh_target(app: &mut AppView, target_id: String) -> Vec<Effect> {
-    if let Some(manager) = ssh_manager_mut(app) {
-        manager.show_info("Connecting through the local SSH service…");
-    }
+    let client_id = app.ssh_client_id;
+    let Some(owner) = ssh_manager_owner(app) else {
+        return vec![];
+    };
+    let Some(manager) = ssh_manager_for_owner_mut(app, owner) else {
+        return vec![];
+    };
+    manager.begin_connection_action(&target_id, true);
     vec![Effect::SshConnect {
+        session_id: manager.session_id.clone(),
         target_id,
-        client_id: app.ssh_client_id,
+        client_id,
+        owner,
     }]
 }
 
 pub(super) fn dispatch_disconnect_ssh_target(app: &mut AppView, target_id: String) -> Vec<Effect> {
-    if let Some(manager) = ssh_manager_mut(app) {
-        manager.show_info("Releasing the retained SSH connection…");
-    }
+    let client_id = app.ssh_client_id;
+    let Some(owner) = ssh_manager_owner(app) else {
+        return vec![];
+    };
+    let Some(manager) = ssh_manager_for_owner_mut(app, owner) else {
+        return vec![];
+    };
+    manager.begin_connection_action(&target_id, false);
     vec![Effect::SshDisconnect {
+        session_id: manager.session_id.clone(),
         target_id,
-        client_id: app.ssh_client_id,
+        client_id,
+        owner,
     }]
 }
 
@@ -473,21 +791,28 @@ pub(super) fn dispatch_request_ssh_grant(
     lifetime: crate::views::ssh_modal::SshGrantLifetime,
     set_default: bool,
 ) -> Vec<Effect> {
-    let Some(session_id) = session_or_show_error(app) else {
+    let client_id = app.ssh_client_id;
+    let Some(owner) = ssh_manager_owner(app) else {
         return vec![];
     };
-    if let Some(manager) = ssh_manager_mut(app) {
-        manager.remember_local_grant_options(
-            target_id.clone(),
-            root.clone(),
-            capabilities,
-            lifetime,
-            set_default,
-        );
-    }
+    let Some(manager) = ssh_manager_for_owner_mut(app, owner) else {
+        return vec![];
+    };
+    let Some(session_id) = manager.session_id.clone() else {
+        manager.show_error("Open or create a session before granting SSH access.");
+        return vec![];
+    };
+    manager.remember_local_grant_options(
+        target_id.clone(),
+        root.clone(),
+        capabilities,
+        lifetime,
+        set_default,
+    );
     vec![Effect::SshRequestGrant {
         session_id,
-        client_id: app.ssh_client_id,
+        client_id,
+        owner,
         target_id,
         root,
         capabilities,
@@ -501,22 +826,23 @@ pub(super) fn dispatch_inspect_ssh_grant_target(
     request_id: String,
     target_id: String,
 ) -> Vec<Effect> {
-    if let Some(manager) = ssh_manager_mut(app) {
-        manager.show_info("Authenticating the selected SSH target before access review…");
-    }
-    let session_id = ssh_manager_mut(app)
-        .and_then(|manager| manager.grant_session_id_for(&request_id))
-        .or_else(|| active_session_id(app))
-        .or_else(|| {
-            app.welcome_ssh_manager
-                .as_ref()
-                .and_then(|manager| manager.session_id.clone())
-        });
+    let client_id = app.ssh_client_id;
+    let Some(owner) = ssh_manager_owner(app) else {
+        return vec![];
+    };
+    let Some(manager) = ssh_manager_for_owner_mut(app, owner) else {
+        return vec![];
+    };
+    manager.show_info("Authenticating the selected SSH target before access review…");
+    let session_id = manager
+        .grant_session_id_for(&request_id)
+        .or_else(|| manager.session_id.clone());
     vec![Effect::SshInspectGrantTarget {
         session_id,
         request_id,
         target_id,
-        client_id: app.ssh_client_id,
+        client_id,
+        owner,
     }]
 }
 
@@ -530,37 +856,31 @@ pub(super) fn dispatch_approve_ssh_grant(
     lifetime: crate::views::ssh_modal::SshGrantLifetime,
     set_default: bool,
 ) -> Vec<Effect> {
+    let client_id = app.ssh_client_id;
     // `groky ssh open` and remote worktree resumes have intentionally not created their
     // pre-minted child ACP session yet. The displayed consent request, not the active source
     // project, is authoritative for the grant decision's session id.
-    let session_id = ssh_manager_mut(app)
-        .and_then(|manager| {
-            let session_id = manager.grant_session_id_for(&request_id);
-            if approved && session_id.is_some() {
-                let _ = manager.record_grant_approval(
-                    &request_id,
-                    target_id.as_deref(),
-                    root.as_deref(),
-                );
-            }
-            session_id
-        })
-        .or_else(|| active_session_id(app))
-        .or_else(|| {
-            app.welcome_ssh_manager
-                .as_ref()
-                .and_then(|manager| manager.session_id.clone())
-        });
-    let Some(session_id) = session_id else {
-        if let Some(manager) = ssh_manager_mut(app) {
-            manager.show_error("Open or create a session before granting SSH access.");
-        }
+    let Some(owner) = ssh_manager_owner(app) else {
         return vec![];
     };
+    let Some(manager) = ssh_manager_for_owner_mut(app, owner) else {
+        return vec![];
+    };
+    let session_id = manager
+        .grant_session_id_for(&request_id)
+        .or_else(|| manager.session_id.clone());
+    let Some(session_id) = session_id else {
+        manager.show_error("Open or create a session before granting SSH access.");
+        return vec![];
+    };
+    if approved {
+        let _ = manager.record_grant_approval(&request_id, target_id.as_deref(), root.as_deref());
+    }
     vec![Effect::SshApproveGrant {
         session_id,
         request_id,
-        client_id: app.ssh_client_id,
+        client_id,
+        owner,
         approved,
         target_id,
         root,
@@ -571,24 +891,42 @@ pub(super) fn dispatch_approve_ssh_grant(
 }
 
 pub(super) fn dispatch_use_ssh_binding(app: &mut AppView, binding_id: String) -> Vec<Effect> {
-    let Some(session_id) = session_or_show_error(app) else {
+    let client_id = app.ssh_client_id;
+    let Some(owner) = ssh_manager_owner(app) else {
+        return vec![];
+    };
+    let Some(manager) = ssh_manager_for_owner_mut(app, owner) else {
+        return vec![];
+    };
+    let Some(session_id) = manager.session_id.clone() else {
+        manager.show_error("Open or create a session before selecting an SSH default.");
         return vec![];
     };
     vec![Effect::SshUseBinding {
         session_id,
         binding_id,
-        client_id: app.ssh_client_id,
+        client_id,
+        owner,
     }]
 }
 
 pub(super) fn dispatch_revoke_ssh_binding(app: &mut AppView, binding_id: String) -> Vec<Effect> {
-    let Some(session_id) = session_or_show_error(app) else {
+    let client_id = app.ssh_client_id;
+    let Some(owner) = ssh_manager_owner(app) else {
+        return vec![];
+    };
+    let Some(manager) = ssh_manager_for_owner_mut(app, owner) else {
+        return vec![];
+    };
+    let Some(session_id) = manager.session_id.clone() else {
+        manager.show_error("Open or create a session before revoking SSH access.");
         return vec![];
     };
     vec![Effect::SshRevokeBinding {
         session_id,
         binding_id,
-        client_id: app.ssh_client_id,
+        client_id,
+        owner,
     }]
 }
 
@@ -599,13 +937,21 @@ pub(super) fn dispatch_open_ssh_project(
     binding_id: String,
     capabilities: crate::views::ssh_modal::SshCapabilitiesView,
 ) -> Vec<Effect> {
-    let Some(source_session_id) = session_or_show_error(app) else {
+    let client_id = app.ssh_client_id;
+    let Some(owner) = ssh_manager_owner(app) else {
         return vec![];
     };
-    let project_session_id = uuid::Uuid::now_v7().to_string();
-    if let Some(manager) = ssh_manager_mut(app) {
-        manager.show_info("Preparing an inherited SSH binding for the new local project…");
+    let Some(manager) = ssh_manager_for_owner_mut(app, owner) else {
+        return vec![];
+    };
+    let Some(source_session_id) = manager.session_id.clone() else {
+        manager.show_error("Open or create a session before opening an SSH project.");
+        return vec![];
+    };
+    if !manager.begin_project_open() {
+        return vec![];
     }
+    let project_session_id = uuid::Uuid::now_v7().to_string();
     vec![Effect::SshInheritBinding {
         source_session_id,
         source_binding_id: binding_id,
@@ -613,7 +959,8 @@ pub(super) fn dispatch_open_ssh_project(
         target_id,
         root,
         capabilities,
-        client_id: app.ssh_client_id,
+        client_id,
+        owner,
     }]
 }
 
@@ -625,6 +972,7 @@ pub(super) fn dispatch_inherited_ssh_project(
     root: String,
     project_session_id: String,
     binding_id: String,
+    source_owner: Option<SshManagerOwner>,
 ) -> Vec<Effect> {
     let ssh_project_location = crate::app::agent_view::SshProjectLocation {
         target_id: target_id.clone(),
@@ -633,23 +981,31 @@ pub(super) fn dispatch_inherited_ssh_project(
     let start = match xai_grok_shell::project::SshProjectStart::new(
         target_id,
         root,
-        Some(binding_id),
-        Some(project_session_id),
+        Some(binding_id.clone()),
+        Some(project_session_id.clone()),
     ) {
         Ok(start) => start,
         Err(error) => {
-            if let Some(manager) = ssh_manager_mut(app) {
+            if let Some(owner) = source_owner
+                && let Some(manager) = ssh_manager_for_owner_mut(app, owner)
+            {
+                manager.settle_project_open();
                 manager.show_error(error.to_string());
             }
             return vec![];
         }
     };
     let ssh_client_id = app.ssh_client_id;
+    // Keep the initiating source visible through the install/consent phase. Besides making the
+    // fallback actionable, this preserves the source in minimal mode.
     let (agent_id, mut effects) =
-        super::session::lifecycle::dispatch_new_session_inner_with_id(app, None, false);
+        super::session::lifecycle::dispatch_new_session_inner_with_id(app, None, true);
     let mut start = Some(start);
     if let Some(agent) = app.agents.get_mut(&agent_id) {
         agent.ssh_project_location = Some(ssh_project_location);
+        agent.ssh_project_open_owner = source_owner;
+        agent.ssh_project_open_session_id = Some(project_session_id);
+        agent.ssh_project_binding_id = Some(binding_id);
     }
     for effect in &mut effects {
         if let Effect::CreateSession {
@@ -683,8 +1039,12 @@ pub(super) fn dispatch_submit_ssh_authentication(
     secret: Option<crate::views::ssh_modal::SshSecret>,
     answers: Vec<crate::views::ssh_modal::SshSecret>,
 ) -> Vec<Effect> {
+    let Some(owner) = ssh_manager_owner(app) else {
+        return vec![];
+    };
     vec![Effect::SshSubmitAuthentication {
         client_id: app.ssh_client_id,
+        owner,
         challenge_id,
         connection_generation,
         host_key_decision,
@@ -699,8 +1059,11 @@ pub(super) fn dispatch_approve_ssh_operation(
     approval_id: String,
     approved: bool,
 ) -> Vec<Effect> {
+    let Some(owner) = ssh_manager_owner(app) else {
+        return vec![];
+    };
     let client_id = app.ssh_client_id;
-    let Some(manager) = ssh_manager_mut(app) else {
+    let Some(manager) = ssh_manager_for_owner_mut(app, owner) else {
         return vec![];
     };
     if !manager.submit_operation_approval(&approval_id, approved) {
@@ -709,7 +1072,35 @@ pub(super) fn dispatch_approve_ssh_operation(
     vec![Effect::SshApproveOperation {
         session_id: manager.session_id.clone(),
         client_id,
+        owner,
         approval_id,
+        approved,
+    }]
+}
+
+pub(super) fn dispatch_approve_ssh_worker_install(
+    app: &mut AppView,
+    request_id: String,
+    session_id: String,
+    binding_id: String,
+    approved: bool,
+) -> Vec<Effect> {
+    let Some(owner) = ssh_manager_owner(app) else {
+        return vec![];
+    };
+    let client_id = app.ssh_client_id;
+    let Some(manager) = ssh_manager_for_owner_mut(app, owner) else {
+        return vec![];
+    };
+    if !manager.submit_worker_install(client_id, &request_id, &session_id, &binding_id, approved) {
+        return vec![];
+    }
+    vec![Effect::SshApproveWorkerInstall {
+        client_id,
+        owner,
+        request_id,
+        session_id,
+        binding_id,
         approved,
     }]
 }
@@ -718,12 +1109,12 @@ pub(super) fn dispatch_approve_ssh_operation(
 /// pre-minted child session before that child has an `AgentView`, so its consent remains on the
 /// source project manager until the child binding is accepted.
 fn manager_session_for_grant(app: &AppView, request_id: &str) -> Option<Option<String>> {
-    if app
+    if let Some(manager) = app
         .welcome_ssh_manager
         .as_ref()
-        .is_some_and(|manager| manager.grant_session_id_for(request_id).is_some())
+        .filter(|manager| manager.grant_session_id_for(request_id).is_some())
     {
-        return Some(None);
+        return Some(manager.session_id.clone());
     }
     app.agents.values().find_map(|agent| {
         agent
@@ -740,14 +1131,16 @@ fn active_worktree_child_matches_source(
     agent: &crate::app::agent_view::AgentView,
     source_session_id: &str,
 ) -> bool {
-    agent.pending_fork_banner.as_ref().is_some_and(|fork| {
-        fork.worktree && fork.parent_sid == source_session_id
-    }) || (agent.pending_worktree_source_session_id.as_deref() == Some(source_session_id)
-        && agent.session.session_id.is_none()
-        && matches!(
-            agent.session.state.command_in_flight(),
-            Some(crate::app::agent::AgentCommand::RestoreWorktree)
-        ))
+    agent
+        .pending_fork_banner
+        .as_ref()
+        .is_some_and(|fork| fork.worktree && fork.parent_sid == source_session_id)
+        || (agent.pending_worktree_source_session_id.as_deref() == Some(source_session_id)
+            && agent.session.session_id.is_none()
+            && matches!(
+                agent.session.state.command_in_flight(),
+                Some(crate::app::agent::AgentCommand::RestoreWorktree)
+            ))
 }
 
 /// The exact pre-minted child remains authoritative only while its worktree creation command
@@ -839,7 +1232,6 @@ fn worktree_source_session_for_grant(
     Some(source_session_id.to_owned())
 }
 
-
 fn operation_approval_target(
     detail: &serde_json::Value,
     binding_id: &str,
@@ -858,7 +1250,9 @@ fn operation_approval_target(
         let hostname = identity.get("hostname")?.as_str()?;
         let port = identity.get("port")?.as_u64()?;
         let mut rendered = format!("{username}@{hostname}:{port}");
-        if let Some(fingerprint) = identity.get("fingerprint").and_then(serde_json::Value::as_str)
+        if let Some(fingerprint) = identity
+            .get("fingerprint")
+            .and_then(serde_json::Value::as_str)
         {
             rendered.push_str(&format!(" ({fingerprint})"));
         }
@@ -871,9 +1265,119 @@ fn operation_approval_target(
 pub(super) fn apply_ssh_control_event(
     app: &mut AppView,
     session_id: Option<String>,
+    owner: Option<SshManagerOwner>,
     event: xai_grok_shell::ssh::SshEvent,
 ) -> Vec<Effect> {
     let client_id = app.ssh_client_id;
+    match &event {
+        xai_grok_shell::ssh::SshEvent::WorkerInstallRequested(request) => {
+            let mut effects = vec![Effect::SshAwaitEvent {
+                client_id,
+                session_id,
+            }];
+            if request.client_id != client_id {
+                return effects;
+            }
+            let displayed_owner = match show_resumed_worker_install_fallback(app, request) {
+                ResumeWorkerInstallRoute::Displayed(owner) => Some(owner),
+                ResumeWorkerInstallRoute::ClosedOrReplaced => None,
+                ResumeWorkerInstallRoute::NotPending => {
+                    worker_install_owner_for_request(
+                        app,
+                        &request.session_id,
+                        &request.binding_id,
+                        &request.target_id,
+                    )
+                    .and_then(|owner| {
+                        ssh_manager_for_owner_mut(app, owner).map(|manager| {
+                            manager.show_worker_install_fallback(request.clone());
+                            owner
+                        })
+                    })
+                }
+            };
+            if let Some(owner) = displayed_owner {
+                focus_worker_install_source_from_active_child(
+                    app,
+                    owner,
+                    &request.session_id,
+                    &request.binding_id,
+                    &request.target_id,
+                );
+            } else {
+                effects.push(Effect::SshRejectWorkerInstall {
+                    client_id,
+                    request_id: request.request_id.clone(),
+                    session_id: request.session_id.clone(),
+                    binding_id: request.binding_id.clone(),
+                });
+            }
+            return effects;
+        }
+        xai_grok_shell::ssh::SshEvent::WorkerInstallProgress(progress) => {
+            if progress.client_id == client_id
+                && let Some(owner) = resumed_worker_install_owner(
+                    app,
+                    progress.client_id,
+                    &progress.request_id,
+                    &progress.session_id,
+                    &progress.binding_id,
+                    &progress.target_id,
+                )
+                .or_else(|| {
+                    (!has_recorded_resumed_worker_install(
+                        app,
+                        progress.client_id,
+                        &progress.request_id,
+                        &progress.session_id,
+                        &progress.binding_id,
+                        &progress.target_id,
+                    ))
+                    .then(|| {
+                        worker_install_owner_for_request(
+                            app,
+                            &progress.session_id,
+                            &progress.binding_id,
+                            &progress.target_id,
+                        )
+                    })
+                    .flatten()
+                })
+                && let Some(manager) = ssh_manager_for_owner_mut(app, owner)
+            {
+                manager.apply_worker_install_progress(
+                    progress.client_id,
+                    &progress.request_id,
+                    &progress.session_id,
+                    &progress.binding_id,
+                    &progress.target_id,
+                    progress.message.clone(),
+                );
+            }
+            return vec![Effect::SshAwaitEvent {
+                client_id,
+                session_id,
+            }];
+        }
+        _ => {}
+    }
+    let direct_grant_request_id = match &event {
+        xai_grok_shell::ssh::SshEvent::GrantRequested(request) => Some(request.id.as_str()),
+        xai_grok_shell::ssh::SshEvent::GrantResolved { request_id, .. } => {
+            Some(request_id.as_str())
+        }
+        _ => None,
+    };
+    if let Some(request_id) = direct_grant_request_id {
+        if owner.is_some() {
+            remember_direct_ssh_grant_reply(app, request_id);
+        } else if is_direct_ssh_grant_reply(app, request_id) {
+            return vec![Effect::SshAwaitEvent {
+                client_id,
+                session_id,
+            }];
+        }
+    }
     let event_session_id = match &event {
         xai_grok_shell::ssh::SshEvent::GrantRequested(request) => Some(request.session_id.clone()),
         xai_grok_shell::ssh::SshEvent::BindingRevoked { session_id, .. } => {
@@ -887,6 +1391,12 @@ pub(super) fn apply_ssh_control_event(
             active_session_id(app).or_else(|| session_id.clone())
         }
         xai_grok_shell::ssh::SshEvent::GrantResolved { .. } => session_id.clone(),
+        xai_grok_shell::ssh::SshEvent::WorkerInstallRequested(request) => {
+            Some(request.session_id.clone())
+        }
+        xai_grok_shell::ssh::SshEvent::WorkerInstallProgress(progress) => {
+            Some(progress.session_id.clone())
+        }
         // Worker progress is delivered to the session's ACP subscriber. Keep the manager
         // control stream alive without creating a local SSH manager overlay.
         xai_grok_shell::ssh::SshEvent::Worker(_) => {
@@ -906,20 +1416,40 @@ pub(super) fn apply_ssh_control_event(
         }
         _ => event_session_id.clone(),
     };
-    let operation_approval_origin = match &event {
-        xai_grok_shell::ssh::SshEvent::OperationApproval(_) => {
-            match existing_ssh_manager_for_session(app, manager_session_id.as_deref()) {
-                Some(manager) => manager
-                    .operation_approval_origin()
-                    .unwrap_or(crate::views::ssh_modal::SshOperationApprovalOrigin::ExplicitManager),
-                None => crate::views::ssh_modal::SshOperationApprovalOrigin::TransientEvent,
-            }
+    let operation_approval_origin = match (&owner, &event) {
+        (Some(owner), xai_grok_shell::ssh::SshEvent::OperationApproval(_)) => {
+            ssh_manager_for_owner_mut(app, *owner)
+                .and_then(|manager| manager.operation_approval_origin())
+                .unwrap_or(crate::views::ssh_modal::SshOperationApprovalOrigin::ExplicitManager)
+        }
+        (None, xai_grok_shell::ssh::SshEvent::OperationApproval(_)) => {
+            existing_ssh_manager_for_session(app, manager_session_id.as_deref())
+                .and_then(|manager| manager.operation_approval_origin())
+                .unwrap_or(crate::views::ssh_modal::SshOperationApprovalOrigin::TransientEvent)
         }
         _ => crate::views::ssh_modal::SshOperationApprovalOrigin::ExplicitManager,
     };
     let pending_project = app.pending_ssh_project_open.clone();
     let mut grant_resolution = None;
-    if let Some(manager) = ssh_manager_for_session_mut(app, manager_session_id.as_deref()) {
+    let manager = match owner {
+        Some(owner) => ssh_manager_for_owner_mut(app, owner),
+        None => match &event {
+            xai_grok_shell::ssh::SshEvent::TargetStatus(_)
+            | xai_grok_shell::ssh::SshEvent::BindingRevoked { .. }
+            | xai_grok_shell::ssh::SshEvent::GrantResolved { .. } => {
+                existing_ssh_manager_for_session_mut(app, manager_session_id.as_deref())
+            }
+            xai_grok_shell::ssh::SshEvent::GrantRequested(_)
+            | xai_grok_shell::ssh::SshEvent::Authentication(_)
+            | xai_grok_shell::ssh::SshEvent::OperationApproval(_) => {
+                ssh_manager_for_session_mut(app, manager_session_id.as_deref())
+            }
+            xai_grok_shell::ssh::SshEvent::WorkerInstallRequested(_)
+            | xai_grok_shell::ssh::SshEvent::WorkerInstallProgress(_)
+            | xai_grok_shell::ssh::SshEvent::Worker(_) => None,
+        },
+    };
+    if let Some(manager) = manager {
         match event {
             xai_grok_shell::ssh::SshEvent::GrantRequested(request) => {
                 if request.client_id == Some(client_id) {
@@ -970,10 +1500,9 @@ pub(super) fn apply_ssh_control_event(
                 });
                 let resolution_matches_pending_project =
                     pending_project.as_ref().is_none_or(|project| {
-                        let receiver_matches =
-                            event_session_id.as_deref().is_none_or(|session_id| {
-                                session_id == project.project_session_id
-                            });
+                        let receiver_matches = event_session_id
+                            .as_deref()
+                            .is_none_or(|session_id| session_id == project.project_session_id);
                         if !approved {
                             return receiver_matches;
                         }
@@ -1108,14 +1637,11 @@ pub(super) fn apply_ssh_control_event(
                 }
             }
             xai_grok_shell::ssh::SshEvent::TargetStatus(status) => {
-                manager.apply_target_status(
-                    &status.target_id,
-                    matches!(
-                        status.connection,
-                        xai_grok_shell::ssh::SshConnectionState::Connected
-                    ),
-                    status.detail,
-                );
+                manager.apply_target_status(&status.target_id, status.connection, status.detail);
+            }
+            xai_grok_shell::ssh::SshEvent::WorkerInstallRequested(_)
+            | xai_grok_shell::ssh::SshEvent::WorkerInstallProgress(_) => {
+                unreachable!("worker install events were handled before manager routing")
             }
             xai_grok_shell::ssh::SshEvent::Worker(_) => {
                 return vec![Effect::SshAwaitEvent {
@@ -1136,9 +1662,9 @@ pub(super) fn apply_ssh_control_event(
             app.pending_ssh_project_open
                 .as_ref()
                 .is_some_and(|project| {
-                    event_session_id.as_deref().is_none_or(|session_id| {
-                        session_id == project.project_session_id
-                    })
+                    event_session_id
+                        .as_deref()
+                        .is_none_or(|session_id| session_id == project.project_session_id)
                 });
         if !approved {
             if pending_matches_session {
@@ -1154,6 +1680,8 @@ pub(super) fn apply_ssh_control_event(
             if let Some(project) = project {
                 let target_id = project.target_id.clone();
                 let project_session_id = project.project_session_id.clone();
+                let source_owner =
+                    ssh_manager_owner_for_session(app, Some(project_session_id.as_str()));
                 app.pending_ssh_project_open = None;
                 // The binding root is authoritative: the worker may have canonicalized the
                 // user-approved raw path. The retained request id/session/target and submitted
@@ -1166,29 +1694,34 @@ pub(super) fn apply_ssh_control_event(
                     canonical_binding_root = %root,
                     "opening SSH project from resolved worker binding"
                 );
-                // The Welcome-only consent card no longer owns any operation after its exact
-                // binding has been accepted; dropping it avoids a stale overlay over the project.
-                app.welcome_ssh_manager = None;
                 return dispatch_inherited_ssh_project(
                     app,
                     target_id,
                     root,
                     project_session_id,
                     binding.id,
+                    source_owner,
                 );
             }
         }
     }
-    vec![
-        Effect::SshAwaitEvent {
-            client_id,
+    let refresh = owner
+        .or_else(|| ssh_manager_owner_for_session(app, manager_session_id.as_deref()))
+        .and_then(|owner| {
+            ssh_manager_for_owner_mut(app, owner).map(|manager| (owner, manager.session_id.clone()))
+        });
+    let mut effects = vec![Effect::SshAwaitEvent {
+        client_id,
+        session_id,
+    }];
+    if let Some((owner, session_id)) = refresh {
+        effects.push(Effect::SshListTargets {
             session_id,
-        },
-        Effect::SshListTargets {
-            session_id: event_session_id,
             client_id,
-        },
-    ]
+            owner,
+        });
+    }
+    effects
 }
 
 /// Route input to the local SSH modal while it is displayed on Welcome.

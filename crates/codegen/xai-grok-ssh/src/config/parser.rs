@@ -938,6 +938,14 @@ fn apply_directive(
         "xauthlocation" => {
             let _ = one!();
         }
+        "remoteforward" | "localforward" | "dynamicforward" => {
+            return Err(ConfigError::UnsupportedDirective {
+                path: source.path,
+                line: source.line,
+                directive: key.to_owned(),
+                reason: "Groky's native SSH transport does not provide port forwarding. Use system OpenSSH when forwarding is required, or scope forwarding directives to a different Host block and use a dedicated alias without forwarding for Groky. This setting was not silently ignored.".to_owned(),
+            });
+        }
         // These options alter authentication, routing, connection behavior, or
         // host-verification policy. Refuse them until the native transport can
         // implement their OpenSSH semantics exactly.

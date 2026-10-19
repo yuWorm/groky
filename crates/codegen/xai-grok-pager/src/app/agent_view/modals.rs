@@ -176,7 +176,13 @@ impl AgentView {
             SshModalOutcome::Changed => InputOutcome::Changed,
             SshModalOutcome::Unchanged => InputOutcome::Unchanged,
             SshModalOutcome::Refresh => InputOutcome::Action(Action::RefreshSshTargets),
-            SshModalOutcome::AddTarget(draft) => InputOutcome::Action(Action::AddSshTarget(draft)),
+            SshModalOutcome::AddTarget {
+                draft,
+                submission_id,
+            } => InputOutcome::Action(Action::AddSshTarget {
+                draft,
+                submission_id,
+            }),
             SshModalOutcome::Connect { target_id } => {
                 InputOutcome::Action(Action::ConnectSshTarget { target_id })
             }
@@ -242,6 +248,17 @@ impl AgentView {
                 approved,
             } => InputOutcome::Action(Action::ApproveSshOperation {
                 approval_id,
+                approved,
+            }),
+            SshModalOutcome::ApproveWorkerInstall {
+                request_id,
+                session_id,
+                binding_id,
+                approved,
+            } => InputOutcome::Action(Action::ApproveSshWorkerInstall {
+                request_id,
+                session_id,
+                binding_id,
                 approved,
             }),
             SshModalOutcome::AnswerAuthentication {

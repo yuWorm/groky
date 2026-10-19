@@ -9,6 +9,7 @@ mod native_files;
 mod native_tasks;
 mod service;
 mod tools;
+mod worker_install;
 
 pub use control::{SshAuthControlResponse, SshControlCommand, SshControlReply};
 pub use control_client::{SshControlClient, SshControlClientError};
@@ -18,7 +19,7 @@ pub use model::{
     SshDispatchRequest, SshDispatchResult, SshEvent, SshGrantDecision, SshGrantRequest,
     SshGrantScope, SshGrantStatus, SshHostKeyDecision, SshKeyboardInteractiveQuestion,
     SshOperationApproval, SshOperationApprovalDecision, SshSessionWorkerEvent, SshTargetAccess,
-    SshTargetStatus,
+    SshTargetStatus, SshWorkerInstallDecision, SshWorkerInstallProgress, SshWorkerInstallRequest,
 };
 pub use service::{SessionSsh, SessionSshResource, SshServiceError};
 pub(crate) use tools::configure_default_tools;

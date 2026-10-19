@@ -541,12 +541,13 @@ pub(super) fn dispatch_task_result(result: TaskResult, app: &mut AppView) -> Vec
         TaskResult::SshTargetsLoaded {
             session_id,
             client_id,
+            owner,
             targets,
             error,
         } => {
             app.ssh_client_id = client_id;
-            if let Some(manager) =
-                super::ssh::ssh_manager_for_target_list_session_mut(app, session_id.as_deref())
+            if let Some(manager) = super::ssh::ssh_manager_for_owner_mut(app, owner)
+                && manager.session_id == session_id
             {
                 match error {
                     Some(error) => manager.show_error(error),
@@ -554,6 +555,30 @@ pub(super) fn dispatch_task_result(result: TaskResult, app: &mut AppView) -> Vec
                 }
             }
             vec![]
+        }
+        TaskResult::SshTargetAdded {
+            session_id,
+            client_id,
+            owner,
+            submission_id,
+            result,
+        } => {
+            app.ssh_client_id = client_id;
+            let succeeded = result.is_ok();
+            let refresh = if let Some(manager) = super::ssh::ssh_manager_for_owner_mut(app, owner)
+                && manager.session_id == session_id
+                && manager.settle_target_add_for_submission(submission_id, result)
+                && succeeded
+            {
+                Some(Effect::SshListTargets {
+                    session_id: manager.session_id.clone(),
+                    client_id,
+                    owner,
+                })
+            } else {
+                None
+            };
+            refresh.into_iter().collect()
         }
         TaskResult::SshProjectOpenSetupFailed {
             session_id,
@@ -563,7 +588,7 @@ pub(super) fn dispatch_task_result(result: TaskResult, app: &mut AppView) -> Vec
         } => {
             app.ssh_client_id = client_id;
             if let Some(manager) =
-                super::ssh::ssh_manager_for_session_mut(app, Some(session_id.as_str()))
+                super::ssh::existing_ssh_manager_for_session_mut(app, Some(session_id.as_str()))
                 && manager.session_id.as_deref() == Some(session_id.as_str())
             {
                 manager.show_error(error);
@@ -575,17 +600,30 @@ pub(super) fn dispatch_task_result(result: TaskResult, app: &mut AppView) -> Vec
             }
             vec![]
         }
-        TaskResult::SshActionComplete {
-            session_id,
+        TaskResult::SshProjectBindingInheritFailed {
+            source_session_id: _,
             client_id,
+            owner,
+            error,
+        } => {
+            app.ssh_client_id = client_id;
+            if let Some(manager) = super::ssh::ssh_manager_for_owner_mut(app, owner) {
+                manager.settle_project_open();
+                manager.show_error(error);
+            }
+            vec![]
+        }
+        TaskResult::SshActionComplete {
+            session_id: _,
+            client_id,
+            owner,
             target_id: _,
             message,
             error,
         } => {
             app.ssh_client_id = client_id;
-            let manager_session_id = if let Some(manager) = super::ssh::ssh_manager_mut(app)
-                && (session_id.is_none() || manager.session_id == session_id)
-            {
+            let refresh = owner.and_then(|owner| {
+                let manager = super::ssh::ssh_manager_for_owner_mut(app, owner)?;
                 match error {
                     Some(error) => manager.show_error(error),
                     None => {
@@ -598,44 +636,74 @@ pub(super) fn dispatch_task_result(result: TaskResult, app: &mut AppView) -> Vec
                         }
                     }
                 }
-                manager.session_id.clone()
-            } else {
-                None
-            };
-            vec![Effect::SshListTargets {
-                session_id: session_id.or(manager_session_id),
-                client_id,
-            }]
+                Some(Effect::SshListTargets {
+                    session_id: manager.session_id.clone(),
+                    client_id,
+                    owner,
+                })
+            });
+            refresh.into_iter().collect()
         }
         TaskResult::SshOperationApprovalComplete {
-            session_id,
+            session_id: _,
             client_id,
+            owner,
             approval_id,
             error,
         } => {
             app.ssh_client_id = client_id;
-            let dismiss_transient = super::ssh::existing_ssh_manager_for_session_mut(
-                app,
-                session_id.as_deref(),
-            )
-            .is_some_and(|manager| manager.settle_operation_approval(&approval_id, error));
+            let (dismiss_transient, refresh_session_id) =
+                if let Some(manager) = super::ssh::ssh_manager_for_owner_mut(app, owner) {
+                    (
+                        manager.settle_operation_approval(&approval_id, error),
+                        Some(manager.session_id.clone()),
+                    )
+                } else {
+                    (false, None)
+                };
             if dismiss_transient {
-                super::ssh::close_transient_ssh_manager_for_session(app, session_id.as_deref());
+                super::ssh::close_ssh_manager_for_owner(app, owner);
                 vec![]
-            } else {
+            } else if let Some(session_id) = refresh_session_id {
                 vec![Effect::SshListTargets {
                     session_id,
                     client_id,
+                    owner,
                 }]
+            } else {
+                vec![]
             }
+        }
+        TaskResult::SshWorkerInstallApprovalComplete {
+            client_id,
+            owner,
+            request_id,
+            session_id,
+            binding_id,
+            approved,
+            error,
+        } => {
+            app.ssh_client_id = client_id;
+            if let Some(manager) = super::ssh::ssh_manager_for_owner_mut(app, owner) {
+                manager.settle_worker_install_decision(
+                    client_id,
+                    &request_id,
+                    &session_id,
+                    &binding_id,
+                    approved,
+                    error,
+                );
+            }
+            vec![]
         }
         TaskResult::SshControlEvent {
             session_id,
             client_id,
+            owner,
             event,
         } => {
             app.ssh_client_id = client_id;
-            super::ssh::apply_ssh_control_event(app, session_id, event)
+            super::ssh::apply_ssh_control_event(app, session_id, owner, event)
         }
         TaskResult::SshProjectBindingInherited {
             target_id,
@@ -643,6 +711,7 @@ pub(super) fn dispatch_task_result(result: TaskResult, app: &mut AppView) -> Vec
             project_session_id,
             binding,
             client_id,
+            owner,
         } => {
             app.ssh_client_id = client_id;
             super::ssh::dispatch_inherited_ssh_project(
@@ -651,6 +720,7 @@ pub(super) fn dispatch_task_result(result: TaskResult, app: &mut AppView) -> Vec
                 root,
                 project_session_id,
                 binding.id,
+                Some(owner),
             )
         }
         TaskResult::SshProjectGrantRestored {
@@ -664,23 +734,26 @@ pub(super) fn dispatch_task_result(result: TaskResult, app: &mut AppView) -> Vec
                 project.project_session_id == project_session_id && project.target_id == target_id
             });
             if !pending_matches {
-                if let Some(manager) =
-                    super::ssh::ssh_manager_for_session_mut(app, Some(project_session_id.as_str()))
-                {
+                if let Some(manager) = super::ssh::existing_ssh_manager_for_session_mut(
+                    app,
+                    Some(project_session_id.as_str()),
+                ) {
                     manager.show_error(
                         "Discarded an SSH project grant restore for a different pending project.",
                     );
                 }
                 return vec![];
             }
+            let source_owner =
+                super::ssh::ssh_manager_owner_for_session(app, Some(project_session_id.as_str()));
             app.pending_ssh_project_open = None;
-            app.welcome_ssh_manager = None;
             super::ssh::dispatch_inherited_ssh_project(
                 app,
                 binding.target_id.clone(),
                 binding.root.clone(),
                 project_session_id,
                 binding.id,
+                source_owner,
             )
         }
         TaskResult::SessionCreated {

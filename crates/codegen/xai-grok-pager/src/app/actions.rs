@@ -13,6 +13,16 @@ use std::num::NonZeroU64;
 use xai_grok_shell::compat::custom::CustomModel;
 use xai_grok_shell::sampling::types::ReasoningEffort;
 use xai_grok_shell::session::unified_list::SessionKind;
+/// Exact SSH manager instance that initiated an asynchronous local-control request.
+///
+/// `agent_id == None` identifies the Welcome manager. `instance_id` prevents a result from an
+/// overlay that was dismissed and reopened from changing the replacement overlay.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SshManagerOwner {
+    pub agent_id: Option<AgentId>,
+    pub instance_id: u64,
+}
+
 /// Typed error for model switch failures.
 /// Replaces the raw `String` in `TaskResult::SwitchModelComplete` so dispatch can match on the variant instead of parsing strings.
 #[derive(Debug, Clone)]
@@ -650,7 +660,10 @@ pub enum Action {
     /// Reload configured targets and current-session SSH grant/connection status.
     RefreshSshTargets,
     /// Save a manually configured SSH target; no credential material is included.
-    AddSshTarget(crate::views::ssh_modal::SshManualTargetDraft),
+    AddSshTarget {
+        draft: crate::views::ssh_modal::SshManualTargetDraft,
+        submission_id: u64,
+    },
     /// Acquire or retain a manual connection through the persistent local SSH service.
     ConnectSshTarget { target_id: String },
     /// Release the persistent manual connection hold for a target.
@@ -696,6 +709,14 @@ pub enum Action {
     /// Resolve a local-only, per-operation remote worker approval.
     ApproveSshOperation {
         approval_id: String,
+        approved: bool,
+    },
+    /// Resolve explicit consent to download an exact managed worker build locally and upload it
+    /// over the already-authenticated SSH connection.
+    ApproveSshWorkerInstall {
+        request_id: String,
+        session_id: String,
+        binding_id: String,
         approved: bool,
     },
     /// Return a local-only authentication answer to the original client/channel.
@@ -2485,27 +2506,35 @@ pub enum Effect {
     SshListTargets {
         session_id: Option<String>,
         client_id: u64,
+        owner: SshManagerOwner,
     },
     /// Persist a manually entered SSH target without credential material.
     SshAddTarget {
         session_id: Option<String>,
         client_id: u64,
+        submission_id: u64,
+        owner: SshManagerOwner,
         draft: crate::views::ssh_modal::SshManualTargetDraft,
     },
     /// Acquire a retained manual connection through the persistent local SSH service.
     SshConnect {
+        session_id: Option<String>,
         target_id: String,
         client_id: u64,
+        owner: SshManagerOwner,
     },
     /// Release a retained manual connection through the persistent local SSH service.
     SshDisconnect {
+        session_id: Option<String>,
         target_id: String,
         client_id: u64,
+        owner: SshManagerOwner,
     },
     /// Submit a user-created, session-scoped SSH grant request.
     SshRequestGrant {
         session_id: String,
         client_id: u64,
+        owner: SshManagerOwner,
         target_id: String,
         root: String,
         capabilities: crate::views::ssh_modal::SshCapabilitiesView,
@@ -2518,12 +2547,14 @@ pub enum Effect {
         request_id: String,
         target_id: String,
         client_id: u64,
+        owner: SshManagerOwner,
     },
     /// Resolve a pending agent SSH grant request.
     SshApproveGrant {
         session_id: String,
         request_id: String,
         client_id: u64,
+        owner: SshManagerOwner,
         approved: bool,
         target_id: Option<String>,
         root: Option<String>,
@@ -2536,12 +2567,14 @@ pub enum Effect {
         session_id: String,
         binding_id: String,
         client_id: u64,
+        owner: SshManagerOwner,
     },
     /// Locally revoke an SSH binding and await worker acknowledgement.
     SshRevokeBinding {
         session_id: String,
         binding_id: String,
         client_id: u64,
+        owner: SshManagerOwner,
     },
     /// Mint an inherited binding for a pre-minted SSH project session before `session/new`.
     SshInheritBinding {
@@ -2552,6 +2585,7 @@ pub enum Effect {
         root: String,
         capabilities: crate::views::ssh_modal::SshCapabilitiesView,
         client_id: u64,
+        owner: SshManagerOwner,
     },
     /// Register an SSH project location, then request human consent for the pre-minted session.
     SshBeginProjectGrant {
@@ -2568,6 +2602,7 @@ pub enum Effect {
     /// Deliver a host-key or secret answer through the local authenticated control channel.
     SshSubmitAuthentication {
         client_id: u64,
+        owner: SshManagerOwner,
         challenge_id: String,
         connection_generation: u64,
         host_key_decision: Option<xai_grok_shell::ssh::SshHostKeyDecision>,
@@ -2579,8 +2614,26 @@ pub enum Effect {
     SshApproveOperation {
         session_id: Option<String>,
         client_id: u64,
+        owner: SshManagerOwner,
         approval_id: String,
         approved: bool,
+    },
+    /// Resolve one exact managed-worker local-download/upload fallback.
+    SshApproveWorkerInstall {
+        client_id: u64,
+        owner: SshManagerOwner,
+        request_id: String,
+        session_id: String,
+        binding_id: String,
+        approved: bool,
+    },
+    /// Unblock a worker installer whose manager no longer exists without materializing another
+    /// session's modal.
+    SshRejectWorkerInstall {
+        client_id: u64,
+        request_id: String,
+        session_id: String,
+        binding_id: String,
     },
     /// Wait for exactly one targeted SSH control event while the SSH manager is active.
     SshAwaitEvent {
@@ -2708,14 +2761,27 @@ pub enum TaskResult {
         session_id: Option<String>,
         /// Identity allocated by the persistent local leader for this SSH-control client.
         client_id: u64,
+        owner: SshManagerOwner,
         targets: Vec<crate::views::ssh_modal::SshTargetView>,
         error: Option<String>,
+    },
+    /// A manually configured SSH target save completed.
+    SshTargetAdded {
+        session_id: Option<String>,
+        /// Identity allocated by the persistent local leader for this SSH-control client.
+        client_id: u64,
+        owner: SshManagerOwner,
+        submission_id: u64,
+        /// Saved target id on success; a user-readable diagnostic on failure.
+        result: Result<String, String>,
     },
     /// A non-project local SSH control operation completed.
     SshActionComplete {
         session_id: Option<String>,
         /// Identity allocated by the persistent local leader for this SSH-control client.
         client_id: u64,
+        /// Present for user-initiated requests and absent for the global event waiter.
+        owner: Option<SshManagerOwner>,
         target_id: Option<String>,
         message: Option<String>,
         error: Option<String>,
@@ -2725,7 +2791,18 @@ pub enum TaskResult {
         session_id: Option<String>,
         /// Identity allocated by the persistent local leader for this SSH-control client.
         client_id: u64,
+        owner: SshManagerOwner,
         approval_id: String,
+        error: Option<String>,
+    },
+    /// A correlated local-control acknowledgement for one managed-worker fallback decision.
+    SshWorkerInstallApprovalComplete {
+        client_id: u64,
+        owner: SshManagerOwner,
+        request_id: String,
+        session_id: String,
+        binding_id: String,
+        approved: bool,
         error: Option<String>,
     },
     /// A targeted local SSH event; it is not a chat, ACP, or replay event.
@@ -2733,6 +2810,8 @@ pub enum TaskResult {
         session_id: Option<String>,
         /// Identity allocated by the persistent local leader for this SSH-control client.
         client_id: u64,
+        /// `None` belongs to the global event receiver; a direct request must retain its origin.
+        owner: Option<SshManagerOwner>,
         event: xai_grok_shell::ssh::SshEvent,
     },
     /// The leader minted a binding owned by the pre-minted SSH project session.
@@ -2742,6 +2821,14 @@ pub enum TaskResult {
         project_session_id: String,
         binding: xai_grok_shell::ssh::SshBinding,
         client_id: u64,
+        owner: SshManagerOwner,
+    },
+    /// The local service could not create the inherited binding for a user-opened SSH project.
+    SshProjectBindingInheritFailed {
+        source_session_id: String,
+        client_id: u64,
+        owner: SshManagerOwner,
+        error: String,
     },
     /// A persisted SSH project rule revalidated to a binding owned by the pre-minted session.
     SshProjectGrantRestored {

@@ -265,14 +265,27 @@ fn init_tracing_simple(app_entrypoint: &'static str) {
         ),
     );
 }
+
+fn print_ssh_worker_info() -> Result<()> {
+    println!(
+        "{}",
+        serde_json::to_string(&xai_grok_workspace_types::ssh_wire::local_worker_build_info())?
+    );
+    Ok(())
+}
+
 /// Run the internal SSH worker without touching provider or model authentication.
 async fn run_ssh_worker(args: SshWorkerArgs) -> Result<()> {
+    if args.info {
+        return print_ssh_worker_info();
+    }
     match (args.stdio, args.daemon) {
         (true, false) => xai_grok_workspace::ssh_worker::run_stdio().await,
         (false, true) => {
-            let socket = args
-                .socket
-                .unwrap_or_else(xai_grok_workspace::ssh_worker::default_private_socket_path);
+            let socket = match args.socket {
+                Some(socket) => socket,
+                None => xai_grok_workspace::ssh_worker::default_private_socket_path()?,
+            };
             xai_grok_workspace::ssh_worker::run_private_daemon(socket).await
         }
         _ => anyhow::bail!("`groky worker` requires exactly one of `--stdio` or `--daemon`"),
@@ -2090,6 +2103,17 @@ fn main() {
     xai_grok_version::set_full_version(env!("VERSION_WITH_COMMIT"));
     xai_grok_shell::compat::set_product_version(env!("GROKY_VERSION"));
     xai_grok_telemetry::startup::mark_process_start();
+    let args = PagerArgs::parse_cli();
+    if matches!(
+        args.command.as_ref(),
+        Some(Command::Worker(worker_args)) if worker_args.info
+    ) {
+        if let Err(error) = print_ssh_worker_info() {
+            eprintln!("Error: {error:#}");
+            std::process::exit(1);
+        }
+        return;
+    }
     if let Some(code) = xai_grok_pager::app::mermaid_worker::maybe_run_render_subprocess() {
         std::process::exit(code);
     }
@@ -2099,7 +2123,6 @@ fn main() {
     set_release_channel(ReleaseChannel::from_label(
         xai_grok_update::channel_name().unwrap_or_default(),
     ));
-    let args = PagerArgs::parse_cli();
     if dispatch_version_if_requested(&args) || dispatch_doctor_if_requested(&args) {
         return;
     }
@@ -2194,7 +2217,9 @@ async fn async_main(mut args: PagerArgs) -> Result<()> {
         return xai_grok_pager::wrap_cmd::run(wrap_args);
     }
     if let Some(Command::Worker(worker_args)) = &args.command {
-        init_tracing_simple("ssh-worker");
+        if !worker_args.info {
+            init_tracing_simple("ssh-worker");
+        }
         return run_ssh_worker(worker_args.clone()).await;
     }
     if let Some(Command::Ssh(ssh_args)) = args.command.clone() {

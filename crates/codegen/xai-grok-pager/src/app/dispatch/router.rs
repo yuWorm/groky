@@ -1279,7 +1279,10 @@ fn dispatch_inner(action: Action, app: &mut AppView) -> Vec<Effect> {
         }
         Action::OpenSshManager => super::ssh::dispatch_open_ssh_manager(app),
         Action::RefreshSshTargets => super::ssh::dispatch_refresh_ssh_targets(app),
-        Action::AddSshTarget(draft) => super::ssh::dispatch_add_ssh_target(app, draft),
+        Action::AddSshTarget {
+            draft,
+            submission_id,
+        } => super::ssh::dispatch_add_ssh_target(app, draft, submission_id),
         Action::ConnectSshTarget { target_id } => {
             super::ssh::dispatch_connect_ssh_target(app, target_id)
         }
@@ -1339,6 +1342,18 @@ fn dispatch_inner(action: Action, app: &mut AppView) -> Vec<Effect> {
             approval_id,
             approved,
         } => super::ssh::dispatch_approve_ssh_operation(app, approval_id, approved),
+        Action::ApproveSshWorkerInstall {
+            request_id,
+            session_id,
+            binding_id,
+            approved,
+        } => super::ssh::dispatch_approve_ssh_worker_install(
+            app,
+            request_id,
+            session_id,
+            binding_id,
+            approved,
+        ),
         Action::SubmitSshAuthentication {
             challenge_id,
             connection_generation,

@@ -14,11 +14,14 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadHalf, Wr
 use tokio::sync::{Mutex, RwLock, oneshot};
 use xai_grok_workspace_types::rpc::WorkspaceRpc;
 use xai_grok_workspace_types::ssh::{ResolvedSshInvocation, SshBinding};
+#[cfg(test)]
+use xai_grok_workspace_types::ssh_wire::local_worker_build_info;
 use xai_grok_workspace_types::ssh_wire::{
     SSH_WIRE_MAX_FRAME_BYTES, SSH_WIRE_PROTOCOL_VERSION, SshApprovalDecision, SshApprovalRequest,
     SshCancellation, SshClientHello, SshMutationId, SshOperationId, SshOperationRecord,
     SshResumeToken, SshTaskRecord, SshWireError, SshWireFrame, SshWorkerCapabilities,
     SshWorkerEvent, SshWorkerHello, SshWorkerReply, SshWorkerRequest, SshWorkerResponse,
+    local_worker_product_version,
 };
 
 /// Native SSH's concrete erased stream type, reused directly to preserve the
@@ -162,8 +165,14 @@ impl SshWorkspaceClient {
         revocation_only: bool,
     ) -> Result<Self, SshClientError> {
         let (mut reader, mut writer) = tokio::io::split(stream);
+        let expected_product_version = if revocation_only {
+            None
+        } else {
+            local_worker_product_version()
+        };
         let hello = SshWireFrame::ClientHello(SshClientHello {
             protocol_version: SSH_WIRE_PROTOCOL_VERSION,
+            expected_product_version: expected_product_version.map(str::to_owned),
             client_id: format!("ssh-client-{}", next_id()),
             binding: binding.clone(),
             resume_token,
@@ -204,6 +213,13 @@ impl SshWorkspaceClient {
             return Err(SshClientError::Protocol(format!(
                 "protocol version mismatch: client={}, worker={}",
                 SSH_WIRE_PROTOCOL_VERSION, hello.protocol_version
+            )));
+        }
+        if !revocation_only && hello.product_version.as_deref() != expected_product_version {
+            return Err(SshClientError::Protocol(format!(
+                "product release mismatch: client={}, worker={}",
+                expected_product_version.unwrap_or("development"),
+                hello.product_version.as_deref().unwrap_or("development")
             )));
         }
         if hello.binding.id != binding.id
@@ -770,6 +786,131 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn normal_worker_release_mismatch_is_rejected() {
+        let (stream, mut worker) = duplex(4096);
+        let binding = test_binding();
+        let worker_binding = binding.clone();
+        let product_version = match local_worker_build_info().product_version {
+            Some(version) => Some(format!("{version}-mismatch")),
+            None => Some("test-release".into()),
+        };
+        let worker_task = tokio::spawn(async move {
+            let _ = read_frame(&mut worker)
+                .await
+                .expect("read client hello")
+                .expect("client hello frame");
+            write_frame(
+                &mut worker,
+                &SshWireFrame::WorkerHello(SshWorkerHello {
+                    protocol_version: SSH_WIRE_PROTOCOL_VERSION,
+                    product_version,
+                    worker_id: "worker".into(),
+                    os: std::env::consts::OS.into(),
+                    path_semantics: if cfg!(windows) {
+                        xai_grok_workspace_types::ssh_wire::SshPathSemantics::Windows
+                    } else {
+                        xai_grok_workspace_types::ssh_wire::SshPathSemantics::Posix
+                    },
+                    capabilities: SshWorkerCapabilities::complete(),
+                    root: worker_binding.root.clone(),
+                    binding: worker_binding,
+                    resume_token: "resume".into(),
+                }),
+            )
+            .await
+            .expect("write worker hello");
+        });
+        let error =
+            SshWorkspaceClient::connect(Box::pin(stream), binding, Arc::new(DenySshApprovals))
+                .await
+                .expect_err("mismatched worker release must be rejected");
+        assert!(matches!(
+            error,
+            SshClientError::Protocol(message) if message.contains("product release mismatch")
+        ));
+        worker_task.await.expect("worker task");
+    }
+
+    #[tokio::test]
+    async fn revocation_tombstone_works_with_a_protocol_one_worker() {
+        use tokio::io::AsyncReadExt;
+
+        let (stream, mut worker) = duplex(4096);
+        let mut binding = test_binding();
+        binding.revoked = true;
+        binding.epoch = 2;
+        let worker_binding = binding.clone();
+        let worker_task = tokio::spawn(async move {
+            let mut length = [0_u8; 4];
+            worker
+                .read_exact(&mut length)
+                .await
+                .expect("read protocol-one hello frame length");
+            let mut bytes = vec![0_u8; u32::from_be_bytes(length) as usize];
+            worker
+                .read_exact(&mut bytes)
+                .await
+                .expect("read protocol-one hello frame");
+            let hello: serde_json::Value =
+                serde_json::from_slice(&bytes).expect("decode protocol-one hello");
+            assert_eq!(hello["type"], "client_hello");
+            assert!(
+                hello["data"].get("expected_product_version").is_none(),
+                "tombstones must omit release expectation for protocol-one workers"
+            );
+            write_frame(
+                &mut worker,
+                &SshWireFrame::WorkerHello(SshWorkerHello {
+                    protocol_version: SSH_WIRE_PROTOCOL_VERSION,
+                    product_version: None,
+                    worker_id: "protocol-one-worker".into(),
+                    os: std::env::consts::OS.into(),
+                    path_semantics: if cfg!(windows) {
+                        xai_grok_workspace_types::ssh_wire::SshPathSemantics::Windows
+                    } else {
+                        xai_grok_workspace_types::ssh_wire::SshPathSemantics::Posix
+                    },
+                    capabilities: SshWorkerCapabilities::complete(),
+                    root: worker_binding.root.clone(),
+                    binding: worker_binding.clone(),
+                    resume_token: "resume".into(),
+                }),
+            )
+            .await
+            .expect("write protocol-one worker hello");
+            let request = read_frame(&mut worker)
+                .await
+                .expect("read tombstone acknowledgement")
+                .expect("tombstone acknowledgement frame");
+            let SshWireFrame::Request(SshWorkerRequest::Revoke {
+                request_id,
+                binding_id,
+                epoch,
+            }) = request
+            else {
+                panic!("protocol-one worker must receive a tombstone revoke");
+            };
+            assert_eq!(binding_id, worker_binding.id);
+            assert_eq!(epoch, worker_binding.epoch);
+            write_frame(
+                &mut worker,
+                &SshWireFrame::Reply(SshWorkerReply {
+                    request_id,
+                    result: Ok(SshWorkerResponse::Revoked { binding_id, epoch }),
+                }),
+            )
+            .await
+            .expect("write tombstone acknowledgement");
+        });
+        let acknowledged = SshWorkspaceClient::revoke_tombstone(Box::pin(stream), binding.clone())
+            .await
+            .expect("protocol-one worker acknowledges tombstone");
+        assert_eq!(acknowledged.binding_id, binding.id);
+        assert_eq!(acknowledged.epoch, binding.epoch);
+        worker_task.await.expect("worker task");
+    }
+
+    #[tokio::test]
     async fn disconnect_after_request_registration_closes_waiter() {
         let (stream, mut worker) = duplex(4096);
         let binding = test_binding();
@@ -784,6 +925,7 @@ mod tests {
                 &mut worker,
                 &SshWireFrame::WorkerHello(SshWorkerHello {
                     protocol_version: SSH_WIRE_PROTOCOL_VERSION,
+                    product_version: local_worker_build_info().product_version,
                     worker_id: "worker".into(),
                     os: std::env::consts::OS.into(),
                     path_semantics: if cfg!(windows) {

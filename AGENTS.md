@@ -27,4 +27,13 @@ Voice: `**Lead** rest.` Lead is the noun the user already knows (`/default`, `Re
 Next groky version after `v0.1.25`.
 
 - **SSH host trust** correctly isolates known_hosts ports and key algorithms, and offers explicit changed-key replacement with old/new fingerprints, backups and safeguards against ambiguous records.
-- **SSH diagnostics** provide a wrapped, scrollable full-error view and readable host-key details instead of clipping failures to one status line.
+- **SSH diagnostics** provide wrapped, scrollable full errors, selected target/grant details, and explicit explanations for unsupported forwarding settings.
+- **SSH connection status** clears completed connect/disconnect progress without replacing newer errors or another target's progress.
+- **SSH access grants** show every active binding separately, revoke only the selected binding, preserve failed forms, and guide ungranted project/default actions through explicit authorization.
+- **SSH controls** support clickable targets and footer actions, mouse scrolling, and keyboard-focusable grant options with wrapped, scrollable authorization details.
+- **SSH target saving** prevents duplicate submissions, preserves form fields after failure, and selects the saved target with a completed status message.
+- **SSH project startup** no longer stalls on repeated pending guards, returns failures to the originating manager for retry, and isolates asynchronous results from other sessions or reopened managers.
+- **SSH worker startup** uses a short private socket namespace for long home directories and retains early daemon startup diagnostics.
+- **SSH worker installation** detects the remote platform and installs the exact local release automatically, with checksum validation and an explicit local-download/SSH-upload fallback when remote downloads fail.
+- **SSH worker updates** prepare matching versions on project open or resume, keep existing versions intact, and isolate their daemons while preserving cross-version grant revocation.
+- **SSH project resume** restores projects opened from non-default grants and keeps worker installation confirmations visible while the session loads, without reopening dismissed dialogs.

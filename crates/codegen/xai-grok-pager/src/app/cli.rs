@@ -313,6 +313,9 @@ pub struct SshAddArgs {
 /// Hidden worker-mode arguments used by SSH transports.
 #[derive(Debug, clap::Args, Clone)]
 pub struct SshWorkerArgs {
+    /// Print worker build metadata as JSON without starting a daemon or bridge.
+    #[arg(long, conflicts_with_all = ["stdio", "daemon", "socket"])]
+    pub info: bool,
     /// Bridge SSH stdio to the user-private worker daemon.
     #[arg(long, conflicts_with = "daemon")]
     pub stdio: bool,

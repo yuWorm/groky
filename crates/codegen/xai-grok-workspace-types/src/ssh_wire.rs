@@ -12,6 +12,31 @@ use serde_json::Value;
 pub const SSH_WIRE_PROTOCOL_VERSION: u32 = 1;
 /// Frames larger than this are rejected before JSON decoding.
 pub const SSH_WIRE_MAX_FRAME_BYTES: usize = 16 * 1024 * 1024;
+/// Build identity reported by `groky worker --info` before opening an SSH worker bridge.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SshWorkerBuildInfo {
+    /// Exact product release. `None` identifies a development build.
+    pub product_version: Option<String>,
+    pub protocol_version: u32,
+    pub os: String,
+    pub arch: String,
+}
+
+/// Product release identity without allocating the platform metadata.
+pub fn local_worker_product_version() -> Option<&'static str> {
+    option_env!("GROKY_VERSION").filter(|version| !version.is_empty())
+}
+
+/// Return the build identity of the local SSH worker executable.
+pub fn local_worker_build_info() -> SshWorkerBuildInfo {
+    let product_version = local_worker_product_version().map(str::to_owned);
+    SshWorkerBuildInfo {
+        product_version,
+        protocol_version: SSH_WIRE_PROTOCOL_VERSION,
+        os: std::env::consts::OS.to_owned(),
+        arch: std::env::consts::ARCH.to_owned(),
+    }
+}
 
 /// A client-generated request identifier. It is unique only within a bridge.
 pub type SshRequestId = String;
@@ -35,6 +60,10 @@ pub enum SshPathSemantics {
 #[serde(deny_unknown_fields)]
 pub struct SshClientHello {
     pub protocol_version: u32,
+    /// Exact worker release expected for normal bridges. Omitted for a development build and
+    /// revocation-only tombstones so those tombstones remain compatible with protocol-1 workers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_product_version: Option<String>,
     /// Local bridge identity for diagnostics and ownership; it is not authority.
     pub client_id: String,
     /// The binding was granted locally and is revalidated by the worker.
@@ -79,6 +108,9 @@ impl SshWorkerCapabilities {
 #[serde(deny_unknown_fields)]
 pub struct SshWorkerHello {
     pub protocol_version: u32,
+    /// Exact release of this worker. `None` identifies a development build.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub product_version: Option<String>,
     pub worker_id: String,
     pub os: String,
     pub path_semantics: SshPathSemantics,

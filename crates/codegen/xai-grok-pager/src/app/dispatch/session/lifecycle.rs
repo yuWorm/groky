@@ -5,7 +5,8 @@ use super::modal::{drop_other_agents_in_minimal, remove_agent_and_cleanup};
 use crate::acp::model_state::{EffortTokenError, ModelState};
 use crate::acp::tracker::AcpUpdateTracker;
 use crate::app::actions::{
-    Action, AfterSessionDelete, Effect, ModelChoice, PermissionModePersist, SwitchModelError,
+    Action, AfterSessionDelete, Effect, ModelChoice, PermissionModePersist, SshManagerOwner,
+    SwitchModelError,
 };
 use crate::app::agent::{AgentCommand, AgentId, AgentSession, AgentState, DeferredModelSwitch};
 use crate::app::agent_view::{ActivePane, AgentView};
@@ -377,7 +378,11 @@ pub(in crate::app::dispatch) fn dispatch_new_session_inner_with_id(
         ),
         None => (None, app.cwd.clone(), false),
     };
-    let mut effects = unregister_session_effect(previous_session_id);
+    let mut effects = if stay_on_welcome {
+        Vec::new()
+    } else {
+        unregister_session_effect(previous_session_id)
+    };
     reseed_tip_for_new_session(app);
     let agent_id = AgentId(app.next_agent_id);
     app.next_agent_id += 1;
@@ -433,10 +438,10 @@ pub(in crate::app::dispatch) fn dispatch_new_session_inner_with_id(
         agent.apply_credit_balance(app.credit_balance.clone(), app.auto_topup.clone());
         agent.active_pane = ActivePane::Prompt;
     }
-    if stay_on_welcome {
+    if stay_on_welcome && matches!(app.active_view, ActiveView::Welcome) {
         app.home_session_agent = Some(agent_id);
         app.optimistic_home_husk = Some(agent_id);
-    } else {
+    } else if !stay_on_welcome {
         switch_to_agent(app, agent_id, SwitchCause::New);
         effects.extend(drop_other_agents_in_minimal(app, agent_id));
     }
@@ -1425,6 +1430,39 @@ pub(in crate::app::dispatch) fn handle_session_created(
     new_models: Option<acp::SessionModelState>,
     modes: Option<acp::SessionModeState>,
 ) -> Vec<Effect> {
+    let source_ssh_manager = app
+        .agents
+        .get(&agent_id)
+        .and_then(|agent| agent.ssh_project_open_owner);
+    let return_to_ssh_project = source_ssh_manager.is_some_and(|owner| match owner.agent_id {
+        Some(source_id) => {
+            matches!(app.active_view, ActiveView::Agent(active_id) if active_id == source_id)
+                && app.agents.get(&source_id).is_some_and(|agent| {
+                    agent
+                        .ssh_manager
+                        .as_ref()
+                        .is_some_and(|manager| manager.instance_id() == owner.instance_id)
+                })
+        }
+        None => {
+            matches!(app.active_view, ActiveView::Welcome)
+                && app
+                    .welcome_ssh_manager
+                    .as_ref()
+                    .is_some_and(|manager| manager.instance_id() == owner.instance_id)
+        }
+    });
+    if let Some(owner) = source_ssh_manager {
+        if let Some(manager) = super::super::ssh::ssh_manager_for_owner_mut(app, owner) {
+            manager.settle_project_open();
+        }
+        if owner.agent_id.is_none() {
+            super::super::ssh::close_ssh_manager_for_owner(app, owner);
+        }
+    }
+    if return_to_ssh_project {
+        switch_to_agent(app, agent_id, SwitchCause::Picker);
+    }
     let identity_rebind = super::super::dashboard::WorkspaceIdentityRebind::capture(app);
     crate::app::workspace_sync::allow_loaded_session(app, session_id.0.as_ref());
     let agent_count = app.agents.len();
@@ -1452,6 +1490,18 @@ pub(in crate::app::dispatch) fn handle_session_created(
             )));
         }
         agent.bind_session_id(session_id);
+        agent.ssh_project_open_owner = None;
+        agent.ssh_project_open_session_id = None;
+        let refresh_ssh_targets_owner = agent.ssh_manager.as_mut().and_then(|manager| {
+            if manager.session_id.is_some() {
+                return None;
+            }
+            manager.session_id = Some(session_id_clone.to_string());
+            Some(SshManagerOwner {
+                agent_id: Some(agent_id),
+                instance_id: manager.instance_id(),
+            })
+        });
         if let Some(m) = new_models {
             app.models = Some(m).into();
             agent.session.models = app.models.clone();
@@ -1532,6 +1582,13 @@ pub(in crate::app::dispatch) fn handle_session_created(
                 session_id: Some(session_id_clone.to_string()),
             });
         }
+        if let Some(owner) = refresh_ssh_targets_owner {
+            effects.push(Effect::SshListTargets {
+                session_id: Some(session_id_clone.to_string()),
+                client_id: ssh_client_id,
+                owner,
+            });
+        }
         effects.push(Effect::RegisterActiveSession {
             session_id: session_id_clone,
             cwd: agent.session.cwd.display().to_string(),
@@ -1610,7 +1667,9 @@ pub(in crate::app::dispatch) fn handle_worktree_session_created(
         } else {
             format!("Worktree ready: {}", worktree_path.display())
         };
-        agent.scrollback.push_block(RenderBlock::system(worktree_label));
+        agent
+            .scrollback
+            .push_block(RenderBlock::system(worktree_label));
         if let Some(summary) = strategy_summary {
             agent.scrollback.push_block(RenderBlock::system(summary));
         }
@@ -1814,6 +1873,32 @@ pub(in crate::app::dispatch) fn handle_session_failed(
         Some(step) if timed_out => crate::app::effects::timed_out_while(step),
         Some(_) | None => format!("Session creation failed: {error}"),
     };
+    let ssh_project_open_owner = app
+        .agents
+        .get(&agent_id)
+        .and_then(|agent| agent.ssh_project_open_owner);
+    if let Some(owner) = ssh_project_open_owner
+        && let Some(manager) = super::super::ssh::ssh_manager_for_owner_mut(app, owner)
+    {
+        manager.settle_project_open();
+        manager.show_error(format!("Could not open SSH project: {error}"));
+        let failed_was_active =
+            matches!(app.active_view, ActiveView::Agent(active_id) if active_id == agent_id);
+        remove_agent_and_cleanup(app, agent_id);
+        if failed_was_active {
+            match owner.agent_id {
+                Some(source_agent) if app.agents.contains_key(&source_agent) => {
+                    switch_to_agent(app, source_agent, SwitchCause::Picker);
+                }
+                Some(_) => {}
+                None => {
+                    show_welcome(app);
+                    app.welcome_prompt_focused = true;
+                }
+            }
+        }
+        return vec![];
+    }
     let is_orphan = app
         .agents
         .get(&agent_id)

@@ -1057,6 +1057,10 @@ pub struct AppView {
     pub(crate) ssh_event_consumer_active: bool,
     /// A pre-minted CLI SSH project waiting for explicit local grant consent.
     pub(crate) pending_ssh_project_open: Option<crate::app::cli::SshProjectOpen>,
+    /// Recently applied direct grant replies. The global event stream broadcasts the same
+    /// request/resolution; retaining their opaque ids prevents that duplicate from reopening a
+    /// manager the user dismissed after the direct reply.
+    pub(crate) direct_ssh_grant_replies: std::collections::VecDeque<String>,
     /// Doc viewer overlay for the welcome screen (release notes via Ctrl+L).
     pub welcome_doc_viewer: Option<crate::views::modal::ActiveModal>,
     /// Whether the pager uses fullscreen (alt-screen) or inline mode.
@@ -1579,6 +1583,7 @@ impl AppView {
             ssh_client_id: rand::random(),
             ssh_event_consumer_active: false,
             pending_ssh_project_open: None,
+            direct_ssh_grant_replies: Default::default(),
             welcome_doc_viewer: None,
             screen_mode: ScreenMode::Inline,
             pending_screen_mode_switch: None,
@@ -5090,7 +5095,7 @@ impl AppView {
     /// True when any modal that should swallow scroll input is open.
     fn is_scroll_blocking_modal_open(&self) -> bool {
         let cloud_modal_open = false;
-        matches!(self.active_view, ActiveView::Agent(id) if self.agents.get(&id).is_some_and(|a| a.extensions_modal.is_some() || a.active_modal.is_some()))
+        matches!(self.active_view, ActiveView::Agent(id) if self.agents.get(&id).is_some_and(|a| a.extensions_modal.is_some() || a.active_modal.is_some() || a.ssh_manager.is_some()))
             || self.import_claude_modal.is_some()
             || self.welcome_vendor_login.is_some()
             || self.welcome_ssh_manager.is_some()

@@ -35,6 +35,7 @@ xai-grok-update = { path = "../xai-grok-update", default-features = false }
 xai-grok-version = { workspace = true }
 xai-grok-telemetry = { workspace = true }
 xai-grok-workspace = { workspace = true }
+xai-grok-workspace-types = { path = "../xai-grok-workspace-types" }
 xai-crash-handler = { path = "../xai-crash-handler" }
 xai-acp-lib = { workspace = true }
 

@@ -35,7 +35,7 @@ use xai_grok_workspace_types::ssh_wire::{
     SshPostToolHookNote, SshPostToolHookOutcome, SshPostToolReplacement, SshProjectBootstrap,
     SshResumeToken, SshTaskRecord, SshToolProgress, SshWireError, SshWireFrame,
     SshWorkerCapabilities, SshWorkerEvent, SshWorkerHello, SshWorkerReply, SshWorkerRequest,
-    SshWorkerResponse,
+    SshWorkerResponse, local_worker_product_version,
 };
 use xai_tool_runtime::{Cancellation, ToolCallContext, ToolProgress, ToolStreamItem};
 
@@ -765,12 +765,19 @@ impl WorkerWorkspace {
         use xai_grok_tools::types::{
             resources::AvailableSkills, skill_discovery_tracker::SkillManager,
         };
-        if toolset.resources.lock().await.get::<SkillManager>()
+        if toolset
+            .resources
+            .lock()
+            .await
+            .get::<SkillManager>()
             .is_some_and(|manager| manager.discovery_root.is_some())
         {
             return Ok(());
         }
-        let skills = self.skills().await.into_iter()
+        let skills = self
+            .skills()
+            .await
+            .into_iter()
             .map(serde_json::from_value)
             .collect::<Result<Vec<_>, _>>()
             .map_err(|error| wire_error("skill_decode_failed", error.to_string()))?;
@@ -781,13 +788,22 @@ impl WorkerWorkspace {
             // The client announces the same authorized startup snapshot.
             // Seed the worker catalog as well so Skill executes remotely.
             manager.restore_announced_names(
-                skills.iter().map(|skill: &xai_grok_tools::implementations::skills::types::SkillInfo| {
-                    skill.dedup_key()
-                }).collect(),
+                skills
+                    .iter()
+                    .map(
+                        |skill: &xai_grok_tools::implementations::skills::types::SkillInfo| {
+                            skill.dedup_key()
+                        },
+                    )
+                    .collect(),
             );
             manager.seed(
-                Some(self.root.clone()), Some(self.root.clone()),
-                skills.clone(), None, None, None,
+                Some(self.root.clone()),
+                Some(self.root.clone()),
+                skills.clone(),
+                None,
+                None,
+                None,
             );
             resources.insert(AvailableSkills(skills));
         }
@@ -868,11 +884,7 @@ impl WorkerWorkspace {
 
 /// Discovery normally includes ancestors and user homes. An SSH file grant
 /// does not authorize those contents, including through an in-root symlink.
-fn retain_discovery_within_root(
-    values: &mut Vec<serde_json::Value>,
-    path_key: &str,
-    root: &Path,
-) {
+fn retain_discovery_within_root(values: &mut Vec<serde_json::Value>, path_key: &str, root: &Path) {
     values.retain(|value| {
         value
             .get(path_key)
@@ -1115,8 +1127,24 @@ where
         binding,
         resume_token,
         revocation_only,
+        expected_product_version,
         ..
     } = hello;
+    let product_version = local_worker_product_version();
+    if !revocation_only && expected_product_version.as_deref() != product_version {
+        let error = wire_error(
+            "product_version_mismatch",
+            format!(
+                "client expects worker release {}, but this worker is {}",
+                expected_product_version.as_deref().unwrap_or("development"),
+                product_version.unwrap_or("development")
+            ),
+        );
+        write_frame(&mut writer, &SshWireFrame::HandshakeError(error))
+            .await
+            .context("writing worker product version mismatch")?;
+        return Ok(());
+    }
     let admission = if revocation_only {
         if resume_token.is_some() {
             Err(wire_error(
@@ -1146,6 +1174,11 @@ where
         &mut writer,
         &SshWireFrame::WorkerHello(SshWorkerHello {
             protocol_version: SSH_WIRE_PROTOCOL_VERSION,
+            product_version: if revocation_only {
+                None
+            } else {
+                product_version.map(str::to_owned)
+            },
             worker_id: service.worker_id.clone(),
             os: std::env::consts::OS.to_owned(),
             path_semantics: if cfg!(windows) {
@@ -1499,7 +1532,9 @@ async fn run_rpc<W: AsyncWrite + Unpin + Send + 'static>(
             authorized.workspace.instruction_files().await,
         ))
     } else if method == "workspace.discover_skills" {
-        Ok(serde_json::Value::Array(authorized.workspace.skills().await))
+        Ok(serde_json::Value::Array(
+            authorized.workspace.skills().await,
+        ))
     } else if method == "workspace.skill_content" {
         match params.get("path").and_then(serde_json::Value::as_str) {
             Some(path) => {
@@ -1510,7 +1545,9 @@ async fn run_rpc<W: AsyncWrite + Unpin + Send + 'static>(
                 xai_grok_tools::implementations::skills::skill::load_skill_content(&skill)
                     .await
                     .map(|mut content| {
-                        xai_grok_tools::implementations::skills::skill::cap_skill_body(&mut content);
+                        xai_grok_tools::implementations::skills::skill::cap_skill_body(
+                            &mut content,
+                        );
                         serde_json::Value::String(content)
                     })
                     .map_err(|error| wire_error("skill_read_failed", error))
@@ -1612,7 +1649,10 @@ async fn run_tool<W: AsyncWrite + Unpin + Send + 'static>(
         .map_err(|e| wire_error("path_denied", e.to_string()))?;
     ensure_json_session_owner(&args, &authorized.binding.session_id)
         .map_err(|e| wire_error("session_denied", e.to_string()))?;
-    authorized.workspace.prepare_skill_discovery(&toolset).await?;
+    authorized
+        .workspace
+        .prepare_skill_discovery(&toolset)
+        .await?;
     let begin = connection
         .service
         .begin_operation(&authorized.binding, expected, mutation_id)
@@ -2775,18 +2815,321 @@ fn request_id(request: &SshWorkerRequest) -> &str {
     }
 }
 
-/// The private daemon endpoint path in a dedicated user-only state namespace.
-pub fn default_private_socket_path() -> PathBuf {
+#[cfg(unix)]
+const DAEMON_STARTUP_ATTEMPTS: usize = 50;
+#[cfg(unix)]
+const DAEMON_STARTUP_RETRY: Duration = Duration::from_millis(50);
+#[cfg(unix)]
+const MAX_DAEMON_STARTUP_ERROR_BYTES: usize = 16 * 1024;
+
+#[cfg(unix)]
+fn worker_state_root_identity(state_root: &Path) -> PathBuf {
+    use std::ffi::OsString;
+    use std::io::ErrorKind;
+
+    let absolute = if state_root.is_absolute() {
+        state_root.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map(|cwd| cwd.join(state_root))
+            .unwrap_or_else(|_| state_root.to_path_buf())
+    };
+    let mut missing_components = Vec::<OsString>::new();
+    let mut existing = absolute.as_path();
+    loop {
+        match dunce::canonicalize(existing) {
+            Ok(mut canonical) => {
+                for component in missing_components.iter().rev() {
+                    canonical.push(component);
+                }
+                return canonical;
+            }
+            Err(error) if error.kind() == ErrorKind::NotFound => {
+                let Some(component) = existing.file_name() else {
+                    return absolute;
+                };
+                missing_components.push(component.to_os_string());
+                let Some(parent) = existing.parent() else {
+                    return absolute;
+                };
+                existing = parent;
+            }
+            Err(_) => return absolute,
+        }
+    }
+}
+
+#[cfg(unix)]
+fn worker_executable_identity() -> anyhow::Result<PathBuf> {
+    let executable = std::env::current_exe().context("resolving worker executable")?;
+    dunce::canonicalize(&executable)
+        .with_context(|| format!("canonicalizing worker executable {}", executable.display()))
+}
+
+#[cfg(unix)]
+fn worker_state_namespace(
+    state_root: &Path,
+    executable: &Path,
+    product_version: Option<&str>,
+) -> String {
+    use sha2::{Digest, Sha256};
+    use std::fmt::Write as _;
+    use std::os::unix::ffi::OsStrExt;
+
+    let state_root = worker_state_root_identity(state_root);
+    let mut hasher = Sha256::new();
+    hasher.update(b"groky-ssh-worker-state-root-v2\0");
+    hasher.update(state_root.as_os_str().as_bytes());
+    hasher.update(b"\0executable\0");
+    hasher.update(executable.as_os_str().as_bytes());
+    hasher.update(b"\0product-version\0");
+    match product_version {
+        Some(version) => {
+            hasher.update([1]);
+            hasher.update(version.as_bytes());
+        }
+        None => hasher.update([0]),
+    }
+
+    let digest = hasher.finalize();
+    let mut namespace = String::with_capacity(24);
+    for byte in &digest[..12] {
+        write!(namespace, "{byte:02x}").expect("writing into a String cannot fail");
+    }
+    namespace
+}
+
+#[cfg(unix)]
+fn private_socket_path_for_worker(
+    state_root: &Path,
+    user_id: u32,
+    executable: &Path,
+    product_version: Option<&str>,
+) -> PathBuf {
+    // This must stay far below macOS's 104-byte sockaddr_un.sun_path limit.
+    PathBuf::from("/tmp")
+        .join(format!(
+            "groky-ssh-{user_id}-{}",
+            worker_state_namespace(state_root, executable, product_version)
+        ))
+        .join("worker.sock")
+}
+
+#[cfg(unix)]
+fn private_socket_path_for_state_root(state_root: &Path, user_id: u32) -> anyhow::Result<PathBuf> {
+    let executable = worker_executable_identity()?;
+    Ok(private_socket_path_for_worker(
+        state_root,
+        user_id,
+        &executable,
+        local_worker_product_version(),
+    ))
+}
+
+#[cfg(unix)]
+fn startup_error_file(socket: &Path) -> anyhow::Result<tempfile::NamedTempFile> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let parent = socket
+        .parent()
+        .ok_or_else(|| anyhow!("private worker socket must have a parent"))?;
+    let file = tempfile::Builder::new()
+        .prefix(".ssh-worker-startup-")
+        .suffix(".error")
+        .tempfile_in(parent)
+        .with_context(|| {
+            format!(
+                "creating private worker startup diagnostic in {}",
+                parent.display()
+            )
+        })?;
+    std::fs::set_permissions(file.path(), std::fs::Permissions::from_mode(0o600)).with_context(
+        || {
+            format!(
+                "protecting private worker startup diagnostic {}",
+                file.path().display()
+            )
+        },
+    )?;
+    Ok(file)
+}
+
+#[cfg(unix)]
+fn daemon_startup_error(file: &tempfile::NamedTempFile) -> String {
+    use std::io::Read;
+
+    let mut bytes = Vec::new();
+    match file.reopen().and_then(|reader| {
+        reader
+            .take(MAX_DAEMON_STARTUP_ERROR_BYTES as u64 + 1)
+            .read_to_end(&mut bytes)
+    }) {
+        Ok(0) => "no startup diagnostic available".to_owned(),
+        Ok(_) => {
+            let truncated = bytes.len() > MAX_DAEMON_STARTUP_ERROR_BYTES;
+            bytes.truncate(MAX_DAEMON_STARTUP_ERROR_BYTES);
+            let message = String::from_utf8_lossy(&bytes).trim().to_owned();
+            if truncated {
+                format!("{message} [startup diagnostic truncated]")
+            } else {
+                message
+            }
+        }
+        Err(error) => format!("could not read startup diagnostic: {error}"),
+    }
+}
+
+#[cfg(unix)]
+fn current_user_id() -> u32 {
+    // SAFETY: geteuid has no preconditions and cannot fail.
+    unsafe { libc::geteuid() }
+}
+
+#[cfg(unix)]
+fn trusted_private_runtime_root() -> anyhow::Result<PathBuf> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    // /tmp is intentionally the only shared ancestor. Canonicalizing handles
+    // macOS's /tmp -> /private/tmp alias before validating ownership.
+    let root = dunce::canonicalize("/tmp").context("resolving the system temporary directory")?;
+    let metadata = std::fs::symlink_metadata(&root)
+        .with_context(|| format!("inspecting private worker runtime root {}", root.display()))?;
+    let mode = metadata.permissions().mode();
+    if !metadata.is_dir() || metadata.uid() != 0 || mode & 0o1000 == 0 || mode & 0o002 == 0 {
+        bail!(
+            "refusing private worker runtime root {}: expected a root-owned sticky world-writable directory",
+            root.display()
+        );
+    }
+    Ok(root)
+}
+
+#[cfg(unix)]
+fn validate_existing_private_socket(socket: &Path) -> anyhow::Result<()> {
+    use std::io::ErrorKind;
+    use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
+
+    match std::fs::symlink_metadata(socket) {
+        Ok(metadata) => {
+            if !metadata.file_type().is_socket() {
+                bail!(
+                    "refusing to use non-socket private worker path {}",
+                    socket.display()
+                );
+            }
+            if metadata.uid() != current_user_id() {
+                bail!(
+                    "refusing private worker socket {} not owned by the current user",
+                    socket.display()
+                );
+            }
+            if metadata.permissions().mode() & 0o077 != 0 {
+                bail!(
+                    "refusing private worker socket {} with group or world permissions",
+                    socket.display()
+                );
+            }
+            Ok(())
+        }
+        Err(error) if error.kind() == ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error)
+            .with_context(|| format!("inspecting private worker socket {}", socket.display())),
+    }
+}
+
+#[cfg(unix)]
+fn prepare_private_socket_directory(socket: &Path, state_root: &Path) -> anyhow::Result<()> {
+    use std::io::ErrorKind;
+    use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
+
+    let expected = private_socket_path_for_state_root(state_root, current_user_id())?;
+    if socket != expected {
+        bail!(
+            "refusing private worker socket outside the state-root private namespace: {}",
+            socket.display()
+        );
+    }
+    let parent = socket
+        .parent()
+        .ok_or_else(|| anyhow!("private worker socket must have a parent"))?;
+    let runtime_parent = parent
+        .parent()
+        .ok_or_else(|| anyhow!("private worker socket directory must have a parent"))?;
+    let trusted_root = trusted_private_runtime_root()?;
+    let actual_runtime_parent = dunce::canonicalize(runtime_parent).with_context(|| {
+        format!(
+            "resolving private worker runtime parent {}",
+            runtime_parent.display()
+        )
+    })?;
+    if actual_runtime_parent != trusted_root {
+        bail!(
+            "refusing private worker runtime parent {} outside {}",
+            actual_runtime_parent.display(),
+            trusted_root.display()
+        );
+    }
+
+    let mut builder = std::fs::DirBuilder::new();
+    builder.mode(0o700);
+    match builder.create(parent) {
+        Ok(()) => {}
+        Err(error) if error.kind() == ErrorKind::AlreadyExists => {}
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!("creating private worker directory {}", parent.display())
+            });
+        }
+    }
+
+    let metadata = std::fs::symlink_metadata(parent)
+        .with_context(|| format!("inspecting private worker directory {}", parent.display()))?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        bail!(
+            "refusing private worker directory {} because it is not a real directory",
+            parent.display()
+        );
+    }
+    if metadata.uid() != current_user_id() {
+        bail!(
+            "refusing private worker directory {} not owned by the current user",
+            parent.display()
+        );
+    }
+    std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700))
+        .with_context(|| format!("protecting private worker directory {}", parent.display()))?;
+    let metadata = std::fs::symlink_metadata(parent)
+        .with_context(|| format!("rechecking private worker directory {}", parent.display()))?;
+    if metadata.file_type().is_symlink()
+        || !metadata.is_dir()
+        || metadata.uid() != current_user_id()
+        || metadata.permissions().mode() & 0o777 != 0o700
+    {
+        bail!(
+            "private worker directory {} could not be secured as owner-only",
+            parent.display()
+        );
+    }
+    validate_existing_private_socket(socket)
+}
+
+/// The private daemon endpoint in a short per-user, state-root, executable, and release namespace.
+pub fn default_private_socket_path() -> anyhow::Result<PathBuf> {
     #[cfg(windows)]
     {
         let user = std::env::var("USERNAME").unwrap_or_else(|_| "user".to_owned());
-        return PathBuf::from(format!(r"\\.\pipe\groky-ssh-worker-{user}"));
+        return Ok(PathBuf::from(format!(r"\\.\pipe\groky-ssh-worker-{user}")));
     }
-    #[cfg(not(windows))]
+    #[cfg(unix)]
     {
-        crate::handle::resolve_workspace_home()
+        let state_root = crate::handle::resolve_workspace_home();
+        return private_socket_path_for_state_root(&state_root, current_user_id());
+    }
+    #[cfg(all(not(unix), not(windows)))]
+    {
+        Ok(crate::handle::resolve_workspace_home()
             .join("ssh-worker")
-            .join("worker.sock")
+            .join("worker.sock"))
     }
 }
 
@@ -2797,11 +3140,14 @@ pub async fn run_stdio() -> anyhow::Result<()> {
     use std::process::Stdio;
     use tokio::net::UnixStream;
 
-    let socket = default_private_socket_path();
+    let state_root = crate::handle::resolve_workspace_home();
+    let socket = private_socket_path_for_state_root(&state_root, current_user_id())?;
+    prepare_private_socket_directory(&socket, &state_root)?;
     let stream = match UnixStream::connect(&socket).await {
         Ok(stream) => stream,
         Err(_) => {
-            let executable = std::env::current_exe().context("resolving worker executable")?;
+            let startup_error = startup_error_file(&socket)?;
+            let executable = worker_executable_identity()?;
             let mut child = tokio::process::Command::new(executable);
             // The worker must retain task/session state after this SSH stdio
             // bridge exits. A separate session prevents the bridge's process
@@ -2818,80 +3164,150 @@ pub async fn run_stdio() -> anyhow::Result<()> {
                     });
                 }
             }
-            child
+            let mut child = child
                 .arg("worker")
                 .arg("--daemon")
                 .arg("--socket")
                 .arg(&socket)
                 .stdin(Stdio::null())
                 .stdout(Stdio::null())
-                .stderr(Stdio::null())
+                .stderr(Stdio::from(
+                    startup_error
+                        .reopen()
+                        .context("opening private SSH worker startup diagnostic")?,
+                ))
                 .kill_on_drop(false)
                 .spawn()
                 .context("starting private SSH worker daemon")?;
             let mut connected = None;
-            for _ in 0..50 {
+            let mut last_connect_error = None;
+            for _ in 0..DAEMON_STARTUP_ATTEMPTS {
                 match UnixStream::connect(&socket).await {
                     Ok(stream) => {
                         connected = Some(stream);
                         break;
                     }
-                    Err(_) => tokio::time::sleep(Duration::from_millis(50)).await,
+                    Err(error) => {
+                        last_connect_error = Some(error);
+                        match child.try_wait() {
+                            Ok(Some(status)) => {
+                                bail!(
+                                    "private SSH worker daemon exited during startup ({status}): {}",
+                                    daemon_startup_error(&startup_error)
+                                );
+                            }
+                            Ok(None) => {}
+                            Err(error) => {
+                                let _ = child.start_kill();
+                                let _ = child.wait().await;
+                                return Err(error)
+                                    .context("checking private SSH worker daemon startup");
+                            }
+                        }
+                        tokio::time::sleep(DAEMON_STARTUP_RETRY).await;
+                    }
                 }
             }
-            connected.ok_or_else(|| anyhow!("private SSH worker daemon did not become ready"))?
+            if let Some(stream) = connected {
+                drop(startup_error);
+                stream
+            } else {
+                let _ = child.start_kill();
+                let status = child
+                    .wait()
+                    .await
+                    .context("waiting for private SSH worker daemon after startup timeout")?;
+                bail!(
+                    "private SSH worker daemon did not become ready after {} ms (last connect error: {}; exit: {status}): {}",
+                    DAEMON_STARTUP_ATTEMPTS as u64 * DAEMON_STARTUP_RETRY.as_millis() as u64,
+                    last_connect_error
+                        .as_ref()
+                        .map(|error| error.to_string())
+                        .unwrap_or_else(|| "none".to_owned()),
+                    daemon_startup_error(&startup_error)
+                );
+            }
         }
     };
     let (mut reader, mut writer) = stream.into_split();
-    let to_worker = tokio::spawn(async move {
+    let mut to_worker = tokio::spawn(async move {
         let mut stdin = tokio::io::stdin();
         tokio::io::copy(&mut stdin, &mut writer).await
     });
     let mut stdout = tokio::io::stdout();
-    tokio::select! {
-        result = to_worker => {
-            result
-                .context("joining private SSH worker input bridge")?
-                .context("bridging private SSH worker input")?;
-        }
+    let bridge_result: anyhow::Result<()> = tokio::select! {
+        result = &mut to_worker => result
+            .context("joining private SSH worker input bridge")
+            .and_then(|result| result.context("bridging private SSH worker input"))
+            .map(|_| ()),
         result = tokio::io::copy(&mut reader, &mut stdout) => {
-            result.context("bridging private SSH worker output")?;
+            result.context("bridging private SSH worker output").map(|_| ())
         }
+    };
+    to_worker.abort();
+    bridge_result
+}
+#[cfg(unix)]
+fn silence_daemon_stderr() -> anyhow::Result<()> {
+    use std::os::unix::io::AsRawFd;
+
+    let null = std::fs::OpenOptions::new()
+        .write(true)
+        .open("/dev/null")
+        .context("opening /dev/null for the private SSH worker daemon")?;
+    // SAFETY: both file descriptors are valid for the duration of this call.
+    if unsafe { libc::dup2(null.as_raw_fd(), libc::STDERR_FILENO) } == -1 {
+        return Err(std::io::Error::last_os_error())
+            .context("redirecting private SSH worker daemon stderr to /dev/null");
     }
     Ok(())
 }
-
 /// Run the private user-only Unix-domain worker daemon. This never opens a TCP
 /// listener and refuses to replace an existing non-socket path.
 #[cfg(unix)]
 pub async fn run_private_daemon(socket: PathBuf) -> anyhow::Result<()> {
+    use std::io::ErrorKind;
     use std::os::unix::fs::{FileTypeExt, PermissionsExt};
     use tokio::net::UnixListener;
 
-    let parent = socket
-        .parent()
-        .ok_or_else(|| anyhow!("private worker socket must have a parent"))?;
-    std::fs::create_dir_all(parent)
-        .with_context(|| format!("creating private worker directory {}", parent.display()))?;
-    std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700))
-        .with_context(|| format!("protecting private worker directory {}", parent.display()))?;
-    if let Ok(metadata) = std::fs::symlink_metadata(&socket) {
-        if !metadata.file_type().is_socket() {
-            bail!(
-                "refusing to replace non-socket private worker path {}",
-                socket.display()
-            );
+    let state_root = crate::handle::resolve_workspace_home();
+    prepare_private_socket_directory(&socket, &state_root)?;
+    match std::fs::symlink_metadata(&socket) {
+        Ok(metadata) => {
+            if !metadata.file_type().is_socket() {
+                bail!(
+                    "refusing to replace non-socket private worker path {}",
+                    socket.display()
+                );
+            }
+            match tokio::net::UnixStream::connect(&socket).await {
+                Ok(_) => bail!("private SSH worker daemon is already running"),
+                Err(_) => std::fs::remove_file(&socket).with_context(|| {
+                    format!("removing stale private socket {}", socket.display())
+                })?,
+            }
         }
-        match tokio::net::UnixStream::connect(&socket).await {
-            Ok(_) => bail!("private SSH worker daemon is already running"),
-            Err(_) => std::fs::remove_file(&socket)
-                .with_context(|| format!("removing stale private socket {}", socket.display()))?,
+        Err(error) if error.kind() == ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("inspecting private worker socket {}", socket.display()));
         }
     }
     let listener = UnixListener::bind(&socket)
         .with_context(|| format!("binding private worker socket {}", socket.display()))?;
-    std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600))
-        .with_context(|| format!("protecting private worker socket {}", socket.display()))?;
+    if let Err(error) = std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600)) {
+        let _ = std::fs::remove_file(&socket);
+        return Err(error)
+            .with_context(|| format!("protecting private worker socket {}", socket.display()));
+    }
+    if let Err(error) = validate_existing_private_socket(&socket) {
+        let _ = std::fs::remove_file(&socket);
+        return Err(error);
+    }
+    if let Err(error) = silence_daemon_stderr() {
+        let _ = std::fs::remove_file(&socket);
+        return Err(error);
+    }
     let service = SshWorkerService::new();
     loop {
         let (stream, _) = listener
@@ -2904,7 +3320,6 @@ pub async fn run_private_daemon(socket: PathBuf) -> anyhow::Result<()> {
         });
     }
 }
-
 /// Start or use the current user's local named-pipe worker daemon, then bridge
 /// stdin/stdout. The pipe rejects remote clients and its default DACL is taken
 /// from the current user's process token.
@@ -2913,7 +3328,9 @@ pub async fn run_stdio() -> anyhow::Result<()> {
     use std::process::Stdio;
     use tokio::net::windows::named_pipe::ClientOptions;
 
-    let pipe = default_private_socket_path().to_string_lossy().into_owned();
+    let pipe = default_private_socket_path()?
+        .to_string_lossy()
+        .into_owned();
     let stream = match ClientOptions::new().open(&pipe) {
         Ok(stream) => stream,
         Err(_) => {
@@ -2951,22 +3368,22 @@ pub async fn run_stdio() -> anyhow::Result<()> {
         }
     };
     let (mut reader, mut writer) = tokio::io::split(stream);
-    let to_worker = tokio::spawn(async move {
+    let mut to_worker = tokio::spawn(async move {
         let mut stdin = tokio::io::stdin();
         tokio::io::copy(&mut stdin, &mut writer).await
     });
     let mut stdout = tokio::io::stdout();
-    tokio::select! {
-        result = to_worker => {
-            result
-                .context("joining private SSH worker input bridge")?
-                .context("bridging private SSH worker input")?;
-        }
+    let bridge_result: anyhow::Result<()> = tokio::select! {
+        result = &mut to_worker => result
+            .context("joining private SSH worker input bridge")
+            .and_then(|result| result.context("bridging private SSH worker input"))
+            .map(|_| ()),
         result = tokio::io::copy(&mut reader, &mut stdout) => {
-            result.context("bridging private SSH worker output")?;
+            result.context("bridging private SSH worker output").map(|_| ())
         }
-    }
-    Ok(())
+    };
+    to_worker.abort();
+    bridge_result
 }
 
 /// Run the current user's private named-pipe worker daemon. The pipe is local
@@ -3009,6 +3426,136 @@ pub async fn run_private_daemon(_socket: PathBuf) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn private_worker_socket_path_is_short_and_isolates_state_roots_and_users() {
+        use std::os::unix::ffi::OsStrExt;
+
+        let long_root = PathBuf::from("/").join("state-root-".repeat(64));
+        let user = current_user_id();
+        let socket = private_socket_path_for_state_root(&long_root, user)
+            .expect("resolve private worker socket");
+        assert!(
+            socket.as_os_str().as_bytes().len() <= 100,
+            "portable Unix socket path must remain below macOS's 104-byte limit: {}",
+            socket.display()
+        );
+        assert_ne!(
+            socket,
+            private_socket_path_for_state_root(&long_root.with_extension("other"), user)
+                .expect("resolve distinct state-root socket"),
+            "distinct workspace state roots must not share a worker endpoint"
+        );
+        assert_ne!(
+            socket,
+            private_socket_path_for_state_root(&long_root, user.saturating_add(1))
+                .expect("resolve distinct user socket"),
+            "distinct users must not share a worker endpoint"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn different_installed_worker_paths_do_not_reuse_a_daemon() {
+        let fixture = tempfile::tempdir().expect("create installed-worker fixture");
+        let state_root = fixture.path().join("workspace-state");
+        let first_path = fixture.path().join("workers/1.2.3/groky");
+        let second_path = fixture.path().join("workers/1.2.3-rebuilt/groky");
+        std::fs::create_dir_all(first_path.parent().expect("first worker parent"))
+            .expect("create first worker directory");
+        std::fs::create_dir_all(second_path.parent().expect("second worker parent"))
+            .expect("create second worker directory");
+        std::fs::write(&first_path, "first installed worker").expect("write first worker");
+        std::fs::write(&second_path, "second installed worker").expect("write second worker");
+        let first_path = dunce::canonicalize(&first_path).expect("canonicalize first worker");
+        let second_path = dunce::canonicalize(&second_path).expect("canonicalize second worker");
+
+        let first_socket = private_socket_path_for_worker(
+            &state_root,
+            current_user_id(),
+            &first_path,
+            Some("1.2.3"),
+        );
+        assert_ne!(
+            first_socket,
+            private_socket_path_for_worker(
+                &state_root,
+                current_user_id(),
+                &second_path,
+                Some("1.2.3"),
+            ),
+            "separate installed worker paths must not reuse an existing daemon"
+        );
+        assert_ne!(
+            first_socket,
+            private_socket_path_for_worker(
+                &state_root,
+                current_user_id(),
+                &first_path,
+                Some("1.2.4"),
+            ),
+            "a different worker release must not reuse an existing daemon"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn private_worker_namespace_is_stable_when_a_missing_state_root_is_created() {
+        let fixture = tempfile::tempdir().expect("create state-root fixture");
+        let real_parent = fixture.path().join("real-parent");
+        std::fs::create_dir(&real_parent).expect("create symlink target");
+        let aliased_parent = fixture.path().join("aliased-parent");
+        std::os::unix::fs::symlink(&real_parent, &aliased_parent)
+            .expect("create state-root parent symlink");
+        let state_root = aliased_parent.join("missing").join("workspace");
+
+        let before_identity = worker_state_root_identity(&state_root);
+        let before_socket = private_socket_path_for_state_root(&state_root, current_user_id())
+            .expect("resolve private worker socket");
+        std::fs::create_dir_all(&state_root).expect("create missing state root");
+        assert_eq!(
+            worker_state_root_identity(&state_root),
+            before_identity,
+            "creating a state root under a symlink must not change its namespace identity"
+        );
+        assert_eq!(
+            private_socket_path_for_state_root(&state_root, current_user_id())
+                .expect("resolve private worker socket after creation"),
+            before_socket,
+            "the daemon endpoint must survive first creation of its state root"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn private_worker_socket_directory_is_owner_only_and_rejects_symlinks() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        let state_root = tempfile::tempdir().expect("create state root");
+        let socket = private_socket_path_for_state_root(state_root.path(), current_user_id())
+            .expect("resolve private worker socket");
+        let parent = socket.parent().expect("socket has parent").to_path_buf();
+        prepare_private_socket_directory(&socket, state_root.path())
+            .expect("create an owner-only private worker directory");
+        let metadata =
+            std::fs::symlink_metadata(&parent).expect("inspect private worker directory");
+        assert!(metadata.is_dir());
+        assert_eq!(metadata.uid(), current_user_id());
+        assert_eq!(metadata.permissions().mode() & 0o777, 0o700);
+
+        std::fs::remove_dir(&parent).expect("remove private worker directory");
+        let target = tempfile::tempdir().expect("create symlink target");
+        std::os::unix::fs::symlink(target.path(), &parent)
+            .expect("plant a symlink where the private directory would be");
+        let error = prepare_private_socket_directory(&socket, state_root.path())
+            .expect_err("a private worker directory symlink must be rejected");
+        assert!(
+            error.to_string().contains("not a real directory"),
+            "unexpected error: {error}"
+        );
+        std::fs::remove_file(&parent).expect("remove planted private directory symlink");
+    }
 
     #[test]
     fn path_guard_rejects_escape_through_parent() {
@@ -3186,6 +3733,46 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn normal_release_mismatch_is_rejected_before_workspace_bootstrap() {
+        let service = SshWorkerService::new();
+        let (mut client, worker) = tokio::io::duplex(4096);
+        let server = tokio::spawn(serve_stream(Arc::clone(&service), worker));
+        let expected_product_version = match local_worker_product_version() {
+            Some(version) => Some(format!("{version}-mismatch")),
+            None => Some("test-release".into()),
+        };
+        write_frame(
+            &mut client,
+            &SshWireFrame::ClientHello(xai_grok_workspace_types::ssh_wire::SshClientHello {
+                protocol_version: SSH_WIRE_PROTOCOL_VERSION,
+                expected_product_version,
+                client_id: "release-mismatch-client".into(),
+                binding: test_binding(),
+                resume_token: None,
+                revocation_only: false,
+            }),
+        )
+        .await
+        .expect("write release-mismatch hello");
+        let response = read_frame(&mut client)
+            .await
+            .expect("read release-mismatch response")
+            .expect("release-mismatch response frame");
+        assert!(matches!(
+            response,
+            SshWireFrame::HandshakeError(error) if error.code == "product_version_mismatch"
+        ));
+        assert!(
+            service.workspaces.lock().await.is_empty(),
+            "mismatched releases must fail before workspace bootstrap"
+        );
+        server
+            .await
+            .expect("worker task")
+            .expect("worker exits after mismatch");
+    }
+
+    #[tokio::test]
     async fn read_binding_creates_provider_free_workspace_session() {
         use xai_grok_workspace_client::ssh::{BoxSshStream, DenySshApprovals, SshWorkspaceClient};
 
@@ -3327,16 +3914,25 @@ mod tests {
         let toolset = xai_grok_tools::registry::types::FinalizedToolset::empty_for_test();
         workspace.prepare_skill_discovery(&toolset).await.unwrap();
         let mut resources = toolset.resources.lock().await;
-        let catalog = resources.get::<xai_grok_tools::types::resources::AvailableSkills>().unwrap();
+        let catalog = resources
+            .get::<xai_grok_tools::types::resources::AvailableSkills>()
+            .unwrap();
         assert!(catalog.0.iter().any(|skill| skill.name == "inside"));
-        let escaped = xai_grok_tools::implementations::skills::discovery::parse_skill_files(vec![(
-            escaped_skill,
-            xai_grok_tools::implementations::skills::types::SkillScope::Local,
-        )]);
+        let escaped =
+            xai_grok_tools::implementations::skills::discovery::parse_skill_files(vec![(
+                escaped_skill,
+                xai_grok_tools::implementations::skills::types::SkillScope::Local,
+            )]);
         let manager = resources
-            .get_mut::<xai_grok_tools::types::skill_discovery_tracker::SkillManager>().unwrap();
+            .get_mut::<xai_grok_tools::types::skill_discovery_tracker::SkillManager>()
+            .unwrap();
         assert!(!manager.add_discovered(escaped));
-        assert!(!manager.slash_skills().iter().any(|skill| skill.name == "outside"));
+        assert!(
+            !manager
+                .slash_skills()
+                .iter()
+                .any(|skill| skill.name == "outside")
+        );
         drop(resources);
 
         std::os::unix::fs::symlink(&secret, workspace.root.join(".grok/config.toml"))
@@ -3362,14 +3958,25 @@ mod tests {
             let tree = repo.find_tree(index.write_tree().unwrap()).unwrap();
             let parent = commits.last().map(|oid| repo.find_commit(*oid).unwrap());
             let parents = parent.iter().collect::<Vec<_>>();
-            commits.push(repo.commit(
-                Some("HEAD"), &signature, &signature, content, &tree, &parents,
-            ).unwrap());
+            commits.push(
+                repo.commit(
+                    Some("HEAD"),
+                    &signature,
+                    &signature,
+                    content,
+                    &tree,
+                    &parents,
+                )
+                .unwrap(),
+            );
         }
         std::fs::write(root.join("tracked.txt"), "uncommitted tracked\n").unwrap();
         std::fs::write(root.join("untracked.txt"), "uncommitted untracked\n").unwrap();
         let service = SshWorkerService::new();
-        let workspace = service.workspace_for_root(root.clone(), false).await.unwrap();
+        let workspace = service
+            .workspace_for_root(root.clone(), false)
+            .await
+            .unwrap();
         let outcome: crate::session::git::CheckoutSessionOutcome = serde_json::from_value(
             workspace.rpc.dispatch(
                 "workspace.checkout_session_commit",
@@ -3379,21 +3986,47 @@ mod tests {
         ).unwrap();
         assert!(outcome.checked_out);
         assert_eq!(repo.head().unwrap().target(), Some(commits[0]));
-        assert_eq!(std::fs::read_to_string(root.join("tracked.txt")).unwrap(), "saved head\n");
+        assert_eq!(
+            std::fs::read_to_string(root.join("tracked.txt")).unwrap(),
+            "saved head\n"
+        );
         assert!(!root.join("untracked.txt").exists());
-        let stash = repo.find_commit(
-            git2::Oid::from_str(outcome.stash_ref.as_deref().expect("dirty state stashed")).unwrap(),
-        ).unwrap();
-        let tracked = stash.tree().unwrap().get_path(Path::new("tracked.txt")).unwrap().id();
-        assert_eq!(repo.find_blob(tracked).unwrap().content(), b"uncommitted tracked\n");
-        let untracked = stash.parent(2).unwrap().tree().unwrap()
-            .get_path(Path::new("untracked.txt")).unwrap().id();
-        assert_eq!(repo.find_blob(untracked).unwrap().content(), b"uncommitted untracked\n");
-        let invalid = workspace.rpc.dispatch(
-            "workspace.checkout_session_commit",
-            serde_json::json!({"target_sha": "--force", "session_id": "restore-session"}),
-            Some("restore-session"),
-        ).await;
+        let stash = repo
+            .find_commit(
+                git2::Oid::from_str(outcome.stash_ref.as_deref().expect("dirty state stashed"))
+                    .unwrap(),
+            )
+            .unwrap();
+        let tracked = stash
+            .tree()
+            .unwrap()
+            .get_path(Path::new("tracked.txt"))
+            .unwrap()
+            .id();
+        assert_eq!(
+            repo.find_blob(tracked).unwrap().content(),
+            b"uncommitted tracked\n"
+        );
+        let untracked = stash
+            .parent(2)
+            .unwrap()
+            .tree()
+            .unwrap()
+            .get_path(Path::new("untracked.txt"))
+            .unwrap()
+            .id();
+        assert_eq!(
+            repo.find_blob(untracked).unwrap().content(),
+            b"uncommitted untracked\n"
+        );
+        let invalid = workspace
+            .rpc
+            .dispatch(
+                "workspace.checkout_session_commit",
+                serde_json::json!({"target_sha": "--force", "session_id": "restore-session"}),
+                Some("restore-session"),
+            )
+            .await;
         assert!(invalid.is_err());
         assert_eq!(repo.head().unwrap().target(), Some(commits[0]));
     }
@@ -3570,8 +4203,10 @@ mod tests {
                     "type": "command",
                     "command": "cat > .grok/stop-envelope.json; pwd > .grok/stop.cwd"
                 }]}]
-            }}).to_string(),
-        ).expect("write lifecycle hooks");
+            }})
+            .to_string(),
+        )
+        .expect("write lifecycle hooks");
         let mut binding = test_binding();
         binding.root = root.to_string_lossy().into_owned();
         binding.cwd = binding.root.clone();
@@ -3579,8 +4214,12 @@ mod tests {
         let (client_stream, worker_stream) = tokio::io::duplex(64 * 1024);
         let server = tokio::spawn(serve_stream(service, worker_stream));
         let client = SshWorkspaceClient::connect(
-            Box::pin(client_stream), binding.clone(), Arc::new(Approve),
-        ).await.expect("connect worker");
+            Box::pin(client_stream),
+            binding.clone(),
+            Arc::new(Approve),
+        )
+        .await
+        .expect("connect worker");
         let ops = crate::WorkspaceOps::ssh(client);
         let mut envelope = HookEventEnvelope {
             hook_event_name: HookEventName::UserPromptSubmit,
@@ -3588,7 +4227,13 @@ mod tests {
             cwd: local.path().to_string_lossy().into_owned(),
             workspace_root: "ssh-v1-local-storage-identity".into(),
             timestamp: chrono::Utc::now().to_rfc3339(),
-            transcript_path: Some(local.path().join("transcript.jsonl").to_string_lossy().into_owned()),
+            transcript_path: Some(
+                local
+                    .path()
+                    .join("transcript.jsonl")
+                    .to_string_lossy()
+                    .into_owned(),
+            ),
             client_identifier: None,
             prompt_id: Some("prompt".into()),
             permission_mode: Some("default".into()),
@@ -3597,7 +4242,9 @@ mod tests {
                 subagent_type: None,
             },
         };
-        ops.dispatch_remote_prompt_hook(&envelope).await.expect("prompt hook after transcript creation");
+        ops.dispatch_remote_prompt_hook(&envelope)
+            .await
+            .expect("prompt hook after transcript creation");
         envelope.hook_event_name = HookEventName::Stop;
         envelope.payload = xai_grok_hooks::event::HookPayload::Stop {
             reason: "end_turn".into(),
@@ -3606,21 +4253,33 @@ mod tests {
             background_tasks: None,
             session_crons: None,
         };
-        assert!(ops.dispatch_remote_stop_hook(&envelope).await.expect("stop hook").is_none());
+        assert!(
+            ops.dispatch_remote_stop_hook(&envelope)
+                .await
+                .expect("stop hook")
+                .is_none()
+        );
         for event in ["prompt", "stop"] {
             let observed: serde_json::Value = serde_json::from_slice(
-                &std::fs::read(root.join(format!(".grok/{event}-envelope.json"))).expect("hook stdin"),
-            ).expect("hook envelope");
+                &std::fs::read(root.join(format!(".grok/{event}-envelope.json")))
+                    .expect("hook stdin"),
+            )
+            .expect("hook envelope");
             assert_eq!(observed["cwd"], binding.cwd);
             assert_eq!(observed["workspaceRoot"], binding.root);
             assert!(observed.get("transcriptPath").is_none());
             assert!(observed.get("transcript_path").is_none());
             assert_eq!(
-                std::fs::read_to_string(root.join(format!(".grok/{event}.cwd"))).expect("hook cwd").trim(),
+                std::fs::read_to_string(root.join(format!(".grok/{event}.cwd")))
+                    .expect("hook cwd")
+                    .trim(),
                 binding.root,
             );
         }
-        assert!(envelope.transcript_path.is_some(), "client hooks keep their local transcript");
+        assert!(
+            envelope.transcript_path.is_some(),
+            "client hooks keep their local transcript"
+        );
         drop(ops);
         server.abort();
     }

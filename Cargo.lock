@@ -15350,6 +15350,7 @@ dependencies = [
  "xai-grok-update",
  "xai-grok-version",
  "xai-grok-workspace",
+ "xai-grok-workspace-types",
  "xai-tty-utils",
  "zstd",
 ]

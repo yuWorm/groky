@@ -325,23 +325,22 @@ impl MvpAgent {
         let service = self.session_ssh.as_ref().ok_or_else(|| {
             acp::Error::invalid_params().data("SSH projects require a host-owned SSH service")
         })?;
-        let binding_id = match metadata_binding_id {
-            Some(binding_id) => binding_id,
-            None => service
-                .snapshot_session(session_id.0.as_ref())
-                .await
-                .default_binding_id
-                .ok_or_else(|| {
-                    acp::Error::invalid_params()
-                        .data("SSH project session has no persisted default binding")
-                })?,
-        };
         let xai_grok_workspace_types::ssh::ProjectLocation::Ssh { target_id, root } =
             project_location
         else {
             return Err(acp::Error::invalid_params().data(
                 "SSH project metadata must name an SSH location",
             ));
+        };
+        let binding_id = match metadata_binding_id {
+            Some(binding_id) => binding_id,
+            None => resumed_ssh_project_binding(
+                &service.snapshot_session(session_id.0.as_ref()).await,
+                target_id,
+                root,
+            )
+            .map(str::to_owned)
+            .map_err(|error| acp::Error::invalid_params().data(error))?,
         };
         let granted = service
             .bind_project(session_id.0.as_ref(), &binding_id)
@@ -387,6 +386,82 @@ impl MvpAgent {
         })
     }
 }
+/// Project authority is independent of the explicit-tool default. Older sessions opened from
+/// a non-default grant have no default at all; recover only their unique, already-used binding.
+fn resumed_ssh_project_binding<'a>(
+    state: &'a crate::ssh::PersistedSshState,
+    target_id: &str,
+    root: &str,
+) -> Result<&'a str, &'static str> {
+    let matches_project = |grant: &&crate::ssh::PersistedSshGrant| {
+        !grant.binding.revoked
+            && grant.binding.target_id == target_id
+            && grant.binding.root == root
+    };
+    if let Some(default) = state.default_binding_id.as_deref()
+        && let Some(grant) = state.grants.iter().filter(matches_project)
+            .find(|grant| grant.binding.id == default)
+    {
+        return Ok(&grant.binding.id);
+    }
+    let mut candidates = state.grants.iter().filter(matches_project)
+        .filter(|grant| grant.worker_bound);
+    let grant = candidates.next().ok_or(
+        "SSH project has no active persisted project grant; authorize its root in /ssh before reopening it",
+    )?;
+    if candidates.next().is_some() {
+        return Err("SSH project has multiple matching grants; select its grant with /ssh use before resuming");
+    }
+    Ok(&grant.binding.id)
+}
+
+#[cfg(test)]
+mod ssh_resume_binding_tests {
+    use super::resumed_ssh_project_binding;
+    use crate::ssh::{PersistedSshGrant, PersistedSshState};
+
+    fn grant(id: &str, target: &str, root: &str) -> PersistedSshGrant {
+        serde_json::from_value(serde_json::json!({
+            "binding": {
+                "id": id, "session_id": "session", "target_id": target,
+                "identity": { "hostname": "host", "port": 22, "username": "user", "fingerprint": "SHA256:test" },
+                "root": root, "cwd": root,
+                "capabilities": { "read": true, "write": false, "execute": false },
+                "epoch": 1, "revoked": false
+            },
+            "worker_bound": true
+        })).unwrap()
+    }
+
+    #[test]
+    fn ssh_resume_recovers_project_grant_without_reassigning_tool_default() {
+        let mut state = PersistedSshState {
+            grants: vec![grant("project", "host", "/project"), grant("tools", "other", "/tools")],
+            ..Default::default()
+        };
+        assert_eq!(resumed_ssh_project_binding(&state, "host", "/project"), Ok("project"));
+        state.default_binding_id = Some("tools".into());
+        assert_eq!(resumed_ssh_project_binding(&state, "host", "/project"), Ok("project"));
+        assert_eq!(state.default_binding_id.as_deref(), Some("tools"));
+        state.grants.first_mut().unwrap().binding.revoked = true;
+        assert!(resumed_ssh_project_binding(&state, "host", "/project").is_err());
+    }
+
+    #[test]
+    fn ssh_resume_refuses_ambiguous_or_unused_project_authority() {
+        let mut state = PersistedSshState {
+            grants: vec![grant("first", "host", "/project"), grant("second", "host", "/project")],
+            ..Default::default()
+        };
+        assert!(resumed_ssh_project_binding(&state, "host", "/project").is_err());
+        state.default_binding_id = Some("second".into());
+        assert_eq!(resumed_ssh_project_binding(&state, "host", "/project"), Ok("second"));
+        state.default_binding_id = None;
+        state.grants.iter_mut().for_each(|grant| grant.worker_bound = false);
+        assert!(resumed_ssh_project_binding(&state, "host", "/project").is_err());
+    }
+}
+
 /// A blocking step in `new_session_inner`, recorded on entry so a timeout can name the stuck step.
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, strum::IntoStaticStr, strum::EnumMessage, strum::EnumString,

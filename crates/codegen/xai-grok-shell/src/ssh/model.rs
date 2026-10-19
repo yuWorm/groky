@@ -85,6 +85,10 @@ pub struct PersistedSshGrant {
     /// grants were always worker-backed and must still revoke remotely.
     #[serde(default = "legacy_worker_bound")]
     pub worker_bound: bool,
+    /// Managed worker executables that received this grant, retained for cross-version revocation.
+    /// Custom argv may contain secrets and remains only in the local target configuration.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub worker_commands: Vec<Vec<String>>,
 }
 
 fn legacy_worker_bound() -> bool {
@@ -199,6 +203,8 @@ pub enum SshEvent {
     Authentication(SshAuthPrompt),
     Worker(SshSessionWorkerEvent),
     OperationApproval(SshOperationApproval),
+    WorkerInstallRequested(SshWorkerInstallRequest),
+    WorkerInstallProgress(SshWorkerInstallProgress),
     TargetStatus(SshTargetStatus),
 }
 
@@ -221,6 +227,40 @@ pub struct SshOperationApprovalDecision {
     pub client_id: u64,
     pub approval_id: String,
     pub approved: bool,
+}
+
+/// Local-only consent to download an exact worker build locally and upload it over SSH.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SshWorkerInstallRequest {
+    pub client_id: u64,
+    pub request_id: String,
+    pub session_id: String,
+    pub binding_id: String,
+    pub target_id: String,
+    pub version: String,
+    pub platform: String,
+    pub remote_error: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SshWorkerInstallDecision {
+    pub client_id: u64,
+    pub request_id: String,
+    pub session_id: String,
+    pub binding_id: String,
+    pub approved: bool,
+}
+
+/// Installation progress belongs only to the client and binding that opened the project.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SshWorkerInstallProgress {
+    pub client_id: u64,
+    pub request_id: String,
+    pub session_id: String,
+    pub binding_id: String,
+    pub target_id: String,
+    /// None clears this request's progress without touching newer messages.
+    pub message: Option<String>,
 }
 
 /// A native SSH interaction translated into a local-client-only event. The

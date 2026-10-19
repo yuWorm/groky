@@ -9,10 +9,12 @@ use crate::theme::Theme;
 use crate::views::modal_window::{
     self, ModalSizing, ModalWindowConfig, ModalWindowOutcome, ModalWindowState, Shortcut,
 };
-use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEvent};
+use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEvent, MouseEventKind};
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
+use std::sync::atomic::{AtomicU64, Ordering};
+use xai_grok_shell::ssh::SshConnectionState;
 use zeroize::Zeroizing;
 
 /// A configured target as displayed by the pager. This is a view model rather than a credential
@@ -153,6 +155,47 @@ impl SshGrantLifetime {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SshGrantFocus {
+    Root,
+    Read,
+    Write,
+    Execute,
+    Lifetime,
+    Default,
+}
+
+impl SshGrantFocus {
+    const ALL: [Self; 6] = [
+        Self::Root,
+        Self::Read,
+        Self::Write,
+        Self::Execute,
+        Self::Lifetime,
+        Self::Default,
+    ];
+
+    fn next(self, backwards: bool) -> Self {
+        let index = Self::ALL
+            .iter()
+            .position(|focus| *focus == self)
+            .unwrap_or(0);
+        let len = Self::ALL.len();
+        let next = if backwards {
+            (index + len - 1) % len
+        } else {
+            (index + 1) % len
+        };
+        Self::ALL[next]
+    }
+}
+
+#[derive(Clone)]
+struct GrantControlHit {
+    focus: SshGrantFocus,
+    rect: Rect,
+}
+
 /// Human consent card for a pending model or user SSH access request.
 pub struct SshGrantCard {
     pub request_id: String,
@@ -167,6 +210,13 @@ pub struct SshGrantCard {
     pub set_default: bool,
     pub agent_requested: bool,
     pub error: Option<String>,
+    focus: SshGrantFocus,
+    scroll_offset: usize,
+    max_scroll_offset: usize,
+    page_size: usize,
+    reviewed_to_end: bool,
+    control_hits: Vec<GrantControlHit>,
+    follow_up: Option<String>,
 }
 
 impl SshGrantCard {
@@ -193,6 +243,13 @@ impl SshGrantCard {
             set_default: false,
             agent_requested,
             error: None,
+            focus: SshGrantFocus::Root,
+            scroll_offset: 0,
+            max_scroll_offset: 0,
+            page_size: 1,
+            reviewed_to_end: false,
+            control_hits: Vec::new(),
+            follow_up: None,
         }
     }
 }
@@ -577,14 +634,14 @@ impl ManualTargetField {
         Self::WorkerCommand,
     ];
 
-    fn label(self) -> &'static str {
+    fn input_label(self) -> &'static str {
         match self {
-            Self::Host => "Host / alias",
-            Self::Label => "Label",
-            Self::User => "User override",
-            Self::Port => "Port override",
-            Self::IdentityFile => "Identity file",
-            Self::WorkerCommand => "Worker command",
+            Self::Host => "Host / alias: ",
+            Self::Label => "Label: ",
+            Self::User => "User override: ",
+            Self::Port => "Port override: ",
+            Self::IdentityFile => "Identity file: ",
+            Self::WorkerCommand => "Worker command: ",
         }
     }
 
@@ -612,6 +669,9 @@ struct SshManualTargetForm {
     worker_command: LineEditor,
     active: ManualTargetField,
     error: Option<String>,
+    field_hits: Vec<(ManualTargetField, Rect)>,
+    submitting: bool,
+    submission_id: Option<u64>,
 }
 
 impl Default for SshManualTargetForm {
@@ -625,6 +685,9 @@ impl Default for SshManualTargetForm {
             worker_command: LineEditor::default(),
             active: ManualTargetField::Host,
             error: None,
+            field_hits: Vec::new(),
+            submitting: false,
+            submission_id: None,
         }
     }
 }
@@ -659,10 +722,15 @@ impl SshManualTargetForm {
         }
         let port = match self.port.text().trim() {
             "" => None,
-            raw => Some(
-                raw.parse::<u16>()
-                    .map_err(|_| "Port must be an integer between 1 and 65535.")?,
-            ),
+            raw => {
+                let port = raw
+                    .parse::<u16>()
+                    .map_err(|_| "Port must be an integer between 1 and 65535.")?;
+                if port == 0 {
+                    return Err("Port must be an integer between 1 and 65535.".into());
+                }
+                Some(port)
+            }
         };
         let optional = |value: &str| {
             let trimmed = value.trim();
@@ -676,6 +744,15 @@ impl SshManualTargetForm {
             identity_file: optional(self.identity_file.text()),
             worker_command: optional(self.worker_command.text()),
         })
+    }
+
+    fn start_submit(&mut self) -> Result<(SshManualTargetDraft, u64), String> {
+        let draft = self.draft()?;
+        let submission_id = next_nonzero_id(&NEXT_TARGET_ADD_SUBMISSION_ID);
+        self.submitting = true;
+        self.submission_id = Some(submission_id);
+        self.error = None;
+        Ok((draft, submission_id))
     }
 }
 
@@ -723,6 +800,65 @@ impl SshOperationApprovalCard {
     }
 }
 
+/// Local-only fallback after the remote host cannot download the exact managed worker build.
+///
+/// The request tuple is retained verbatim so input, local control, progress, and terminal
+/// project setup cannot accidentally cross sessions or bindings.
+struct SshWorkerInstallFallbackCard {
+    client_id: u64,
+    request_id: String,
+    session_id: String,
+    binding_id: String,
+    target_id: String,
+    version: String,
+    platform: String,
+    remote_error: String,
+    scroll_offset: usize,
+    max_scroll_offset: usize,
+    submitting: bool,
+    decision_accepted: Option<bool>,
+    progress: Option<String>,
+    error: Option<String>,
+}
+
+impl SshWorkerInstallFallbackCard {
+    fn new(request: xai_grok_shell::ssh::SshWorkerInstallRequest) -> Self {
+        Self {
+            client_id: request.client_id,
+            request_id: request.request_id,
+            session_id: request.session_id,
+            binding_id: request.binding_id,
+            target_id: request.target_id,
+            version: request.version,
+            platform: request.platform,
+            remote_error: request.remote_error,
+            scroll_offset: 0,
+            max_scroll_offset: 0,
+            submitting: false,
+            decision_accepted: None,
+            progress: None,
+            error: None,
+        }
+    }
+
+    fn matches(
+        &self,
+        client_id: u64,
+        request_id: &str,
+        session_id: &str,
+        binding_id: &str,
+    ) -> bool {
+        self.client_id == client_id
+            && self.request_id == request_id
+            && self.session_id == session_id
+            && self.binding_id == binding_id
+    }
+
+    fn is_decided(&self) -> bool {
+        self.decision_accepted.is_some()
+    }
+}
+
 /// Whether an operation approval interrupted chat or was opened from the SSH manager.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SshOperationApprovalOrigin {
@@ -738,6 +874,8 @@ struct SshDiagnosticCard {
     message: String,
     scroll_offset: usize,
     max_scroll_offset: usize,
+    return_grant: Option<SshGrantCard>,
+    return_add: Option<SshManualTargetForm>,
 }
 
 impl SshDiagnosticCard {
@@ -746,6 +884,8 @@ impl SshDiagnosticCard {
             message,
             scroll_offset: 0,
             max_scroll_offset: 0,
+            return_grant: None,
+            return_add: None,
         }
     }
 }
@@ -762,8 +902,28 @@ enum SshModalPage {
     Add(SshManualTargetForm),
     Grant(SshGrantCard),
     OperationApproval(SshOperationApprovalCard),
+    WorkerInstallFallback(SshWorkerInstallFallbackCard),
     Authentication(SshAuthCard),
     Diagnostic(SshDiagnosticCard),
+}
+
+#[derive(Clone)]
+struct ManagerRowHit {
+    target_id: String,
+    binding_id: Option<String>,
+    rect: Rect,
+}
+
+static NEXT_MANAGER_INSTANCE_ID: AtomicU64 = AtomicU64::new(1);
+static NEXT_TARGET_ADD_SUBMISSION_ID: AtomicU64 = AtomicU64::new(1);
+
+fn next_nonzero_id(counter: &AtomicU64) -> u64 {
+    loop {
+        let id = counter.fetch_add(1, Ordering::Relaxed);
+        if id != 0 {
+            return id;
+        }
+    }
 }
 
 /// Manager state usable from Welcome and from a running session.
@@ -774,6 +934,14 @@ pub struct SshManagerState {
     pub selected: usize,
     pub loading: bool,
     pub message: Option<(String, bool)>,
+    instance_id: u64,
+    manager_scroll_offset: usize,
+    manager_visible_rows: usize,
+    manager_row_hits: Vec<ManagerRowHit>,
+    pending_added_target_id: Option<String>,
+    project_open_pending: bool,
+    /// Target owning the current connect/disconnect progress message.
+    pending_connection: Option<String>,
     /// Immutable request tuple retained through the displayed consent card so resolution can
     /// be correlated with the original target/root rather than editable card state.
     pending_grant: Option<SshIncomingGrant>,
@@ -801,6 +969,13 @@ impl SshManagerState {
             selected: 0,
             loading: true,
             message: None,
+            instance_id: next_nonzero_id(&NEXT_MANAGER_INSTANCE_ID),
+            manager_scroll_offset: 0,
+            manager_visible_rows: 0,
+            manager_row_hits: Vec::new(),
+            pending_added_target_id: None,
+            project_open_pending: false,
+            pending_connection: None,
             pending_grant: None,
             submitted_grant: None,
             pending_grant_session_id: None,
@@ -808,6 +983,99 @@ impl SshManagerState {
             session_id,
             operation_approval_origin: None,
             submitted_operation_approval: None,
+        }
+    }
+
+    /// Globally unique identity for matching asynchronous local-control completions to this
+    /// concrete manager instance after an overlay is closed and re-opened.
+    pub fn instance_id(&self) -> u64 {
+        self.instance_id
+    }
+
+    /// The exact add-target submission currently displayed by the form.
+    pub fn target_add_submission_id(&self) -> Option<u64> {
+        match &self.page {
+            SshModalPage::Add(form) if form.submitting => form.submission_id,
+            SshModalPage::Manager
+            | SshModalPage::Add(_)
+            | SshModalPage::Grant(_)
+            | SshModalPage::OperationApproval(_)
+            | SshModalPage::WorkerInstallFallback(_)
+            | SshModalPage::Authentication(_)
+            | SshModalPage::Diagnostic(_) => None,
+        }
+    }
+
+    pub fn target_add_is_submitting(&self) -> bool {
+        self.target_add_submission_id().is_some()
+    }
+
+    /// Correlated variant for lifecycle dispatch. Prefer this when the task result carries the
+    /// submission ID echoed from [`SshModalOutcome::AddTarget`].
+    pub fn settle_target_add_for_submission(
+        &mut self,
+        submission_id: u64,
+        result: Result<String, String>,
+    ) -> bool {
+        if self.target_add_submission_id() != Some(submission_id) {
+            return false;
+        }
+        self.settle_target_add(result)
+    }
+
+    /// Settle the add form only while its exact submission remains visibly pending.
+    ///
+    /// Lifecycle dispatch correlates the task's client ID to [`Self::target_add_submission_id`]
+    /// before calling this method, so an old completion cannot settle a later form.
+    pub fn settle_target_add(&mut self, result: Result<String, String>) -> bool {
+        let saved_target_id = match result {
+            Ok(target_id) => target_id,
+            Err(error) => {
+                let SshModalPage::Add(form) = &mut self.page else {
+                    return false;
+                };
+                if !form.submitting {
+                    return false;
+                }
+                form.submitting = false;
+                form.submission_id = None;
+                self.show_error(error);
+                return true;
+            }
+        };
+        let SshModalPage::Add(form) = &self.page else {
+            return false;
+        };
+        if !form.submitting {
+            return false;
+        }
+        self.pending_added_target_id = Some(saved_target_id);
+        self.loading = true;
+        self.page = SshModalPage::Manager;
+        self.show_info("SSH target saved.");
+        true
+    }
+
+    /// Start one explicit project-open operation. Repeated keys or footer clicks do not create
+    /// concurrent sessions for the same selected binding.
+    pub fn begin_project_open(&mut self) -> bool {
+        if self.project_open_pending {
+            return false;
+        }
+        self.project_open_pending = true;
+        self.show_info("Preparing remote SSH project…");
+        true
+    }
+
+    /// Clear the visible project-open progress after its terminal session outcome arrives.
+    pub fn settle_project_open(&mut self) {
+        self.project_open_pending = false;
+        if matches!(&self.page, SshModalPage::WorkerInstallFallback(_)) {
+            self.page = SshModalPage::Manager;
+        }
+        if matches!(&self.message, Some((message, false)) if message == "Preparing remote SSH project…")
+        {
+            self.message = None;
         }
     }
 
@@ -840,16 +1108,6 @@ impl SshManagerState {
         request_matches
             .then(|| self.pending_grant_session_id.clone())
             .flatten()
-    }
-
-    /// Whether this manager owns a still-displayed grant for this exact pre-minted session.
-    ///
-    /// Worktree children receive their session ID before their optimistic pager agent has bound
-    /// it. Target-list completion must use this retained grant correlation rather than treating
-    /// that child ID as a normal active-agent session.
-    pub fn owns_pending_grant_session(&self, session_id: &str) -> bool {
-        self.pending_grant_session_id.as_deref() == Some(session_id)
-            && (self.pending_grant.is_some() || matches!(&self.page, SshModalPage::Grant(_)))
     }
 
     /// Record the exact tuple sent to the service for an approved displayed grant.
@@ -913,28 +1171,80 @@ impl SshManagerState {
     }
 
     pub fn set_targets(&mut self, mut targets: Vec<SshTargetView>) {
-        for target in &mut targets {
-            if matches!(&target.grant, SshGrantView::NotGranted)
-                && let Some((binding_id, worker_acknowledged)) = self
-                    .targets
+        let selected_key = self.selected_target().map(|target| {
+            (
+                target.target_id.clone(),
+                target.grant.binding_id().map(str::to_owned),
+            )
+        });
+
+        // A local revoke remains visible until the worker's acknowledgement has been observed.
+        // Preserve each binding independently: a target can have several rows and revoking one
+        // must not rewrite or hide its remaining grants.
+        for previous in self
+            .targets
+            .iter()
+            .filter(|target| matches!(&target.grant, SshGrantView::Revoking { .. }))
+        {
+            let binding_id = previous.grant.binding_id();
+            let exact_row = targets.iter_mut().find(|target| {
+                target.target_id == previous.target_id && target.grant.binding_id() == binding_id
+            });
+            if let Some(target) = exact_row {
+                target.grant = previous.grant.clone();
+            } else {
+                let only_ungranted_row = targets
                     .iter()
-                    .find(|previous| previous.target_id == target.target_id)
-                    .and_then(|previous| match &previous.grant {
-                        SshGrantView::Revoking {
-                            binding_id,
-                            worker_acknowledged,
-                        } => Some((binding_id.clone(), *worker_acknowledged)),
-                        SshGrantView::NotGranted | SshGrantView::Granted { .. } => None,
-                    })
-            {
-                target.grant = SshGrantView::Revoking {
-                    binding_id,
-                    worker_acknowledged,
-                };
+                    .filter(|target| target.target_id == previous.target_id)
+                    .all(|target| matches!(&target.grant, SshGrantView::NotGranted));
+                if only_ungranted_row {
+                    if let Some(target) = targets
+                        .iter_mut()
+                        .find(|target| target.target_id == previous.target_id)
+                    {
+                        target.grant = previous.grant.clone();
+                    }
+                } else if let Some(index) = targets
+                    .iter()
+                    .rposition(|target| target.target_id == previous.target_id)
+                {
+                    targets.insert(index + 1, previous.clone());
+                }
             }
         }
+
         self.targets = targets;
-        self.selected = self.selected.min(self.targets.len().saturating_sub(1));
+        let pending_added_target_id = self.pending_added_target_id.clone();
+        if let Some(target_id) = pending_added_target_id
+            && let Some(index) = self
+                .targets
+                .iter()
+                .position(|target| target.target_id == target_id)
+        {
+            self.selected = index;
+            self.pending_added_target_id = None;
+        } else if let Some((target_id, binding_id)) = selected_key {
+            self.selected = self
+                .targets
+                .iter()
+                .position(|target| {
+                    target.target_id == target_id
+                        && target.grant.binding_id() == binding_id.as_deref()
+                })
+                .or_else(|| {
+                    self.targets
+                        .iter()
+                        .position(|target| target.target_id == target_id)
+                })
+                .unwrap_or_else(|| self.selected.min(self.targets.len().saturating_sub(1)));
+        } else {
+            self.selected = self.selected.min(self.targets.len().saturating_sub(1));
+        }
+        self.manager_scroll_offset = self.manager_scroll_offset.min(
+            self.targets
+                .len()
+                .saturating_sub(self.manager_visible_rows.max(1)),
+        );
         self.loading = false;
         if matches!(
             &self.page,
@@ -1041,6 +1351,96 @@ impl SshManagerState {
         false
     }
 
+    /// Display the exact local-download/upload fallback for one managed worker installation.
+    ///
+    /// A duplicate event preserves the visible progress and a different request deliberately
+    /// replaces it: only the service's opaque request tuple decides which fallback is current.
+    pub fn show_worker_install_fallback(
+        &mut self,
+        request: xai_grok_shell::ssh::SshWorkerInstallRequest,
+    ) {
+        if matches!(
+            &self.page,
+            SshModalPage::WorkerInstallFallback(card)
+                if card.matches(
+                    request.client_id,
+                    &request.request_id,
+                    &request.session_id,
+                    &request.binding_id,
+                ) && card.target_id == request.target_id
+        ) {
+            return;
+        }
+        self.page = SshModalPage::WorkerInstallFallback(SshWorkerInstallFallbackCard::new(request));
+    }
+
+    /// Submit exactly the fallback decision visible on this manager.
+    pub fn submit_worker_install(
+        &mut self,
+        client_id: u64,
+        request_id: &str,
+        session_id: &str,
+        binding_id: &str,
+        approved: bool,
+    ) -> bool {
+        let SshModalPage::WorkerInstallFallback(card) = &mut self.page else {
+            return false;
+        };
+        if !card.matches(client_id, request_id, session_id, binding_id)
+            || card.submitting
+            || card.is_decided()
+        {
+            return false;
+        }
+        card.submitting = true;
+        card.error = None;
+        true
+    }
+
+    /// Apply one acknowledgement without erasing progress that arrived first.
+    pub fn settle_worker_install_decision(
+        &mut self,
+        client_id: u64,
+        request_id: &str,
+        session_id: &str,
+        binding_id: &str,
+        approved: bool,
+        error: Option<String>,
+    ) {
+        let SshModalPage::WorkerInstallFallback(card) = &mut self.page else {
+            return;
+        };
+        if !card.matches(client_id, request_id, session_id, binding_id) || !card.submitting {
+            return;
+        }
+        card.submitting = false;
+        if let Some(error) = error {
+            card.error = Some(error);
+            return;
+        }
+        card.decision_accepted = Some(approved);
+    }
+
+    /// Update or clear only the matching fallback's phase text.
+    pub fn apply_worker_install_progress(
+        &mut self,
+        client_id: u64,
+        request_id: &str,
+        session_id: &str,
+        binding_id: &str,
+        target_id: &str,
+        message: Option<String>,
+    ) {
+        let SshModalPage::WorkerInstallFallback(card) = &mut self.page else {
+            return;
+        };
+        if card.matches(client_id, request_id, session_id, binding_id)
+            && card.target_id == target_id
+        {
+            card.progress = message;
+        }
+    }
+
     /// Display a real agent access request only after the selected target's SSH identity was
     /// inspected. A target/root from the initial request is intent, not consent evidence.
     pub fn show_incoming_grant(&mut self, session_id: String, request: SshIncomingGrant) {
@@ -1097,36 +1497,63 @@ impl SshManagerState {
         self.page = SshModalPage::Grant(card);
     }
 
+    pub fn begin_connection_action(&mut self, target_id: &str, connect: bool) {
+        self.show_info(if connect {
+            "Connecting through the local SSH service…"
+        } else {
+            "Releasing the retained SSH connection…"
+        });
+        self.pending_connection = Some(target_id.to_owned());
+    }
+
     /// Apply an asynchronous local connection update without exposing transport state elsewhere.
     pub fn apply_target_status(
         &mut self,
         target_id: &str,
-        connected: bool,
+        connection: SshConnectionState,
         detail: Option<String>,
     ) {
-        if let Some(target) = self
+        let connected = connection == SshConnectionState::Connected;
+        let detail = detail.unwrap_or_else(|| {
+            match connection {
+                SshConnectionState::Disconnected => "Disconnected.",
+                SshConnectionState::Connecting => "Connecting through local SSH service…",
+                SshConnectionState::Connected => "Connected through local SSH service.",
+                SshConnectionState::AuthenticationRequired => "Local authentication is required.",
+                SshConnectionState::Failed => "Connection failed.",
+            }
+            .into()
+        });
+        for target in self
             .targets
             .iter_mut()
-            .find(|target| target.target_id == target_id)
+            .filter(|target| target.target_id == target_id)
         {
             target.connected = connected;
-            target.connection_detail = detail.unwrap_or_else(|| {
-                if connected {
-                    "Connected through local SSH service.".into()
-                } else {
-                    "Disconnected.".into()
-                }
-            });
+            target.connection_detail = detail.clone();
         }
         if connected
             && matches!(&self.page, SshModalPage::Authentication(card) if card.target_id == target_id)
         {
             self.page = SshModalPage::Manager;
         }
+        if self.pending_connection.as_deref() == Some(target_id) {
+            match connection {
+                SshConnectionState::Connected => self.show_info("SSH connection established."),
+                SshConnectionState::Disconnected => self.show_info("SSH connection released."),
+                SshConnectionState::Failed => self.show_error("SSH connection failed."),
+                SshConnectionState::Connecting | SshConnectionState::AuthenticationRequired => {}
+            }
+        }
     }
 
     /// Keep the distinction between local revocation and worker acknowledgement visible.
     pub fn mark_binding_revoked(&mut self, binding_id: &str, worker_acknowledged: bool) {
+        let revoked_target_id = self
+            .targets
+            .iter()
+            .find(|target| target.grant.binding_id() == Some(binding_id))
+            .map(|target| target.target_id.clone());
         let mut changed = false;
         for target in &mut self.targets {
             if target.grant.binding_id() == Some(binding_id) {
@@ -1137,15 +1564,39 @@ impl SshManagerState {
                 changed = true;
             }
         }
-        if changed && worker_acknowledged {
-            self.show_info("SSH access revocation confirmed by worker.");
+        let Some(target_id) = revoked_target_id else {
+            return;
+        };
+        if !changed {
+            return;
         }
+        let remaining = self
+            .targets
+            .iter()
+            .filter(|target| {
+                target.target_id == target_id
+                    && matches!(&target.grant, SshGrantView::Granted { .. })
+            })
+            .count();
+        let remaining = if remaining == 0 {
+            "no other active grants remain".to_owned()
+        } else {
+            format!(
+                "{remaining} other active grant{} remain",
+                if remaining == 1 { "" } else { "s" }
+            )
+        };
+        self.show_info(if worker_acknowledged {
+            format!("Selected SSH grant revocation confirmed by worker; {remaining}.")
+        } else {
+            format!("Revoking selected SSH grant; {remaining}.")
+        });
     }
 
     pub fn has_worker_acknowledged_revocation(&self) -> bool {
         self.targets.iter().any(|target| {
             matches!(
-                target.grant,
+                &target.grant,
                 SshGrantView::Revoking {
                     worker_acknowledged: true,
                     ..
@@ -1173,7 +1624,57 @@ impl SshManagerState {
         })
     }
 
-    fn open_error_diagnostic(&mut self) -> bool {
+    fn open_diagnostic(&mut self) -> bool {
+        if let Some(target) = self.selected_target() {
+            let grant = match &target.grant {
+                SshGrantView::NotGranted => "Grant: no active SSH authorization.".to_owned(),
+                SshGrantView::Granted {
+                    binding_id,
+                    root,
+                    capabilities,
+                    is_default,
+                } => format!(
+                    "Grant binding: {binding_id}\nRemote root: {root}\nCapabilities: {}\nDefault binding: {}",
+                    capabilities.compact(),
+                    if *is_default { "yes" } else { "no" }
+                ),
+                SshGrantView::Revoking {
+                    binding_id,
+                    worker_acknowledged,
+                } => format!(
+                    "Grant binding: {binding_id}\nRevocation: {}",
+                    if *worker_acknowledged {
+                        "confirmed by worker"
+                    } else {
+                        "locally revoked; worker confirmation pending"
+                    }
+                ),
+            };
+            let connected = if target.connected {
+                "connected"
+            } else {
+                "disconnected"
+            };
+            let latest_error = self
+                .message
+                .as_ref()
+                .filter(|(_, is_error)| *is_error)
+                .map(|(message, _)| format!("\n\nLatest SSH error:\n{message}"))
+                .unwrap_or_default();
+            let message = format!(
+                "SSH target configuration\n\nLabel: {}\nTarget ID: {}\nSource: {}\nResolved address: {}\nConnection: {}\nConnection detail: {}\n\n{}{}",
+                target.label,
+                target.target_id,
+                target.source,
+                target.effective_address,
+                connected,
+                target.connection_detail,
+                grant,
+                latest_error,
+            );
+            self.page = SshModalPage::Diagnostic(SshDiagnosticCard::new(message));
+            return true;
+        }
         let Some((message, true)) = self.message.as_ref() else {
             return false;
         };
@@ -1182,10 +1683,35 @@ impl SshManagerState {
     }
 
     pub fn show_error(&mut self, error: impl Into<String>) {
-        self.message = Some((error.into(), true));
+        self.pending_connection = None;
+        let error = error.into();
+        match std::mem::replace(&mut self.page, SshModalPage::Manager) {
+            SshModalPage::Grant(card) => {
+                let mut diagnostic = SshDiagnosticCard::new(error);
+                diagnostic.return_grant = Some(card);
+                self.page = SshModalPage::Diagnostic(diagnostic);
+                self.message = None;
+            }
+            SshModalPage::Add(form) => {
+                let mut diagnostic = SshDiagnosticCard::new(error);
+                diagnostic.return_add = Some(form);
+                self.page = SshModalPage::Diagnostic(diagnostic);
+                self.message = None;
+            }
+            SshModalPage::Diagnostic(mut card) => {
+                card.message = error;
+                card.scroll_offset = 0;
+                self.page = SshModalPage::Diagnostic(card);
+            }
+            page => {
+                self.page = page;
+                self.message = Some((error, true));
+            }
+        }
     }
 
     pub fn show_info(&mut self, message: impl Into<String>) {
+        self.pending_connection = None;
         self.message = Some((message.into(), false));
     }
 
@@ -1204,7 +1730,10 @@ pub enum SshModalOutcome {
     Changed,
     Unchanged,
     Refresh,
-    AddTarget(SshManualTargetDraft),
+    AddTarget {
+        draft: SshManualTargetDraft,
+        submission_id: u64,
+    },
     Connect {
         target_id: String,
     },
@@ -1247,6 +1776,12 @@ pub enum SshModalOutcome {
         approval_id: String,
         approved: bool,
     },
+    ApproveWorkerInstall {
+        request_id: String,
+        session_id: String,
+        binding_id: String,
+        approved: bool,
+    },
     AnswerAuthentication {
         challenge_id: String,
         connection_generation: u64,
@@ -1258,6 +1793,36 @@ pub enum SshModalOutcome {
     },
 }
 
+const FOOTER_MANAGER_CONNECT: usize = 101;
+const FOOTER_MANAGER_ADD: usize = 102;
+const FOOTER_MANAGER_GRANT: usize = 103;
+const FOOTER_MANAGER_USE: usize = 104;
+const FOOTER_MANAGER_REVOKE: usize = 105;
+const FOOTER_MANAGER_DIAGNOSTIC: usize = 106;
+const FOOTER_MANAGER_OPEN: usize = 107;
+const FOOTER_MANAGER_CLOSE: usize = 108;
+const FOOTER_ADD_SAVE: usize = 201;
+const FOOTER_ADD_CANCEL: usize = 202;
+const FOOTER_GRANT_READ: usize = 301;
+const FOOTER_GRANT_WRITE: usize = 302;
+const FOOTER_GRANT_EXECUTE: usize = 303;
+const FOOTER_GRANT_LIFETIME: usize = 304;
+const FOOTER_GRANT_DEFAULT: usize = 305;
+const FOOTER_GRANT_ALLOW: usize = 306;
+const FOOTER_GRANT_DENY: usize = 307;
+const FOOTER_OPERATION_ALLOW: usize = 401;
+const FOOTER_OPERATION_DENY: usize = 402;
+const FOOTER_OPERATION_CLOSE: usize = 403;
+const FOOTER_WORKER_INSTALL_APPROVE: usize = 404;
+const FOOTER_WORKER_INSTALL_DECLINE: usize = 405;
+const FOOTER_AUTH_SUBMIT: usize = 501;
+const FOOTER_AUTH_CANCEL: usize = 502;
+const FOOTER_HOST_TRUST_ONCE: usize = 511;
+const FOOTER_HOST_TRUST_STORE: usize = 512;
+const FOOTER_HOST_REPLACE: usize = 513;
+const FOOTER_HOST_REJECT: usize = 514;
+const FOOTER_DIAGNOSTIC_CLOSE: usize = 601;
+
 const MANAGER_SHORTCUTS: &[Shortcut<'static>] = &[
     Shortcut {
         label: "j/k move",
@@ -1266,43 +1831,43 @@ const MANAGER_SHORTCUTS: &[Shortcut<'static>] = &[
     },
     Shortcut {
         label: "Enter connect",
-        clickable: false,
-        id: 0,
+        clickable: true,
+        id: FOOTER_MANAGER_CONNECT,
     },
     Shortcut {
         label: "a add",
-        clickable: false,
-        id: 0,
+        clickable: true,
+        id: FOOTER_MANAGER_ADD,
     },
     Shortcut {
         label: "g grant",
-        clickable: false,
-        id: 0,
+        clickable: true,
+        id: FOOTER_MANAGER_GRANT,
     },
     Shortcut {
         label: "u use",
-        clickable: false,
-        id: 0,
+        clickable: true,
+        id: FOOTER_MANAGER_USE,
     },
     Shortcut {
-        label: "r revoke / refresh",
-        clickable: false,
-        id: 0,
+        label: "r revoke selected grant / refresh",
+        clickable: true,
+        id: FOOTER_MANAGER_REVOKE,
     },
     Shortcut {
         label: "d diagnostic",
-        clickable: false,
-        id: 0,
+        clickable: true,
+        id: FOOTER_MANAGER_DIAGNOSTIC,
     },
     Shortcut {
         label: "o open project",
-        clickable: false,
-        id: 0,
+        clickable: true,
+        id: FOOTER_MANAGER_OPEN,
     },
     Shortcut {
         label: "Esc close",
-        clickable: false,
-        id: 0,
+        clickable: true,
+        id: FOOTER_MANAGER_CLOSE,
     },
 ];
 
@@ -1314,16 +1879,47 @@ const OPERATION_APPROVAL_SHORTCUTS: &[Shortcut<'static>] = &[
     },
     Shortcut {
         label: "y allow after review",
-        clickable: false,
-        id: 0,
+        clickable: true,
+        id: FOOTER_OPERATION_ALLOW,
     },
     Shortcut {
         label: "n deny",
+        clickable: true,
+        id: FOOTER_OPERATION_DENY,
+    },
+    Shortcut {
+        label: "Esc deny",
+        clickable: true,
+        id: FOOTER_OPERATION_CLOSE,
+    },
+];
+
+const WORKER_INSTALL_FALLBACK_SHORTCUTS: &[Shortcut<'static>] = &[
+    Shortcut {
+        label: "↑/↓ inspect",
         clickable: false,
         id: 0,
     },
     Shortcut {
-        label: "Esc deny",
+        label: "Enter/y install via this computer",
+        clickable: true,
+        id: FOOTER_WORKER_INSTALL_APPROVE,
+    },
+    Shortcut {
+        label: "n/Esc decline",
+        clickable: true,
+        id: FOOTER_WORKER_INSTALL_DECLINE,
+    },
+];
+
+const WORKER_INSTALL_PROGRESS_SHORTCUTS: &[Shortcut<'static>] = &[
+    Shortcut {
+        label: "↑/↓ inspect",
+        clickable: false,
+        id: 0,
+    },
+    Shortcut {
+        label: "Project setup pending…",
         clickable: false,
         id: 0,
     },
@@ -1332,8 +1928,8 @@ const OPERATION_APPROVAL_SHORTCUTS: &[Shortcut<'static>] = &[
 const AUTHENTICATION_SHORTCUTS: &[Shortcut<'static>] = &[
     Shortcut {
         label: "Enter submit",
-        clickable: false,
-        id: 0,
+        clickable: true,
+        id: FOOTER_AUTH_SUBMIT,
     },
     Shortcut {
         label: "PgUp/PgDn scroll",
@@ -1342,39 +1938,39 @@ const AUTHENTICATION_SHORTCUTS: &[Shortcut<'static>] = &[
     },
     Shortcut {
         label: "Esc cancel",
-        clickable: false,
-        id: 0,
+        clickable: true,
+        id: FOOTER_AUTH_CANCEL,
     },
 ];
 
 const UNKNOWN_HOST_KEY_SHORTCUTS: &[Shortcut<'static>] = &[
     Shortcut {
         label: "y trust once",
-        clickable: false,
-        id: 0,
+        clickable: true,
+        id: FOOTER_HOST_TRUST_ONCE,
     },
     Shortcut {
         label: "s trust and save",
-        clickable: false,
-        id: 0,
+        clickable: true,
+        id: FOOTER_HOST_TRUST_STORE,
     },
     Shortcut {
         label: "n/Esc reject",
-        clickable: false,
-        id: 0,
+        clickable: true,
+        id: FOOTER_HOST_REJECT,
     },
 ];
 
 const REPLACE_HOST_KEY_SHORTCUTS: &[Shortcut<'static>] = &[
     Shortcut {
         label: "r replace and save",
-        clickable: false,
-        id: 0,
+        clickable: true,
+        id: FOOTER_HOST_REPLACE,
     },
     Shortcut {
         label: "n/Esc reject",
-        clickable: false,
-        id: 0,
+        clickable: true,
+        id: FOOTER_HOST_REJECT,
     },
     Shortcut {
         label: "↑/↓ inspect",
@@ -1391,8 +1987,8 @@ const MANUAL_HOST_KEY_REMEDIATION_SHORTCUTS: &[Shortcut<'static>] = &[
     },
     Shortcut {
         label: "n/Esc reject",
-        clickable: false,
-        id: 0,
+        clickable: true,
+        id: FOOTER_HOST_REJECT,
     },
     Shortcut {
         label: "↑/↓ inspect",
@@ -1409,8 +2005,92 @@ const DIAGNOSTIC_SHORTCUTS: &[Shortcut<'static>] = &[
     },
     Shortcut {
         label: "Esc back",
+        clickable: true,
+        id: FOOTER_DIAGNOSTIC_CLOSE,
+    },
+];
+
+const ADD_SHORTCUTS: &[Shortcut<'static>] = &[
+    Shortcut {
+        label: "Tab field",
         clickable: false,
         id: 0,
+    },
+    Shortcut {
+        label: "Enter save",
+        clickable: true,
+        id: FOOTER_ADD_SAVE,
+    },
+    Shortcut {
+        label: "Esc back",
+        clickable: true,
+        id: FOOTER_ADD_CANCEL,
+    },
+];
+
+const ADD_SUBMITTING_SHORTCUTS: &[Shortcut<'static>] = &[
+    Shortcut {
+        label: "Tab field",
+        clickable: false,
+        id: 0,
+    },
+    Shortcut {
+        label: "Saving…",
+        clickable: false,
+        id: FOOTER_ADD_SAVE,
+    },
+    Shortcut {
+        label: "Esc back",
+        clickable: true,
+        id: FOOTER_ADD_CANCEL,
+    },
+];
+
+const GRANT_SHORTCUTS: &[Shortcut<'static>] = &[
+    Shortcut {
+        label: "Alt+r read",
+        clickable: true,
+        id: FOOTER_GRANT_READ,
+    },
+    Shortcut {
+        label: "Alt+w write",
+        clickable: true,
+        id: FOOTER_GRANT_WRITE,
+    },
+    Shortcut {
+        label: "Alt+x run",
+        clickable: true,
+        id: FOOTER_GRANT_EXECUTE,
+    },
+    Shortcut {
+        label: "Alt+l lifetime",
+        clickable: true,
+        id: FOOTER_GRANT_LIFETIME,
+    },
+    Shortcut {
+        label: "Alt+d default",
+        clickable: true,
+        id: FOOTER_GRANT_DEFAULT,
+    },
+    Shortcut {
+        label: "PgUp/PgDn inspect",
+        clickable: false,
+        id: 0,
+    },
+    Shortcut {
+        label: "Tab/Space options",
+        clickable: false,
+        id: 0,
+    },
+    Shortcut {
+        label: "Enter allow",
+        clickable: true,
+        id: FOOTER_GRANT_ALLOW,
+    },
+    Shortcut {
+        label: "Esc deny",
+        clickable: true,
+        id: FOOTER_GRANT_DENY,
     },
 ];
 
@@ -1449,61 +2129,38 @@ pub fn render_ssh_modal(
     compact: bool,
     theme: &Theme,
 ) -> Option<(u16, u16)> {
+    state.manager_row_hits.clear();
+    match &mut state.page {
+        SshModalPage::Add(form) => form.field_hits.clear(),
+        SshModalPage::Grant(card) => card.control_hits.clear(),
+        SshModalPage::Manager
+        | SshModalPage::OperationApproval(_)
+        | SshModalPage::WorkerInstallFallback(_)
+        | SshModalPage::Authentication(_)
+        | SshModalPage::Diagnostic(_) => {}
+    }
     let (title, shortcuts): (&str, &[Shortcut<'_>]) = match &state.page {
         SshModalPage::Manager => ("SSH targets", MANAGER_SHORTCUTS),
-        SshModalPage::Add(_) => (
+        SshModalPage::Add(form) => (
             "Add SSH target",
-            &[
-                Shortcut {
-                    label: "Tab field",
-                    clickable: false,
-                    id: 0,
-                },
-                Shortcut {
-                    label: "Enter save",
-                    clickable: false,
-                    id: 0,
-                },
-                Shortcut {
-                    label: "Esc back",
-                    clickable: false,
-                    id: 0,
-                },
-            ],
+            if form.submitting {
+                ADD_SUBMITTING_SHORTCUTS
+            } else {
+                ADD_SHORTCUTS
+            },
         ),
-        SshModalPage::Grant(_) => (
-            "SSH access grant",
-            &[
-                Shortcut {
-                    label: "Alt+r/w/x capability",
-                    clickable: false,
-                    id: 0,
-                },
-                Shortcut {
-                    label: "Alt+l lifetime",
-                    clickable: false,
-                    id: 0,
-                },
-                Shortcut {
-                    label: "Alt+d default",
-                    clickable: false,
-                    id: 0,
-                },
-                Shortcut {
-                    label: "Enter allow",
-                    clickable: false,
-                    id: 0,
-                },
-                Shortcut {
-                    label: "Esc deny",
-                    clickable: false,
-                    id: 0,
-                },
-            ],
-        ),
+        SshModalPage::Grant(_) => ("SSH access grant", GRANT_SHORTCUTS),
         SshModalPage::OperationApproval(_) => {
             ("SSH operation approval", OPERATION_APPROVAL_SHORTCUTS)
         }
+        SshModalPage::WorkerInstallFallback(card) => (
+            "Remote worker fallback",
+            if card.submitting || card.is_decided() {
+                WORKER_INSTALL_PROGRESS_SHORTCUTS
+            } else {
+                WORKER_INSTALL_FALLBACK_SHORTCUTS
+            },
+        ),
         SshModalPage::Authentication(card) => match &card.kind {
             SshAuthKind::HostKey {
                 status,
@@ -1525,27 +2182,36 @@ pub fn render_ssh_modal(
         },
         SshModalPage::Diagnostic(_) => ("SSH diagnostic", DIAGNOSTIC_SHORTCUTS),
     };
-    let config = window_config(title, compact, shortcuts);
+    let config = window_config(title, compact || area.height < 16, shortcuts);
     let areas = modal_window::render_modal_window(buf, area, &mut state.window, &config, theme)?;
     let content = areas.content;
-    match &mut state.page {
-        SshModalPage::Manager => render_manager(buf, content, state, theme),
-        SshModalPage::Add(form) => render_add(buf, content, form, theme),
-        SshModalPage::Grant(card) => render_grant(buf, content, card, theme),
-        SshModalPage::OperationApproval(card) => {
-            render_operation_approval(buf, content, card, theme)
+    if matches!(&state.page, SshModalPage::Manager) {
+        render_manager(buf, content, state, theme);
+    } else {
+        match &mut state.page {
+            SshModalPage::Add(form) => render_add(buf, content, form, theme),
+            SshModalPage::Grant(card) => render_grant(buf, content, card, theme),
+            SshModalPage::OperationApproval(card) => {
+                render_operation_approval(buf, content, card, theme)
+            }
+            SshModalPage::WorkerInstallFallback(card) => {
+                render_worker_install_fallback(buf, content, card, theme)
+            }
+            SshModalPage::Authentication(card) => render_authentication(buf, content, card, theme),
+            SshModalPage::Diagnostic(card) => render_diagnostic(buf, content, card, theme),
+            SshModalPage::Manager => unreachable!("manager rendered before mutable page match"),
         }
-        SshModalPage::Authentication(card) => render_authentication(buf, content, card, theme),
-        SshModalPage::Diagnostic(card) => render_diagnostic(buf, content, card, theme),
     }
     None
 }
 
-fn render_manager(buf: &mut Buffer, area: Rect, state: &SshManagerState, theme: &Theme) {
+fn render_manager(buf: &mut Buffer, area: Rect, state: &mut SshManagerState, theme: &Theme) {
     if area.height == 0 {
+        state.manager_visible_rows = 0;
         return;
     }
     if state.loading {
+        state.manager_visible_rows = 0;
         buf.set_string(
             area.x,
             area.y,
@@ -1555,6 +2221,7 @@ fn render_manager(buf: &mut Buffer, area: Rect, state: &SshManagerState, theme: 
         return;
     }
     if state.targets.is_empty() {
+        state.manager_visible_rows = 0;
         buf.set_string(
             area.x,
             area.y,
@@ -1565,17 +2232,21 @@ fn render_manager(buf: &mut Buffer, area: Rect, state: &SshManagerState, theme: 
         return;
     }
     let row_height = 3u16;
-    let visible = area.height.saturating_sub(2) / row_height;
-    let start = state
-        .selected
-        .saturating_sub(visible.saturating_sub(1) as usize);
-    for (offset, target) in state
-        .targets
-        .iter()
-        .skip(start)
-        .take(visible as usize)
-        .enumerate()
-    {
+    let visible = (area.height.saturating_sub(2) / row_height) as usize;
+    state.manager_visible_rows = visible;
+    if visible == 0 {
+        render_message(buf, area, state.message.as_ref(), theme);
+        return;
+    }
+    let max_start = state.targets.len().saturating_sub(visible);
+    if state.selected < state.manager_scroll_offset {
+        state.manager_scroll_offset = state.selected;
+    } else if state.selected >= state.manager_scroll_offset.saturating_add(visible) {
+        state.manager_scroll_offset = state.selected + 1 - visible;
+    }
+    state.manager_scroll_offset = state.manager_scroll_offset.min(max_start);
+    let start = state.manager_scroll_offset;
+    for (offset, target) in state.targets.iter().skip(start).take(visible).enumerate() {
         let y = area.y + offset as u16 * row_height;
         let selected = start + offset == state.selected;
         let base = if selected {
@@ -1613,6 +2284,11 @@ fn render_manager(buf: &mut Buffer, area: Rect, state: &SshManagerState, theme: 
             area.width as usize,
             Style::default().fg(theme.gray_dim),
         );
+        state.manager_row_hits.push(ManagerRowHit {
+            target_id: target.target_id.clone(),
+            binding_id: target.grant.binding_id().map(str::to_owned),
+            rect: Rect::new(area.x, y, area.width, row_height),
+        });
     }
     render_message(buf, area, state.message.as_ref(), theme);
 }
@@ -1684,101 +2360,304 @@ fn render_diagnostic(buf: &mut Buffer, area: Rect, card: &mut SshDiagnosticCard,
     }
 }
 
-fn render_add(buf: &mut Buffer, area: Rect, form: &SshManualTargetForm, theme: &Theme) {
+fn render_line_editor(
+    buf: &mut Buffer,
+    area: Rect,
+    label: &str,
+    editor: &LineEditor,
+    active: bool,
+    theme: &Theme,
+) {
+    if area.width == 0 {
+        return;
+    }
+    let label_width = (label.len() as u16).min(area.width);
+    let label_style = if active {
+        Style::default()
+            .fg(theme.accent_user)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(theme.text_secondary)
+    };
+    buf.set_stringn(area.x, area.y, label, label_width as usize, label_style);
+    let input_x = area.x.saturating_add(label_width);
+    let input_width = area.width.saturating_sub(label_width) as usize;
+    if input_width == 0 {
+        return;
+    }
+    let viewport = editor.viewport(input_width);
+    let visible = editor
+        .text()
+        .get(viewport.visible_byte_range)
+        .unwrap_or_default();
+    buf.set_stringn(
+        input_x,
+        area.y,
+        visible,
+        input_width,
+        Style::default().fg(theme.text_secondary),
+    );
+    if active {
+        let cursor_x = input_x.saturating_add(
+            (viewport.cursor_display_column as u16).min(input_width.saturating_sub(1) as u16),
+        );
+        if let Some(cell) = buf.cell_mut((cursor_x, area.y)) {
+            cell.set_style(theme.block_cursor_over(theme.bg_base));
+        }
+    }
+}
+
+fn render_add(buf: &mut Buffer, area: Rect, form: &mut SshManualTargetForm, theme: &Theme) {
     let mut y = area.y;
+    let status = form.error.as_deref().or_else(|| {
+        form.submitting
+            .then_some("Saving target through the local SSH service…")
+    });
+    let fields_bottom = area.bottom().saturating_sub(u16::from(status.is_some()));
+    let mut worker_command_visible = false;
     for field in ManualTargetField::ALL {
-        if y >= area.bottom() {
+        if y >= fields_bottom {
             break;
         }
-        let selected = form.active == field;
-        let style = if selected {
+        let row = Rect::new(area.x, y, area.width, 1);
+        render_line_editor(
+            buf,
+            row,
+            field.input_label(),
+            form.editor(field),
+            form.active == field,
+            theme,
+        );
+        form.field_hits.push((field, row));
+        worker_command_visible |= field == ManualTargetField::WorkerCommand;
+        y = y.saturating_add(1);
+    }
+    if worker_command_visible {
+        let helper_lines = modal_window::word_wrap(
+            "Blank: automatic managed worker install and updates. Explicit command: user-managed; never overwritten.",
+            (area.width as usize).max(1),
+        );
+        if y.saturating_add(helper_lines.len() as u16) <= fields_bottom {
+            for line in helper_lines {
+                buf.set_stringn(
+                    area.x,
+                    y,
+                    line,
+                    area.width as usize,
+                    Style::default().fg(theme.text_secondary),
+                );
+                y = y.saturating_add(1);
+            }
+        }
+    }
+    if let Some(status) = status
+        && y < area.bottom()
+    {
+        buf.set_stringn(
+            area.x,
+            y,
+            status,
+            area.width as usize,
+            if form.error.is_some() {
+                Style::default()
+                    .fg(theme.accent_error)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(theme.text_secondary)
+            },
+        );
+    }
+}
+
+struct GrantRenderLine {
+    text: String,
+    focus: Option<SshGrantFocus>,
+    warning: bool,
+    root_editor: bool,
+}
+
+fn push_grant_wrapped(
+    lines: &mut Vec<GrantRenderLine>,
+    text: impl AsRef<str>,
+    width: usize,
+    focus: Option<SshGrantFocus>,
+    warning: bool,
+) {
+    for line in modal_window::word_wrap(text.as_ref(), width.max(1)) {
+        lines.push(GrantRenderLine {
+            text: line.to_owned(),
+            focus,
+            warning,
+            root_editor: false,
+        });
+    }
+}
+
+fn render_grant(buf: &mut Buffer, area: Rect, card: &mut SshGrantCard, theme: &Theme) {
+    if area.height == 0 || area.width == 0 {
+        card.max_scroll_offset = 0;
+        card.reviewed_to_end = false;
+        return;
+    }
+    let width = area.width as usize;
+    let mut lines = Vec::new();
+    push_grant_wrapped(
+        &mut lines,
+        format!("Target: {} ({})", card.target_label, card.target_id),
+        width,
+        None,
+        false,
+    );
+    push_grant_wrapped(
+        &mut lines,
+        match card.identity.as_deref() {
+            Some(identity) => format!("Verified SSH identity: {identity}"),
+            None => "Connection identity will be verified before authorization can be approved."
+                .to_owned(),
+        },
+        width,
+        None,
+        false,
+    );
+    push_grant_wrapped(
+        &mut lines,
+        format!("Requested remote root: {}", card.root.text()),
+        width,
+        None,
+        false,
+    );
+    lines.push(GrantRenderLine {
+        text: "Edit root: ".into(),
+        focus: Some(SshGrantFocus::Root),
+        warning: false,
+        root_editor: true,
+    });
+    for (focus, enabled, label) in [
+        (
+            SshGrantFocus::Read,
+            card.capabilities.read,
+            "Read remote files",
+        ),
+        (
+            SshGrantFocus::Write,
+            card.capabilities.write,
+            "Write remote files",
+        ),
+        (
+            SshGrantFocus::Execute,
+            card.capabilities.execute,
+            "Run remote commands",
+        ),
+    ] {
+        push_grant_wrapped(
+            &mut lines,
+            format!("[{}] {label}", if enabled { "x" } else { " " }),
+            width,
+            Some(focus),
+            false,
+        );
+    }
+    push_grant_wrapped(
+        &mut lines,
+        format!("Lifetime: {}", card.lifetime.label()),
+        width,
+        Some(SshGrantFocus::Lifetime),
+        false,
+    );
+    push_grant_wrapped(
+        &mut lines,
+        format!(
+            "Default SSH target: {}",
+            if card.set_default { "yes" } else { "no" }
+        ),
+        width,
+        Some(SshGrantFocus::Default),
+        false,
+    );
+    if card.agent_requested {
+        push_grant_wrapped(
+            &mut lines,
+            "This access request came from the agent; allowing it does not expose credentials to it.",
+            width,
+            None,
+            false,
+        );
+    }
+    if card.capabilities.execute {
+        push_grant_wrapped(
+            &mut lines,
+            "Warning: run executes with this SSH user's remote privileges; cwd is not a sandbox.",
+            width,
+            None,
+            true,
+        );
+    }
+    if let Some(reason) = card.reason.as_deref() {
+        push_grant_wrapped(&mut lines, format!("Reason: {reason}"), width, None, false);
+    }
+    if let Some(follow_up) = card.follow_up.as_deref() {
+        push_grant_wrapped(&mut lines, follow_up, width, None, false);
+    } else if card.request_id.is_empty() {
+        push_grant_wrapped(
+            &mut lines,
+            "Press Enter to continue to identity verification. A later card will require explicit approval of the verified identity and scope.",
+            width,
+            None,
+            false,
+        );
+    } else {
+        push_grant_wrapped(
+            &mut lines,
+            "Scroll through every authorization detail before allowing this grant.",
+            width,
+            None,
+            false,
+        );
+    }
+
+    let body_height = area.height.saturating_sub(u16::from(card.error.is_some())) as usize;
+    card.page_size = body_height.max(1);
+    card.max_scroll_offset = lines.len().saturating_sub(body_height);
+    card.scroll_offset = card.scroll_offset.min(card.max_scroll_offset);
+    card.reviewed_to_end = body_height > 0 && card.scroll_offset >= card.max_scroll_offset;
+    for (index, line) in lines
+        .iter()
+        .skip(card.scroll_offset)
+        .take(body_height)
+        .enumerate()
+    {
+        let y = area.y.saturating_add(index as u16);
+        let rect = Rect::new(area.x, y, area.width, 1);
+        let focused = line.focus == Some(card.focus);
+        let style = if line.warning {
+            Style::default()
+                .fg(theme.accent_error)
+                .add_modifier(Modifier::BOLD)
+        } else if focused {
             Style::default()
                 .fg(theme.accent_user)
                 .add_modifier(Modifier::BOLD)
         } else {
             Style::default().fg(theme.text_secondary)
         };
-        let label = format!("{}: ", field.label());
-        buf.set_string(area.x, y, &label, style);
-        let editor = form.editor(field);
-        buf.set_stringn(
-            area.x + label.len() as u16,
-            y,
-            editor.text(),
-            area.width.saturating_sub(label.len() as u16) as usize,
-            Style::default().fg(theme.text_secondary),
-        );
-        y = y.saturating_add(1);
-    }
-    if let Some(error) = form.error.as_deref()
-        && y < area.bottom()
-    {
-        buf.set_stringn(
-            area.x,
-            y,
-            error,
-            area.width as usize,
-            Style::default().fg(theme.accent_error),
-        );
-    }
-}
-
-fn render_grant(buf: &mut Buffer, area: Rect, card: &SshGrantCard, theme: &Theme) {
-    let identity = match card.identity.as_deref() {
-        Some(identity) => format!("Verified SSH identity: {identity}"),
-        None => "Connection identity will be verified before this grant can be approved.".into(),
-    };
-    let mut lines = vec![
-        format!("Target: {} ({})", card.target_label, card.target_id),
-        identity,
-        format!("Root: {}", card.root.text()),
-        format!(
-            "Capabilities: [{}] read  [{}] write  [{}] run",
-            if card.capabilities.read { "x" } else { " " },
-            if card.capabilities.write { "x" } else { " " },
-            if card.capabilities.execute { "x" } else { " " },
-        ),
-        format!("Lifetime: {}", card.lifetime.label()),
-        format!(
-            "Default SSH target: {}",
-            if card.set_default { "yes" } else { "no" }
-        ),
-    ];
-    if card.agent_requested {
-        lines.push("This access request came from the agent; allowing it does not expose credentials to it.".into());
-    }
-    if card.capabilities.execute {
-        lines.push(
-            "Warning: run executes with this SSH user's remote privileges; cwd is not a sandbox."
-                .into(),
-        );
-    }
-    if let Some(reason) = card.reason.as_deref() {
-        lines.push(format!("Reason: {reason}"));
-    }
-    for (index, line) in lines.iter().enumerate() {
-        let y = area.y + index as u16;
-        if y >= area.bottom() {
-            break;
-        }
-        let warning = line.starts_with("Warning:");
-        let style = if warning {
-            Style::default()
-                .fg(theme.accent_error)
-                .add_modifier(Modifier::BOLD)
+        if line.root_editor {
+            render_line_editor(buf, rect, &line.text, &card.root, focused, theme);
         } else {
-            Style::default().fg(theme.text_secondary)
-        };
-        buf.set_stringn(area.x, y, line, area.width as usize, style);
+            buf.set_stringn(area.x, y, &line.text, area.width as usize, style);
+        }
+        if let Some(focus) = line.focus {
+            card.control_hits.push(GrantControlHit { focus, rect });
+        }
     }
     if let Some(error) = card.error.as_deref() {
-        let y = area.bottom().saturating_sub(1);
         buf.set_stringn(
             area.x,
-            y,
+            area.bottom().saturating_sub(1),
             error,
             area.width as usize,
-            Style::default().fg(theme.accent_error),
+            Style::default()
+                .fg(theme.accent_error)
+                .add_modifier(Modifier::BOLD),
         );
     }
 }
@@ -1880,6 +2759,85 @@ fn operation_approval_lines(card: &SshOperationApprovalCard, width: usize) -> Ve
         "Allow this one remote operation? y allow · n deny".into()
     });
     lines
+}
+
+fn render_worker_install_fallback(
+    buf: &mut Buffer,
+    area: Rect,
+    card: &mut SshWorkerInstallFallbackCard,
+    theme: &Theme,
+) {
+    if area.height == 0 {
+        return;
+    }
+    let lines = worker_install_fallback_lines(card, area.width as usize);
+    card.max_scroll_offset = lines.len().saturating_sub(area.height as usize);
+    card.scroll_offset = card.scroll_offset.min(card.max_scroll_offset);
+    for (index, line) in lines
+        .iter()
+        .skip(card.scroll_offset)
+        .take(area.height as usize)
+        .enumerate()
+    {
+        let style = if line.starts_with("Remote worker installation")
+            || line.starts_with("Remote installation detail:")
+            || line.starts_with("Error:")
+        {
+            Style::default()
+                .fg(theme.accent_error)
+                .add_modifier(Modifier::BOLD)
+        } else if line.starts_with("Requested version:") || line.starts_with("Remote platform:") {
+            Style::default()
+                .fg(theme.accent_user)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(theme.text_secondary)
+        };
+        buf.set_stringn(
+            area.x,
+            area.y.saturating_add(index as u16),
+            line,
+            area.width as usize,
+            style,
+        );
+    }
+}
+
+fn worker_install_fallback_lines(card: &SshWorkerInstallFallbackCard, width: usize) -> Vec<String> {
+    let options = textwrap::Options::new(width.max(1))
+        .break_words(true)
+        .wrap_algorithm(textwrap::WrapAlgorithm::FirstFit);
+    let mut paragraphs = vec![
+        "Remote worker installation needs a local transfer.".into(),
+        format!("Requested version: {}", card.version),
+        format!("Remote platform: {}", card.platform),
+        format!("SSH target: {}", card.target_id),
+        String::new(),
+        "Approve to obtain this exact build on this computer and upload it through the already-authenticated SSH connection. Release builds are downloaded using this computer's network; development builds use this computer's executable. No SSH credentials or tokens are sent to the remote host.".into(),
+        String::new(),
+        "Remote installation detail:".into(),
+    ];
+    paragraphs.extend(card.remote_error.lines().map(str::to_owned));
+    if card.remote_error.is_empty() {
+        paragraphs.push("(No remote error detail was supplied.)".into());
+    }
+    paragraphs.push(String::new());
+    paragraphs.push(if let Some(error) = card.error.as_deref() {
+        format!("Error: {error}")
+    } else if card.submitting {
+        "Submitting local fallback decision…".into()
+    } else if let Some(progress) = card.progress.as_deref() {
+        progress.to_owned()
+    } else if card.decision_accepted == Some(true) {
+        "Local transfer approved; waiting for project setup…".into()
+    } else if card.decision_accepted == Some(false) {
+        "Local transfer declined; waiting for project setup…".into()
+    } else {
+        "Obtain locally and upload this exact build? Enter/y approve · n/Esc decline".into()
+    });
+    paragraphs.iter().flat_map(|paragraph| {
+        textwrap::wrap(paragraph, &options).into_iter().map(std::borrow::Cow::into_owned)
+    }).collect()
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -2215,6 +3173,7 @@ pub fn handle_ssh_key(state: &mut SshManagerState, key: &KeyEvent) -> SshModalOu
         SshModalPage::Add(form) => handle_add_key(form, key),
         SshModalPage::Grant(card) => handle_grant_key(card, key),
         SshModalPage::OperationApproval(card) => handle_operation_approval_key(card, key),
+        SshModalPage::WorkerInstallFallback(card) => handle_worker_install_fallback_key(card, key),
         SshModalPage::Authentication(card) => handle_authentication_key(card, key),
         SshModalPage::Diagnostic(card) => handle_diagnostic_key(card, key),
         SshModalPage::Manager => unreachable!("manager handled before borrowing modal page"),
@@ -2225,62 +3184,362 @@ pub fn handle_ssh_key(state: &mut SshManagerState, key: &KeyEvent) -> SshModalOu
     outcome
 }
 
+fn footer_key_for(page: &SshModalPage, id: usize) -> Option<KeyEvent> {
+    let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
+    let alt = |code| KeyEvent::new(code, KeyModifiers::ALT);
+    match (page, id) {
+        (SshModalPage::Manager, FOOTER_MANAGER_CONNECT) => Some(key(KeyCode::Enter)),
+        (SshModalPage::Manager, FOOTER_MANAGER_ADD) => Some(key(KeyCode::Char('a'))),
+        (SshModalPage::Manager, FOOTER_MANAGER_GRANT) => Some(key(KeyCode::Char('g'))),
+        (SshModalPage::Manager, FOOTER_MANAGER_USE) => Some(key(KeyCode::Char('u'))),
+        (SshModalPage::Manager, FOOTER_MANAGER_REVOKE) => Some(key(KeyCode::Char('r'))),
+        (SshModalPage::Manager, FOOTER_MANAGER_DIAGNOSTIC) => Some(key(KeyCode::Char('d'))),
+        (SshModalPage::Manager, FOOTER_MANAGER_OPEN) => Some(key(KeyCode::Char('o'))),
+        (SshModalPage::Manager, FOOTER_MANAGER_CLOSE) => Some(key(KeyCode::Esc)),
+        (SshModalPage::Add(form), FOOTER_ADD_SAVE) if !form.submitting => Some(key(KeyCode::Enter)),
+        (SshModalPage::Add(_), FOOTER_ADD_CANCEL) => Some(key(KeyCode::Esc)),
+        (SshModalPage::Grant(_), FOOTER_GRANT_READ) => Some(alt(KeyCode::Char('r'))),
+        (SshModalPage::Grant(_), FOOTER_GRANT_WRITE) => Some(alt(KeyCode::Char('w'))),
+        (SshModalPage::Grant(_), FOOTER_GRANT_EXECUTE) => Some(alt(KeyCode::Char('x'))),
+        (SshModalPage::Grant(_), FOOTER_GRANT_LIFETIME) => Some(alt(KeyCode::Char('l'))),
+        (SshModalPage::Grant(_), FOOTER_GRANT_DEFAULT) => Some(alt(KeyCode::Char('d'))),
+        (SshModalPage::Grant(_), FOOTER_GRANT_ALLOW) => Some(key(KeyCode::Enter)),
+        (SshModalPage::Grant(_), FOOTER_GRANT_DENY) => Some(key(KeyCode::Esc)),
+        (SshModalPage::OperationApproval(_), FOOTER_OPERATION_ALLOW) => {
+            Some(key(KeyCode::Char('y')))
+        }
+        (SshModalPage::OperationApproval(_), FOOTER_OPERATION_DENY) => {
+            Some(key(KeyCode::Char('n')))
+        }
+        (SshModalPage::OperationApproval(_), FOOTER_OPERATION_CLOSE) => Some(key(KeyCode::Esc)),
+        (SshModalPage::WorkerInstallFallback(card), FOOTER_WORKER_INSTALL_APPROVE)
+            if !card.submitting && !card.is_decided() =>
+        {
+            Some(key(KeyCode::Enter))
+        }
+        (SshModalPage::WorkerInstallFallback(card), FOOTER_WORKER_INSTALL_DECLINE)
+            if !card.submitting && !card.is_decided() =>
+        {
+            Some(key(KeyCode::Char('n')))
+        }
+        (SshModalPage::Authentication(card), FOOTER_AUTH_SUBMIT)
+            if !matches!(&card.kind, SshAuthKind::HostKey { .. }) =>
+        {
+            Some(key(KeyCode::Enter))
+        }
+        (SshModalPage::Authentication(card), FOOTER_AUTH_CANCEL)
+            if !matches!(&card.kind, SshAuthKind::HostKey { .. }) =>
+        {
+            Some(key(KeyCode::Esc))
+        }
+        (
+            SshModalPage::Authentication(SshAuthCard {
+                kind:
+                    SshAuthKind::HostKey {
+                        status,
+                        previous_keys,
+                        can_replace,
+                        ..
+                    },
+                ..
+            }),
+            FOOTER_HOST_REPLACE,
+        ) if changed_host_key(status, previous_keys) && *can_replace => {
+            Some(key(KeyCode::Char('r')))
+        }
+        (
+            SshModalPage::Authentication(SshAuthCard {
+                kind:
+                    SshAuthKind::HostKey {
+                        status,
+                        previous_keys,
+                        ..
+                    },
+                ..
+            }),
+            FOOTER_HOST_TRUST_ONCE,
+        ) if !changed_host_key(status, previous_keys) => Some(key(KeyCode::Char('y'))),
+        (
+            SshModalPage::Authentication(SshAuthCard {
+                kind:
+                    SshAuthKind::HostKey {
+                        status,
+                        previous_keys,
+                        ..
+                    },
+                ..
+            }),
+            FOOTER_HOST_TRUST_STORE,
+        ) if !changed_host_key(status, previous_keys) => Some(key(KeyCode::Char('s'))),
+        (
+            SshModalPage::Authentication(SshAuthCard {
+                kind: SshAuthKind::HostKey { .. },
+                ..
+            }),
+            FOOTER_HOST_REJECT,
+        ) => Some(key(KeyCode::Char('n'))),
+        (SshModalPage::Diagnostic(_), FOOTER_DIAGNOSTIC_CLOSE) => Some(key(KeyCode::Esc)),
+        _ => None,
+    }
+}
+
 /// Paste directly into the focused non-secret or secret local editor. The paste is never placed in
 /// chat state, notifications, or a replay buffer.
 pub fn handle_ssh_paste(state: &mut SshManagerState, text: &str) -> SshModalOutcome {
     let outcome = match &mut state.page {
-        SshModalPage::Add(form) => form.editor_mut().insert_paste(text),
-        SshModalPage::Grant(card) => card.root.insert_paste(text),
+        SshModalPage::Add(form) => {
+            if form.submitting {
+                return SshModalOutcome::Unchanged;
+            }
+            let outcome = form.editor_mut().insert_paste(text);
+            if matches!(&outcome, LineEditOutcome::TextChanged) {
+                form.error = None;
+            }
+            outcome
+        }
+        SshModalPage::Grant(card) if card.focus == SshGrantFocus::Root => {
+            let outcome = card.root.insert_paste(text);
+            if matches!(&outcome, LineEditOutcome::TextChanged) {
+                mark_grant_edited(card);
+            }
+            outcome
+        }
+        SshModalPage::Grant(_)
+        | SshModalPage::Manager
+        | SshModalPage::OperationApproval(_)
+        | SshModalPage::WorkerInstallFallback(_)
+        | SshModalPage::Diagnostic(_) => return SshModalOutcome::Unchanged,
         SshModalPage::Authentication(card) => card
             .answer_mut()
             .map(|answer| answer.insert_paste(text))
             .unwrap_or(LineEditOutcome::Unhandled),
-        SshModalPage::Manager
-        | SshModalPage::OperationApproval(_)
-        | SshModalPage::Diagnostic(_) => {
-            return SshModalOutcome::Unchanged;
-        }
     };
     line_outcome(outcome)
 }
 
-/// Mouse handling is limited to modal chrome and scrolling review surfaces; operational actions
-/// remain keyboard-confirmed so a stale row map can never connect, grant, or revoke the wrong target.
+/// Route modal chrome first, then act only on render-time content hitboxes. Footer actions are
+/// deliberately translated back into their keyboard event so mouse and keyboard share consent,
+/// validation, and pending-operation semantics.
 pub fn handle_ssh_mouse(state: &mut SshManagerState, mouse: &MouseEvent) -> SshModalOutcome {
     match modal_window::handle_modal_mouse(&mut state.window, mouse.kind, mouse.column, mouse.row) {
         ModalWindowOutcome::CloseRequested => return close_current_page(state),
+        ModalWindowOutcome::ShortcutActivated(id) => {
+            let Some(key) = footer_key_for(&state.page, id) else {
+                return SshModalOutcome::Unchanged;
+            };
+            return handle_ssh_key(state, &key);
+        }
         ModalWindowOutcome::Handled => return SshModalOutcome::Changed,
         ModalWindowOutcome::Unhandled => {}
-        _ => return SshModalOutcome::Unchanged,
+        ModalWindowOutcome::TabChanged(_)
+        | ModalWindowOutcome::CollapseGroup
+        | ModalWindowOutcome::ExpandGroup
+        | ModalWindowOutcome::CollapseDetails
+        | ModalWindowOutcome::ExpandDetails
+        | ModalWindowOutcome::JumpToParent(_) => return SshModalOutcome::Unchanged,
     }
+
+    if matches!(
+        mouse.kind,
+        MouseEventKind::Down(crossterm::event::MouseButton::Left)
+    ) {
+        if matches!(&state.page, SshModalPage::Manager) {
+            let hit = state
+                .manager_row_hits
+                .iter()
+                .find(|hit| {
+                    mouse.column >= hit.rect.x
+                        && mouse.column < hit.rect.right()
+                        && mouse.row >= hit.rect.y
+                        && mouse.row < hit.rect.bottom()
+                })
+                .cloned();
+            let Some(hit) = hit else {
+                return SshModalOutcome::Unchanged;
+            };
+            let Some(index) = state.targets.iter().position(|target| {
+                target.target_id == hit.target_id
+                    && target.grant.binding_id() == hit.binding_id.as_deref()
+            }) else {
+                return SshModalOutcome::Unchanged;
+            };
+            state.selected = index;
+            return SshModalOutcome::Changed;
+        }
+        match &mut state.page {
+            SshModalPage::Add(form) if !form.submitting => {
+                if let Some((field, _)) = form.field_hits.iter().find(|(_, rect)| {
+                    mouse.column >= rect.x
+                        && mouse.column < rect.right()
+                        && mouse.row >= rect.y
+                        && mouse.row < rect.bottom()
+                }) {
+                    form.active = *field;
+                    return SshModalOutcome::Changed;
+                }
+                return SshModalOutcome::Unchanged;
+            }
+            SshModalPage::Grant(card) => {
+                let focus = card
+                    .control_hits
+                    .iter()
+                    .find(|hit| {
+                        mouse.column >= hit.rect.x
+                            && mouse.column < hit.rect.right()
+                            && mouse.row >= hit.rect.y
+                            && mouse.row < hit.rect.bottom()
+                    })
+                    .map(|hit| hit.focus);
+                let Some(focus) = focus else {
+                    return SshModalOutcome::Unchanged;
+                };
+                card.focus = focus;
+                if focus != SshGrantFocus::Root {
+                    activate_grant_focus(card);
+                }
+                return SshModalOutcome::Changed;
+            }
+            SshModalPage::Manager
+            | SshModalPage::Add(_)
+            | SshModalPage::OperationApproval(_)
+            | SshModalPage::WorkerInstallFallback(_)
+            | SshModalPage::Authentication(_)
+            | SshModalPage::Diagnostic(_) => return SshModalOutcome::Unchanged,
+        }
+    }
+
     let delta = match mouse.kind {
-        crossterm::event::MouseEventKind::ScrollUp => Some(-3isize),
-        crossterm::event::MouseEventKind::ScrollDown => Some(3isize),
-        _ => None,
-    };
-    let Some(delta) = delta else {
-        return SshModalOutcome::Unchanged;
-    };
-    let (scroll, max_scroll_offset) = match &mut state.page {
-        SshModalPage::Authentication(card) => (&mut card.scroll_offset, card.max_scroll_offset),
-        SshModalPage::Diagnostic(card) => (&mut card.scroll_offset, card.max_scroll_offset),
+        MouseEventKind::ScrollUp => -3isize,
+        MouseEventKind::ScrollDown => 3isize,
         _ => return SshModalOutcome::Unchanged,
     };
-    *scroll = if delta.is_negative() {
-        scroll.saturating_sub(delta.unsigned_abs())
+    if matches!(&state.page, SshModalPage::Manager) {
+        return scroll_manager(state, delta);
+    }
+    match &mut state.page {
+        SshModalPage::Grant(card) => {
+            let next = if delta.is_negative() {
+                card.scroll_offset.saturating_sub(delta.unsigned_abs())
+            } else {
+                card.scroll_offset
+                    .saturating_add(delta as usize)
+                    .min(card.max_scroll_offset)
+            };
+            if next == card.scroll_offset {
+                SshModalOutcome::Unchanged
+            } else {
+                card.scroll_offset = next;
+                SshModalOutcome::Changed
+            }
+        }
+        SshModalPage::WorkerInstallFallback(card) => {
+            let next = if delta.is_negative() {
+                card.scroll_offset.saturating_sub(delta.unsigned_abs())
+            } else {
+                card.scroll_offset
+                    .saturating_add(delta as usize)
+                    .min(card.max_scroll_offset)
+            };
+            if next == card.scroll_offset {
+                SshModalOutcome::Unchanged
+            } else {
+                card.scroll_offset = next;
+                SshModalOutcome::Changed
+            }
+        }
+        SshModalPage::Authentication(card) => {
+            let next = if delta.is_negative() {
+                card.scroll_offset.saturating_sub(delta.unsigned_abs())
+            } else {
+                card.scroll_offset
+                    .saturating_add(delta as usize)
+                    .min(card.max_scroll_offset)
+            };
+            if next == card.scroll_offset {
+                SshModalOutcome::Unchanged
+            } else {
+                card.scroll_offset = next;
+                SshModalOutcome::Changed
+            }
+        }
+        SshModalPage::Diagnostic(card) => {
+            let next = if delta.is_negative() {
+                card.scroll_offset.saturating_sub(delta.unsigned_abs())
+            } else {
+                card.scroll_offset
+                    .saturating_add(delta as usize)
+                    .min(card.max_scroll_offset)
+            };
+            if next == card.scroll_offset {
+                SshModalOutcome::Unchanged
+            } else {
+                card.scroll_offset = next;
+                SshModalOutcome::Changed
+            }
+        }
+        SshModalPage::Manager | SshModalPage::Add(_) | SshModalPage::OperationApproval(_) => {
+            SshModalOutcome::Unchanged
+        }
+    }
+}
+
+fn scroll_manager(state: &mut SshManagerState, delta: isize) -> SshModalOutcome {
+    let visible = state.manager_visible_rows;
+    if visible == 0 {
+        return SshModalOutcome::Unchanged;
+    }
+    let max_scroll = state.targets.len().saturating_sub(visible);
+    let next = if delta.is_negative() {
+        state
+            .manager_scroll_offset
+            .saturating_sub(delta.unsigned_abs())
     } else {
-        scroll.saturating_add(delta as usize).min(max_scroll_offset)
+        state
+            .manager_scroll_offset
+            .saturating_add(delta as usize)
+            .min(max_scroll)
     };
+    if next == state.manager_scroll_offset {
+        return SshModalOutcome::Unchanged;
+    }
+    state.manager_scroll_offset = next;
+    if state.selected < next {
+        state.selected = next;
+    } else if state.selected >= next.saturating_add(visible) {
+        state.selected = next + visible - 1;
+    }
     SshModalOutcome::Changed
 }
 
 fn close_current_page(state: &mut SshManagerState) -> SshModalOutcome {
-    if matches!(
-        &state.page,
-        SshModalPage::Add(_) | SshModalPage::Diagnostic(_)
-    ) {
+    if let SshModalPage::Diagnostic(card) = &mut state.page {
+        state.page = if let Some(grant) = card.return_grant.take() {
+            SshModalPage::Grant(grant)
+        } else if let Some(form) = card.return_add.take() {
+            SshModalPage::Add(form)
+        } else {
+            SshModalPage::Manager
+        };
+        return SshModalOutcome::Changed;
+    }
+    if matches!(&state.page, SshModalPage::Grant(card) if card.request_id.is_empty()) {
         state.return_to_manager();
         return SshModalOutcome::Changed;
+    }
+    if matches!(&state.page, SshModalPage::Add(_)) {
+        state.return_to_manager();
+        return SshModalOutcome::Changed;
+    }
+    if let SshModalPage::WorkerInstallFallback(card) = &state.page {
+        if card.submitting || card.is_decided() {
+            return SshModalOutcome::Unchanged;
+        }
+        return SshModalOutcome::ApproveWorkerInstall {
+            request_id: card.request_id.clone(),
+            session_id: card.session_id.clone(),
+            binding_id: card.binding_id.clone(),
+            approved: false,
+        };
     }
     if let SshModalPage::Authentication(card) = &mut state.page {
         let challenge_id = card.challenge_id.clone();
@@ -2327,12 +3586,58 @@ fn close_current_page(state: &mut SshManagerState) -> SshModalOutcome {
             approval_id: card.approval_id.clone(),
             approved: false,
         },
+        SshModalPage::WorkerInstallFallback(_) => {
+            unreachable!("worker install fallback was handled before read-only match")
+        }
         SshModalPage::Authentication(_) => {
             unreachable!("authentication answers were cleared before read-only match")
         }
         SshModalPage::Add(_) => unreachable!("add page returned before read-only match"),
         SshModalPage::Diagnostic(_) => unreachable!("diagnostic returned before read-only match"),
     }
+}
+
+fn begin_grant_flow(state: &mut SshManagerState, follow_up: Option<&str>) -> SshModalOutcome {
+    let Some((target_id, target_label, granted_root)) = state.selected_target().map(|target| {
+        (
+            target.target_id.clone(),
+            target.label.clone(),
+            target
+                .grant
+                .granted_root()
+                .map(str::to_owned)
+                .unwrap_or_default(),
+        )
+    }) else {
+        state.show_error("Select an SSH target before starting an access grant.");
+        return SshModalOutcome::Changed;
+    };
+    if state.session_id.is_none() {
+        state.show_error("Open or create a session before granting SSH access.");
+        return SshModalOutcome::Changed;
+    }
+    if let Some(request_id) = state
+        .pending_grant
+        .as_ref()
+        .map(|request| request.request_id.clone())
+    {
+        return SshModalOutcome::InspectGrantTarget {
+            request_id,
+            target_id,
+        };
+    }
+    let mut card = SshGrantCard::new(
+        String::new(),
+        target_id,
+        target_label,
+        None,
+        granted_root,
+        None,
+        false,
+    );
+    card.follow_up = follow_up.map(str::to_owned);
+    state.page = SshModalPage::Grant(card);
+    SshModalOutcome::Changed
 }
 
 fn handle_manager_key(state: &mut SshManagerState, key: &KeyEvent) -> SshModalOutcome {
@@ -2353,108 +3658,118 @@ fn handle_manager_key(state: &mut SshManagerState, key: &KeyEvent) -> SshModalOu
             SshModalOutcome::Changed
         }
         KeyCode::Char('d') if key.modifiers.is_empty() => {
-            if state.open_error_diagnostic() {
+            if state.open_diagnostic() {
                 SshModalOutcome::Changed
             } else {
-                SshModalOutcome::Unchanged
+                state.show_info("Select an SSH target to inspect its configuration.");
+                SshModalOutcome::Changed
             }
         }
-        KeyCode::Char('r') if key.modifiers.is_empty() && state.selected_target().is_none() => {
-            SshModalOutcome::Refresh
-        }
-        KeyCode::Char('r') if key.modifiers.is_empty() => match state.selected_target() {
-            Some(target) => match &target.grant {
-                SshGrantView::Granted { binding_id, .. } => SshModalOutcome::RevokeBinding {
-                    binding_id: binding_id.clone(),
-                },
-                SshGrantView::NotGranted | SshGrantView::Revoking { .. } => {
-                    SshModalOutcome::Refresh
-                }
-            },
-            None => SshModalOutcome::Refresh,
-        },
-        KeyCode::Enter => match state.selected_target() {
-            Some(target) if target.connected => SshModalOutcome::Disconnect {
-                target_id: target.target_id.clone(),
-            },
-            Some(target) => SshModalOutcome::Connect {
-                target_id: target.target_id.clone(),
-            },
-            None => SshModalOutcome::Unchanged,
-        },
-        KeyCode::Char('g') if key.modifiers.is_empty() => {
-            let Some((target_id, target_label, granted_root)) =
-                state.selected_target().map(|target| {
-                    (
-                        target.target_id.clone(),
-                        target.label.clone(),
-                        target
-                            .grant
-                            .granted_root()
-                            .map(str::to_owned)
-                            .unwrap_or_default(),
-                    )
-                })
-            else {
-                return SshModalOutcome::Unchanged;
-            };
-            if state.session_id.is_none() {
-                state.show_error("Open or create a session before granting SSH access.");
-                return SshModalOutcome::Changed;
+        KeyCode::Char('r') if key.modifiers.is_empty() => {
+            let binding_id = state
+                .selected_target()
+                .and_then(|target| match &target.grant {
+                    SshGrantView::Granted { binding_id, .. } => Some(binding_id.clone()),
+                    SshGrantView::NotGranted | SshGrantView::Revoking { .. } => None,
+                });
+            if let Some(binding_id) = binding_id {
+                state.mark_binding_revoked(&binding_id, false);
+                SshModalOutcome::RevokeBinding { binding_id }
+            } else {
+                SshModalOutcome::Refresh
             }
-            if let Some(request_id) = state
-                .pending_grant
-                .as_ref()
-                .map(|request| request.request_id.clone())
-            {
-                return SshModalOutcome::InspectGrantTarget {
-                    request_id,
-                    target_id,
-                };
-            }
-            state.page = SshModalPage::Grant(SshGrantCard::new(
-                String::new(),
-                target_id,
-                target_label,
-                None,
-                granted_root,
-                None,
-                false,
-            ));
-            SshModalOutcome::Changed
         }
-        KeyCode::Char('u') if key.modifiers.is_empty() => state
-            .selected_target()
-            .and_then(|target| target.grant.binding_id())
-            .map(|binding_id| SshModalOutcome::UseBinding {
-                binding_id: binding_id.to_owned(),
-            })
-            .unwrap_or(SshModalOutcome::Unchanged),
-        KeyCode::Char('o') if key.modifiers.is_empty() => match state.selected_target() {
-            Some(target) => match &target.grant {
-                SshGrantView::Granted {
-                    binding_id,
-                    root,
-                    capabilities,
-                    ..
-                } => SshModalOutcome::OpenProject {
-                    target_id: target.target_id.clone(),
-                    root: root.clone(),
-                    binding_id: binding_id.clone(),
-                    capabilities: *capabilities,
-                },
-                SshGrantView::NotGranted | SshGrantView::Revoking { .. } => {
-                    state.show_error("Grant a remote root before opening an SSH project.");
+        KeyCode::Enter => {
+            let selected = state
+                .selected_target()
+                .map(|target| (target.target_id.clone(), target.connected));
+            match selected {
+                Some((target_id, true)) => SshModalOutcome::Disconnect { target_id },
+                Some((target_id, false)) => SshModalOutcome::Connect { target_id },
+                None => {
+                    state.show_error("Select an SSH target before connecting.");
                     SshModalOutcome::Changed
                 }
-            },
-            None => SshModalOutcome::Unchanged,
-        },
+            }
+        }
+        KeyCode::Char('g') if key.modifiers.is_empty() => begin_grant_flow(state, None),
+        KeyCode::Char('u') if key.modifiers.is_empty() => {
+            let binding_id = state
+                .selected_target()
+                .and_then(|target| match &target.grant {
+                    SshGrantView::Granted { binding_id, .. } => Some(binding_id.clone()),
+                    SshGrantView::NotGranted | SshGrantView::Revoking { .. } => None,
+                });
+            if let Some(binding_id) = binding_id {
+                SshModalOutcome::UseBinding { binding_id }
+            } else if matches!(
+                state.selected_target().map(|target| &target.grant),
+                Some(SshGrantView::Revoking { .. })
+            ) {
+                state.show_info("The selected SSH grant is being revoked; refresh before using another binding.");
+                SshModalOutcome::Changed
+            } else {
+                begin_grant_flow(
+                    state,
+                    Some(
+                        "No active binding is selected. Continue only after identity verification and explicit approval; then press u to use the new binding.",
+                    ),
+                )
+            }
+        }
+        KeyCode::Char('o') if key.modifiers.is_empty() => {
+            let project = state
+                .selected_target()
+                .and_then(|target| match &target.grant {
+                    SshGrantView::Granted {
+                        binding_id,
+                        root,
+                        capabilities,
+                        ..
+                    } => Some((
+                        target.target_id.clone(),
+                        root.clone(),
+                        binding_id.clone(),
+                        *capabilities,
+                    )),
+                    SshGrantView::NotGranted | SshGrantView::Revoking { .. } => None,
+                });
+            if let Some((target_id, root, binding_id, capabilities)) = project {
+                if !state.project_open_pending {
+                    SshModalOutcome::OpenProject {
+                        target_id,
+                        root,
+                        binding_id,
+                        capabilities,
+                    }
+                } else {
+                    SshModalOutcome::Changed
+                }
+            } else if matches!(
+                state.selected_target().map(|target| &target.grant),
+                Some(SshGrantView::Revoking { .. })
+            ) {
+                state.show_info(
+                    "The selected SSH grant is being revoked; choose an active binding first.",
+                );
+                SshModalOutcome::Changed
+            } else {
+                begin_grant_flow(
+                    state,
+                    Some(
+                        "Before opening a remote project, verify the identity and explicitly approve a remote root; then press o again.",
+                    ),
+                )
+            }
+        }
         _ => SshModalOutcome::Unchanged,
     }
 }
 
 fn handle_add_key(form: &mut SshManualTargetForm, key: &KeyEvent) -> SshModalOutcome {
+    if form.submitting {
+        return SshModalOutcome::Unchanged;
+    }
     match key.code {
         KeyCode::Esc => SshModalOutcome::Close,
         KeyCode::Tab => {
@@ -2465,14 +3780,43 @@ fn handle_add_key(form: &mut SshManualTargetForm, key: &KeyEvent) -> SshModalOut
             form.active = form.active.next(true);
             SshModalOutcome::Changed
         }
-        KeyCode::Enter => match form.draft() {
-            Ok(draft) => SshModalOutcome::AddTarget(draft),
+        KeyCode::Enter => match form.start_submit() {
+            Ok((draft, submission_id)) => SshModalOutcome::AddTarget {
+                draft,
+                submission_id,
+            },
             Err(error) => {
                 form.error = Some(error);
                 SshModalOutcome::Changed
             }
         },
-        _ => line_outcome(form.editor_mut().handle_key(key)),
+        _ => {
+            let outcome = form.editor_mut().handle_key(key);
+            if matches!(&outcome, LineEditOutcome::TextChanged) {
+                form.error = None;
+            }
+            line_outcome(outcome)
+        }
+    }
+}
+
+fn mark_grant_edited(card: &mut SshGrantCard) {
+    card.error = None;
+    card.scroll_offset = 0;
+    card.reviewed_to_end = false;
+}
+
+fn activate_grant_focus(card: &mut SshGrantCard) {
+    match card.focus {
+        SshGrantFocus::Root => {}
+        SshGrantFocus::Read => card.capabilities.read = !card.capabilities.read,
+        SshGrantFocus::Write => card.capabilities.write = !card.capabilities.write,
+        SshGrantFocus::Execute => card.capabilities.execute = !card.capabilities.execute,
+        SshGrantFocus::Lifetime => card.lifetime = card.lifetime.toggle(),
+        SshGrantFocus::Default => card.set_default = !card.set_default,
+    }
+    if card.focus != SshGrantFocus::Root {
+        mark_grant_edited(card);
     }
 }
 
@@ -2487,24 +3831,60 @@ fn handle_grant_key(card: &mut SshGrantCard, key: &KeyEvent) -> SshModalOutcome 
             lifetime: card.lifetime,
             set_default: card.set_default,
         },
+        KeyCode::Tab => {
+            card.focus = card.focus.next(false);
+            SshModalOutcome::Changed
+        }
+        KeyCode::BackTab => {
+            card.focus = card.focus.next(true);
+            SshModalOutcome::Changed
+        }
+        KeyCode::PageUp => {
+            card.scroll_offset = card.scroll_offset.saturating_sub(card.page_size);
+            SshModalOutcome::Changed
+        }
+        KeyCode::PageDown => {
+            card.scroll_offset = card
+                .scroll_offset
+                .saturating_add(card.page_size)
+                .min(card.max_scroll_offset);
+            SshModalOutcome::Changed
+        }
+        KeyCode::Home => {
+            card.scroll_offset = 0;
+            SshModalOutcome::Changed
+        }
+        KeyCode::End => {
+            card.scroll_offset = card.max_scroll_offset;
+            SshModalOutcome::Changed
+        }
         KeyCode::Char('r') if key.modifiers == KeyModifiers::ALT => {
-            card.capabilities.read = !card.capabilities.read;
+            card.focus = SshGrantFocus::Read;
+            activate_grant_focus(card);
             SshModalOutcome::Changed
         }
         KeyCode::Char('w') if key.modifiers == KeyModifiers::ALT => {
-            card.capabilities.write = !card.capabilities.write;
+            card.focus = SshGrantFocus::Write;
+            activate_grant_focus(card);
             SshModalOutcome::Changed
         }
         KeyCode::Char('x') if key.modifiers == KeyModifiers::ALT => {
-            card.capabilities.execute = !card.capabilities.execute;
+            card.focus = SshGrantFocus::Execute;
+            activate_grant_focus(card);
             SshModalOutcome::Changed
         }
         KeyCode::Char('l') if key.modifiers == KeyModifiers::ALT => {
-            card.lifetime = card.lifetime.toggle();
+            card.focus = SshGrantFocus::Lifetime;
+            activate_grant_focus(card);
             SshModalOutcome::Changed
         }
         KeyCode::Char('d') if key.modifiers == KeyModifiers::ALT => {
-            card.set_default = !card.set_default;
+            card.focus = SshGrantFocus::Default;
+            activate_grant_focus(card);
+            SshModalOutcome::Changed
+        }
+        KeyCode::Char(' ') if key.modifiers.is_empty() && card.focus != SshGrantFocus::Root => {
+            activate_grant_focus(card);
             SshModalOutcome::Changed
         }
         KeyCode::Enter => {
@@ -2515,6 +3895,13 @@ fn handle_grant_key(card: &mut SshGrantCard, key: &KeyEvent) -> SshModalOutcome 
             }
             if !card.capabilities.any() {
                 card.error = Some("Choose at least one capability.".into());
+                return SshModalOutcome::Changed;
+            }
+            if !card.request_id.is_empty() && !card.reviewed_to_end {
+                card.error = Some(
+                    "Review every wrapped identity, root, reason, and capability detail before allowing this grant."
+                        .into(),
+                );
                 return SshModalOutcome::Changed;
             }
             if card.request_id.is_empty() {
@@ -2537,7 +3924,14 @@ fn handle_grant_key(card: &mut SshGrantCard, key: &KeyEvent) -> SshModalOutcome 
                 }
             }
         }
-        _ => line_outcome(card.root.handle_key(key)),
+        _ if card.focus == SshGrantFocus::Root => {
+            let outcome = card.root.handle_key(key);
+            if matches!(&outcome, LineEditOutcome::TextChanged) {
+                mark_grant_edited(card);
+            }
+            line_outcome(outcome)
+        }
+        _ => SshModalOutcome::Unchanged,
     }
 }
 
@@ -2593,6 +3987,64 @@ fn handle_operation_approval_key(
             approval_id: card.approval_id.clone(),
             approved: false,
         },
+        _ => SshModalOutcome::Unchanged,
+    }
+}
+
+fn handle_worker_install_fallback_key(
+    card: &mut SshWorkerInstallFallbackCard,
+    key: &KeyEvent,
+) -> SshModalOutcome {
+    if card.submitting || card.is_decided() {
+        return SshModalOutcome::Unchanged;
+    }
+    match key.code {
+        KeyCode::Up | KeyCode::Char('k') if key.modifiers.is_empty() => {
+            card.scroll_offset = card.scroll_offset.saturating_sub(1);
+            card.error = None;
+            SshModalOutcome::Changed
+        }
+        KeyCode::Down | KeyCode::Char('j') if key.modifiers.is_empty() => {
+            card.scroll_offset = card.scroll_offset.saturating_add(1);
+            card.error = None;
+            SshModalOutcome::Changed
+        }
+        KeyCode::PageUp => {
+            card.scroll_offset = card.scroll_offset.saturating_sub(8);
+            card.error = None;
+            SshModalOutcome::Changed
+        }
+        KeyCode::PageDown => {
+            card.scroll_offset = card.scroll_offset.saturating_add(8);
+            card.error = None;
+            SshModalOutcome::Changed
+        }
+        KeyCode::Home => {
+            card.scroll_offset = 0;
+            card.error = None;
+            SshModalOutcome::Changed
+        }
+        KeyCode::End => {
+            card.scroll_offset = card.max_scroll_offset;
+            card.error = None;
+            SshModalOutcome::Changed
+        }
+        KeyCode::Enter | KeyCode::Char('y') if key.modifiers.is_empty() => {
+            SshModalOutcome::ApproveWorkerInstall {
+                request_id: card.request_id.clone(),
+                session_id: card.session_id.clone(),
+                binding_id: card.binding_id.clone(),
+                approved: true,
+            }
+        }
+        KeyCode::Char('n') | KeyCode::Esc if key.modifiers.is_empty() => {
+            SshModalOutcome::ApproveWorkerInstall {
+                request_id: card.request_id.clone(),
+                session_id: card.session_id.clone(),
+                binding_id: card.binding_id.clone(),
+                approved: false,
+            }
+        }
         _ => SshModalOutcome::Unchanged,
     }
 }
@@ -2754,6 +4206,141 @@ mod tests {
         )
     }
 
+    fn worker_install_request(request_id: &str) -> xai_grok_shell::ssh::SshWorkerInstallRequest {
+        xai_grok_shell::ssh::SshWorkerInstallRequest {
+            client_id: 7,
+            request_id: request_id.into(),
+            session_id: "project-session".into(),
+            binding_id: "project-binding".into(),
+            target_id: "fixture-worker".into(),
+            version: "1.2.3-rc.4".into(),
+            platform: "linux-aarch64".into(),
+            remote_error: format!(
+                "remote download failed because proxy rejected artifact request {request_id}; diagnostic-tail-{request_id}"
+            ),
+        }
+    }
+
+    #[test]
+    fn worker_fallback_wraps_details_and_routes_keyboard_mouse_and_close_decisions() {
+        let mut state = SshManagerState::new(Some("source-session".into()));
+        state.show_worker_install_fallback(worker_install_request("fallback-1"));
+        let area = Rect::new(0, 0, 60, 12);
+        let theme = Theme::current();
+        let mut frames = String::new();
+        loop {
+            let mut buffer = Buffer::empty(area);
+            render_ssh_modal(&mut buffer, area, &mut state, false, &theme);
+            frames.push_str(&buffer_text(&buffer));
+            let at_end = matches!(
+                &state.page,
+                SshModalPage::WorkerInstallFallback(card)
+                    if card.scroll_offset == card.max_scroll_offset
+            );
+            if at_end {
+                break;
+            }
+            assert!(matches!(
+                handle_ssh_key(&mut state, &key(KeyCode::Down)),
+                SshModalOutcome::Changed
+            ));
+        }
+        assert!(frames.contains("1.2.3-rc.4"));
+        assert!(frames.contains("linux-aarch64"));
+        let unwrapped: String = frames.chars().filter(char::is_ascii_alphanumeric).collect();
+        assert!(unwrapped.contains("diagnostictailfallback1"), "{frames}");
+
+        let approve = state
+            .window
+            .shortcut_hits
+            .iter()
+            .find(|hit| hit.id == FOOTER_WORKER_INSTALL_APPROVE)
+            .expect("rendered fallback approve footer")
+            .rect;
+        let click = MouseEvent {
+            kind: MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            column: approve.x,
+            row: approve.y,
+            modifiers: KeyModifiers::NONE,
+        };
+        assert!(matches!(
+            handle_ssh_mouse(&mut state, &click),
+            SshModalOutcome::ApproveWorkerInstall { approved: true, .. }
+        ));
+
+        let mut declined = SshManagerState::new(Some("source-session".into()));
+        declined.show_worker_install_fallback(worker_install_request("fallback-2"));
+        assert!(matches!(
+            handle_ssh_key(&mut declined, &key(KeyCode::Esc)),
+            SshModalOutcome::ApproveWorkerInstall {
+                approved: false,
+                ..
+            }
+        ));
+
+        let mut closed = SshManagerState::new(Some("source-session".into()));
+        closed.show_worker_install_fallback(worker_install_request("fallback-3"));
+        assert!(matches!(
+            close_current_page(&mut closed),
+            SshModalOutcome::ApproveWorkerInstall {
+                approved: false,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn worker_fallback_completion_preserves_matching_progress_until_project_terminal_state() {
+        let mut state = SshManagerState::new(Some("source-session".into()));
+        state.show_worker_install_fallback(worker_install_request("fallback-1"));
+        assert!(state.submit_worker_install(
+            7,
+            "fallback-1",
+            "project-session",
+            "project-binding",
+            true,
+        ));
+        state.apply_worker_install_progress(
+            7,
+            "fallback-1",
+            "project-session",
+            "project-binding",
+            "fixture-worker",
+            Some("Uploading exact build…".into()),
+        );
+        state.settle_worker_install_decision(
+            7,
+            "fallback-1",
+            "project-session",
+            "project-binding",
+            true,
+            None,
+        );
+        assert!(matches!(
+            &state.page,
+            SshModalPage::WorkerInstallFallback(card)
+                if card.decision_accepted == Some(true)
+                    && card.progress.as_deref() == Some("Uploading exact build…")
+        ));
+
+        state.show_worker_install_fallback(worker_install_request("fallback-2"));
+        state.settle_worker_install_decision(
+            7,
+            "fallback-1",
+            "project-session",
+            "project-binding",
+            true,
+            Some("late local control failure".into()),
+        );
+        assert!(matches!(
+            &state.page,
+            SshModalPage::WorkerInstallFallback(card) if card.request_id == "fallback-2"
+        ));
+
+        state.settle_project_open();
+        assert!(matches!(&state.page, SshModalPage::Manager));
+    }
+
     #[test]
     fn transient_allowed_operation_returns_to_chat_only_after_matching_acknowledgement() {
         let mut state = SshManagerState::new(Some("session-1".into()));
@@ -2830,6 +4417,435 @@ mod tests {
 
     fn key(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    fn target_view(target_id: &str, grant: SshGrantView) -> SshTargetView {
+        SshTargetView {
+            target_id: target_id.into(),
+            label: format!("{target_id} label"),
+            source: "manual".into(),
+            effective_address: "user@example.test:22".into(),
+            connected: false,
+            connection_detail: "Disconnected.".into(),
+            grant,
+        }
+    }
+
+    fn granted(binding_id: &str, root: &str) -> SshGrantView {
+        SshGrantView::Granted {
+            binding_id: binding_id.into(),
+            root: root.into(),
+            capabilities: SshCapabilitiesView::default(),
+            is_default: false,
+        }
+    }
+
+    fn add_submission_id(outcome: SshModalOutcome) -> u64 {
+        match outcome {
+            SshModalOutcome::AddTarget { submission_id, .. } => submission_id,
+            _ => panic!("expected add-target submission"),
+        }
+    }
+
+    #[test]
+    fn target_add_completion_is_correlated_and_failure_keeps_the_editable_form() {
+        let mut state = SshManagerState::new(None);
+        assert!(matches!(
+            handle_manager_key(&mut state, &key(KeyCode::Char('a'))),
+            SshModalOutcome::Changed
+        ));
+        let SshModalPage::Add(form) = &mut state.page else {
+            panic!("add target form must open");
+        };
+        form.host.set_text("first.example.test");
+        let first_submission = add_submission_id(handle_ssh_key(&mut state, &key(KeyCode::Enter)));
+        assert_eq!(state.target_add_submission_id(), Some(first_submission));
+
+        assert!(matches!(
+            close_current_page(&mut state),
+            SshModalOutcome::Changed
+        ));
+        assert!(matches!(&state.page, SshModalPage::Manager));
+        handle_manager_key(&mut state, &key(KeyCode::Char('a')));
+        let SshModalPage::Add(form) = &mut state.page else {
+            panic!("second add target form must open");
+        };
+        form.host.set_text("second.example.test");
+        let second_submission = add_submission_id(handle_ssh_key(&mut state, &key(KeyCode::Enter)));
+        assert_ne!(first_submission, second_submission);
+
+        assert!(
+            !state.settle_target_add_for_submission(first_submission, Ok("first-target".into()))
+        );
+        assert_eq!(state.target_add_submission_id(), Some(second_submission));
+        assert!(state.settle_target_add_for_submission(
+            second_submission,
+            Err("The target already exists.".into())
+        ));
+        let area = Rect::new(0, 0, 100, 40);
+        let mut buffer = Buffer::empty(area);
+        render_ssh_modal(&mut buffer, area, &mut state, false, &Theme::current());
+        assert!(buffer_text(&buffer).contains("The target already exists."));
+        assert!(matches!(&state.page, SshModalPage::Diagnostic(_)));
+        close_current_page(&mut state);
+        assert!(matches!(
+            &state.page,
+            SshModalPage::Add(form)
+                if !form.submitting
+                    && form.host.text() == "second.example.test"
+                    && form.error.is_none()
+        ));
+        assert!(matches!(
+            handle_ssh_key(&mut state, &key(KeyCode::Char('x'))),
+            SshModalOutcome::Changed
+        ));
+        assert!(matches!(
+            &state.page,
+            SshModalPage::Add(form) if form.error.is_none()
+        ));
+
+        let third_submission = add_submission_id(handle_ssh_key(&mut state, &key(KeyCode::Enter)));
+        assert!(
+            state.settle_target_add_for_submission(third_submission, Ok("saved-target".into()))
+        );
+        assert!(matches!(&state.page, SshModalPage::Manager));
+        state.set_targets(vec![target_view("saved-target", SshGrantView::NotGranted)]);
+        assert_eq!(
+            state
+                .selected_target()
+                .map(|target| target.target_id.as_str()),
+            Some("saved-target")
+        );
+        let mut replacement = SshManagerState::new(None);
+        handle_manager_key(&mut replacement, &key(KeyCode::Char('a')));
+        let SshModalPage::Add(form) = &mut replacement.page else {
+            panic!("replacement manager must open an add form");
+        };
+        form.host.set_text("replacement.example.test");
+        let replacement_submission =
+            add_submission_id(handle_ssh_key(&mut replacement, &key(KeyCode::Enter)));
+        assert_ne!(third_submission, replacement_submission);
+        assert_ne!(state.instance_id(), replacement.instance_id());
+    }
+
+    #[test]
+    fn multiple_binding_rows_keep_selected_grant_and_share_connection_state() {
+        let mut state = SshManagerState::new(Some("session-1".into()));
+        state.set_targets(vec![
+            target_view("target-1", granted("binding-a", "/a")),
+            target_view("target-1", granted("binding-b", "/b")),
+        ]);
+        state.selected = 1;
+        state.set_targets(vec![
+            target_view("target-1", granted("binding-b", "/b")),
+            target_view("target-1", granted("binding-a", "/a")),
+        ]);
+        assert_eq!(
+            state
+                .selected_target()
+                .and_then(|target| target.grant.binding_id()),
+            Some("binding-b")
+        );
+
+        state.apply_target_status(
+            "target-1",
+            SshConnectionState::Connected,
+            Some("Connected once for every binding row.".into()),
+        );
+        assert!(state.targets.iter().all(|target| {
+            target.target_id == "target-1"
+                && target.connected
+                && target.connection_detail == "Connected once for every binding row."
+        }));
+
+        state.mark_binding_revoked("binding-b", false);
+        assert!(matches!(
+            state.selected_target().map(|target| &target.grant),
+            Some(SshGrantView::Revoking { binding_id, .. }) if binding_id == "binding-b"
+        ));
+        assert!(matches!(
+            state
+                .targets
+                .iter()
+                .find(|target| target.grant.binding_id() == Some("binding-a"))
+                .map(|target| &target.grant),
+            Some(SshGrantView::Granted { binding_id, .. }) if binding_id == "binding-a"
+        ));
+        state.set_targets(vec![
+            target_view("target-1", granted("binding-a", "/a")),
+            target_view("target-2", SshGrantView::NotGranted),
+        ]);
+        assert_eq!(
+            state
+                .selected_target()
+                .and_then(|target| target.grant.binding_id()),
+            Some("binding-b")
+        );
+        assert_eq!(
+            state.targets[state.selected - 1].grant.binding_id(),
+            Some("binding-a")
+        );
+        assert_eq!(state.targets[state.selected + 1].target_id, "target-2");
+    }
+
+    #[test]
+    fn manual_target_port_rejects_zero_and_accepts_the_u16_upper_bound() {
+        let mut form = SshManualTargetForm::default();
+        form.host.set_text("build.example.test");
+        form.port.set_text("0");
+        assert_eq!(
+            form.draft()
+                .expect_err("zero is outside the TCP port range"),
+            "Port must be an integer between 1 and 65535."
+        );
+        form.port.set_text("65535");
+        assert_eq!(
+            form.draft().expect("upper bound is valid").port,
+            Some(65535)
+        );
+    }
+
+    #[test]
+    fn narrow_grant_card_exposes_wrapped_identity_root_reason_and_run_warning() {
+        let mut card = SshGrantCard::new(
+            "request-1".into(),
+            "target-1".into(),
+            "Build host".into(),
+            Some("verified@example.test SHA256:verified-fingerprint".into()),
+            "/remote/project-root/that-must-remain-inspectable",
+            Some("reason-token-visible-after-scrolling".into()),
+            true,
+        );
+        card.capabilities.execute = true;
+        assert!(matches!(
+            handle_grant_key(&mut card, &key(KeyCode::Enter)),
+            SshModalOutcome::Changed
+        ));
+        card.error = None;
+        let area = Rect::new(0, 0, 30, 4);
+        let theme = Theme::current();
+        let mut frames = String::new();
+        for _ in 0..128 {
+            let mut buffer = Buffer::empty(area);
+            render_grant(&mut buffer, area, &mut card, &theme);
+            frames.push_str(&buffer_text(&buffer));
+            frames.push('\n');
+            if card.scroll_offset == card.max_scroll_offset {
+                break;
+            }
+            assert!(matches!(
+                handle_grant_key(&mut card, &key(KeyCode::PageDown)),
+                SshModalOutcome::Changed
+            ));
+        }
+        assert!(frames.contains("SHA256:"));
+        assert!(frames.contains("fingerprint"));
+        assert!(frames.contains("project-root"));
+        assert!(frames.contains("reason-token"));
+        assert!(frames.contains("scrolling"));
+        assert!(frames.contains("Warning:"));
+        assert!(card.reviewed_to_end);
+    }
+
+    #[test]
+    fn grant_controls_support_tab_space_and_alt_activation() {
+        let mut card = SshGrantCard::new(
+            String::new(),
+            "target-1".into(),
+            "Build host".into(),
+            None,
+            "/remote/root",
+            None,
+            false,
+        );
+        assert!(matches!(
+            handle_grant_key(&mut card, &key(KeyCode::Tab)),
+            SshModalOutcome::Changed
+        ));
+        assert_eq!(card.focus, SshGrantFocus::Read);
+        assert!(matches!(
+            handle_grant_key(&mut card, &key(KeyCode::Char(' '))),
+            SshModalOutcome::Changed
+        ));
+        assert!(!card.capabilities.read);
+        let alt_write = KeyEvent::new(KeyCode::Char('w'), KeyModifiers::ALT);
+        assert!(matches!(
+            handle_grant_key(&mut card, &alt_write),
+            SshModalOutcome::Changed
+        ));
+        assert_eq!(card.focus, SshGrantFocus::Write);
+        assert!(card.capabilities.write);
+        assert!(matches!(
+            handle_grant_key(&mut card, &key(KeyCode::BackTab)),
+            SshModalOutcome::Changed
+        ));
+        assert_eq!(card.focus, SshGrantFocus::Read);
+    }
+
+    #[test]
+    fn rendered_mouse_targets_footer_and_form_hits_follow_keyboard_semantics() {
+        let mut state = SshManagerState::new(None);
+        state.set_targets(
+            (0..12)
+                .map(|index| target_view(&format!("target-{index}"), SshGrantView::NotGranted))
+                .collect(),
+        );
+        let area = Rect::new(0, 0, 100, 40);
+        let theme = Theme::current();
+        let mut buffer = Buffer::empty(area);
+        render_ssh_modal(&mut buffer, area, &mut state, false, &theme);
+        let second_row = state
+            .manager_row_hits
+            .get(1)
+            .expect("second manager row must be visible")
+            .rect;
+        let left_click = |column, row| MouseEvent {
+            kind: MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        };
+        assert!(matches!(
+            handle_ssh_mouse(&mut state, &left_click(second_row.x, second_row.y)),
+            SshModalOutcome::Changed
+        ));
+        assert_eq!(
+            state
+                .selected_target()
+                .map(|target| target.target_id.as_str()),
+            Some("target-1")
+        );
+        let wheel = MouseEvent {
+            kind: MouseEventKind::ScrollDown,
+            column: second_row.x,
+            row: second_row.y,
+            modifiers: KeyModifiers::NONE,
+        };
+        assert!(matches!(
+            handle_ssh_mouse(&mut state, &wheel),
+            SshModalOutcome::Changed
+        ));
+        assert!(state.manager_scroll_offset > 0);
+
+        let add_footer = state
+            .window
+            .shortcut_hits
+            .iter()
+            .find(|hit| hit.id == FOOTER_MANAGER_ADD)
+            .expect("rendered manager add footer")
+            .rect;
+        assert!(matches!(
+            handle_ssh_mouse(&mut state, &left_click(add_footer.x, add_footer.y)),
+            SshModalOutcome::Changed
+        ));
+        assert!(matches!(&state.page, SshModalPage::Add(_)));
+        assert!(matches!(
+            handle_ssh_mouse(&mut state, &left_click(add_footer.x, add_footer.y)),
+            SshModalOutcome::Unchanged
+        ));
+
+        let mut buffer = Buffer::empty(area);
+        render_ssh_modal(&mut buffer, area, &mut state, false, &theme);
+        let port_row = match &state.page {
+            SshModalPage::Add(form) => {
+                form.field_hits
+                    .iter()
+                    .find(|(field, _)| *field == ManualTargetField::Port)
+                    .expect("rendered port field")
+                    .1
+            }
+            _ => panic!("add target form must remain open"),
+        };
+        assert!(matches!(
+            handle_ssh_mouse(&mut state, &left_click(port_row.x, port_row.y)),
+            SshModalOutcome::Changed
+        ));
+        assert!(matches!(
+            &state.page,
+            SshModalPage::Add(form) if form.active == ManualTargetField::Port
+        ));
+    }
+
+    #[test]
+    fn unsubmitted_grant_can_be_cancelled_without_a_service_decision() {
+        let mut state = SshManagerState::new(Some("session-1".into()));
+        state.show_grant(SshGrantCard::new(
+            String::new(),
+            "target-1".into(),
+            "Build host".into(),
+            None,
+            "/tmp",
+            None,
+            false,
+        ));
+        assert!(matches!(
+            handle_ssh_key(&mut state, &key(KeyCode::Esc)),
+            SshModalOutcome::Changed
+        ));
+        assert!(matches!(&state.page, SshModalPage::Manager));
+        assert!(matches!(
+            handle_ssh_key(&mut state, &key(KeyCode::Esc)),
+            SshModalOutcome::Close
+        ));
+    }
+
+    #[test]
+    fn grant_failure_is_readable_and_returns_to_the_same_editable_request() {
+        let mut state = SshManagerState::new(Some("session-1".into()));
+        state.show_grant(SshGrantCard::new(
+            "request-1".into(),
+            "target-1".into(),
+            "Build host".into(),
+            Some("user@host SHA256:verified".into()),
+            "/missing/project",
+            None,
+            false,
+        ));
+        state.show_error("SSH access failed: the requested remote root does not exist");
+        assert!(matches!(&state.page, SshModalPage::Diagnostic(_)));
+        let area = Rect::new(0, 0, 60, 20);
+        let mut buffer = Buffer::empty(area);
+        render_ssh_modal(&mut buffer, area, &mut state, false, &Theme::current());
+        assert!(buffer_text(&buffer).contains("does not exist"));
+        assert!(matches!(
+            handle_ssh_key(&mut state, &key(KeyCode::Esc)),
+            SshModalOutcome::Changed
+        ));
+        assert!(matches!(
+            &state.page,
+            SshModalPage::Grant(card)
+                if card.request_id == "request-1" && card.root.text() == "/missing/project"
+        ));
+        assert!(matches!(
+            handle_ssh_key(&mut state, &key(KeyCode::Esc)),
+            SshModalOutcome::ApproveGrant { approved: false, request_id, .. }
+                if request_id == "request-1"
+        ));
+    }
+
+    #[test]
+    fn terminal_status_clears_only_matching_connection_progress_without_hiding_errors() {
+        let mut state = SshManagerState::new(Some("session-1".into()));
+        for (connect, terminal) in [
+            (true, SshConnectionState::Connected),
+            (false, SshConnectionState::Disconnected),
+        ] {
+            state.begin_connection_action("target-1", connect);
+            let progress = state.message.clone();
+            state.apply_target_status("other-target", terminal, None);
+            assert_eq!(state.message, progress);
+            state.apply_target_status("target-1", SshConnectionState::Connecting, None);
+            assert_eq!(state.message, progress);
+            state.apply_target_status("target-1", terminal, None);
+            assert!(state.pending_connection.is_none());
+            assert_ne!(state.message, progress);
+        }
+
+        state.begin_connection_action("target-1", true);
+        state.show_error("a newer operation failed");
+        let failure = state.message.clone();
+        state.apply_target_status("target-1", SshConnectionState::Connected, None);
+        assert_eq!(state.message, failure);
     }
 
     fn host_key_card(status: &str, previous_keys: Vec<String>, can_replace: bool) -> SshAuthCard {

@@ -28,6 +28,7 @@ pub use self_update::{
     is_managed_install as is_groky_managed_install, is_release_build, product_version,
     set_product_version, updates_allowed as groky_updates_allowed,
 };
+pub(crate) use self_update::{parse_sha256, release_download_url, repo};
 pub use vendor_models::{
     refresh as refresh_vendor_models, refresh_for_account as refresh_vendor_models_for_account,
     refresh_stale_unlocked as refresh_stale_vendor_models,

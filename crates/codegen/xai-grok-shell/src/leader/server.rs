@@ -1662,6 +1662,12 @@ pub async fn run_leader_server(
                             crate::ssh::SshEvent::OperationApproval(approval) => {
                                 Some(ClientId(approval.client_id))
                             }
+                            crate::ssh::SshEvent::WorkerInstallRequested(request) => {
+                                Some(ClientId(request.client_id))
+                            }
+                            crate::ssh::SshEvent::WorkerInstallProgress(progress) => {
+                                Some(ClientId(progress.client_id))
+                            }
                             crate::ssh::SshEvent::GrantRequested(request) => request
                                 .client_id
                                 .map(ClientId)

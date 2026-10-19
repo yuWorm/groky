@@ -133,6 +133,11 @@ impl AgentView {
         let mut view = Self {
             session,
             ssh_project_location: None,
+            ssh_project_open_owner: None,
+            ssh_project_open_session_id: None,
+            ssh_project_binding_id: None,
+            ssh_project_resume_pending_session_id: None,
+            ssh_project_resume_install: None,
             session_binding_epoch: 0,
             scrollback,
             prompt,

@@ -257,6 +257,7 @@ fn dispatch_load_session_ungated(
     );
     agent_mut.chat_kind = chat_kind || app.chat_mode;
     agent_mut.conversation_entry = conversation_entry;
+    agent_mut.ssh_project_resume_pending_session_id = Some(session_id.clone());
     #[cfg(feature = "local-workspace")]
     {
         let history_build = app.welcome_history_load_as_build;
@@ -1213,6 +1214,22 @@ pub(in crate::app::dispatch) fn dispatch_load_session_with_restore(
         session_cwd,
     }]
 }
+
+/// Drop only the transient consent surface created for an in-flight explicit SSH project resume.
+/// The opaque request remains recorded to discard late events, while a user-created replacement
+/// manager has a distinct owner and survives this terminal load.
+fn clear_pending_ssh_project_resume(app: &mut AppView, agent_id: AgentId) {
+    let owner = app.agents.get_mut(&agent_id).and_then(|agent| {
+        agent.ssh_project_resume_pending_session_id = None;
+        agent
+            .ssh_project_resume_install
+            .as_ref()
+            .map(|install| install.owner)
+    });
+    if let Some(owner) = owner {
+        super::super::ssh::close_ssh_manager_for_owner(app, owner);
+    }
+}
 #[allow(clippy::too_many_arguments)]
 pub(in crate::app::dispatch) fn handle_session_loaded(
     app: &mut AppView,
@@ -1237,6 +1254,7 @@ pub(in crate::app::dispatch) fn handle_session_loaded(
     {
         return vec![];
     }
+    clear_pending_ssh_project_resume(app, agent_id);
     let identity_rebind = super::super::dashboard::WorkspaceIdentityRebind::capture(app);
     crate::app::workspace_sync::allow_loaded_session(app, session_id.0.as_ref());
     if let Some(agent) = app.agents.get_mut(&agent_id) {
@@ -1383,10 +1401,15 @@ pub(in crate::app::dispatch) fn handle_session_load_failed(
     error: String,
 ) -> Vec<Effect> {
     tracing::error!(agent = ?agent_id, session = ?session_id, error = %error, "Session load failed");
+    if app
+        .agents
+        .get_mut(&agent_id)
+        .is_some_and(|agent| defer_to_open_reload_window(agent, agent_id, "SessionLoadFailed"))
+    {
+        return vec![];
+    }
+    clear_pending_ssh_project_resume(app, agent_id);
     if let Some(agent) = app.agents.get_mut(&agent_id) {
-        if defer_to_open_reload_window(agent, agent_id, "SessionLoadFailed") {
-            return vec![];
-        }
         agent.pending_extensions_fetch = false;
         agent.session.prompt_history_loading = false;
         agent.session.finish_command();

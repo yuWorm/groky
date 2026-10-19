@@ -72,6 +72,7 @@ pub enum SshControlCommand {
     },
     SubmitAuthentication(SshAuthControlResponse),
     SubmitOperationApproval(SshOperationApprovalDecision),
+    SubmitWorkerInstall(super::SshWorkerInstallDecision),
 }
 
 /// IPC-only secret input. Its Debug implementation is redacted and it is never
@@ -230,6 +231,7 @@ pub enum SshControlReply {
     TargetStatus(SshTargetStatus),
     AuthenticationAccepted,
     OperationApprovalAccepted,
+    WorkerInstallAccepted,
 }
 
 #[cfg(test)]
