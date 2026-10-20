@@ -704,7 +704,7 @@ pub(super) fn dispatch_begin_ssh_project_open(
             source_session_id,
             target_id: project.target_id,
             root: project.root,
-            expected_identity: None,
+            expected_identity: project.expected_identity,
             client_id: app.ssh_client_id,
             owner,
         });
@@ -1653,82 +1653,9 @@ pub(super) fn apply_ssh_control_event(
             }
             xai_grok_shell::ssh::SshEvent::Authentication(prompt) => {
                 if prompt.client_id == client_id {
-                    let challenge_id = prompt.challenge_id;
-                    let connection_generation = prompt.connection_generation;
-                    let target_id = prompt.target_id;
-                    let kind = match (prompt.kind, prompt.detail) {
-                        (
-                            xai_grok_shell::ssh::SshAuthPromptKind::HostKey,
-                            xai_grok_shell::ssh::SshAuthPromptDetail::HostKey {
-                                hostname,
-                                port,
-                                algorithm,
-                                fingerprint,
-                                status,
-                                previous_keys,
-                                can_replace,
-                            },
-                        ) => Some(crate::views::ssh_modal::SshAuthKind::HostKey {
-                            hostname,
-                            port,
-                            algorithm,
-                            fingerprint,
-                            status,
-                            previous_keys,
-                            can_replace,
-                        }),
-                        (
-                            xai_grok_shell::ssh::SshAuthPromptKind::Password,
-                            xai_grok_shell::ssh::SshAuthPromptDetail::Secret {
-                                username,
-                                message,
-                                allow_remember,
-                            },
-                        ) => Some(crate::views::ssh_modal::SshAuthKind::Password {
-                            username,
-                            message,
-                            allow_remember,
-                        }),
-                        (
-                            xai_grok_shell::ssh::SshAuthPromptKind::PrivateKeyPassphrase,
-                            xai_grok_shell::ssh::SshAuthPromptDetail::Secret {
-                                username,
-                                message,
-                                allow_remember,
-                            },
-                        ) => Some(crate::views::ssh_modal::SshAuthKind::PrivateKeyPassphrase {
-                            username,
-                            message,
-                            allow_remember,
-                        }),
-                        (
-                            xai_grok_shell::ssh::SshAuthPromptKind::KeyboardInteractive,
-                            xai_grok_shell::ssh::SshAuthPromptDetail::KeyboardInteractive {
-                                name,
-                                instruction,
-                                questions,
-                            },
-                        ) => Some(crate::views::ssh_modal::SshAuthKind::KeyboardInteractive {
-                            name,
-                            instruction,
-                            prompts: questions
-                                .into_iter()
-                                .map(|question| question.prompt)
-                                .collect(),
-                        }),
-                        _ => None,
-                    };
-                    if let Some(kind) = kind {
-                        manager.show_authentication(crate::views::ssh_modal::SshAuthCard::new(
-                            challenge_id,
-                            connection_generation,
-                            target_id,
-                            kind,
-                        ));
-                    } else {
-                        manager.show_error(
-                            "SSH authentication prompt kind did not match its local details.",
-                        );
+                    match crate::app::ssh_control::authentication_card(prompt) {
+                        Ok(card) => manager.show_authentication(card),
+                        Err(error) => manager.show_error(error),
                     }
                 }
             }

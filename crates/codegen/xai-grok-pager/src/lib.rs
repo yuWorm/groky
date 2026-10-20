@@ -49,6 +49,7 @@ pub mod scrollback;
 pub mod sessions_cmd;
 pub mod settings;
 pub mod ssh_cmd;
+pub mod ssh_tui;
 pub mod share_cmd;
 pub mod signal_streams;
 pub mod slash;

@@ -33,7 +33,7 @@ use tokio_util::sync::CancellationToken;
 use xai_grok_pager::agent_runtime::AgentRuntime;
 use xai_grok_pager::app::{
     AgentCmd, Command, EARLY_PREFETCH_WAIT, HeadlessArgs, LeaderMgmtArgs, LeaderMgmtCommand,
-    LeaderMode, LeaderTargetArgs, PagerArgs, SshCommand, SshWorkerArgs, resolve_use_leader,
+    LeaderMode, LeaderTargetArgs, PagerArgs, SshWorkerArgs, resolve_use_leader,
     WorkspaceMgmtArgs, WorkspaceMgmtCommand, WorkspaceStartArgs, warn_leader_disabled_by_sandbox,
 };
 use xai_grok_pager::client_identity::PAGER_CLIENT_VERSION;
@@ -2222,18 +2222,16 @@ async fn async_main(mut args: PagerArgs) -> Result<()> {
         }
         return run_ssh_worker(worker_args.clone()).await;
     }
-    if let Some(Command::Ssh(ssh_args)) = args.command.clone() {
-        match ssh_args.command {
-            SshCommand::Open { target, root } => {
-                // Fall through to the ordinary TUI bootstrap, which installs the TUI tracing
-                // subscriber exactly once before showing local SSH consent.
-                args.ssh_project_open = Some(xai_grok_pager::ssh_cmd::prepare_open(target, root)?);
-                args.command = None;
-            }
-            _ => {
-                init_tracing_simple("ssh");
-                return xai_grok_pager::ssh_cmd::run(ssh_args).await;
-            }
+    if matches!(args.command.as_ref(), Some(Command::Ssh(_))) {
+        let Some(Command::Ssh(ssh_args)) = args.command.take() else {
+            unreachable!("SSH command was checked above");
+        };
+        // SSH management starts before any provider or model setup. A selected remote directory
+        // alone continues into the ordinary TUI bootstrap, which installs its tracing subscriber
+        // exactly once before consent is requested.
+        match xai_grok_pager::ssh_cmd::run(ssh_args).await? {
+            Some(project) => args.ssh_project_open = Some(project),
+            None => return Ok(()),
         }
     }
     let is_interactive = args.command.is_none()
@@ -2354,13 +2352,7 @@ async fn async_main(mut args: PagerArgs) -> Result<()> {
                 .await;
             }
             Command::Worker(worker_args) => return run_ssh_worker(worker_args).await,
-            Command::Ssh(ssh_args) => match ssh_args.command {
-                SshCommand::Open { target, root } => {
-                    args.ssh_project_open =
-                        Some(xai_grok_pager::ssh_cmd::prepare_open(target, root)?);
-                }
-                _ => return xai_grok_pager::ssh_cmd::run(ssh_args).await,
-            },
+            Command::Ssh(_) => unreachable!("SSH was consumed before runtime startup"),
             Command::Doctor(_) => {
                 unreachable!("doctor was consumed before runtime startup")
             }

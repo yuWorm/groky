@@ -540,7 +540,7 @@ pub(crate) fn execute(
             owner,
         } => {
             tasks.spawn(async move {
-                let result = tokio::task::spawn_blocking(move || add_ssh_target(draft)).await;
+                let result = tokio::task::spawn_blocking(move || crate::app::ssh_control::add_target(draft)).await;
                 let actual_client_id = ssh_control_client_id(client_id).await;
                 let result = match result {
                     Ok(Ok(target)) => Ok(target.id),
@@ -6197,185 +6197,18 @@ async fn load_ssh_targets(
     fallback_client_id: u64,
     owner: actions::SshManagerOwner,
 ) -> TaskResult {
-    let (client_id, configured) = match ssh_control_reply(
-        xai_grok_shell::ssh::SshControlCommand::ListConfiguredTargets,
-        fallback_client_id,
-    )
-    .await
-    {
-        Ok((client_id, xai_grok_shell::ssh::SshControlReply::ConfiguredTargets(targets))) => {
-            (client_id, targets)
-        }
-        Ok((client_id, _)) => {
-            return TaskResult::SshTargetsLoaded {
-                session_id,
-                client_id,
-                owner,
-                targets: Vec::new(),
-                error: Some("SSH local service returned an unexpected target list.".into()),
-            };
-        }
-        Err((client_id, error)) => {
-            return TaskResult::SshTargetsLoaded {
-                session_id,
-                client_id,
-                owner,
-                targets: Vec::new(),
-                error: Some(error),
-            };
-        }
-    };
-    let configured = match serde_json::from_str::<Vec<xai_grok_ssh::SshTarget>>(&configured) {
-        Ok(targets) => targets,
-        Err(error) => {
-            return TaskResult::SshTargetsLoaded {
-                session_id,
-                client_id,
-                owner,
-                targets: Vec::new(),
-                error: Some(format!("Could not read SSH target configuration: {error}")),
-            };
-        }
-    };
-    let accesses = if let Some(session_id) = session_id.as_deref() {
-        match ssh_control_reply(
-            xai_grok_shell::ssh::SshControlCommand::ListSessionTargets {
-                session_id: session_id.to_owned(),
-            },
-            client_id,
-        )
-        .await
-        {
-            Ok((_, xai_grok_shell::ssh::SshControlReply::SessionTargets(accesses))) => accesses,
-            Ok(_) => {
-                return TaskResult::SshTargetsLoaded {
-                    session_id: Some(session_id.to_owned()),
-                    client_id,
-                    owner,
-                    targets: Vec::new(),
-                    error: Some("SSH local service returned an unexpected session target list.".into()),
-                };
-            }
-            Err((_, error)) => {
-                return TaskResult::SshTargetsLoaded {
-                    session_id: Some(session_id.to_owned()),
-                    client_id,
-                    owner,
-                    targets: Vec::new(),
-                    error: Some(error),
-                };
-            }
-        }
-    } else {
-        Vec::new()
-    };
-    let mut grants_by_target = std::collections::HashMap::<_, Vec<_>>::new();
-    for access in accesses {
-        grants_by_target.entry(access.target_id).or_default().push(
-            crate::views::ssh_modal::SshGrantView::Granted {
-                binding_id: access.binding_id,
-                root: access.root,
-                capabilities: crate::views::ssh_modal::SshCapabilitiesView {
-                    read: access.capabilities.read,
-                    write: access.capabilities.write,
-                    execute: access.capabilities.execute,
-                },
-                is_default: access.is_default,
-            },
-        );
-    }
-
-    let store = xai_grok_ssh::TargetStore::new(xai_grok_shell::util::grok_home::grok_home());
-    let mut views = Vec::with_capacity(configured.len());
-    for target in configured {
-        let effective_address = match store.resolve(&target.id) {
-            Ok(resolved) => format!("{}@{}:{}", resolved.username, resolved.hostname, resolved.port),
-            Err(error) => format!("configuration error: {error}"),
+    let (client_id, targets, error) =
+        match crate::app::ssh_control::load_targets(session_id.as_deref()).await {
+            Ok((client_id, targets)) => (client_id, targets, None),
+            Err(error) => (
+                ssh_control_client_id(fallback_client_id).await,
+                Vec::new(),
+                Some(format!("SSH local service: {error:#}")),
+            ),
         };
-        let status = match ssh_control_reply(
-            xai_grok_shell::ssh::SshControlCommand::ConnectionStatus {
-                target_id: target.id.clone(),
-            },
-            client_id,
-        )
-        .await
-        {
-            Ok((_, xai_grok_shell::ssh::SshControlReply::TargetStatus(status))) => status,
-            Ok(_) => xai_grok_shell::ssh::SshTargetStatus {
-                target_id: target.id.clone(),
-                connection: xai_grok_shell::ssh::SshConnectionState::Disconnected,
-                detail: Some("Connection status unavailable.".into()),
-            },
-            Err((_, error)) => xai_grok_shell::ssh::SshTargetStatus {
-                target_id: target.id.clone(),
-                connection: xai_grok_shell::ssh::SshConnectionState::Disconnected,
-                detail: Some(error),
-            },
-        };
-        let source = match &target.source {
-            xai_grok_ssh::TargetSource::User => "Groky config".into(),
-            xai_grok_ssh::TargetSource::Imported { path, line } => {
-                format!("OpenSSH {}:{line}", path.display())
-            }
-        };
-        let connected = matches!(status.connection, xai_grok_shell::ssh::SshConnectionState::Connected);
-        let connection_detail = status.detail.unwrap_or_else(|| match status.connection {
-            xai_grok_shell::ssh::SshConnectionState::Disconnected => "Not connected.".into(),
-            xai_grok_shell::ssh::SshConnectionState::Connecting => "Connecting through local SSH service…".into(),
-            xai_grok_shell::ssh::SshConnectionState::Connected => "Connected through local SSH service.".into(),
-            xai_grok_shell::ssh::SshConnectionState::AuthenticationRequired => "Local authentication is required.".into(),
-            xai_grok_shell::ssh::SshConnectionState::Failed => "Connection failed.".into(),
-        });
-        let mut grants = grants_by_target.remove(&target.id).unwrap_or_default().into_iter();
-        let view = crate::views::ssh_modal::SshTargetView {
-            target_id: target.id,
-            label: target.label,
-            source,
-            effective_address,
-            connected,
-            connection_detail,
-            grant: grants.next_back().unwrap_or(crate::views::ssh_modal::SshGrantView::NotGranted),
-        };
-        for grant in grants {
-            views.push(crate::views::ssh_modal::SshTargetView {
-                target_id: view.target_id.clone(),
-                label: view.label.clone(),
-                source: view.source.clone(),
-                effective_address: view.effective_address.clone(),
-                connected: view.connected,
-                connection_detail: view.connection_detail.clone(),
-                grant,
-            });
-        }
-        views.push(view);
-    }
-    TaskResult::SshTargetsLoaded {
-        session_id,
-        client_id,
-        owner,
-        targets: views,
-        error: None,
-    }
+    TaskResult::SshTargetsLoaded { session_id, client_id, owner, targets, error }
 }
 
-fn add_ssh_target(
-    draft: crate::views::ssh_modal::SshManualTargetDraft,
-) -> std::result::Result<xai_grok_ssh::SshTarget, String> {
-    let mut target = xai_grok_ssh::SshTarget::new(draft.host);
-    if let Some(label) = draft.label {
-        target.label = label;
-    }
-    target.user = draft.user;
-    target.port = draft.port;
-    target.identity_files = draft.identity_file.into_iter().map(Into::into).collect();
-    if let Some(worker_command) = draft.worker_command {
-        target.worker_command = xai_grok_ssh::parse_worker_command(&worker_command)
-            .map_err(|error| error.to_string())?;
-    }
-    xai_grok_ssh::TargetStore::new(xai_grok_shell::util::grok_home::grok_home())
-        .upsert(target)
-        .map_err(|error| error.to_string())
-}
 
 fn ssh_capabilities(
     capabilities: crate::views::ssh_modal::SshCapabilitiesView,

@@ -111,6 +111,11 @@ SSH 目标自动复用 `~/.ssh/config` 和系统 SSH 配置中的具体主机别
 **已连接不等于已授权**，连接成功不会自动给 agent 开放访问权限。
 
 ```sh
+groky ssh                                  # 独立 SSH 管理界面
+groky ssh add                              # 交互式添加目标表单
+groky ssh open                             # 选择服务器与远端目录
+groky ssh open dev                         # 在 dev 上选择目录
+groky ssh connect dev --interactive        # 处理主机信任、密码及私钥口令
 groky ssh list
 groky ssh add my-server --id dev --label "Development"
 groky ssh open dev /srv/project
@@ -118,6 +123,15 @@ groky ssh open dev /srv/project
 groky ssh connect dev
 groky ssh disconnect dev
 ```
+
+独立管理器复用 `/ssh` 的操作界面，不打开聊天，也不要求模型／供应商登录。
+可以添加目标、连接／断开、查看诊断和浏览远端目录。选择项目后，将已验证的主机身份和规范化目录
+交给完整 TUI；访问授权与 worker 准备由最终项目会话完成。独立管理器不提供会话授权／默认授权控制。
+关闭管理器不会断开显式保留的连接，需要时使用 `ssh disconnect`。
+
+交互式入口要求标准输入和标准输出均连接终端。`ssh list`、`ssh disconnect`、
+`ssh add HOST ...` 及普通 `ssh connect TARGET` 保持原有文本／JSON 行为。
+`--interactive` 与 `--json` 不能同时使用；`ssh add` 的目标字段及 `--json` 必须同时提供 `HOST`。
 
 **显式 SSH 工具不需要在远端安装 groky 或 worker。** 它们直接复用已认证的原生
 SSH 连接，通过 SFTP 操作文件、通过 POSIX shell 执行命令。SSH 服务端需启用 SFTP；
@@ -171,8 +185,8 @@ SSH 操作审批直接展示高亮的多行命令、完整文件内容或修改�
 
 支持密码、带口令私钥、ssh-agent 和 keyboard-interactive。主机信任确认与访问授权
 分别处理。密码输入隐藏；只有主动选择记住时才使用系统凭据库，凭据库不可用时禁用
-记住选项，不回退到明文文件。`ssh connect` 是非交互命令；需要输入密码或确认主机时
-请使用 `/ssh`。
+记住选项，不回退到明文文件。`ssh connect` 默认仍为非交互命令；需要输入密码或确认主机时，
+使用 `ssh connect TARGET --interactive`、独立管理器或 `/ssh`。
 
 `known_hosts` 检查按主机和端口隔离，允许同一目标保存多种密钥算法。已保存的密钥变化时，
 `StrictHostKeyChecking` 允许询问（`ask`）时，`/ssh` 会展示新旧指纹和记录位置；

@@ -5,18 +5,117 @@
 
 use anyhow::{Context, Result, bail};
 
-use crate::app::{SshAddArgs, SshArgs, SshCommand, SshProjectOpen};
+use crate::{
+    app::{SshAddArgs, SshArgs, SshCommand, SshProjectOpen},
+    ssh_tui::SshTuiStart,
+};
 
-pub async fn run(args: SshArgs) -> Result<()> {
+/// Run one SSH command. A selected remote directory is returned for the normal pager startup
+/// path; a completed management interaction without a selected project returns `None`.
+pub async fn run(args: SshArgs) -> Result<Option<SshProjectOpen>> {
     match args.command {
-        SshCommand::List { json } => list(json).await,
-        SshCommand::Add(args) => add(args),
-        SshCommand::Connect { target, json } => connect(&target, false, json).await,
-        SshCommand::Disconnect { target, json } => connect(&target, true, json).await,
-        SshCommand::Open { .. } => {
-            bail!("SSH project opening must be started by the interactive pager")
+        None => run_interactive(SshTuiStart::Manager, "`groky ssh`").await,
+        Some(SshCommand::List { json }) => {
+            list(json).await?;
+            Ok(None)
         }
+        Some(SshCommand::Add(args)) if args.host.is_some() => {
+            add(args)?;
+            Ok(None)
+        }
+        Some(SshCommand::Add(args)) => {
+            reject_add_flags_without_host(&args)?;
+            run_interactive(SshTuiStart::Add, "`groky ssh add`").await
+        }
+        Some(SshCommand::Connect {
+            target,
+            json,
+            interactive: false,
+        }) => {
+            connect(&target, false, json).await?;
+            Ok(None)
+        }
+        Some(SshCommand::Connect {
+            target,
+            interactive: true,
+            ..
+        }) => {
+            let command = "`groky ssh connect TARGET --interactive`";
+            require_interactive_terminal(command)?;
+            let target_id = target_by_id_or_alias(&target)?.id;
+            crate::ssh_tui::run(SshTuiStart::Connect { target_id }).await
+        }
+        Some(SshCommand::Disconnect { target, json }) => {
+            connect(&target, true, json).await?;
+            Ok(None)
+        }
+        Some(SshCommand::Open {
+            target: Some(target),
+            root: Some(root),
+        }) => {
+            require_interactive_terminal("`groky ssh open TARGET REMOTE_ROOT`")?;
+            Ok(Some(prepare_open(target, root)?))
+        }
+        Some(SshCommand::Open {
+            target: Some(target),
+            root: None,
+        }) => {
+            let command = "`groky ssh open [TARGET] [REMOTE_ROOT]`";
+            require_interactive_terminal(command)?;
+            let target_id = target_by_id_or_alias(&target)?.id;
+            crate::ssh_tui::run(SshTuiStart::Open {
+                target_id: Some(target_id),
+            })
+            .await
+        }
+        Some(SshCommand::Open {
+            target: None,
+            root: None,
+        }) => run_interactive(
+            SshTuiStart::Open { target_id: None },
+            "`groky ssh open [TARGET] [REMOTE_ROOT]`",
+        )
+        .await,
+        Some(SshCommand::Open {
+            target: None,
+            root: Some(_),
+        }) => bail!("`REMOTE_ROOT` requires a configured SSH target"),
     }
+}
+
+fn reject_add_flags_without_host(args: &SshAddArgs) -> Result<()> {
+    if args.id.is_some()
+        || args.label.is_some()
+        || args.user.is_some()
+        || args.port.is_some()
+        || !args.identity_files.is_empty()
+        || args.credential_ref.is_some()
+        || args.worker_command.is_some()
+        || args.json
+    {
+        bail!("SSH target fields require HOST; omit them to open the interactive add form");
+    }
+    Ok(())
+}
+
+async fn run_interactive(
+    start: SshTuiStart,
+    command: &'static str,
+) -> Result<Option<SshProjectOpen>> {
+    require_interactive_terminal(command)?;
+    crate::ssh_tui::run(start).await
+}
+
+fn require_interactive_terminal(command: &str) -> Result<()> {
+    use std::io::IsTerminal;
+
+    if std::io::stdin().is_terminal() && std::io::stdout().is_terminal() {
+        return Ok(());
+    }
+    bail!(
+        "{command} requires an interactive terminal with both stdin and stdout attached; \
+         provide HOST for noninteractive target saving or use an existing noninteractive SSH command"
+    );
 }
 
 /// Validate the target before the normal pager startup path pre-mints a session id for consent.
@@ -29,6 +128,7 @@ pub fn prepare_open(target: String, root: String) -> Result<SshProjectOpen> {
         target_id: target.id,
         root,
         project_session_id: uuid::Uuid::now_v7().to_string(),
+        expected_identity: None,
     })
 }
 
@@ -103,7 +203,10 @@ async fn list(json: bool) -> Result<()> {
 }
 
 fn add(args: SshAddArgs) -> Result<()> {
-    let mut target = xai_grok_ssh::SshTarget::new(args.host);
+    let host = args
+        .host
+        .ok_or_else(|| anyhow::anyhow!("SSH target saving requires HOST"))?;
+    let mut target = xai_grok_ssh::SshTarget::new(host);
     if let Some(id) = args.id {
         target.id = id;
     }

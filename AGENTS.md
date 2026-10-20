@@ -34,6 +34,7 @@ Next groky version after `v0.1.25`.
 - **SSH operation previews** show highlighted multiline commands and exact file changes, with mouse/keyboard scrolling, raw details and command copying.
 - **SSH operation approvals** offer allow-once or current-session approval for the exact grant and operation kind; Advanced can restore per-operation prompts without revoking access.
 - **SSH controls** offer server selection and remote folder browsing as the primary flow, with clickable rows, scrolling and keyboard-focusable permissions; grant/default/revocation controls live under Advanced.
+- **groky ssh** opens a standalone manager for targets, connections, diagnostics and folders; parameter-free add and optional open arguments use shared interactive controls, while explicit interactive connect handles local authentication without changing script/JSON commands.
 - **SSH target saving** prevents duplicate submissions, preserves form fields after failure, and selects the saved target with a completed status message.
 - **SSH project startup** no longer stalls on repeated pending guards, returns failures to the originating manager for retry, and isolates asynchronous results from other sessions or reopened managers.
 - **SSH worker startup** uses a short private socket namespace for long home directories and retains early daemon startup diagnostics.

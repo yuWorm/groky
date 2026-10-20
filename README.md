@@ -124,6 +124,11 @@ SSH targets reuse literal aliases from `~/.ssh/config` and the system SSH
 configuration. A connection alone does **not** authorize an agent to use it.
 
 ```sh
+groky ssh                                  # Standalone SSH manager
+groky ssh add                              # Interactive target form
+groky ssh open                             # Choose a server and remote folder
+groky ssh open dev                         # Choose a folder on dev
+groky ssh connect dev --interactive        # Handle host trust/password/key prompts
 groky ssh list
 groky ssh add my-server --id dev --label "Development"
 groky ssh open dev /srv/project
@@ -131,6 +136,19 @@ groky ssh open dev /srv/project
 groky ssh connect dev
 groky ssh disconnect dev
 ```
+
+The standalone manager reuses `/ssh` controls without opening a chat or requiring
+model/provider login. It can add targets, connect/disconnect, inspect diagnostics,
+and browse remote folders. Choosing a project hands its verified identity and
+canonical folder to the full TUI; access approval and worker preparation belong
+to that final project session. Session grant/default controls are unavailable in
+the standalone manager. Closing it does not disconnect explicitly retained
+connections; use `ssh disconnect` to release them.
+
+Interactive entry points require both stdin and stdout to be terminals.
+`ssh list`, `ssh disconnect`, `ssh add HOST ...`, and ordinary `ssh connect TARGET`
+retain their text/JSON behavior. `--interactive` cannot be combined with `--json`;
+target fields and `--json` on `ssh add` require `HOST`.
 
 **Explicit SSH tools do not require remote groky or a worker.** They use the
 authenticated native SSH connection, SFTP for files, and POSIX shell execution.
@@ -205,8 +223,8 @@ Passwords, encrypted private keys, ssh-agent and keyboard-interactive authentica
 Host trust and access grants are separate confirmations. Passwords are masked and
 remembered only by explicit opt-in to the OS credential store; if that store is
 unavailable, remembering is disabled rather than falling back to a plaintext file.
-`ssh connect` is noninteractive: use `/ssh` when authentication or host trust needs
-an answer.
+`ssh connect` stays noninteractive by default: use `ssh connect TARGET --interactive`,
+the standalone manager, or `/ssh` when authentication or host trust needs an answer.
 
 Known-host checks isolate each host/port and allow multiple key algorithms. If a
 stored key changes and `StrictHostKeyChecking` permits prompting (`ask`), `/ssh`

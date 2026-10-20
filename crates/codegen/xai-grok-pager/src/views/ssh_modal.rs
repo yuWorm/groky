@@ -1200,6 +1200,8 @@ pub struct SshManagerState {
     resume_project_browser_after_authentication: bool,
     /// Target owning the current connect/disconnect progress message.
     pending_connection: Option<String>,
+    /// Only a connect (not a disconnect) may own a local authentication prompt.
+    pending_connection_is_connecting: bool,
     /// Immutable request retained while a directory selection or identity inspection is pending.
     pending_grant: Option<SshIncomingGrant>,
     /// Request created for a live model tool, used only to close its automatically-opened manager
@@ -1251,6 +1253,7 @@ impl SshManagerState {
             pending_project_open: None,
             resume_project_browser_after_authentication: false,
             pending_connection: None,
+            pending_connection_is_connecting: false,
             pending_grant: None,
             transient_tool_grant_id: None,
             inspecting_grant_ids: Vec::new(),
@@ -1551,14 +1554,37 @@ impl SshManagerState {
         {
             return Some(target_id);
         }
-        self.pending_grant.as_ref().and_then(|request| {
-            (!self
-                .cancelled_grant_ids
-                .iter()
-                .any(|cancelled| cancelled == &request.request_id))
-            .then_some(request.target_id.as_deref())
-            .flatten()
-        })
+        self.pending_grant
+            .as_ref()
+            .and_then(|request| {
+                (!self
+                    .cancelled_grant_ids
+                    .iter()
+                    .any(|cancelled| cancelled == &request.request_id))
+                .then_some(request.target_id.as_deref())
+                .flatten()
+            })
+            .or(
+                self.pending_connection_is_connecting
+                    .then_some(self.pending_connection.as_deref())
+                    .flatten(),
+            )
+    }
+    
+    /// Select a configured target by stable ID without requiring a rendered row hit.
+    ///
+    /// The standalone manager uses this to make a direct `ssh connect TARGET` failure
+    /// retryable from the same target row after its asynchronous listing arrives.
+    pub fn select_target_id(&mut self, target_id: &str) -> bool {
+        let Some(index) = self
+            .targets
+            .iter()
+            .position(|target| target.target_id == target_id)
+        else {
+            return false;
+        };
+        self.selected = index;
+        true
     }
 
     /// Browser request that owns the in-flight project preparation or post-approval open.
@@ -2277,6 +2303,7 @@ impl SshManagerState {
             "Releasing the retained SSH connection…"
         });
         self.pending_connection = Some(target_id.to_owned());
+        self.pending_connection_is_connecting = connect;
     }
 
     /// Apply an asynchronous local connection update without exposing transport state elsewhere.
@@ -2539,6 +2566,7 @@ impl SshManagerState {
 
     pub fn show_error(&mut self, error: impl Into<String>) {
         self.pending_connection = None;
+        self.pending_connection_is_connecting = false;
         let error = error.into();
         match std::mem::replace(&mut self.page, SshModalPage::Manager) {
             SshModalPage::ProjectBrowser | SshModalPage::Authentication(_)
@@ -2587,6 +2615,7 @@ impl SshManagerState {
 
     pub fn show_info(&mut self, message: impl Into<String>) {
         self.pending_connection = None;
+        self.pending_connection_is_connecting = false;
         self.message = Some((message.into(), false));
     }
 
@@ -2855,6 +2884,53 @@ const ADVANCED_MANAGER_WITH_BINDING_SHORTCUTS: &[Shortcut<'static>] = &[
         label: "p ask each time",
         clickable: true,
         id: FOOTER_MANAGER_RESET_OPERATION_APPROVALS,
+    },
+    Shortcut {
+        label: "d details",
+        clickable: true,
+        id: FOOTER_MANAGER_DIAGNOSTIC,
+    },
+    Shortcut {
+        label: "m basic",
+        clickable: true,
+        id: FOOTER_MANAGER_ADVANCED,
+    },
+    Shortcut {
+        label: "Esc close",
+        clickable: true,
+        id: FOOTER_MANAGER_CLOSE,
+    },
+];
+
+/// Standalone management has no model session, so it intentionally omits every
+/// action that could grant, select, revoke, or otherwise alter model authority.
+/// Refresh remains available because configured-target and connection state are
+/// meaningful before a project has been opened.
+const STANDALONE_ADVANCED_MANAGER_SHORTCUTS: &[Shortcut<'static>] = &[
+    Shortcut {
+        label: "j/k move",
+        clickable: false,
+        id: 0,
+    },
+    Shortcut {
+        label: "Enter choose folder",
+        clickable: true,
+        id: FOOTER_MANAGER_OPEN_FOLDER,
+    },
+    Shortcut {
+        label: "c connect/disconnect",
+        clickable: true,
+        id: FOOTER_MANAGER_CONNECTION,
+    },
+    Shortcut {
+        label: "a add",
+        clickable: true,
+        id: FOOTER_MANAGER_ADD,
+    },
+    Shortcut {
+        label: "r refresh",
+        clickable: true,
+        id: FOOTER_MANAGER_REVOKE,
     },
     Shortcut {
         label: "d details",
@@ -3247,7 +3323,9 @@ pub fn render_ssh_modal(
     let (title, shortcuts): (&str, &[Shortcut<'_>]) = match &state.page {
         SshModalPage::Manager => (
             "SSH targets",
-            if state.manager_advanced && state.selected_active_binding_id().is_some() {
+            if state.session_id.is_none() && state.manager_advanced {
+                STANDALONE_ADVANCED_MANAGER_SHORTCUTS
+            } else if state.manager_advanced && state.selected_active_binding_id().is_some() {
                 ADVANCED_MANAGER_WITH_BINDING_SHORTCUTS
             } else if state.manager_advanced {
                 ADVANCED_MANAGER_SHORTCUTS
@@ -5682,10 +5760,18 @@ fn handle_manager_key(state: &mut SshManagerState, key: &KeyEvent) -> SshModalOu
             };
             state.begin_project_browser(target_id, None)
         }
-        KeyCode::Char('g') if key.modifiers.is_empty() && state.manager_advanced => {
+        KeyCode::Char('g')
+            if key.modifiers.is_empty()
+                && state.manager_advanced
+                && state.session_id.is_some() =>
+        {
             begin_grant_flow(state, None)
         }
-        KeyCode::Char('p') if key.modifiers.is_empty() && state.manager_advanced => {
+        KeyCode::Char('p')
+            if key.modifiers.is_empty()
+                && state.manager_advanced
+                && state.session_id.is_some() =>
+        {
             state
                 .selected_active_binding_id()
                 .map(|binding_id| SshModalOutcome::ResetOperationApprovals {
@@ -5694,6 +5780,9 @@ fn handle_manager_key(state: &mut SshManagerState, key: &KeyEvent) -> SshModalOu
                 .unwrap_or(SshModalOutcome::Unchanged)
         }
         KeyCode::Char('r') if key.modifiers.is_empty() && state.manager_advanced => {
+            if state.session_id.is_none() {
+                return SshModalOutcome::Refresh;
+            }
             let binding_id = state
                 .selected_target()
                 .and_then(|target| match &target.grant {
@@ -5707,7 +5796,11 @@ fn handle_manager_key(state: &mut SshManagerState, key: &KeyEvent) -> SshModalOu
                 SshModalOutcome::Refresh
             }
         }
-        KeyCode::Char('u') if key.modifiers.is_empty() && state.manager_advanced => {
+        KeyCode::Char('u')
+            if key.modifiers.is_empty()
+                && state.manager_advanced
+                && state.session_id.is_some() =>
+        {
             let binding_id = state
                 .selected_target()
                 .and_then(|target| match &target.grant {
@@ -8409,5 +8502,44 @@ mod tests {
         render_diagnostic(&mut buffer, area, card, &theme);
         assert!(buffer.content.iter().any(|cell| cell.fg == theme.accent_error && cell.symbol() == "c"));
         assert!(!buffer.content.iter().any(|cell| cell.fg == theme.accent_success));
+    }
+
+    #[test]
+    fn sessionless_manager_keeps_authority_actions_inert_but_allows_refresh() {
+        let mut state = SshManagerState::new(None);
+        assert!(matches!(
+            handle_ssh_key(&mut state, &key(KeyCode::Char('m'))),
+            SshModalOutcome::Changed
+        ));
+        assert!(matches!(
+            handle_ssh_key(&mut state, &key(KeyCode::Char('g'))),
+            SshModalOutcome::Unchanged
+        ));
+        assert!(matches!(
+            handle_ssh_key(&mut state, &key(KeyCode::Char('u'))),
+            SshModalOutcome::Unchanged
+        ));
+        assert!(matches!(
+            handle_ssh_key(&mut state, &key(KeyCode::Char('p'))),
+            SshModalOutcome::Unchanged
+        ));
+        assert!(matches!(
+            handle_ssh_key(&mut state, &key(KeyCode::Char('r'))),
+            SshModalOutcome::Refresh
+        ));
+    }
+
+    #[test]
+    fn only_pending_connect_owns_matching_authentication_prompt() {
+        let mut connecting = SshManagerState::new(None);
+        connecting.begin_connection_action("server-1", true);
+        assert_eq!(
+            connecting.pending_authentication_target_id(),
+            Some("server-1")
+        );
+
+        let mut disconnecting = SshManagerState::new(None);
+        disconnecting.begin_connection_action("server-1", false);
+        assert_eq!(disconnecting.pending_authentication_target_id(), None);
     }
 }

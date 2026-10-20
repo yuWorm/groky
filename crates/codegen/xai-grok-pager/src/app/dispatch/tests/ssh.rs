@@ -29,6 +29,7 @@ fn pending_project() -> SshProjectOpen {
         target_id: TARGET_ID.into(),
         root: RAW_ROOT.into(),
         project_session_id: SESSION_ID.into(),
+        expected_identity: None,
     }
 }
 

@@ -241,7 +241,7 @@ pub enum WorkspaceMgmtCommand {
 #[derive(Debug, clap::Args, Clone)]
 pub struct SshArgs {
     #[command(subcommand)]
-    pub command: SshCommand,
+    pub command: Option<SshCommand>,
 }
 /// SSH target and project commands.
 #[derive(Debug, Subcommand, Clone)]
@@ -259,8 +259,11 @@ pub enum SshCommand {
         /// Configured target id or OpenSSH host alias.
         target: String,
         /// Emit machine-readable JSON output.
-        #[arg(long)]
+        #[arg(long, conflicts_with = "interactive")]
         json: bool,
+        /// Complete SSH authentication in the standalone terminal UI.
+        #[arg(long, conflicts_with = "json")]
+        interactive: bool,
     },
     /// Release the retained local SSH service connection for a target.
     Disconnect {
@@ -270,44 +273,44 @@ pub enum SshCommand {
         #[arg(long)]
         json: bool,
     },
-    /// Open a local Groky TUI bound to a remote workspace.
+    /// Open or choose a remote workspace in the local Groky TUI.
     Open {
-        /// Configured target id or OpenSSH host alias.
-        target: String,
-        /// Remote project root to bind. This is not a local filesystem path.
-        #[arg(value_name = "REMOTE_ROOT")]
-        root: String,
+        /// Configured target id or OpenSSH host alias. Omit to choose a server.
+        target: Option<String>,
+        /// Remote project root to bind. Omit to choose a remote folder.
+        #[arg(value_name = "REMOTE_ROOT", requires = "target")]
+        root: Option<String>,
     },
 }
 /// Manual SSH target fields for `groky ssh add`.
 #[derive(Debug, clap::Args, Clone)]
 pub struct SshAddArgs {
-    /// SSH host name, address, or OpenSSH host alias.
+    /// SSH host name, address, or OpenSSH host alias. Omit to open the interactive form.
     #[arg(value_name = "HOST")]
-    pub host: String,
+    pub host: Option<String>,
     /// Stable target id. Defaults to a generated id.
-    #[arg(long)]
+    #[arg(long, requires = "host")]
     pub id: Option<String>,
     /// User-visible target label. Defaults to the host.
-    #[arg(long)]
+    #[arg(long, requires = "host")]
     pub label: Option<String>,
     /// SSH login user.
-    #[arg(long)]
+    #[arg(long, requires = "host")]
     pub user: Option<String>,
     /// SSH port.
-    #[arg(long)]
+    #[arg(long, requires = "host")]
     pub port: Option<u16>,
     /// Private key file; repeat to preserve OpenSSH identity-file order.
-    #[arg(long = "identity-file", value_hint = ValueHint::FilePath)]
+    #[arg(long = "identity-file", value_hint = ValueHint::FilePath, requires = "host")]
     pub identity_files: Vec<PathBuf>,
     /// Reference to a saved SSH credential, never a raw secret.
-    #[arg(long)]
+    #[arg(long, requires = "host")]
     pub credential_ref: Option<String>,
     /// Remote worker command, split with shell-like quoting.
-    #[arg(long, value_name = "COMMAND")]
+    #[arg(long, value_name = "COMMAND", requires = "host")]
     pub worker_command: Option<String>,
     /// Emit machine-readable JSON output.
-    #[arg(long)]
+    #[arg(long, requires = "host")]
     pub json: bool,
 }
 /// Hidden worker-mode arguments used by SSH transports.
@@ -336,6 +339,8 @@ pub struct SshProjectOpen {
     pub target_id: String,
     pub root: String,
     pub project_session_id: String,
+    /// Host identity observed while the standalone browser chose this remote folder.
+    pub expected_identity: Option<xai_grok_shell::ssh::SshHostIdentity>,
 }
 #[derive(Debug, clap::Args, Clone)]
 pub struct WorkspaceStartArgs {
@@ -1164,6 +1169,128 @@ mod tests {
                 .command,
             Some(Command::Version { json: false })
         ));
+    }
+    #[test]
+    fn ssh_optional_interactive_forms_parse() {
+        let bare = PagerArgs::try_parse_from(["groky", "ssh"]).expect("bare ssh parses");
+        assert!(matches!(
+            bare.command,
+            Some(Command::Ssh(SshArgs { command: None }))
+        ));
+
+        let saved = PagerArgs::try_parse_from(["groky", "ssh", "add", "dev", "--json"])
+            .expect("SSH target saving with a host parses");
+        assert!(matches!(
+            saved.command,
+            Some(Command::Ssh(SshArgs {
+                command: Some(SshCommand::Add(SshAddArgs {
+                    host: Some(host),
+                    json: true,
+                    ..
+                }))
+            })) if host == "dev"
+        ));
+
+        let noninteractive_connect =
+            PagerArgs::try_parse_from(["groky", "ssh", "connect", "dev"])
+                .expect("ordinary ssh connect parses");
+        assert!(matches!(
+            noninteractive_connect.command,
+            Some(Command::Ssh(SshArgs {
+                command: Some(SshCommand::Connect {
+                    target,
+                    json: false,
+                    interactive: false,
+                })
+            })) if target == "dev"
+        ));
+
+        let add = PagerArgs::try_parse_from(["groky", "ssh", "add"])
+            .expect("ssh add without a host parses");
+        assert!(matches!(
+            add.command,
+            Some(Command::Ssh(SshArgs {
+                command: Some(SshCommand::Add(SshAddArgs {
+                    host: None,
+                    json: false,
+                    ..
+                }))
+            }))
+        ));
+
+        let interactive_connect =
+            PagerArgs::try_parse_from(["groky", "ssh", "connect", "dev", "--interactive"])
+                .expect("interactive ssh connect parses");
+        assert!(matches!(
+            interactive_connect.command,
+            Some(Command::Ssh(SshArgs {
+                command: Some(SshCommand::Connect {
+                    target,
+                    json: false,
+                    interactive: true,
+                })
+            })) if target == "dev"
+        ));
+
+        let choose_server =
+            PagerArgs::try_parse_from(["groky", "ssh", "open"]).expect("bare ssh open parses");
+        assert!(matches!(
+            choose_server.command,
+            Some(Command::Ssh(SshArgs {
+                command: Some(SshCommand::Open {
+                    target: None,
+                    root: None,
+                })
+            }))
+        ));
+
+        let choose_open =
+            PagerArgs::try_parse_from(["groky", "ssh", "open", "dev"])
+                .expect("ssh open with a target parses");
+        assert!(matches!(
+            choose_open.command,
+            Some(Command::Ssh(SshArgs {
+                command: Some(SshCommand::Open {
+                    target: Some(target),
+                    root: None,
+                })
+            })) if target == "dev"
+        ));
+
+        let direct_open =
+            PagerArgs::try_parse_from(["groky", "ssh", "open", "dev", "/srv/project"])
+                .expect("ssh open with target and root parses");
+        assert!(matches!(
+            direct_open.command,
+            Some(Command::Ssh(SshArgs {
+                command: Some(SshCommand::Open {
+                    target: Some(target),
+                    root: Some(root),
+                })
+            })) if target == "dev" && root == "/srv/project"
+        ));
+    }
+    #[test]
+    fn ssh_machine_readable_flags_reject_interactive_forms() {
+        let connect = PagerArgs::try_parse_from([
+            "groky",
+            "ssh",
+            "connect",
+            "dev",
+            "--interactive",
+            "--json",
+        ])
+        .expect_err("interactive connection must conflict with JSON output");
+        assert_eq!(connect.kind(), clap::error::ErrorKind::ArgumentConflict);
+
+        assert!(
+            PagerArgs::try_parse_from(["groky", "ssh", "add", "--json"]).is_err(),
+            "JSON target saving requires a host"
+        );
+        assert!(
+            PagerArgs::try_parse_from(["groky", "ssh", "add", "--label", "dev"]).is_err(),
+            "target fields cannot be silently ignored by the interactive add form"
+        );
     }
     #[test]
     fn doctor_accepts_report_and_explicit_fix_forms() {
