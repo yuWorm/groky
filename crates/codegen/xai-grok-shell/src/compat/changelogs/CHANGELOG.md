@@ -1,3 +1,28 @@
+# 0.1.26 — 2026-10-20
+
+## Features
+
+- **SSH access grants** choose remote folders before permission confirmation, including requests without a directory; cancellation denies waiting requests without late popups, each active binding remains separately revocable, and default selection continues automatically after approval.
+- **SSH task continuation** waits for access approval and resumes the original tool call automatically; cancellation, session closure and client disconnect prevent late approvals from restoring access.
+- **SSH operation previews** show highlighted multiline commands and exact file changes, with mouse/keyboard scrolling, raw details and command copying.
+- **SSH operation approvals** offer allow-once or current-session approval for the exact grant and operation kind; Advanced can restore per-operation prompts without revoking access.
+- **SSH controls** offer server selection and remote folder browsing as the primary flow, with clickable rows, scrolling and keyboard-focusable permissions; grant/default/revocation controls live under Advanced.
+- **groky ssh** opens a standalone manager for targets, connections, diagnostics and folders; parameter-free add and optional open arguments use shared interactive controls, while explicit interactive connect handles local authentication without changing script/JSON commands.
+- **SSH worker installation** detects the remote platform and installs the exact local release automatically, with checksum validation and an explicit local-download/SSH-upload fallback when remote downloads fail.
+- **SSH worker updates** prepare matching versions on project open or resume, keep existing versions intact, and isolate their daemons while preserving cross-version grant revocation.
+- **SSH projects** connect automatically, confirm the verified folder and permissions once, then prepare the matching worker and open the project without a separate grant/use/open sequence.
+- **SSH project permissions** can optionally remember an exact remote project across sessions and local launch directories, reusing only matching host identity, canonical folder and approved capabilities without expanding access.
+
+## Bug Fixes
+
+- **SSH host trust** correctly isolates known_hosts ports and key algorithms, and offers explicit changed-key replacement with old/new fingerprints, backups and safeguards against ambiguous records.
+- **SSH diagnostics** distinguish normal connection details from actual errors, with green connected status and wrapped, scrollable full errors that return to the retained folder or form.
+- **SSH connection status** clears completed connect/disconnect progress without replacing newer errors or another target's progress.
+- **SSH target saving** prevents duplicate submissions, preserves form fields after failure, and selects the saved target with a completed status message.
+- **SSH project startup** no longer stalls on repeated pending guards, returns failures to the originating manager for retry, and isolates asynchronous results from other sessions or reopened managers.
+- **SSH worker startup** uses a short private socket namespace for long home directories and retains early daemon startup diagnostics.
+- **SSH project resume** restores projects opened from non-default grants and keeps worker installation confirmations visible while the session loads, without reopening dismissed dialogs.
+
 # 0.1.25 — 2026-10-18
 
 ## Features
