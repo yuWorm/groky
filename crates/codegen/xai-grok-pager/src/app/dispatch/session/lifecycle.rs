@@ -1434,6 +1434,15 @@ pub(in crate::app::dispatch) fn handle_session_created(
         .agents
         .get(&agent_id)
         .and_then(|agent| agent.ssh_project_open_owner);
+    if let Some(owner) = source_ssh_manager
+        && !super::super::ssh::ssh_manager_for_owner_mut(app, owner).is_some_and(|manager| {
+            manager.pending_project_session_id() == Some(session_id.0.as_ref())
+        })
+    {
+        // Closing/cancelling a project flow must not revive it when worker startup completes.
+        remove_agent_and_cleanup(app, agent_id);
+        return unregister_session_effect(Some(session_id));
+    }
     let return_to_ssh_project = source_ssh_manager.is_some_and(|owner| match owner.agent_id {
         Some(source_id) => {
             matches!(app.active_view, ActiveView::Agent(active_id) if active_id == source_id)
@@ -1877,8 +1886,11 @@ pub(in crate::app::dispatch) fn handle_session_failed(
         .agents
         .get(&agent_id)
         .and_then(|agent| agent.ssh_project_open_owner);
+    let project_session_id = app.agents.get(&agent_id)
+        .and_then(|agent| agent.ssh_project_open_session_id.clone());
     if let Some(owner) = ssh_project_open_owner
         && let Some(manager) = super::super::ssh::ssh_manager_for_owner_mut(app, owner)
+        && manager.pending_project_session_id() == project_session_id.as_deref()
     {
         manager.settle_project_open();
         manager.show_error(format!("Could not open SSH project: {error}"));

@@ -26,6 +26,12 @@ fn map_ssh_modal_outcome(outcome: SshModalOutcome) -> InputOutcome {
         SshModalOutcome::Disconnect { target_id } => {
             InputOutcome::Action(Action::DisconnectSshTarget { target_id })
         }
+        SshModalOutcome::BrowseProjectDirectory { request_id, target_id, path } =>
+            InputOutcome::Action(Action::BrowseSshProjectDirectory { request_id, target_id, path }),
+        SshModalOutcome::ChooseProjectDirectory { request_id, target_id, root, identity } =>
+            InputOutcome::Action(Action::ChooseSshProjectDirectory { request_id, target_id, root, identity }),
+        SshModalOutcome::CancelProjectOpen { request_id } =>
+            InputOutcome::Action(Action::CancelSshProjectOpen { request_id }),
         SshModalOutcome::RequestGrant {
             target_id,
             root,
@@ -69,17 +75,6 @@ fn map_ssh_modal_outcome(outcome: SshModalOutcome) -> InputOutcome {
         SshModalOutcome::RevokeBinding { binding_id } => {
             InputOutcome::Action(Action::RevokeSshBinding { binding_id })
         }
-        SshModalOutcome::OpenProject {
-            target_id,
-            root,
-            binding_id,
-            capabilities,
-        } => InputOutcome::Action(Action::OpenSshProject {
-            target_id,
-            root,
-            binding_id,
-            capabilities,
-        }),
         SshModalOutcome::ApproveOperation {
             approval_id,
             approved,
@@ -195,6 +190,21 @@ pub(super) fn ssh_manager_owner_for_session(
     })
 }
 
+fn project_manager_owner_for_target(app: &AppView, target_id: &str) -> Option<SshManagerOwner> {
+    if let Some(manager) = app.welcome_ssh_manager.as_ref()
+        && manager.pending_project_target_id() == Some(target_id)
+    {
+        return Some(SshManagerOwner { agent_id: None, instance_id: manager.instance_id() });
+    }
+    app.agents.iter().find_map(|(agent_id, agent)| {
+        agent.ssh_manager.as_ref().filter(|manager| {
+            manager.pending_project_target_id() == Some(target_id)
+        }).map(|manager| SshManagerOwner {
+            agent_id: Some(*agent_id), instance_id: manager.instance_id(),
+        })
+    })
+}
+
 /// Find the exact manager entitled to answer a managed-worker fallback without creating an
 /// overlay. A child bootstrap may be active while its initiating manager belongs to a hidden
 /// source session; ordinary session prompts remain on their own manager.
@@ -204,16 +214,6 @@ fn worker_install_owner_for_request(
     binding_id: &str,
     target_id: &str,
 ) -> Option<SshManagerOwner> {
-    if app
-        .pending_ssh_project_open
-        .as_ref()
-        .is_some_and(|project| {
-            project.project_session_id.as_str() == session_id
-                && project.target_id.as_str() == target_id
-        })
-    {
-        return ssh_manager_owner_for_session(app, Some(session_id));
-    }
     if let Some(owner) = app.agents.values().find_map(|agent| {
         (agent.ssh_project_open_session_id.as_deref() == Some(session_id)
             && agent.ssh_project_binding_id.as_deref() == Some(binding_id)
@@ -497,13 +497,6 @@ pub(super) fn ssh_manager_for_session_mut<'a>(
         }
         return app.welcome_ssh_manager.as_mut();
     };
-    if app
-        .pending_ssh_project_open
-        .as_ref()
-        .is_some_and(|project| project.project_session_id == session_id)
-    {
-        return app.welcome_ssh_manager.as_mut();
-    }
     // A remote worktree's child is pre-minted before ACP binds it to the optimistic
     // agent. Once its grant resolves, retain that exact child ID until WorktreeForked so
     // subsequent checkout approval and completion stay on the visible child.
@@ -682,35 +675,162 @@ pub(super) fn dispatch_open_ssh_manager(app: &mut AppView) -> Vec<Effect> {
     effects
 }
 
-/// Start the `groky ssh open` consent flow. The session id is pre-minted before a grant is
-/// requested, so an approved binding already belongs to the exact session passed to `session/new`.
+/// CLI and interactive entry share the same correlated project preparation and consent.
 pub(super) fn dispatch_begin_ssh_project_open(
     app: &mut AppView,
     project: crate::app::cli::SshProjectOpen,
 ) -> Vec<Effect> {
-    app.welcome_ssh_manager = Some(crate::views::ssh_modal::SshManagerState::new(Some(
-        project.project_session_id.clone(),
-    )));
-    let owner = ssh_manager_owner(app).expect("the CLI SSH manager was just installed");
-    app.pending_ssh_project_open = Some(project.clone());
-    let mut effects = Vec::with_capacity(3);
-    if !app.ssh_event_consumer_active {
-        app.ssh_event_consumer_active = true;
-        effects.push(Effect::SshAwaitEvent {
+    let mut effects = dispatch_open_ssh_manager(app);
+    let Some(owner) = ssh_manager_owner(app) else { return effects };
+    let Some(manager) = ssh_manager_for_owner_mut(app, owner) else { return effects };
+    let SshModalOutcome::BrowseProjectDirectory { request_id, .. } =
+        manager.begin_project_browser(project.target_id.clone(), Some(project.root.clone()))
+    else { return effects };
+    let source_session_id = manager.session_id.clone();
+    if manager.begin_project_preparation(
+        request_id, project.project_session_id.clone(), project.target_id.clone(), project.root.clone(),
+    ) {
+        effects.push(Effect::SshPrepareProjectOpen {
+            request_id,
+            project_session_id: project.project_session_id,
+            source_session_id,
+            target_id: project.target_id,
+            root: project.root,
+            expected_identity: None,
             client_id: app.ssh_client_id,
-            session_id: Some(project.project_session_id.clone()),
+            owner,
         });
     }
-    effects.push(Effect::SshListTargets {
-        session_id: Some(project.project_session_id.clone()),
-        client_id: app.ssh_client_id,
-        owner,
-    });
-    effects.push(Effect::SshBeginProjectGrant {
-        project,
-        client_id: app.ssh_client_id,
-    });
     effects
+}
+
+pub(super) fn dispatch_browse_ssh_project_directory(
+    app: &mut AppView, request_id: u64, target_id: String, path: Option<String>,
+) -> Vec<Effect> {
+    let Some(owner) = ssh_manager_owner(app) else { return vec![] };
+    if !ssh_manager_for_owner_mut(app, owner)
+        .is_some_and(|manager| manager.project_directory_request_matches(request_id, &target_id))
+    { return vec![]; }
+    vec![Effect::SshBrowseProjectDirectory {
+        request_id, target_id, path, client_id: app.ssh_client_id, owner,
+    }]
+}
+
+pub(super) fn dispatch_choose_ssh_project_directory(
+    app: &mut AppView, request_id: u64, target_id: String, root: String,
+    identity: xai_grok_shell::ssh::SshHostIdentity,
+) -> Vec<Effect> {
+    let Some(owner) = ssh_manager_owner(app) else { return vec![] };
+    let Some(manager) = ssh_manager_for_owner_mut(app, owner) else { return vec![] };
+    let project_session_id = uuid::Uuid::new_v4().to_string();
+    let source_session_id = manager.session_id.clone();
+    if !manager.project_directory_request_matches(request_id, &target_id)
+        || !manager.begin_project_preparation(
+            request_id, project_session_id.clone(), target_id.clone(), root.clone(),
+        )
+    { return vec![]; }
+    vec![Effect::SshPrepareProjectOpen {
+        request_id, project_session_id, source_session_id, target_id, root,
+        expected_identity: Some(identity), client_id: app.ssh_client_id, owner,
+    }]
+}
+
+pub(super) fn dispatch_cancel_ssh_project_open(app: &mut AppView, request_id: u64) -> Vec<Effect> {
+    if let Some(owner) = ssh_manager_owner(app)
+        && let Some(manager) = ssh_manager_for_owner_mut(app, owner)
+    {
+        manager.finish_project_preparation(request_id, None);
+    }
+    vec![]
+}
+
+pub(super) fn apply_ssh_project_prepared(
+    app: &mut AppView, owner: SshManagerOwner, request_id: u64,
+    target_id: String, project_session_id: String,
+    result: Result<xai_grok_shell::ssh::SshProjectPreparation, String>,
+) -> Vec<Effect> {
+    use xai_grok_shell::ssh::SshProjectPreparation;
+    if app.agents.values().any(|agent| {
+        agent.ssh_project_open_owner == Some(owner)
+            && agent.ssh_project_open_session_id.as_deref() == Some(project_session_id.as_str())
+    }) {
+        return vec![];
+    }
+    let matches = ssh_manager_for_owner_mut(app, owner).is_some_and(|manager| {
+        manager.pending_project_request_id() == Some(request_id)
+            && manager.pending_project_open_tuple().is_some_and(|(session, target, _)| {
+                session == project_session_id && target == target_id
+            })
+    });
+    if !matches {
+        return match result {
+            Ok(SshProjectPreparation::NeedsApproval(request)) => vec![Effect::SshRejectProjectGrant {
+                request_id: request.id, client_id: app.ssh_client_id,
+            }],
+            _ => vec![],
+        };
+    }
+    match result {
+        Ok(SshProjectPreparation::Ready(binding))
+            if binding.session_id == project_session_id && binding.target_id == target_id =>
+        {
+            dispatch_inherited_ssh_project(
+                app, target_id, binding.root, project_session_id, binding.id, Some(owner),
+            )
+        }
+        Ok(SshProjectPreparation::NeedsApproval(request))
+            if request.session_id == project_session_id
+                && request.target_id.as_deref() == Some(target_id.as_str())
+                && request.client_id == Some(app.ssh_client_id) =>
+        {
+            remember_direct_ssh_grant_reply(app, &request.id);
+            let grant_request_id = request.id.clone();
+            let shown = ssh_manager_for_owner_mut(app, owner).is_some_and(|manager| {
+                manager.show_project_consent(request_id, incoming_grant(request), project_session_id)
+            });
+            if shown {
+                vec![]
+            } else {
+                if let Some(manager) = ssh_manager_for_owner_mut(app, owner) {
+                    manager.finish_project_preparation(request_id, Some(
+                        "SSH project consent no longer matches the active folder selection.".into(),
+                    ));
+                }
+                vec![Effect::SshRejectProjectGrant {
+                    request_id: grant_request_id, client_id: app.ssh_client_id,
+                }]
+            }
+        }
+        other => {
+            let error = match other {
+                Err(error) => error,
+                _ => "SSH service returned a project belonging to a different request.".into(),
+            };
+            if let Some(manager) = ssh_manager_for_owner_mut(app, owner) {
+                manager.finish_project_preparation(request_id, Some(error));
+            }
+            vec![]
+        }
+    }
+}
+
+fn incoming_grant(request: xai_grok_shell::ssh::SshGrantRequest)
+    -> crate::views::ssh_modal::SshIncomingGrant
+{
+    crate::views::ssh_modal::SshIncomingGrant {
+        request_id: request.id,
+        target_id: request.target_id,
+        root: request.root,
+        capabilities: crate::views::ssh_modal::SshCapabilitiesView {
+            read: request.capabilities.read,
+            write: request.capabilities.write,
+            execute: request.capabilities.execute,
+        },
+        verified_identity: request.verified_identity.map(|identity| format!(
+            "{}@{}:{} ({})", identity.username, identity.hostname, identity.port, identity.fingerprint,
+        )),
+        reason: request.reason,
+    }
 }
 
 pub(super) fn dispatch_refresh_ssh_targets(app: &mut AppView) -> Vec<Effect> {
@@ -930,39 +1050,6 @@ pub(super) fn dispatch_revoke_ssh_binding(app: &mut AppView, binding_id: String)
     }]
 }
 
-pub(super) fn dispatch_open_ssh_project(
-    app: &mut AppView,
-    target_id: String,
-    root: String,
-    binding_id: String,
-    capabilities: crate::views::ssh_modal::SshCapabilitiesView,
-) -> Vec<Effect> {
-    let client_id = app.ssh_client_id;
-    let Some(owner) = ssh_manager_owner(app) else {
-        return vec![];
-    };
-    let Some(manager) = ssh_manager_for_owner_mut(app, owner) else {
-        return vec![];
-    };
-    let Some(source_session_id) = manager.session_id.clone() else {
-        manager.show_error("Open or create a session before opening an SSH project.");
-        return vec![];
-    };
-    if !manager.begin_project_open() {
-        return vec![];
-    }
-    let project_session_id = uuid::Uuid::now_v7().to_string();
-    vec![Effect::SshInheritBinding {
-        source_session_id,
-        source_binding_id: binding_id,
-        project_session_id,
-        target_id,
-        root,
-        capabilities,
-        client_id,
-        owner,
-    }]
-}
 
 /// Create the actual local pager session only after the leader has minted a binding owned by
 /// `project_session_id`. Reusing the source binding would be rejected by session setup.
@@ -1269,6 +1356,11 @@ pub(super) fn apply_ssh_control_event(
     event: xai_grok_shell::ssh::SshEvent,
 ) -> Vec<Effect> {
     let client_id = app.ssh_client_id;
+    let owner = owner.or_else(|| match &event {
+        xai_grok_shell::ssh::SshEvent::Authentication(prompt) =>
+            project_manager_owner_for_target(app, &prompt.target_id),
+        _ => None,
+    });
     match &event {
         xai_grok_shell::ssh::SshEvent::WorkerInstallRequested(request) => {
             let mut effects = vec![Effect::SshAwaitEvent {
@@ -1429,8 +1521,12 @@ pub(super) fn apply_ssh_control_event(
         }
         _ => crate::views::ssh_modal::SshOperationApprovalOrigin::ExplicitManager,
     };
-    let pending_project = app.pending_ssh_project_open.clone();
+    let resolution_owner = owner
+        .or_else(|| ssh_manager_owner_for_session(app, manager_session_id.as_deref()));
     let mut grant_resolution = None;
+    let mut project_resolution = None;
+    let mut grant_follow_up = None;
+    let mut inspect_local_grant = None;
     let manager = match owner {
         Some(owner) => ssh_manager_for_owner_mut(app, owner),
         None => match &event {
@@ -1453,30 +1549,23 @@ pub(super) fn apply_ssh_control_event(
         match event {
             xai_grok_shell::ssh::SshEvent::GrantRequested(request) => {
                 if request.client_id == Some(client_id) {
-                    let identity = request.verified_identity.map(|identity| {
-                        format!(
-                            "{}@{}:{} ({})",
-                            identity.username,
-                            identity.hostname,
-                            identity.port,
-                            identity.fingerprint
+                    if let Some(owner) = owner
+                        && manager.bind_local_grant_request(
+                            &request.id, request.target_id.as_deref(), request.root.as_deref(),
                         )
-                    });
-                    manager.show_incoming_grant(
-                        request.session_id.clone(),
-                        crate::views::ssh_modal::SshIncomingGrant {
-                            request_id: request.id,
-                            target_id: request.target_id,
-                            root: request.root,
-                            capabilities: crate::views::ssh_modal::SshCapabilitiesView {
-                                read: request.capabilities.read,
-                                write: request.capabilities.write,
-                                execute: request.capabilities.execute,
-                            },
-                            verified_identity: identity,
-                            reason: request.reason,
-                        },
-                    );
+                        && request.verified_identity.is_none()
+                        && let Some(target_id) = request.target_id.as_ref()
+                    {
+                        inspect_local_grant = Some(Effect::SshInspectGrantTarget {
+                            session_id: Some(request.session_id.clone()),
+                            request_id: request.id.clone(), target_id: target_id.clone(),
+                            client_id, owner,
+                        });
+                    }
+                    manager.show_incoming_grant(request.session_id.clone(), incoming_grant(request));
+                    if inspect_local_grant.is_some() {
+                        manager.show_info("Verifying the selected SSH folder before confirmation…");
+                    }
                 }
             }
             xai_grok_shell::ssh::SshEvent::GrantResolved {
@@ -1488,34 +1577,31 @@ pub(super) fn apply_ssh_control_event(
                 // displayed. A worktree's child session is minted by the shell after the
                 // pager subscribes, so the receiver's source-session tag is not its owner.
                 let owns_resolution = manager.grant_session_id_for(&request_id).is_some();
-                let submitted_project_root = pending_project.as_ref().and_then(|project| {
-                    manager
-                        .submitted_project_grant_root(
-                            &request_id,
-                            &project.project_session_id,
-                            &project.target_id,
-                            &project.root,
-                        )
+                let pending_project = manager.pending_project_open_tuple()
+                    .map(|(session, target, root)| (session.to_owned(), target.to_owned(), root.to_owned()));
+                let submitted_project_root = pending_project.as_ref().and_then(|(session, target, root)| {
+                    manager.submitted_project_grant_root(&request_id, session, target, root)
                         .map(ToOwned::to_owned)
                 });
-                let resolution_matches_pending_project =
-                    pending_project.as_ref().is_none_or(|project| {
-                        let receiver_matches = event_session_id
-                            .as_deref()
-                            .is_none_or(|session_id| session_id == project.project_session_id);
-                        if !approved {
-                            return receiver_matches;
-                        }
-                        receiver_matches
-                            && submitted_project_root.is_some()
+                let matches_project = pending_project.as_ref().is_none_or(|(session, target, _)| {
+                    event_session_id.as_deref().is_none_or(|receiver| receiver == session)
+                        && (!approved || (submitted_project_root.is_some()
                             && binding.as_ref().is_some_and(|binding| {
-                                binding.session_id == project.project_session_id
-                                    && binding.target_id == project.target_id
-                            })
-                    });
-                if owns_resolution && resolution_matches_pending_project {
+                                &binding.session_id == session && &binding.target_id == target
+                            })))
+                });
+                if owns_resolution && matches_project {
+                    grant_follow_up = manager.take_grant_follow_up(&request_id);
+                    if pending_project.is_some() {
+                        project_resolution = manager.pending_project_request_id();
+                    }
                     manager.settle_grant(approved);
-                    grant_resolution = Some((approved, binding, submitted_project_root));
+                    if !approved
+                        && let Some(request_id) = project_resolution
+                    {
+                        manager.finish_project_preparation(request_id, None);
+                    }
+                    grant_resolution = Some((approved, binding));
                 } else if owns_resolution {
                     manager.show_error(
                         "Ignoring an SSH grant resolution that does not match the active project request.",
@@ -1651,58 +1737,21 @@ pub(super) fn apply_ssh_control_event(
             }
         }
     }
-    if pending_project.is_none()
-        && let Some((true, Some(binding), _)) = grant_resolution.as_ref()
-        && let Some(source_session_id) = manager_session_id.as_deref()
-    {
-        promote_worktree_child_session(app, source_session_id, &binding.session_id);
-    }
-    if let Some((approved, binding, submitted_project_root)) = grant_resolution {
-        let pending_matches_session =
-            app.pending_ssh_project_open
-                .as_ref()
-                .is_some_and(|project| {
-                    event_session_id
-                        .as_deref()
-                        .is_none_or(|session_id| session_id == project.project_session_id)
-                });
-        if !approved {
-            if pending_matches_session {
-                app.pending_ssh_project_open = None;
-            }
-        } else if let (Some(binding), Some(submitted_project_root)) =
-            (binding, submitted_project_root)
+    if let Some((true, Some(binding))) = grant_resolution {
+        if project_resolution.is_some() {
+            return dispatch_inherited_ssh_project(
+                app, binding.target_id, binding.root, binding.session_id, binding.id, resolution_owner,
+            );
+        }
+        if let Some(source_session_id) = manager_session_id.as_deref() {
+            promote_worktree_child_session(app, source_session_id, &binding.session_id);
+        }
+        if matches!(grant_follow_up, Some(crate::views::ssh_modal::SshGrantFollowUp::UseBinding))
+            && let Some(owner) = resolution_owner
         {
-            let project = pending_project.as_ref().filter(|project| {
-                binding.session_id == project.project_session_id
-                    && binding.target_id == project.target_id
-            });
-            if let Some(project) = project {
-                let target_id = project.target_id.clone();
-                let project_session_id = project.project_session_id.clone();
-                let source_owner =
-                    ssh_manager_owner_for_session(app, Some(project_session_id.as_str()));
-                app.pending_ssh_project_open = None;
-                // The binding root is authoritative: the worker may have canonicalized the
-                // user-approved raw path. The retained request id/session/target and submitted
-                // raw root above prove this resolution belongs to the pending CLI open.
-                let root = binding.root.clone();
-                tracing::debug!(
-                    target_id,
-                    requested_root = %project.root,
-                    submitted_root = %submitted_project_root,
-                    canonical_binding_root = %root,
-                    "opening SSH project from resolved worker binding"
-                );
-                return dispatch_inherited_ssh_project(
-                    app,
-                    target_id,
-                    root,
-                    project_session_id,
-                    binding.id,
-                    source_owner,
-                );
-            }
+            return vec![Effect::SshUseBinding {
+                session_id: binding.session_id, binding_id: binding.id, client_id, owner,
+            }];
         }
     }
     let refresh = owner
@@ -1721,6 +1770,7 @@ pub(super) fn apply_ssh_control_event(
             owner,
         });
     }
+    effects.extend(inspect_local_grant);
     effects
 }
 

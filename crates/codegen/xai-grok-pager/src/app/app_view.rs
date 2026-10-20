@@ -1055,8 +1055,6 @@ pub struct AppView {
     pub(crate) ssh_client_id: u64,
     /// Exactly one local-control receiver owns this pager connection's SSH event stream.
     pub(crate) ssh_event_consumer_active: bool,
-    /// A pre-minted CLI SSH project waiting for explicit local grant consent.
-    pub(crate) pending_ssh_project_open: Option<crate::app::cli::SshProjectOpen>,
     /// Recently applied direct grant replies. The global event stream broadcasts the same
     /// request/resolution; retaining their opaque ids prevents that duplicate from reopening a
     /// manager the user dismissed after the direct reply.
@@ -1582,7 +1580,6 @@ impl AppView {
             welcome_ssh_manager: None,
             ssh_client_id: rand::random(),
             ssh_event_consumer_active: false,
-            pending_ssh_project_open: None,
             direct_ssh_grant_replies: Default::default(),
             welcome_doc_viewer: None,
             screen_mode: ScreenMode::Inline,

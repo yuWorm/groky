@@ -14,7 +14,7 @@ use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
 use std::sync::atomic::{AtomicU64, Ordering};
-use xai_grok_shell::ssh::SshConnectionState;
+use xai_grok_shell::ssh::{SshConnectionState, SshDirectoryListing, SshHostIdentity};
 use zeroize::Zeroizing;
 
 /// A configured target as displayed by the pager. This is a view model rather than a credential
@@ -163,31 +163,31 @@ enum SshGrantFocus {
     Execute,
     Lifetime,
     Default,
+    RememberProject,
 }
 
-impl SshGrantFocus {
-    const ALL: [Self; 6] = [
-        Self::Root,
-        Self::Read,
-        Self::Write,
-        Self::Execute,
-        Self::Lifetime,
-        Self::Default,
-    ];
 
-    fn next(self, backwards: bool) -> Self {
-        let index = Self::ALL
-            .iter()
-            .position(|focus| *focus == self)
-            .unwrap_or(0);
-        let len = Self::ALL.len();
-        let next = if backwards {
-            (index + len - 1) % len
-        } else {
-            (index + 1) % len
-        };
-        Self::ALL[next]
+/// Typed continuation for an advanced authorization flow.
+///
+/// The app owns dispatching the continuation after the matching approval acknowledgement.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SshGrantFollowUp {
+    UseBinding,
+}
+
+impl SshGrantFollowUp {
+    fn guidance(self) -> &'static str {
+        match self {
+            Self::UseBinding => "The newly approved binding will be used automatically.",
+        }
     }
+}
+
+#[derive(Clone)]
+struct SshProjectConsent {
+    request_id: u64,
+    canonical_root: String,
+    remember: bool,
 }
 
 #[derive(Clone)]
@@ -216,7 +216,8 @@ pub struct SshGrantCard {
     page_size: usize,
     reviewed_to_end: bool,
     control_hits: Vec<GrantControlHit>,
-    follow_up: Option<String>,
+    follow_up: Option<SshGrantFollowUp>,
+    project: Option<SshProjectConsent>,
 }
 
 impl SshGrantCard {
@@ -250,7 +251,62 @@ impl SshGrantCard {
             reviewed_to_end: false,
             control_hits: Vec::new(),
             follow_up: None,
+            project: None,
         }
+    }
+
+    fn is_project_consent(&self) -> bool {
+        self.project.is_some()
+    }
+
+    fn focus_next(&mut self, backwards: bool) {
+        const PROJECT_FOCUSES: [SshGrantFocus; 5] = [
+            SshGrantFocus::Root,
+            SshGrantFocus::Read,
+            SshGrantFocus::Write,
+            SshGrantFocus::Execute,
+            SshGrantFocus::RememberProject,
+        ];
+        const GENERAL_FOCUSES: [SshGrantFocus; 6] = [
+            SshGrantFocus::Root,
+            SshGrantFocus::Read,
+            SshGrantFocus::Write,
+            SshGrantFocus::Execute,
+            SshGrantFocus::Lifetime,
+            SshGrantFocus::Default,
+        ];
+        let focuses: &[SshGrantFocus] = if self.is_project_consent() {
+            &PROJECT_FOCUSES
+        } else {
+            &GENERAL_FOCUSES
+        };
+        let index = focuses
+            .iter()
+            .position(|focus| *focus == self.focus)
+            .unwrap_or(0);
+        let next = if backwards {
+            (index + focuses.len() - 1) % focuses.len()
+        } else {
+            (index + 1) % focuses.len()
+        };
+        self.focus = focuses[next];
+    }
+
+    fn permits_root(&self, root: &str) -> bool {
+        let Some(project) = self.project.as_ref() else {
+            return true;
+        };
+        root == project.canonical_root
+            || (root
+                .strip_prefix(project.canonical_root.trim_end_matches('/'))
+                .is_some_and(|suffix| suffix.starts_with('/'))
+                && !root
+                    .split('/')
+                    .any(|component| matches!(component, "." | "..")))
+    }
+
+    fn project_remember(&self) -> bool {
+        self.project.as_ref().is_some_and(|project| project.remember)
     }
 }
 
@@ -267,6 +323,7 @@ pub struct SshIncomingGrant {
 
 #[derive(Clone)]
 struct LocalGrantOptions {
+    request_id: Option<String>,
     target_id: String,
     root: String,
     capabilities: SshCapabilitiesView,
@@ -872,22 +929,129 @@ pub enum SshOperationApprovalOrigin {
 /// target or consumes a pending SSH authentication challenge.
 struct SshDiagnosticCard {
     message: String,
+    is_error: bool,
     scroll_offset: usize,
     max_scroll_offset: usize,
     return_grant: Option<SshGrantCard>,
     return_add: Option<SshManualTargetForm>,
+    return_browser: bool,
+    connected: Option<bool>,
+    latest_error: Option<String>,
 }
 
 impl SshDiagnosticCard {
     fn new(message: String) -> Self {
         Self {
             message,
+            is_error: true,
             scroll_offset: 0,
             max_scroll_offset: 0,
             return_grant: None,
             return_add: None,
+            return_browser: false,
+            connected: None,
+            latest_error: None,
         }
     }
+
+    fn details(message: String, connected: bool, latest_error: Option<String>) -> Self {
+        Self {
+            is_error: false,
+            connected: Some(connected),
+            latest_error,
+            ..Self::new(message)
+        }
+    }
+}
+
+#[derive(Clone)]
+struct ProjectDirectoryHit {
+    index: usize,
+    rect: Rect,
+}
+
+/// Local browser state for one authenticated remote target.
+///
+/// It retains only directory metadata from the SSH service. The service resolves every listed
+/// path and records the verified identity; this UI never performs local filesystem lookups.
+struct SshProjectBrowser {
+    target_id: String,
+    request_id: u64,
+    open_request_id: Option<u64>,
+    listing: Option<SshDirectoryListing>,
+    path: LineEditor,
+    editing_path: bool,
+    selected: usize,
+    scroll_offset: usize,
+    visible_rows: usize,
+    loading: bool,
+    preparing: bool,
+    error: Option<String>,
+    notice: Option<String>,
+    row_hits: Vec<ProjectDirectoryHit>,
+}
+
+impl SshProjectBrowser {
+    fn new(target_id: String, path: Option<String>, request_id: u64) -> Self {
+        let mut editor = LineEditor::default();
+        editor.set_text(path.unwrap_or_else(|| ".".to_owned()));
+        Self {
+            target_id,
+            request_id,
+            open_request_id: None,
+            listing: None,
+            path: editor,
+            editing_path: false,
+            selected: 0,
+            scroll_offset: 0,
+            visible_rows: 0,
+            loading: true,
+            preparing: false,
+            error: None,
+            notice: None,
+            row_hits: Vec::new(),
+        }
+    }
+
+    fn begin_navigation(&mut self, path: Option<String>, request_id: u64) {
+        self.request_id = request_id;
+        self.open_request_id = None;
+        if let Some(path) = path {
+            self.path.set_text(path);
+        }
+        self.editing_path = false;
+        self.loading = true;
+        self.error = None;
+        self.notice = None;
+    }
+
+    fn settle_listing(&mut self, listing: SshDirectoryListing) {
+        self.path.set_text(listing.path.clone());
+        self.listing = Some(listing);
+        self.selected = 0;
+        self.scroll_offset = 0;
+        self.loading = false;
+        self.error = None;
+    }
+
+    fn selected_directory_path(&self) -> Option<String> {
+        self.listing
+            .as_ref()?
+            .directories
+            .get(self.selected)
+            .map(|entry| entry.path.clone())
+    }
+
+    fn listed_path(&self) -> Option<&str> {
+        self.listing.as_ref().map(|listing| listing.path.as_str())
+    }
+}
+
+struct PendingProjectOpen {
+    request_id: u64,
+    session_id: String,
+    target_id: String,
+    original_root: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -901,6 +1065,7 @@ enum SshModalPage {
     Manager,
     Add(SshManualTargetForm),
     Grant(SshGrantCard),
+    ProjectBrowser,
     OperationApproval(SshOperationApprovalCard),
     WorkerInstallFallback(SshWorkerInstallFallbackCard),
     Authentication(SshAuthCard),
@@ -916,6 +1081,7 @@ struct ManagerRowHit {
 
 static NEXT_MANAGER_INSTANCE_ID: AtomicU64 = AtomicU64::new(1);
 static NEXT_TARGET_ADD_SUBMISSION_ID: AtomicU64 = AtomicU64::new(1);
+static NEXT_PROJECT_DIRECTORY_REQUEST_ID: AtomicU64 = AtomicU64::new(1);
 
 fn next_nonzero_id(counter: &AtomicU64) -> u64 {
     loop {
@@ -938,8 +1104,13 @@ pub struct SshManagerState {
     manager_scroll_offset: usize,
     manager_visible_rows: usize,
     manager_row_hits: Vec<ManagerRowHit>,
+    manager_advanced: bool,
     pending_added_target_id: Option<String>,
-    project_open_pending: bool,
+    project_browser: Option<SshProjectBrowser>,
+    /// The request tuple that owns a preparation, grant, and subsequent project lifecycle.
+    pending_project_open: Option<PendingProjectOpen>,
+    /// Authentication temporarily overlays the browser but must return to the same listing.
+    resume_project_browser_after_authentication: bool,
     /// Target owning the current connect/disconnect progress message.
     pending_connection: Option<String>,
     /// Immutable request tuple retained through the displayed consent card so resolution can
@@ -950,6 +1121,9 @@ pub struct SshManagerState {
     /// Session actually requested by the current human-consent card. Usually this manager's
     /// session, but a remote worktree resume pre-mints a child before it has an AgentView.
     pending_grant_session_id: Option<String>,
+    /// Typed continuation for a local advanced grant, never inferred from rendered prose.
+    pending_grant_follow_up: Option<SshGrantFollowUp>,
+    settled_grant_follow_up: Option<(String, SshGrantFollowUp)>,
     local_grant_options: Option<LocalGrantOptions>,
     /// Session whose grants are shown. `None` is Welcome: connect/config actions remain usable,
     /// but granting and selecting a default requires creating or opening a session first.
@@ -973,12 +1147,17 @@ impl SshManagerState {
             manager_scroll_offset: 0,
             manager_visible_rows: 0,
             manager_row_hits: Vec::new(),
+            manager_advanced: false,
             pending_added_target_id: None,
-            project_open_pending: false,
+            project_browser: None,
+            pending_project_open: None,
+            resume_project_browser_after_authentication: false,
             pending_connection: None,
             pending_grant: None,
             submitted_grant: None,
             pending_grant_session_id: None,
+            pending_grant_follow_up: None,
+            settled_grant_follow_up: None,
             local_grant_options: None,
             session_id,
             operation_approval_origin: None,
@@ -999,6 +1178,7 @@ impl SshManagerState {
             SshModalPage::Manager
             | SshModalPage::Add(_)
             | SshModalPage::Grant(_)
+            | SshModalPage::ProjectBrowser
             | SshModalPage::OperationApproval(_)
             | SshModalPage::WorkerInstallFallback(_)
             | SshModalPage::Authentication(_)
@@ -1056,20 +1236,281 @@ impl SshManagerState {
         true
     }
 
-    /// Start one explicit project-open operation. Repeated keys or footer clicks do not create
-    /// concurrent sessions for the same selected binding.
-    pub fn begin_project_open(&mut self) -> bool {
-        if self.project_open_pending {
+    /// Start the authenticated remote-directory chooser for a selected target.
+    pub fn begin_project_browser(
+        &mut self,
+        target_id: String,
+        path: Option<String>,
+    ) -> SshModalOutcome {
+        if self.pending_project_open.is_some() {
+            return SshModalOutcome::Unchanged;
+        }
+        let request_id = next_nonzero_id(&NEXT_PROJECT_DIRECTORY_REQUEST_ID);
+        self.project_browser = Some(SshProjectBrowser::new(target_id.clone(), path.clone(), request_id));
+        self.resume_project_browser_after_authentication = false;
+        self.page = SshModalPage::ProjectBrowser;
+        SshModalOutcome::BrowseProjectDirectory {
+            request_id,
+            target_id,
+            path,
+        }
+    }
+
+    fn browse_project_directory(&mut self, path: Option<String>) -> SshModalOutcome {
+        let request_id = next_nonzero_id(&NEXT_PROJECT_DIRECTORY_REQUEST_ID);
+        let Some(browser) = self.project_browser.as_mut() else {
+            return SshModalOutcome::Unchanged;
+        };
+        browser.begin_navigation(path.clone(), request_id);
+        SshModalOutcome::BrowseProjectDirectory {
+            request_id,
+            target_id: browser.target_id.clone(),
+            path,
+        }
+    }
+
+    /// Settle a directory list only when its exact browser request is still current.
+    pub fn settle_project_directory(
+        &mut self,
+        request_id: u64,
+        target_id: &str,
+        result: Result<SshDirectoryListing, String>,
+    ) -> bool {
+        let browser_visible = matches!(&self.page, SshModalPage::ProjectBrowser);
+        let browser_behind_authentication = self.resume_project_browser_after_authentication
+            && matches!(&self.page, SshModalPage::Authentication(_));
+        if !browser_visible && !browser_behind_authentication {
             return false;
         }
-        self.project_open_pending = true;
-        self.show_info("Preparing remote SSH project…");
+        let Some(browser) = self.project_browser.as_mut() else {
+            return false;
+        };
+        if browser.request_id != request_id || browser.target_id != target_id {
+            return false;
+        }
+        browser.loading = false;
+        match result {
+            Ok(listing) if listing.target_id == target_id => browser.settle_listing(listing),
+            Ok(_) => {
+                browser.error = Some("SSH returned directories for a different target.".into());
+            }
+            Err(error) => {
+                browser.error = Some(error);
+            }
+        }
+        if browser.error.is_some()
+            && let Some(listing) = browser.listing.as_ref()
+        {
+            browser.path.set_text(listing.path.clone());
+        }
+        if matches!(self.message, Some((_, false))) {
+            self.message = None;
+        }
+        if browser_behind_authentication {
+            self.page = SshModalPage::ProjectBrowser;
+            self.resume_project_browser_after_authentication = false;
+        }
+        if let Some(error) = self.project_browser.as_ref().and_then(|browser| browser.error.clone()) {
+            self.show_error(error);
+        }
         true
     }
 
-    /// Clear the visible project-open progress after its terminal session outcome arrives.
+    /// True only while this manager still owns a browser selection or preparation tuple.
+    pub fn project_directory_request_matches(&self, request_id: u64, target_id: &str) -> bool {
+        self.pending_project_open.as_ref().is_some_and(|pending| {
+            pending.request_id == request_id && pending.target_id == target_id
+        }) || self.project_browser.as_ref().is_some_and(|browser| {
+            browser.target_id == target_id
+                && (browser.open_request_id == Some(request_id) || browser.request_id == request_id)
+        })
+    }
+
+    /// Begin one owner-correlated project preparation after a browser selection or direct CLI
+    /// path request. A direct caller may pass the request id returned by
+    /// [`Self::begin_project_browser`] without waiting for its browse outcome.
+    pub fn begin_project_preparation(
+        &mut self,
+        request_id: u64,
+        project_session_id: String,
+        target_id: String,
+        root: String,
+    ) -> bool {
+        if self.pending_project_open.is_some() {
+            return false;
+        }
+        {
+            let Some(browser) = self.project_browser.as_mut() else {
+                return false;
+            };
+            if browser.target_id != target_id {
+                return false;
+            }
+            let selected_request = browser.open_request_id == Some(request_id);
+            let direct_request = browser.request_id == request_id;
+            if !selected_request && !direct_request {
+                return false;
+            }
+            if selected_request && browser.listed_path() != Some(root.as_str()) {
+                return false;
+            }
+            browser.preparing = true;
+            browser.loading = false;
+            browser.error = None;
+            browser.notice = Some("Preparing remote project…".into());
+        }
+        self.pending_project_open = Some(PendingProjectOpen {
+            request_id,
+            session_id: project_session_id,
+            target_id,
+            original_root: root,
+        });
+        true
+    }
+
+    /// Session that owns the in-flight project preparation or post-approval open.
+    pub fn pending_project_session_id(&self) -> Option<&str> {
+        self.pending_project_open
+            .as_ref()
+            .map(|pending| pending.session_id.as_str())
+    }
+
+    /// Target owning an authenticated browse or project preparation, independent of active view.
+    pub fn pending_project_target_id(&self) -> Option<&str> {
+        if let Some(pending) = self.pending_project_open.as_ref() {
+            return Some(pending.target_id.as_str());
+        }
+        if self.resume_project_browser_after_authentication
+            || matches!(&self.page, SshModalPage::ProjectBrowser)
+        {
+            return self
+                .project_browser
+                .as_ref()
+                .filter(|browser| browser.loading)
+                .map(|browser| browser.target_id.as_str());
+        }
+        None
+    }
+
+    /// Browser request that owns the in-flight project preparation or post-approval open.
+    pub fn pending_project_request_id(&self) -> Option<u64> {
+        self.pending_project_open
+            .as_ref()
+            .map(|pending| pending.request_id)
+    }
+
+    /// Immutable owner tuple for grant-resolution validation: session, target, original root.
+    pub fn pending_project_open_tuple(&self) -> Option<(&str, &str, &str)> {
+        self.pending_project_open.as_ref().map(|pending| {
+            (
+                pending.session_id.as_str(),
+                pending.target_id.as_str(),
+                pending.original_root.as_str(),
+            )
+        })
+    }
+
+    /// Display the exact already-verified consent request for an owned preparation.
+    pub fn show_project_consent(
+        &mut self,
+        request_id: u64,
+        request: SshIncomingGrant,
+        session_id: String,
+    ) -> bool {
+        if self.resume_project_browser_after_authentication {
+            self.return_after_authentication();
+        }
+        let Some(target_id) = request.target_id.as_deref().map(str::to_owned) else {
+            return false;
+        };
+        let Some(root) = request
+            .root
+            .as_deref()
+            .filter(|root| !root.trim().is_empty())
+            .map(str::to_owned)
+        else {
+            return false;
+        };
+        if request.verified_identity.is_none()
+            || !matches!(&self.page, SshModalPage::ProjectBrowser)
+            || !self.pending_project_open.as_ref().is_some_and(|pending| {
+                pending.request_id == request_id
+                    && pending.session_id == session_id
+                    && pending.target_id == target_id
+            })
+        {
+            return false;
+        }
+        let target_label = self
+            .targets
+            .iter()
+            .find(|target| target.target_id == target_id)
+            .map(|target| target.label.clone())
+            .unwrap_or_else(|| "Selected SSH server".to_owned());
+        let mut card = SshGrantCard::new(
+            request.request_id.clone(),
+            target_id,
+            target_label,
+            request.verified_identity.clone(),
+            root.clone(),
+            Some(request.reason.clone()),
+            false,
+        );
+        card.capabilities = request.capabilities;
+        card.project = Some(SshProjectConsent {
+            request_id,
+            canonical_root: root.clone(),
+            remember: false,
+        });
+        self.pending_grant = Some(request);
+        self.pending_grant_session_id = Some(session_id);
+        self.submitted_grant = None;
+        self.pending_grant_follow_up = None;
+        if let Some(pending) = self.pending_project_open.as_mut() {
+            pending.original_root = root;
+        }
+        if let Some(browser) = self.project_browser.as_mut() {
+            browser.preparing = false;
+            browser.notice = None;
+        }
+        self.page = SshModalPage::Grant(card);
+        true
+    }
+
+    /// Finish a preparation failure or denial without losing the browsed folder to retry.
+    pub fn finish_project_preparation(&mut self, request_id: u64, error: Option<String>) -> bool {
+        if self.pending_project_request_id() != Some(request_id) {
+            return false;
+        }
+        self.pending_project_open = None;
+        if let Some(browser) = self.project_browser.as_mut() {
+            browser.loading = false;
+            browser.preparing = false;
+            browser.open_request_id = None;
+            browser.notice = None;
+            browser.error = error.clone();
+        }
+        if self.resume_project_browser_after_authentication {
+            self.return_after_authentication();
+        }
+        if matches!(&self.page, SshModalPage::Grant(card) if card.project.as_ref().is_some_and(|project| project.request_id == request_id)) {
+            self.page = SshModalPage::ProjectBrowser;
+        }
+        if let Some(error) = error {
+            self.show_error(error);
+        }
+        true
+    }
+
+
+    /// Clear visible progress after the terminal project-session lifecycle outcome.
     pub fn settle_project_open(&mut self) {
-        self.project_open_pending = false;
+        self.pending_project_open = None;
+        if let Some(browser) = self.project_browser.as_mut() {
+            browser.preparing = false;
+            browser.open_request_id = None;
+            browser.notice = None;
+        }
         if matches!(&self.page, SshModalPage::WorkerInstallFallback(_)) {
             self.page = SshModalPage::Manager;
         }
@@ -1090,12 +1531,28 @@ impl SshManagerState {
         set_default: bool,
     ) {
         self.local_grant_options = Some(LocalGrantOptions {
+            request_id: None,
             target_id,
             root,
             capabilities,
             lifetime,
             set_default,
         });
+    }
+
+    /// Bind human draft options to the direct control reply before remote canonicalization.
+    pub fn bind_local_grant_request(
+        &mut self, request_id: &str, target_id: Option<&str>, root: Option<&str>,
+    ) -> bool {
+        let Some(options) = self.local_grant_options.as_mut() else { return false };
+        if options.request_id.is_none()
+            && target_id == Some(options.target_id.as_str())
+            && root == Some(options.root.as_str())
+        {
+            options.request_id = Some(request_id.to_owned());
+            return true;
+        }
+        false
     }
 
     /// Return the pre-minted or current session that owns a displayed/pending grant request.
@@ -1136,11 +1593,16 @@ impl SshManagerState {
         if target_id != request_target_id {
             return false;
         }
+        let root = root.unwrap_or(request_root);
+        if matches!(&self.page, SshModalPage::Grant(card) if card.is_project_consent() && !card.permits_root(root))
+        {
+            return false;
+        }
         self.submitted_grant = Some(SubmittedGrantDecision {
             request_id: request_id.to_owned(),
             session_id: session_id.to_owned(),
             target_id: target_id.to_owned(),
-            root: root.unwrap_or(request_root).to_owned(),
+            root: root.to_owned(),
         });
         true
     }
@@ -1254,7 +1716,7 @@ impl SshManagerState {
                     .iter()
                     .any(|target| target.target_id == card.target_id && target.connected)
         ) {
-            self.page = SshModalPage::Manager;
+            self.return_after_authentication();
         }
     }
 
@@ -1263,6 +1725,12 @@ impl SshManagerState {
     }
 
     pub fn show_authentication(&mut self, card: SshAuthCard) {
+        self.resume_project_browser_after_authentication =
+            matches!(&self.page, SshModalPage::ProjectBrowser)
+                && self
+                    .project_browser
+                    .as_ref()
+                    .is_some_and(|browser| browser.target_id == card.target_id);
         self.page = SshModalPage::Authentication(card);
     }
 
@@ -1461,16 +1929,10 @@ impl SshManagerState {
             );
             return;
         }
-        let local_options = (request.reason
-            == "User requested SSH access from the local SSH manager.")
-            .then(|| {
-                self.local_grant_options.as_ref().filter(|options| {
-                    options.target_id == target_id
-                        && request.root.as_deref() == Some(options.root.as_str())
-                })
-            })
-            .flatten()
-            .cloned();
+        let local_options = self.local_grant_options.as_ref().filter(|options| {
+            options.request_id.as_deref() == Some(request.request_id.as_str())
+                && options.target_id == target_id
+        }).cloned();
         self.pending_grant = Some(request.clone());
         let target_label = self
             .targets
@@ -1491,6 +1953,7 @@ impl SshManagerState {
             card.capabilities = options.capabilities;
             card.lifetime = options.lifetime;
             card.set_default = options.set_default;
+            card.follow_up = self.pending_grant_follow_up;
         } else {
             card.capabilities = request.capabilities;
         }
@@ -1535,7 +1998,7 @@ impl SshManagerState {
         if connected
             && matches!(&self.page, SshModalPage::Authentication(card) if card.target_id == target_id)
         {
-            self.page = SshModalPage::Manager;
+            self.return_after_authentication();
         }
         if self.pending_connection.as_deref() == Some(target_id) {
             match connection {
@@ -1605,17 +2068,64 @@ impl SshManagerState {
         })
     }
 
-    /// Return an asynchronously resolved consent card to the manager list.
+    /// Return an asynchronously resolved consent card to the manager or its retained browser.
     pub fn settle_grant(&mut self, approved: bool) {
+        let request_id = self.pending_grant.as_ref().map(|request| request.request_id.clone());
+        let (project_request_id, follow_up) = match &self.page {
+            SshModalPage::Grant(card) => (
+                card.project.as_ref().map(|project| project.request_id),
+                card.follow_up,
+            ),
+            _ => (None, None),
+        };
+        if approved {
+            if let (Some(request_id), Some(follow_up)) = (request_id.clone(), follow_up) {
+                self.settled_grant_follow_up = Some((request_id, follow_up));
+            }
+        }
         self.pending_grant = None;
         self.submitted_grant = None;
         self.pending_grant_session_id = None;
+        self.pending_grant_follow_up = None;
+        self.local_grant_options = None;
+        if project_request_id.is_some() {
+            if let Some(browser) = self.project_browser.as_mut() {
+                browser.preparing = false;
+                browser.notice = Some(if approved {
+                    "Project access approved; opening remote project…".into()
+                } else {
+                    "Project access was not approved.".into()
+                });
+            }
+            self.page = SshModalPage::ProjectBrowser;
+            return;
+        }
         self.page = SshModalPage::Manager;
         self.show_info(if approved {
             "SSH access grant approved."
         } else {
             "SSH access grant denied."
         });
+    }
+
+    /// Take the typed continuation for the exact advanced grant, before or after settlement.
+    pub fn take_grant_follow_up(&mut self, request_id: &str) -> Option<SshGrantFollowUp> {
+        if self
+            .pending_grant
+            .as_ref()
+            .is_some_and(|request| request.request_id == request_id)
+            && let SshModalPage::Grant(card) = &mut self.page
+            && card.request_id == request_id
+        {
+            return card.follow_up.take();
+        }
+        let (resolved_request_id, follow_up) = self.settled_grant_follow_up.as_ref()?;
+        if resolved_request_id != request_id {
+            return None;
+        }
+        let follow_up = *follow_up;
+        self.settled_grant_follow_up = None;
+        Some(follow_up)
     }
 
     pub fn target_label_for_binding(&self, binding_id: &str) -> Option<String> {
@@ -1627,7 +2137,8 @@ impl SshManagerState {
     fn open_diagnostic(&mut self) -> bool {
         if let Some(target) = self.selected_target() {
             let grant = match &target.grant {
-                SshGrantView::NotGranted => "Grant: no active SSH authorization.".to_owned(),
+                SshGrantView::NotGranted =>
+                    "Choose a remote folder to open a project. No project access has been approved yet.".to_owned(),
                 SshGrantView::Granted {
                     binding_id,
                     root,
@@ -1650,29 +2161,21 @@ impl SshManagerState {
                     }
                 ),
             };
-            let connected = if target.connected {
-                "connected"
-            } else {
-                "disconnected"
-            };
             let latest_error = self
                 .message
                 .as_ref()
                 .filter(|(_, is_error)| *is_error)
-                .map(|(message, _)| format!("\n\nLatest SSH error:\n{message}"))
-                .unwrap_or_default();
+                .map(|(message, _)| message.clone());
             let message = format!(
-                "SSH target configuration\n\nLabel: {}\nTarget ID: {}\nSource: {}\nResolved address: {}\nConnection: {}\nConnection detail: {}\n\n{}{}",
+                "Label: {}\nTarget ID: {}\nSource: {}\nResolved address: {}\nConnection detail: {}\n\n{}",
                 target.label,
                 target.target_id,
                 target.source,
                 target.effective_address,
-                connected,
                 target.connection_detail,
                 grant,
-                latest_error,
             );
-            self.page = SshModalPage::Diagnostic(SshDiagnosticCard::new(message));
+            self.page = SshModalPage::Diagnostic(SshDiagnosticCard::details(message, target.connected, latest_error));
             return true;
         }
         let Some((message, true)) = self.message.as_ref() else {
@@ -1686,6 +2189,20 @@ impl SshManagerState {
         self.pending_connection = None;
         let error = error.into();
         match std::mem::replace(&mut self.page, SshModalPage::Manager) {
+            SshModalPage::ProjectBrowser | SshModalPage::Authentication(_)
+                if self.project_browser.is_some() =>
+            {
+                self.resume_project_browser_after_authentication = false;
+                if let Some(browser) = self.project_browser.as_mut() {
+                    browser.loading = false;
+                    browser.preparing = false;
+                    browser.error = Some(error.clone());
+                }
+                let mut diagnostic = SshDiagnosticCard::new(error);
+                diagnostic.return_browser = true;
+                self.page = SshModalPage::Diagnostic(diagnostic);
+                self.message = None;
+            }
             SshModalPage::Grant(card) => {
                 let mut diagnostic = SshDiagnosticCard::new(error);
                 diagnostic.return_grant = Some(card);
@@ -1700,6 +2217,9 @@ impl SshManagerState {
             }
             SshModalPage::Diagnostic(mut card) => {
                 card.message = error;
+                card.is_error = true;
+                card.connected = None;
+                card.latest_error = None;
                 card.scroll_offset = 0;
                 self.page = SshModalPage::Diagnostic(card);
             }
@@ -1721,6 +2241,15 @@ impl SshManagerState {
 
     fn return_to_manager(&mut self) {
         self.page = SshModalPage::Manager;
+    }
+
+    fn return_after_authentication(&mut self) {
+        if self.resume_project_browser_after_authentication && self.project_browser.is_some() {
+            self.page = SshModalPage::ProjectBrowser;
+        } else {
+            self.page = SshModalPage::Manager;
+        }
+        self.resume_project_browser_after_authentication = false;
     }
 }
 
@@ -1766,11 +2295,19 @@ pub enum SshModalOutcome {
     RevokeBinding {
         binding_id: String,
     },
-    OpenProject {
+    BrowseProjectDirectory {
+        request_id: u64,
+        target_id: String,
+        path: Option<String>,
+    },
+    ChooseProjectDirectory {
+        request_id: u64,
         target_id: String,
         root: String,
-        binding_id: String,
-        capabilities: SshCapabilitiesView,
+        identity: SshHostIdentity,
+    },
+    CancelProjectOpen {
+        request_id: u64,
     },
     ApproveOperation {
         approval_id: String,
@@ -1793,13 +2330,14 @@ pub enum SshModalOutcome {
     },
 }
 
-const FOOTER_MANAGER_CONNECT: usize = 101;
-const FOOTER_MANAGER_ADD: usize = 102;
-const FOOTER_MANAGER_GRANT: usize = 103;
-const FOOTER_MANAGER_USE: usize = 104;
-const FOOTER_MANAGER_REVOKE: usize = 105;
-const FOOTER_MANAGER_DIAGNOSTIC: usize = 106;
-const FOOTER_MANAGER_OPEN: usize = 107;
+const FOOTER_MANAGER_OPEN_FOLDER: usize = 101;
+const FOOTER_MANAGER_CONNECTION: usize = 102;
+const FOOTER_MANAGER_ADD: usize = 103;
+const FOOTER_MANAGER_DIAGNOSTIC: usize = 104;
+const FOOTER_MANAGER_ADVANCED: usize = 105;
+const FOOTER_MANAGER_GRANT: usize = 111;
+const FOOTER_MANAGER_USE: usize = 112;
+const FOOTER_MANAGER_REVOKE: usize = 113;
 const FOOTER_MANAGER_CLOSE: usize = 108;
 const FOOTER_ADD_SAVE: usize = 201;
 const FOOTER_ADD_CANCEL: usize = 202;
@@ -1810,6 +2348,8 @@ const FOOTER_GRANT_LIFETIME: usize = 304;
 const FOOTER_GRANT_DEFAULT: usize = 305;
 const FOOTER_GRANT_ALLOW: usize = 306;
 const FOOTER_GRANT_DENY: usize = 307;
+const FOOTER_BROWSER_PARENT: usize = 308;
+const FOOTER_BROWSER_OPEN: usize = 309;
 const FOOTER_OPERATION_ALLOW: usize = 401;
 const FOOTER_OPERATION_DENY: usize = 402;
 const FOOTER_OPERATION_CLOSE: usize = 403;
@@ -1823,21 +2363,59 @@ const FOOTER_HOST_REPLACE: usize = 513;
 const FOOTER_HOST_REJECT: usize = 514;
 const FOOTER_DIAGNOSTIC_CLOSE: usize = 601;
 
-const MANAGER_SHORTCUTS: &[Shortcut<'static>] = &[
+const PRIMARY_MANAGER_SHORTCUTS: &[Shortcut<'static>] = &[
     Shortcut {
         label: "j/k move",
         clickable: false,
         id: 0,
     },
     Shortcut {
-        label: "Enter connect",
+        label: "Enter choose folder",
         clickable: true,
-        id: FOOTER_MANAGER_CONNECT,
+        id: FOOTER_MANAGER_OPEN_FOLDER,
+    },
+    Shortcut {
+        label: "c connect/disconnect",
+        clickable: true,
+        id: FOOTER_MANAGER_CONNECTION,
     },
     Shortcut {
         label: "a add",
         clickable: true,
         id: FOOTER_MANAGER_ADD,
+    },
+    Shortcut {
+        label: "d details",
+        clickable: true,
+        id: FOOTER_MANAGER_DIAGNOSTIC,
+    },
+    Shortcut {
+        label: "m advanced",
+        clickable: true,
+        id: FOOTER_MANAGER_ADVANCED,
+    },
+    Shortcut {
+        label: "Esc close",
+        clickable: true,
+        id: FOOTER_MANAGER_CLOSE,
+    },
+];
+
+const ADVANCED_MANAGER_SHORTCUTS: &[Shortcut<'static>] = &[
+    Shortcut {
+        label: "j/k move",
+        clickable: false,
+        id: 0,
+    },
+    Shortcut {
+        label: "Enter choose folder",
+        clickable: true,
+        id: FOOTER_MANAGER_OPEN_FOLDER,
+    },
+    Shortcut {
+        label: "c connect/disconnect",
+        clickable: true,
+        id: FOOTER_MANAGER_CONNECTION,
     },
     Shortcut {
         label: "g grant",
@@ -1850,22 +2428,55 @@ const MANAGER_SHORTCUTS: &[Shortcut<'static>] = &[
         id: FOOTER_MANAGER_USE,
     },
     Shortcut {
-        label: "r revoke selected grant / refresh",
+        label: "r revoke / refresh",
         clickable: true,
         id: FOOTER_MANAGER_REVOKE,
     },
     Shortcut {
-        label: "d diagnostic",
+        label: "d details",
         clickable: true,
         id: FOOTER_MANAGER_DIAGNOSTIC,
     },
     Shortcut {
-        label: "o open project",
+        label: "m basic",
         clickable: true,
-        id: FOOTER_MANAGER_OPEN,
+        id: FOOTER_MANAGER_ADVANCED,
     },
     Shortcut {
         label: "Esc close",
+        clickable: true,
+        id: FOOTER_MANAGER_CLOSE,
+    },
+];
+
+const PROJECT_BROWSER_SHORTCUTS: &[Shortcut<'static>] = &[
+    Shortcut {
+        label: "↑/↓ or j/k choose",
+        clickable: false,
+        id: 0,
+    },
+    Shortcut {
+        label: "Enter child",
+        clickable: false,
+        id: 0,
+    },
+    Shortcut {
+        label: "/ path",
+        clickable: false,
+        id: 0,
+    },
+    Shortcut {
+        label: "Backspace parent",
+        clickable: true,
+        id: FOOTER_BROWSER_PARENT,
+    },
+    Shortcut {
+        label: "o Open this folder",
+        clickable: true,
+        id: FOOTER_BROWSER_OPEN,
+    },
+    Shortcut {
+        label: "Esc back/cancel",
         clickable: true,
         id: FOOTER_MANAGER_CLOSE,
     },
@@ -2094,6 +2705,29 @@ const GRANT_SHORTCUTS: &[Shortcut<'static>] = &[
     },
 ];
 
+const PROJECT_GRANT_SHORTCUTS: &[Shortcut<'static>] = &[
+    Shortcut {
+        label: "PgUp/PgDn inspect",
+        clickable: false,
+        id: 0,
+    },
+    Shortcut {
+        label: "Tab/Space permissions",
+        clickable: false,
+        id: 0,
+    },
+    Shortcut {
+        label: "Enter allow",
+        clickable: true,
+        id: FOOTER_GRANT_ALLOW,
+    },
+    Shortcut {
+        label: "Esc deny",
+        clickable: true,
+        id: FOOTER_GRANT_DENY,
+    },
+];
+
 fn sizing(compact: bool) -> ModalSizing {
     ModalSizing {
         width_pct: 0.78,
@@ -2130,17 +2764,28 @@ pub fn render_ssh_modal(
     theme: &Theme,
 ) -> Option<(u16, u16)> {
     state.manager_row_hits.clear();
+    if let Some(browser) = state.project_browser.as_mut() {
+        browser.row_hits.clear();
+    }
     match &mut state.page {
         SshModalPage::Add(form) => form.field_hits.clear(),
         SshModalPage::Grant(card) => card.control_hits.clear(),
         SshModalPage::Manager
+        | SshModalPage::ProjectBrowser
         | SshModalPage::OperationApproval(_)
         | SshModalPage::WorkerInstallFallback(_)
         | SshModalPage::Authentication(_)
         | SshModalPage::Diagnostic(_) => {}
     }
     let (title, shortcuts): (&str, &[Shortcut<'_>]) = match &state.page {
-        SshModalPage::Manager => ("SSH targets", MANAGER_SHORTCUTS),
+        SshModalPage::Manager => (
+            "SSH targets",
+            if state.manager_advanced {
+                ADVANCED_MANAGER_SHORTCUTS
+            } else {
+                PRIMARY_MANAGER_SHORTCUTS
+            },
+        ),
         SshModalPage::Add(form) => (
             "Add SSH target",
             if form.submitting {
@@ -2149,7 +2794,19 @@ pub fn render_ssh_modal(
                 ADD_SHORTCUTS
             },
         ),
-        SshModalPage::Grant(_) => ("SSH access grant", GRANT_SHORTCUTS),
+        SshModalPage::Grant(card) => (
+            if card.is_project_consent() {
+                "Open remote project"
+            } else {
+                "SSH access grant"
+            },
+            if card.is_project_consent() {
+                PROJECT_GRANT_SHORTCUTS
+            } else {
+                GRANT_SHORTCUTS
+            },
+        ),
+        SshModalPage::ProjectBrowser => ("Choose remote folder", PROJECT_BROWSER_SHORTCUTS),
         SshModalPage::OperationApproval(_) => {
             ("SSH operation approval", OPERATION_APPROVAL_SHORTCUTS)
         }
@@ -2180,7 +2837,14 @@ pub fn render_ssh_modal(
             }
             _ => (card.kind.title(), AUTHENTICATION_SHORTCUTS),
         },
-        SshModalPage::Diagnostic(_) => ("SSH diagnostic", DIAGNOSTIC_SHORTCUTS),
+        SshModalPage::Diagnostic(card) => (
+            if card.is_error {
+                "SSH diagnostic"
+            } else {
+                "SSH connection details"
+            },
+            DIAGNOSTIC_SHORTCUTS,
+        ),
     };
     let config = window_config(title, compact || area.height < 16, shortcuts);
     let areas = modal_window::render_modal_window(buf, area, &mut state.window, &config, theme)?;
@@ -2191,6 +2855,11 @@ pub fn render_ssh_modal(
         match &mut state.page {
             SshModalPage::Add(form) => render_add(buf, content, form, theme),
             SshModalPage::Grant(card) => render_grant(buf, content, card, theme),
+            SshModalPage::ProjectBrowser => {
+                if let Some(browser) = state.project_browser.as_mut() {
+                    render_project_browser(buf, content, browser, theme);
+                }
+            }
             SshModalPage::OperationApproval(card) => {
                 render_operation_approval(buf, content, card, theme)
             }
@@ -2270,19 +2939,28 @@ fn render_manager(buf: &mut Buffer, area: Rect, state: &mut SshManagerState, the
             connection,
             target.grant.summary()
         );
+        let connection_style = if target.connected {
+            Style::default().fg(theme.accent_success)
+        } else {
+            Style::default().fg(theme.gray)
+        };
         buf.set_stringn(
             area.x,
             y.saturating_add(1),
             detail,
             area.width as usize,
-            Style::default().fg(theme.gray),
+            connection_style,
         );
         buf.set_stringn(
             area.x,
             y.saturating_add(2),
             format!("  {}", target.connection_detail),
             area.width as usize,
-            Style::default().fg(theme.gray_dim),
+            if target.connected {
+                Style::default().fg(theme.accent_success)
+            } else {
+                Style::default().fg(theme.gray_dim)
+            },
         );
         state.manager_row_hits.push(ManagerRowHit {
             target_id: target.target_id.clone(),
@@ -2293,6 +2971,142 @@ fn render_manager(buf: &mut Buffer, area: Rect, state: &mut SshManagerState, the
     render_message(buf, area, state.message.as_ref(), theme);
 }
 
+fn render_project_browser(
+    buf: &mut Buffer,
+    area: Rect,
+    browser: &mut SshProjectBrowser,
+    theme: &Theme,
+) {
+    if area.height == 0 || area.width == 0 {
+        browser.visible_rows = 0;
+        return;
+    }
+    let mut y = area.y;
+    buf.set_stringn(
+        area.x,
+        y,
+        format!("Server: {}", browser.target_id),
+        area.width as usize,
+        Style::default().fg(theme.text_secondary),
+    );
+    y = y.saturating_add(1);
+    if y < area.bottom() {
+        render_line_editor(
+            buf,
+            Rect::new(area.x, y, area.width, 1),
+            "Path: ",
+            &browser.path,
+            browser.editing_path,
+            theme,
+        );
+        y = y.saturating_add(1);
+    }
+    let status = if let Some(error) = browser.error.as_deref() {
+        Some((error, true))
+    } else if let Some(notice) = browser.notice.as_deref() {
+        Some((notice, false))
+    } else if browser.loading {
+        Some(("Loading remote folders…", false))
+    } else if browser.preparing {
+        Some(("Preparing remote project…", false))
+    } else {
+        None
+    };
+    let status_rows = usize::from(status.is_some());
+    let parent = browser
+        .listing
+        .as_ref()
+        .and_then(|listing| listing.parent.as_deref())
+        .unwrap_or("No parent folder");
+    if y < area.bottom().saturating_sub(status_rows as u16) {
+        buf.set_stringn(
+            area.x,
+            y,
+            format!("Parent: {parent}"),
+            area.width as usize,
+            Style::default().fg(theme.gray),
+        );
+        y = y.saturating_add(1);
+    }
+    let rows_bottom = area.bottom().saturating_sub(status_rows as u16);
+    let available = rows_bottom.saturating_sub(y) as usize;
+    browser.visible_rows = available;
+    if let Some(listing) = browser.listing.as_ref() {
+        let directory_count = listing.directories.len();
+        browser.selected = browser.selected.min(directory_count.saturating_sub(1));
+        if browser.selected < browser.scroll_offset {
+            browser.scroll_offset = browser.selected;
+        } else if available > 0 && browser.selected >= browser.scroll_offset + available {
+            browser.scroll_offset = browser.selected + 1 - available;
+        }
+        browser.scroll_offset = browser
+            .scroll_offset
+            .min(directory_count.saturating_sub(available.max(1)));
+        for (offset, entry) in listing
+            .directories
+            .iter()
+            .skip(browser.scroll_offset)
+            .take(available)
+            .enumerate()
+        {
+            let index = browser.scroll_offset + offset;
+            let selected = index == browser.selected;
+            let style = if selected {
+                Style::default()
+                    .fg(theme.accent_user)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(theme.text_secondary)
+            };
+            let prefix = if selected { "› " } else { "  " };
+            let rect = Rect::new(area.x, y.saturating_add(offset as u16), area.width, 1);
+            buf.set_stringn(
+                rect.x,
+                rect.y,
+                format!("{prefix}{}", entry.name),
+                rect.width as usize,
+                style,
+            );
+            browser.row_hits.push(ProjectDirectoryHit { index, rect });
+        }
+        if directory_count == 0 && available > 0 {
+            buf.set_stringn(
+                area.x,
+                y,
+                "No child directories in this folder.",
+                area.width as usize,
+                Style::default().fg(theme.gray),
+            );
+        }
+        if listing.truncated && available > 0 {
+            let row = rows_bottom.saturating_sub(1);
+            buf.set_stringn(
+                area.x,
+                row,
+                "Directory list truncated; enter a path to navigate further.",
+                area.width as usize,
+                Style::default().fg(theme.warning),
+            );
+        }
+    }
+    if let Some((status, error)) = status {
+        let style = if error {
+            Style::default()
+                .fg(theme.accent_error)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(theme.text_secondary)
+        };
+        buf.set_stringn(
+            area.x,
+            area.bottom().saturating_sub(1),
+            status,
+            area.width as usize,
+            style,
+        );
+    }
+}
+
 fn render_diagnostic(buf: &mut Buffer, area: Rect, card: &mut SshDiagnosticCard, theme: &Theme) {
     if area.height == 0 {
         return;
@@ -2300,8 +3114,16 @@ fn render_diagnostic(buf: &mut Buffer, area: Rect, card: &mut SshDiagnosticCard,
     let mut lines = Vec::new();
     append_wrapped_authentication_line(
         &mut lines,
-        "Full SSH diagnostic:",
-        AuthenticationLineTone::Warning,
+        if card.is_error {
+            "Full SSH diagnostic:"
+        } else {
+            "SSH connection details:"
+        },
+        if card.is_error {
+            AuthenticationLineTone::Warning
+        } else {
+            AuthenticationLineTone::Normal
+        },
         area.width as usize,
     );
     append_wrapped_authentication_line(
@@ -2310,12 +3132,30 @@ fn render_diagnostic(buf: &mut Buffer, area: Rect, card: &mut SshDiagnosticCard,
         AuthenticationLineTone::Normal,
         area.width as usize,
     );
+    if let Some(connected) = card.connected {
+        append_wrapped_authentication_line(
+            &mut lines,
+            if connected { "Connection: connected" } else { "Connection: disconnected" },
+            if connected { AuthenticationLineTone::Success } else { AuthenticationLineTone::Muted },
+            area.width as usize,
+        );
+    }
     append_wrapped_authentication_line(
         &mut lines,
         &card.message,
-        AuthenticationLineTone::Error,
+        if card.is_error {
+            AuthenticationLineTone::Error
+        } else {
+            AuthenticationLineTone::Normal
+        },
         area.width as usize,
     );
+    if let Some(error) = card.latest_error.as_deref() {
+        append_wrapped_authentication_line(
+            &mut lines, &format!("\nLatest SSH error:\n{error}"),
+            AuthenticationLineTone::Error, area.width as usize,
+        );
+    }
     let height = area.height as usize;
     let body_height = if lines.len() > height && height > 1 {
         height - 1
@@ -2333,6 +3173,7 @@ fn render_diagnostic(buf: &mut Buffer, area: Rect, card: &mut SshDiagnosticCard,
         let style = match tone {
             AuthenticationLineTone::Normal => Style::default().fg(theme.text_secondary),
             AuthenticationLineTone::Muted => Style::default().fg(theme.gray),
+            AuthenticationLineTone::Success => Style::default().fg(theme.accent_success),
             AuthenticationLineTone::Warning | AuthenticationLineTone::Error => Style::default()
                 .fg(theme.accent_error)
                 .add_modifier(Modifier::BOLD),
@@ -2503,7 +3344,11 @@ fn render_grant(buf: &mut Buffer, area: Rect, card: &mut SshGrantCard, theme: &T
     let mut lines = Vec::new();
     push_grant_wrapped(
         &mut lines,
-        format!("Target: {} ({})", card.target_label, card.target_id),
+        if card.is_project_consent() {
+            format!("Server: {}", card.target_label)
+        } else {
+            format!("Target: {} ({})", card.target_label, card.target_id)
+        },
         width,
         None,
         false,
@@ -2521,13 +3366,21 @@ fn render_grant(buf: &mut Buffer, area: Rect, card: &mut SshGrantCard, theme: &T
     );
     push_grant_wrapped(
         &mut lines,
-        format!("Requested remote root: {}", card.root.text()),
+        if card.is_project_consent() {
+            format!("Project folder: {}", card.root.text())
+        } else {
+            format!("Requested remote root: {}", card.root.text())
+        },
         width,
         None,
         false,
     );
     lines.push(GrantRenderLine {
-        text: "Edit root: ".into(),
+        text: if card.is_project_consent() {
+            "Folder (same or narrower): ".into()
+        } else {
+            "Edit root: ".into()
+        },
         focus: Some(SshGrantFocus::Root),
         warning: false,
         root_editor: true,
@@ -2557,23 +3410,36 @@ fn render_grant(buf: &mut Buffer, area: Rect, card: &mut SshGrantCard, theme: &T
             false,
         );
     }
-    push_grant_wrapped(
-        &mut lines,
-        format!("Lifetime: {}", card.lifetime.label()),
-        width,
-        Some(SshGrantFocus::Lifetime),
-        false,
-    );
-    push_grant_wrapped(
-        &mut lines,
-        format!(
-            "Default SSH target: {}",
-            if card.set_default { "yes" } else { "no" }
-        ),
-        width,
-        Some(SshGrantFocus::Default),
-        false,
-    );
+    if card.is_project_consent() {
+        push_grant_wrapped(
+            &mut lines,
+            format!(
+                "[{}] Remember this project",
+                if card.project_remember() { "x" } else { " " }
+            ),
+            width,
+            Some(SshGrantFocus::RememberProject),
+            false,
+        );
+    } else {
+        push_grant_wrapped(
+            &mut lines,
+            format!("Lifetime: {}", card.lifetime.label()),
+            width,
+            Some(SshGrantFocus::Lifetime),
+            false,
+        );
+        push_grant_wrapped(
+            &mut lines,
+            format!(
+                "Default SSH target: {}",
+                if card.set_default { "yes" } else { "no" }
+            ),
+            width,
+            Some(SshGrantFocus::Default),
+            false,
+        );
+    }
     if card.agent_requested {
         push_grant_wrapped(
             &mut lines,
@@ -2595,12 +3461,20 @@ fn render_grant(buf: &mut Buffer, area: Rect, card: &mut SshGrantCard, theme: &T
     if let Some(reason) = card.reason.as_deref() {
         push_grant_wrapped(&mut lines, format!("Reason: {reason}"), width, None, false);
     }
-    if let Some(follow_up) = card.follow_up.as_deref() {
-        push_grant_wrapped(&mut lines, follow_up, width, None, false);
+    if let Some(follow_up) = card.follow_up {
+        push_grant_wrapped(&mut lines, follow_up.guidance(), width, None, false);
     } else if card.request_id.is_empty() {
         push_grant_wrapped(
             &mut lines,
             "Press Enter to continue to identity verification. A later card will require explicit approval of the verified identity and scope.",
+            width,
+            None,
+            false,
+        );
+    } else if card.is_project_consent() {
+        push_grant_wrapped(
+            &mut lines,
+            "Review the verified identity, folder, and permissions before opening this project.",
             width,
             None,
             false,
@@ -2844,6 +3718,7 @@ fn worker_install_fallback_lines(card: &SshWorkerInstallFallbackCard, width: usi
 enum AuthenticationLineTone {
     Normal,
     Muted,
+    Success,
     Warning,
     Error,
 }
@@ -3114,6 +3989,7 @@ fn render_authentication(buf: &mut Buffer, area: Rect, card: &mut SshAuthCard, t
         let style = match tone {
             AuthenticationLineTone::Normal => Style::default().fg(theme.text_secondary),
             AuthenticationLineTone::Muted => Style::default().fg(theme.gray),
+            AuthenticationLineTone::Success => Style::default().fg(theme.accent_success),
             AuthenticationLineTone::Warning | AuthenticationLineTone::Error => Style::default()
                 .fg(theme.accent_error)
                 .add_modifier(Modifier::BOLD),
@@ -3169,6 +4045,9 @@ pub fn handle_ssh_key(state: &mut SshManagerState, key: &KeyEvent) -> SshModalOu
     if matches!(&state.page, SshModalPage::Manager) {
         return handle_manager_key(state, key);
     }
+    if matches!(&state.page, SshModalPage::ProjectBrowser) {
+        return handle_project_browser_key(state, key);
+    }
     let outcome = match &mut state.page {
         SshModalPage::Add(form) => handle_add_key(form, key),
         SshModalPage::Grant(card) => handle_grant_key(card, key),
@@ -3176,10 +4055,12 @@ pub fn handle_ssh_key(state: &mut SshManagerState, key: &KeyEvent) -> SshModalOu
         SshModalPage::WorkerInstallFallback(card) => handle_worker_install_fallback_key(card, key),
         SshModalPage::Authentication(card) => handle_authentication_key(card, key),
         SshModalPage::Diagnostic(card) => handle_diagnostic_key(card, key),
-        SshModalPage::Manager => unreachable!("manager handled before borrowing modal page"),
+        SshModalPage::Manager | SshModalPage::ProjectBrowser => {
+            unreachable!("manager and browser are handled before borrowing modal page")
+        }
     };
     if matches!(&outcome, SshModalOutcome::AnswerAuthentication { .. }) {
-        state.return_to_manager();
+        state.return_after_authentication();
     }
     outcome
 }
@@ -3188,23 +4069,31 @@ fn footer_key_for(page: &SshModalPage, id: usize) -> Option<KeyEvent> {
     let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
     let alt = |code| KeyEvent::new(code, KeyModifiers::ALT);
     match (page, id) {
-        (SshModalPage::Manager, FOOTER_MANAGER_CONNECT) => Some(key(KeyCode::Enter)),
+        (SshModalPage::Manager, FOOTER_MANAGER_OPEN_FOLDER) => Some(key(KeyCode::Enter)),
+        (SshModalPage::Manager, FOOTER_MANAGER_CONNECTION) => Some(key(KeyCode::Char('c'))),
         (SshModalPage::Manager, FOOTER_MANAGER_ADD) => Some(key(KeyCode::Char('a'))),
+        (SshModalPage::Manager, FOOTER_MANAGER_ADVANCED) => Some(key(KeyCode::Char('m'))),
         (SshModalPage::Manager, FOOTER_MANAGER_GRANT) => Some(key(KeyCode::Char('g'))),
         (SshModalPage::Manager, FOOTER_MANAGER_USE) => Some(key(KeyCode::Char('u'))),
         (SshModalPage::Manager, FOOTER_MANAGER_REVOKE) => Some(key(KeyCode::Char('r'))),
         (SshModalPage::Manager, FOOTER_MANAGER_DIAGNOSTIC) => Some(key(KeyCode::Char('d'))),
-        (SshModalPage::Manager, FOOTER_MANAGER_OPEN) => Some(key(KeyCode::Char('o'))),
         (SshModalPage::Manager, FOOTER_MANAGER_CLOSE) => Some(key(KeyCode::Esc)),
         (SshModalPage::Add(form), FOOTER_ADD_SAVE) if !form.submitting => Some(key(KeyCode::Enter)),
         (SshModalPage::Add(_), FOOTER_ADD_CANCEL) => Some(key(KeyCode::Esc)),
         (SshModalPage::Grant(_), FOOTER_GRANT_READ) => Some(alt(KeyCode::Char('r'))),
         (SshModalPage::Grant(_), FOOTER_GRANT_WRITE) => Some(alt(KeyCode::Char('w'))),
         (SshModalPage::Grant(_), FOOTER_GRANT_EXECUTE) => Some(alt(KeyCode::Char('x'))),
-        (SshModalPage::Grant(_), FOOTER_GRANT_LIFETIME) => Some(alt(KeyCode::Char('l'))),
-        (SshModalPage::Grant(_), FOOTER_GRANT_DEFAULT) => Some(alt(KeyCode::Char('d'))),
+        (SshModalPage::Grant(card), FOOTER_GRANT_LIFETIME) if !card.is_project_consent() => {
+            Some(alt(KeyCode::Char('l')))
+        }
+        (SshModalPage::Grant(card), FOOTER_GRANT_DEFAULT) if !card.is_project_consent() => {
+            Some(alt(KeyCode::Char('d')))
+        }
         (SshModalPage::Grant(_), FOOTER_GRANT_ALLOW) => Some(key(KeyCode::Enter)),
         (SshModalPage::Grant(_), FOOTER_GRANT_DENY) => Some(key(KeyCode::Esc)),
+        (SshModalPage::ProjectBrowser, FOOTER_BROWSER_PARENT) => Some(key(KeyCode::Backspace)),
+        (SshModalPage::ProjectBrowser, FOOTER_BROWSER_OPEN) => Some(key(KeyCode::Char('o'))),
+        (SshModalPage::ProjectBrowser, FOOTER_MANAGER_CLOSE) => Some(key(KeyCode::Esc)),
         (SshModalPage::OperationApproval(_), FOOTER_OPERATION_ALLOW) => {
             Some(key(KeyCode::Char('y')))
         }
@@ -3286,6 +4175,19 @@ fn footer_key_for(page: &SshModalPage, id: usize) -> Option<KeyEvent> {
 /// Paste directly into the focused non-secret or secret local editor. The paste is never placed in
 /// chat state, notifications, or a replay buffer.
 pub fn handle_ssh_paste(state: &mut SshManagerState, text: &str) -> SshModalOutcome {
+    if matches!(&state.page, SshModalPage::ProjectBrowser) {
+        let Some(browser) = state.project_browser.as_mut() else {
+            return SshModalOutcome::Unchanged;
+        };
+        if !browser.editing_path {
+            return SshModalOutcome::Unchanged;
+        }
+        let outcome = browser.path.insert_paste(text);
+        if matches!(&outcome, LineEditOutcome::TextChanged) {
+            browser.error = None;
+        }
+        return line_outcome(outcome);
+    }
     let outcome = match &mut state.page {
         SshModalPage::Add(form) => {
             if form.submitting {
@@ -3313,6 +4215,9 @@ pub fn handle_ssh_paste(state: &mut SshManagerState, text: &str) -> SshModalOutc
             .answer_mut()
             .map(|answer| answer.insert_paste(text))
             .unwrap_or(LineEditOutcome::Unhandled),
+        SshModalPage::ProjectBrowser => {
+            unreachable!("browser paste is handled before borrowing modal page")
+        }
     };
     line_outcome(outcome)
 }
@@ -3366,6 +4271,27 @@ pub fn handle_ssh_mouse(state: &mut SshManagerState, mouse: &MouseEvent) -> SshM
             state.selected = index;
             return SshModalOutcome::Changed;
         }
+        if matches!(&state.page, SshModalPage::ProjectBrowser) {
+            let Some(browser) = state.project_browser.as_mut() else {
+                return SshModalOutcome::Unchanged;
+            };
+            let hit = browser
+                .row_hits
+                .iter()
+                .find(|hit| {
+                    mouse.column >= hit.rect.x
+                        && mouse.column < hit.rect.right()
+                        && mouse.row >= hit.rect.y
+                        && mouse.row < hit.rect.bottom()
+                })
+                .cloned();
+            let Some(hit) = hit else {
+                return SshModalOutcome::Unchanged;
+            };
+            browser.selected = hit.index;
+            browser.editing_path = false;
+            return SshModalOutcome::Changed;
+        }
         match &mut state.page {
             SshModalPage::Add(form) if !form.submitting => {
                 if let Some((field, _)) = form.field_hits.iter().find(|(_, rect)| {
@@ -3399,6 +4325,9 @@ pub fn handle_ssh_mouse(state: &mut SshManagerState, mouse: &MouseEvent) -> SshM
                 }
                 return SshModalOutcome::Changed;
             }
+            SshModalPage::ProjectBrowser => {
+                unreachable!("browser mouse rows are handled before borrowing modal page")
+            }
             SshModalPage::Manager
             | SshModalPage::Add(_)
             | SshModalPage::OperationApproval(_)
@@ -3415,6 +4344,9 @@ pub fn handle_ssh_mouse(state: &mut SshManagerState, mouse: &MouseEvent) -> SshM
     };
     if matches!(&state.page, SshModalPage::Manager) {
         return scroll_manager(state, delta);
+    }
+    if matches!(&state.page, SshModalPage::ProjectBrowser) {
+        return scroll_project_browser(state, delta);
     }
     match &mut state.page {
         SshModalPage::Grant(card) => {
@@ -3477,6 +4409,9 @@ pub fn handle_ssh_mouse(state: &mut SshManagerState, mouse: &MouseEvent) -> SshM
                 SshModalOutcome::Changed
             }
         }
+        SshModalPage::ProjectBrowser => {
+            unreachable!("browser scrolling is handled before borrowing modal page")
+        }
         SshModalPage::Manager | SshModalPage::Add(_) | SshModalPage::OperationApproval(_) => {
             SshModalOutcome::Unchanged
         }
@@ -3511,12 +4446,62 @@ fn scroll_manager(state: &mut SshManagerState, delta: isize) -> SshModalOutcome 
     SshModalOutcome::Changed
 }
 
+fn scroll_project_browser(state: &mut SshManagerState, delta: isize) -> SshModalOutcome {
+    let Some(browser) = state.project_browser.as_mut() else {
+        return SshModalOutcome::Unchanged;
+    };
+    let visible = browser.visible_rows;
+    let directory_count = browser
+        .listing
+        .as_ref()
+        .map_or(0, |listing| listing.directories.len());
+    if visible == 0 || directory_count == 0 {
+        return SshModalOutcome::Unchanged;
+    }
+    let max_scroll = directory_count.saturating_sub(visible);
+    let next = if delta.is_negative() {
+        browser.scroll_offset.saturating_sub(delta.unsigned_abs())
+    } else {
+        browser
+            .scroll_offset
+            .saturating_add(delta as usize)
+            .min(max_scroll)
+    };
+    if next == browser.scroll_offset {
+        return SshModalOutcome::Unchanged;
+    }
+    browser.scroll_offset = next;
+    if browser.selected < next {
+        browser.selected = next;
+    } else if browser.selected >= next.saturating_add(visible) {
+        browser.selected = next + visible - 1;
+    }
+    SshModalOutcome::Changed
+}
+
 fn close_current_page(state: &mut SshManagerState) -> SshModalOutcome {
+    if matches!(&state.page, SshModalPage::ProjectBrowser) {
+        if let Some(pending) = state.pending_project_open.take() {
+            if let Some(browser) = state.project_browser.as_mut() {
+                browser.preparing = false;
+                browser.open_request_id = None;
+                browser.notice = Some("Project opening cancelled.".into());
+            }
+            return SshModalOutcome::CancelProjectOpen {
+                request_id: pending.request_id,
+            };
+        }
+        state.project_browser = None;
+        state.page = SshModalPage::Manager;
+        return SshModalOutcome::Changed;
+    }
     if let SshModalPage::Diagnostic(card) = &mut state.page {
         state.page = if let Some(grant) = card.return_grant.take() {
             SshModalPage::Grant(grant)
         } else if let Some(form) = card.return_add.take() {
             SshModalPage::Add(form)
+        } else if card.return_browser && state.project_browser.is_some() {
+            SshModalPage::ProjectBrowser
         } else {
             SshModalPage::Manager
         };
@@ -3548,7 +4533,7 @@ fn close_current_page(state: &mut SshManagerState) -> SshModalOutcome {
         let host_key_decision = matches!(&card.kind, SshAuthKind::HostKey { .. })
             .then_some(xai_grok_shell::ssh::SshHostKeyDecision::Reject);
         card.clear_answers();
-        state.return_to_manager();
+        state.return_after_authentication();
         return SshModalOutcome::AnswerAuthentication {
             challenge_id,
             connection_generation,
@@ -3592,12 +4577,18 @@ fn close_current_page(state: &mut SshManagerState) -> SshModalOutcome {
         SshModalPage::Authentication(_) => {
             unreachable!("authentication answers were cleared before read-only match")
         }
+        SshModalPage::ProjectBrowser => {
+            unreachable!("project browser was handled before read-only match")
+        }
         SshModalPage::Add(_) => unreachable!("add page returned before read-only match"),
         SshModalPage::Diagnostic(_) => unreachable!("diagnostic returned before read-only match"),
     }
 }
 
-fn begin_grant_flow(state: &mut SshManagerState, follow_up: Option<&str>) -> SshModalOutcome {
+fn begin_grant_flow(
+    state: &mut SshManagerState,
+    follow_up: Option<SshGrantFollowUp>,
+) -> SshModalOutcome {
     let Some((target_id, target_label, granted_root)) = state.selected_target().map(|target| {
         (
             target.target_id.clone(),
@@ -3606,7 +4597,7 @@ fn begin_grant_flow(state: &mut SshManagerState, follow_up: Option<&str>) -> Ssh
                 .grant
                 .granted_root()
                 .map(str::to_owned)
-                .unwrap_or_default(),
+                .unwrap_or_else(|| ".".to_owned()),
         )
     }) else {
         state.show_error("Select an SSH target before starting an access grant.");
@@ -3635,7 +4626,8 @@ fn begin_grant_flow(state: &mut SshManagerState, follow_up: Option<&str>) -> Ssh
         None,
         false,
     );
-    card.follow_up = follow_up.map(str::to_owned);
+    card.follow_up = follow_up;
+    state.pending_grant_follow_up = follow_up;
     state.page = SshModalPage::Grant(card);
     SshModalOutcome::Changed
 }
@@ -3665,7 +4657,35 @@ fn handle_manager_key(state: &mut SshManagerState, key: &KeyEvent) -> SshModalOu
                 SshModalOutcome::Changed
             }
         }
-        KeyCode::Char('r') if key.modifiers.is_empty() => {
+        KeyCode::Char('m') if key.modifiers.is_empty() => {
+            state.manager_advanced = !state.manager_advanced;
+            SshModalOutcome::Changed
+        }
+        KeyCode::Char('c') if key.modifiers.is_empty() => {
+            let selected = state
+                .selected_target()
+                .map(|target| (target.target_id.clone(), target.connected));
+            match selected {
+                Some((target_id, true)) => SshModalOutcome::Disconnect { target_id },
+                Some((target_id, false)) => SshModalOutcome::Connect { target_id },
+                None => {
+                    state.show_error("Select an SSH target before connecting.");
+                    SshModalOutcome::Changed
+                }
+            }
+        }
+        KeyCode::Enter => {
+            let Some(target_id) = state.selected_target().map(|target| target.target_id.clone())
+            else {
+                state.show_error("Select an SSH target before choosing a remote folder.");
+                return SshModalOutcome::Changed;
+            };
+            state.begin_project_browser(target_id, None)
+        }
+        KeyCode::Char('g') if key.modifiers.is_empty() && state.manager_advanced => {
+            begin_grant_flow(state, None)
+        }
+        KeyCode::Char('r') if key.modifiers.is_empty() && state.manager_advanced => {
             let binding_id = state
                 .selected_target()
                 .and_then(|target| match &target.grant {
@@ -3679,21 +4699,7 @@ fn handle_manager_key(state: &mut SshManagerState, key: &KeyEvent) -> SshModalOu
                 SshModalOutcome::Refresh
             }
         }
-        KeyCode::Enter => {
-            let selected = state
-                .selected_target()
-                .map(|target| (target.target_id.clone(), target.connected));
-            match selected {
-                Some((target_id, true)) => SshModalOutcome::Disconnect { target_id },
-                Some((target_id, false)) => SshModalOutcome::Connect { target_id },
-                None => {
-                    state.show_error("Select an SSH target before connecting.");
-                    SshModalOutcome::Changed
-                }
-            }
-        }
-        KeyCode::Char('g') if key.modifiers.is_empty() => begin_grant_flow(state, None),
-        KeyCode::Char('u') if key.modifiers.is_empty() => {
+        KeyCode::Char('u') if key.modifiers.is_empty() && state.manager_advanced => {
             let binding_id = state
                 .selected_target()
                 .and_then(|target| match &target.grant {
@@ -3709,57 +4715,144 @@ fn handle_manager_key(state: &mut SshManagerState, key: &KeyEvent) -> SshModalOu
                 state.show_info("The selected SSH grant is being revoked; refresh before using another binding.");
                 SshModalOutcome::Changed
             } else {
-                begin_grant_flow(
-                    state,
-                    Some(
-                        "No active binding is selected. Continue only after identity verification and explicit approval; then press u to use the new binding.",
-                    ),
-                )
+                begin_grant_flow(state, Some(SshGrantFollowUp::UseBinding))
+            }
+        }
+        _ => SshModalOutcome::Unchanged,
+    }
+}
+
+fn handle_project_browser_key(state: &mut SshManagerState, key: &KeyEvent) -> SshModalOutcome {
+    if matches!(key.code, KeyCode::Esc) && !key.modifiers.is_empty() {
+        return SshModalOutcome::Unchanged;
+    }
+    let editing_path = state
+        .project_browser
+        .as_ref()
+        .is_some_and(|browser| browser.editing_path);
+    if editing_path {
+        match key.code {
+            KeyCode::Esc => {
+                let Some(browser) = state.project_browser.as_mut() else {
+                    return SshModalOutcome::Unchanged;
+                };
+                if let Some(path) = browser.listed_path().map(str::to_owned) {
+                    browser.path.set_text(path);
+                }
+                browser.editing_path = false;
+                return SshModalOutcome::Changed;
+            }
+            KeyCode::Enter => {
+                let path = state
+                    .project_browser
+                    .as_ref()
+                    .map(|browser| browser.path.text().trim().to_owned())
+                    .unwrap_or_default();
+                if path.is_empty() {
+                    if let Some(browser) = state.project_browser.as_mut() {
+                        browser.error = Some("Enter a remote folder path.".into());
+                    }
+                    return SshModalOutcome::Changed;
+                }
+                return state.browse_project_directory(Some(path));
+            }
+            _ => {
+                let Some(browser) = state.project_browser.as_mut() else {
+                    return SshModalOutcome::Unchanged;
+                };
+                let outcome = browser.path.handle_key(key);
+                if matches!(&outcome, LineEditOutcome::TextChanged) {
+                    browser.error = None;
+                }
+                return line_outcome(outcome);
+            }
+        }
+    }
+
+    match key.code {
+        KeyCode::Esc => close_current_page(state),
+        KeyCode::Up | KeyCode::Char('k') if key.modifiers.is_empty() => {
+            let Some(browser) = state.project_browser.as_mut() else {
+                return SshModalOutcome::Unchanged;
+            };
+            browser.selected = browser.selected.saturating_sub(1);
+            SshModalOutcome::Changed
+        }
+        KeyCode::Down | KeyCode::Char('j') if key.modifiers.is_empty() => {
+            let Some(browser) = state.project_browser.as_mut() else {
+                return SshModalOutcome::Unchanged;
+            };
+            let directory_count = browser
+                .listing
+                .as_ref()
+                .map_or(0, |listing| listing.directories.len());
+            if browser.selected + 1 < directory_count {
+                browser.selected += 1;
+            }
+            SshModalOutcome::Changed
+        }
+        KeyCode::Char('/') if key.modifiers.is_empty() => {
+            let Some(browser) = state.project_browser.as_mut() else {
+                return SshModalOutcome::Unchanged;
+            };
+            if browser.loading || browser.preparing {
+                return SshModalOutcome::Unchanged;
+            }
+            browser.path.reset();
+            browser.editing_path = true;
+            browser.error = None;
+            SshModalOutcome::Changed
+        }
+        KeyCode::Enter => {
+            let path = state
+                .project_browser
+                .as_ref()
+                .filter(|browser| !browser.loading && !browser.preparing)
+                .and_then(SshProjectBrowser::selected_directory_path);
+            match path {
+                Some(path) => state.browse_project_directory(Some(path)),
+                None => SshModalOutcome::Unchanged,
+            }
+        }
+        KeyCode::Backspace => {
+            let path = state
+                .project_browser
+                .as_ref()
+                .filter(|browser| !browser.loading && !browser.preparing)
+                .and_then(|browser| {
+                    browser
+                        .listing
+                        .as_ref()
+                        .and_then(|listing| listing.parent.clone())
+                });
+            match path {
+                Some(path) => state.browse_project_directory(Some(path)),
+                None => SshModalOutcome::Unchanged,
             }
         }
         KeyCode::Char('o') if key.modifiers.is_empty() => {
-            let project = state
-                .selected_target()
-                .and_then(|target| match &target.grant {
-                    SshGrantView::Granted {
-                        binding_id,
-                        root,
-                        capabilities,
-                        ..
-                    } => Some((
-                        target.target_id.clone(),
-                        root.clone(),
-                        binding_id.clone(),
-                        *capabilities,
-                    )),
-                    SshGrantView::NotGranted | SshGrantView::Revoking { .. } => None,
-                });
-            if let Some((target_id, root, binding_id, capabilities)) = project {
-                if !state.project_open_pending {
-                    SshModalOutcome::OpenProject {
-                        target_id,
-                        root,
-                        binding_id,
-                        capabilities,
-                    }
-                } else {
-                    SshModalOutcome::Changed
-                }
-            } else if matches!(
-                state.selected_target().map(|target| &target.grant),
-                Some(SshGrantView::Revoking { .. })
-            ) {
-                state.show_info(
-                    "The selected SSH grant is being revoked; choose an active binding first.",
-                );
-                SshModalOutcome::Changed
-            } else {
-                begin_grant_flow(
-                    state,
-                    Some(
-                        "Before opening a remote project, verify the identity and explicitly approve a remote root; then press o again.",
-                    ),
-                )
+            let request_id = next_nonzero_id(&NEXT_PROJECT_DIRECTORY_REQUEST_ID);
+            let Some(browser) = state.project_browser.as_mut() else {
+                return SshModalOutcome::Unchanged;
+            };
+            if browser.loading || browser.preparing || browser.open_request_id.is_some() {
+                return SshModalOutcome::Unchanged;
+            }
+            let Some((root, identity)) = browser
+                .listing
+                .as_ref()
+                .map(|listing| (listing.path.clone(), listing.identity.clone()))
+            else {
+                return SshModalOutcome::Unchanged;
+            };
+            browser.open_request_id = Some(request_id);
+            browser.preparing = true;
+            browser.notice = Some("Opening this folder…".into());
+            SshModalOutcome::ChooseProjectDirectory {
+                request_id,
+                target_id: browser.target_id.clone(),
+                root,
+                identity,
             }
         }
         _ => SshModalOutcome::Unchanged,
@@ -3814,6 +4907,11 @@ fn activate_grant_focus(card: &mut SshGrantCard) {
         SshGrantFocus::Execute => card.capabilities.execute = !card.capabilities.execute,
         SshGrantFocus::Lifetime => card.lifetime = card.lifetime.toggle(),
         SshGrantFocus::Default => card.set_default = !card.set_default,
+        SshGrantFocus::RememberProject => {
+            if let Some(project) = card.project.as_mut() {
+                project.remember = !project.remember;
+            }
+        }
     }
     if card.focus != SshGrantFocus::Root {
         mark_grant_edited(card);
@@ -3828,15 +4926,23 @@ fn handle_grant_key(card: &mut SshGrantCard, key: &KeyEvent) -> SshModalOutcome 
             target_id: None,
             root: None,
             capabilities: None,
-            lifetime: card.lifetime,
-            set_default: card.set_default,
+            lifetime: if card.is_project_consent() && card.project_remember() {
+                SshGrantLifetime::ProjectRule
+            } else {
+                card.lifetime
+            },
+            set_default: if card.is_project_consent() {
+                false
+            } else {
+                card.set_default
+            },
         },
         KeyCode::Tab => {
-            card.focus = card.focus.next(false);
+            card.focus_next(false);
             SshModalOutcome::Changed
         }
         KeyCode::BackTab => {
-            card.focus = card.focus.next(true);
+            card.focus_next(true);
             SshModalOutcome::Changed
         }
         KeyCode::PageUp => {
@@ -3873,12 +4979,16 @@ fn handle_grant_key(card: &mut SshGrantCard, key: &KeyEvent) -> SshModalOutcome 
             activate_grant_focus(card);
             SshModalOutcome::Changed
         }
-        KeyCode::Char('l') if key.modifiers == KeyModifiers::ALT => {
+        KeyCode::Char('l')
+            if key.modifiers == KeyModifiers::ALT && !card.is_project_consent() =>
+        {
             card.focus = SshGrantFocus::Lifetime;
             activate_grant_focus(card);
             SshModalOutcome::Changed
         }
-        KeyCode::Char('d') if key.modifiers == KeyModifiers::ALT => {
+        KeyCode::Char('d')
+            if key.modifiers == KeyModifiers::ALT && !card.is_project_consent() =>
+        {
             card.focus = SshGrantFocus::Default;
             activate_grant_focus(card);
             SshModalOutcome::Changed
@@ -3893,8 +5003,18 @@ fn handle_grant_key(card: &mut SshGrantCard, key: &KeyEvent) -> SshModalOutcome 
                 card.error = Some("A remote root is required.".into());
                 return SshModalOutcome::Changed;
             }
+            if card.is_project_consent() && !card.permits_root(root) {
+                card.error = Some(
+                    "Project access can use the verified folder or a folder beneath it.".into(),
+                );
+                return SshModalOutcome::Changed;
+            }
             if !card.capabilities.any() {
                 card.error = Some("Choose at least one capability.".into());
+                return SshModalOutcome::Changed;
+            }
+            if card.is_project_consent() && !card.capabilities.read {
+                card.error = Some("Read permission is required to open a remote project.".into());
                 return SshModalOutcome::Changed;
             }
             if !card.request_id.is_empty() && !card.reviewed_to_end {
@@ -3904,13 +5024,19 @@ fn handle_grant_key(card: &mut SshGrantCard, key: &KeyEvent) -> SshModalOutcome 
                 );
                 return SshModalOutcome::Changed;
             }
+            let lifetime = if card.is_project_consent() && card.project_remember() {
+                SshGrantLifetime::ProjectRule
+            } else {
+                card.lifetime
+            };
+            let set_default = !card.is_project_consent() && card.set_default;
             if card.request_id.is_empty() {
                 SshModalOutcome::RequestGrant {
                     target_id: card.target_id.clone(),
                     root: root.to_owned(),
                     capabilities: card.capabilities,
-                    lifetime: card.lifetime,
-                    set_default: card.set_default,
+                    lifetime,
+                    set_default,
                 }
             } else {
                 SshModalOutcome::ApproveGrant {
@@ -3919,8 +5045,8 @@ fn handle_grant_key(card: &mut SshGrantCard, key: &KeyEvent) -> SshModalOutcome 
                     target_id: Some(card.target_id.clone()),
                     root: Some(root.to_owned()),
                     capabilities: Some(card.capabilities),
-                    lifetime: card.lifetime,
-                    set_default: card.set_default,
+                    lifetime,
+                    set_default,
                 }
             }
         }
@@ -4440,11 +5566,450 @@ mod tests {
         }
     }
 
+    fn remote_identity() -> SshHostIdentity {
+        SshHostIdentity {
+            hostname: "build.example.test".into(),
+            port: 22,
+            username: "builder".into(),
+            fingerprint: "SHA256:fixture".into(),
+        }
+    }
+
+    fn directory_listing(
+        target_id: &str,
+        path: &str,
+        parent: Option<&str>,
+        directories: &[(&str, &str)],
+    ) -> SshDirectoryListing {
+        SshDirectoryListing {
+            target_id: target_id.into(),
+            identity: remote_identity(),
+            path: path.into(),
+            parent: parent.map(str::to_owned),
+            directories: directories
+                .iter()
+                .map(|(name, path)| xai_grok_shell::ssh::SshDirectoryEntry {
+                    name: (*name).into(),
+                    path: (*path).into(),
+                })
+                .collect(),
+            truncated: false,
+        }
+    }
+
     fn add_submission_id(outcome: SshModalOutcome) -> u64 {
         match outcome {
             SshModalOutcome::AddTarget { submission_id, .. } => submission_id,
             _ => panic!("expected add-target submission"),
         }
+    }
+
+    #[test]
+    fn failed_folder_navigation_restores_the_displayed_directory_before_opening() {
+        let mut state = SshManagerState::new(None);
+        let SshModalOutcome::BrowseProjectDirectory { request_id, .. } =
+            state.begin_project_browser("server-1".into(), None)
+        else { panic!("browse expected") };
+        state.settle_project_directory(request_id, "server-1",
+            Ok(directory_listing("server-1", "/home/project", Some("/home"), &[])));
+        let SshModalOutcome::BrowseProjectDirectory { request_id, .. } =
+            state.browse_project_directory(Some("/missing-folder".into()))
+        else { panic!("navigation expected") };
+        state.settle_project_directory(request_id, "server-1", Err("folder missing".into()));
+        assert!(matches!(state.page, SshModalPage::Diagnostic(_)));
+        close_current_page(&mut state);
+        assert_eq!(state.project_browser.as_ref().unwrap().path.text(), "/home/project");
+        assert!(matches!(handle_ssh_key(&mut state, &key(KeyCode::Char('o'))),
+            SshModalOutcome::ChooseProjectDirectory { root, .. } if root == "/home/project"));
+    }
+
+    #[test]
+    fn primary_folder_browser_uses_real_directory_rows_and_ignores_stale_navigation() {
+        let mut state = SshManagerState::new(Some("source-session".into()));
+        state.set_targets(vec![target_view("server-1", SshGrantView::NotGranted)]);
+        assert!(matches!(
+            handle_ssh_key(&mut state, &key(KeyCode::Char('g'))),
+            SshModalOutcome::Unchanged
+        ));
+        assert!(matches!(
+            handle_ssh_key(&mut state, &key(KeyCode::Char('u'))),
+            SshModalOutcome::Unchanged
+        ));
+        assert!(matches!(
+            handle_ssh_key(&mut state, &key(KeyCode::Char('o'))),
+            SshModalOutcome::Unchanged
+        ));
+        let SshModalOutcome::BrowseProjectDirectory {
+            request_id,
+            target_id,
+            path,
+        } = handle_ssh_key(&mut state, &key(KeyCode::Enter))
+        else {
+            panic!("Enter must begin the folder browser");
+        };
+        assert_eq!(target_id, "server-1");
+        assert_eq!(path, None);
+        assert!(!state.settle_project_directory(
+            request_id,
+            "other-server",
+            Ok(directory_listing(
+                "other-server",
+                "/wrong",
+                None,
+                &[("wrong", "/wrong")],
+            )),
+        ));
+        assert!(state.settle_project_directory(
+            request_id,
+            "server-1",
+            Ok(directory_listing(
+                "server-1",
+                "/srv/project",
+                Some("/srv"),
+                &[("alpha", "/srv/project/alpha"), ("beta", "/srv/project/beta")],
+            )),
+        ));
+        let area = Rect::new(0, 0, 80, 18);
+        let mut buffer = Buffer::empty(area);
+        render_ssh_modal(&mut buffer, area, &mut state, false, &Theme::current());
+        let rendered = buffer_text(&buffer);
+        assert!(rendered.contains("/srv/project"));
+        assert!(rendered.contains("beta"));
+        let beta = state
+            .project_browser
+            .as_ref()
+            .and_then(|browser| browser.row_hits.iter().find(|hit| hit.index == 1))
+            .expect("rendered beta folder row")
+            .rect;
+        assert!(matches!(
+            handle_ssh_mouse(
+                &mut state,
+                &MouseEvent {
+                    kind: MouseEventKind::Down(crossterm::event::MouseButton::Left),
+                    column: beta.x,
+                    row: beta.y,
+                    modifiers: KeyModifiers::NONE,
+                },
+            ),
+            SshModalOutcome::Changed
+        ));
+        let SshModalOutcome::BrowseProjectDirectory {
+            request_id: child_request,
+            path: Some(child_path),
+            ..
+        } = handle_ssh_key(&mut state, &key(KeyCode::Enter))
+        else {
+            panic!("Enter must navigate into the selected folder");
+        };
+        assert_eq!(child_path, "/srv/project/beta");
+        assert_ne!(request_id, child_request);
+        assert!(!state.settle_project_directory(
+            request_id,
+            "server-1",
+            Ok(directory_listing("server-1", "/srv/project", Some("/srv"), &[])),
+        ));
+        assert!(state.settle_project_directory(
+            child_request,
+            "server-1",
+            Ok(directory_listing(
+                "server-1",
+                "/srv/project/beta",
+                Some("/srv/project"),
+                &[],
+            )),
+        ));
+        assert!(matches!(
+            handle_ssh_key(&mut state, &key(KeyCode::Char('/'))),
+            SshModalOutcome::Changed
+        ));
+        for character in "/srv/manual".chars() {
+            assert!(matches!(
+                handle_ssh_key(&mut state, &key(KeyCode::Char(character))),
+                SshModalOutcome::Changed
+            ));
+        }
+        let SshModalOutcome::BrowseProjectDirectory {
+            request_id: manual_request,
+            path: Some(path),
+            ..
+        } = handle_ssh_key(&mut state, &key(KeyCode::Enter))
+        else {
+            panic!("path entry must navigate through the same browser");
+        };
+        assert_eq!(path, "/srv/manual");
+        assert!(state.settle_project_directory(
+            manual_request,
+            "server-1",
+            Ok(directory_listing(
+                "server-1",
+                "/srv/manual",
+                Some("/srv"),
+                &[],
+            )),
+        ));
+        assert!(matches!(
+            handle_ssh_key(&mut state, &key(KeyCode::Backspace)),
+            SshModalOutcome::BrowseProjectDirectory {
+                path: Some(path),
+                ..
+            } if path == "/srv"
+        ));
+    }
+
+    #[test]
+    fn project_consent_keeps_folder_owner_and_submits_remembered_read_scope() {
+        let mut state = SshManagerState::new(Some("source-session".into()));
+        let mut target = target_view("internal-server-id", SshGrantView::NotGranted);
+        target.label = "Build server".into();
+        state.set_targets(vec![target]);
+        let SshModalOutcome::BrowseProjectDirectory { request_id, .. } =
+            state.begin_project_browser("internal-server-id".into(), None)
+        else {
+            panic!("browser request expected");
+        };
+        assert!(state.settle_project_directory(
+            request_id,
+            "internal-server-id",
+            Ok(directory_listing(
+                "internal-server-id",
+                "/srv/project",
+                Some("/srv"),
+                &[],
+            )),
+        ));
+        let SshModalOutcome::ChooseProjectDirectory {
+            request_id: open_request,
+            target_id,
+            root,
+            identity,
+        } = handle_ssh_key(&mut state, &key(KeyCode::Char('o')))
+        else {
+            panic!("open action must choose the current folder");
+        };
+        assert_eq!(target_id, "internal-server-id");
+        assert_eq!(root, "/srv/project");
+        assert_eq!(identity, remote_identity());
+        assert!(state.begin_project_preparation(
+            open_request,
+            "project-session".into(),
+            target_id,
+            root,
+        ));
+        assert_eq!(
+            state.pending_project_open_tuple(),
+            Some(("project-session", "internal-server-id", "/srv/project"))
+        );
+        assert!(state.show_project_consent(
+            open_request,
+            SshIncomingGrant {
+                request_id: "grant-request".into(),
+                target_id: Some("internal-server-id".into()),
+                root: Some("/srv/project".into()),
+                capabilities: SshCapabilitiesView::default(),
+                verified_identity: Some("builder@build.example.test:22 (SHA256:fixture)".into()),
+                reason: "Open the selected project.".into(),
+            },
+            "project-session".into(),
+        ));
+        let area = Rect::new(0, 0, 80, 30);
+        let mut buffer = Buffer::empty(area);
+        render_ssh_modal(&mut buffer, area, &mut state, false, &Theme::current());
+        let rendered = buffer_text(&buffer);
+        assert!(rendered.contains("Build server"));
+        assert!(rendered.contains("/srv/project"));
+        assert!(rendered.contains("SHA256:fixture"));
+        for _ in 0..4 {
+            assert!(matches!(
+                handle_ssh_key(&mut state, &key(KeyCode::Tab)),
+                SshModalOutcome::Changed
+            ));
+        }
+        assert!(matches!(
+            handle_ssh_key(&mut state, &key(KeyCode::Char(' '))),
+            SshModalOutcome::Changed
+        ));
+        let mut buffer = Buffer::empty(area);
+        render_ssh_modal(&mut buffer, area, &mut state, false, &Theme::current());
+        assert!(matches!(
+            handle_ssh_key(&mut state, &key(KeyCode::Enter)),
+            SshModalOutcome::ApproveGrant {
+                request_id,
+                approved: true,
+                root: Some(root),
+                capabilities: Some(SshCapabilitiesView { read: true, .. }),
+                lifetime: SshGrantLifetime::ProjectRule,
+                set_default: false,
+                ..
+            } if request_id == "grant-request" && root == "/srv/project"
+        ));
+        state.settle_grant(true);
+        assert_eq!(
+            state.pending_project_open_tuple(),
+            Some(("project-session", "internal-server-id", "/srv/project"))
+        );
+        state.settle_project_open();
+        assert_eq!(state.pending_project_open_tuple(), None);
+    }
+
+    #[test]
+    fn project_consent_decline_keeps_its_owner_until_preparation_finishes() {
+        let mut state = SshManagerState::new(Some("source-session".into()));
+        state.set_targets(vec![target_view("server-1", SshGrantView::NotGranted)]);
+        let SshModalOutcome::BrowseProjectDirectory { request_id, .. } =
+            state.begin_project_browser("server-1".into(), None)
+        else {
+            panic!("browser request expected");
+        };
+        assert!(state.settle_project_directory(
+            request_id,
+            "server-1",
+            Ok(directory_listing(
+                "server-1",
+                "/srv/project",
+                Some("/srv"),
+                &[],
+            )),
+        ));
+        let SshModalOutcome::ChooseProjectDirectory {
+            request_id: open_request,
+            target_id,
+            root,
+            ..
+        } = handle_ssh_key(&mut state, &key(KeyCode::Char('o')))
+        else {
+            panic!("current folder selection expected");
+        };
+        assert!(state.begin_project_preparation(
+            open_request,
+            "project-session".into(),
+            target_id,
+            root,
+        ));
+        assert!(state.show_project_consent(
+            open_request,
+            SshIncomingGrant {
+                request_id: "grant-request".into(),
+                target_id: Some("server-1".into()),
+                root: Some("/srv/project".into()),
+                capabilities: SshCapabilitiesView::default(),
+                verified_identity: Some("builder@build.example.test:22 (SHA256:fixture)".into()),
+                reason: "Open the selected project.".into(),
+            },
+            "project-session".into(),
+        ));
+        assert!(matches!(
+            handle_ssh_key(&mut state, &key(KeyCode::Esc)),
+            SshModalOutcome::ApproveGrant {
+                request_id,
+                approved: false,
+                ..
+            } if request_id == "grant-request"
+        ));
+        state.settle_grant(false);
+        assert_eq!(
+            state.pending_project_open_tuple(),
+            Some(("project-session", "server-1", "/srv/project"))
+        );
+        assert!(state.finish_project_preparation(open_request, None));
+        assert_eq!(state.pending_project_open_tuple(), None);
+    }
+
+    #[test]
+    fn authenticated_browser_restores_matching_owner_and_cancel_clears_project_pending() {
+        let mut state = SshManagerState::new(Some("source-session".into()));
+        state.set_targets(vec![target_view("server-1", SshGrantView::NotGranted)]);
+        let SshModalOutcome::BrowseProjectDirectory { request_id, .. } =
+            state.begin_project_browser("server-1".into(), None)
+        else {
+            panic!("browser request expected");
+        };
+        state.show_authentication(SshAuthCard::new(
+            "challenge-1".into(),
+            1,
+            "server-1".into(),
+            SshAuthKind::Password {
+                username: "builder".into(),
+                message: "Password".into(),
+                allow_remember: false,
+            },
+        ));
+        assert_eq!(state.pending_project_target_id(), Some("server-1"));
+        assert!(state.settle_project_directory(
+            request_id,
+            "server-1",
+            Ok(directory_listing(
+                "server-1",
+                "/srv/project",
+                Some("/srv"),
+                &[("child", "/srv/project/child")],
+            )),
+        ));
+        let area = Rect::new(0, 0, 70, 18);
+        let mut buffer = Buffer::empty(area);
+        render_ssh_modal(&mut buffer, area, &mut state, false, &Theme::current());
+        assert!(buffer_text(&buffer).contains("child"));
+        let SshModalOutcome::ChooseProjectDirectory {
+            request_id: open_request,
+            target_id,
+            root,
+            ..
+        } = handle_ssh_key(&mut state, &key(KeyCode::Char('o')))
+        else {
+            panic!("current folder selection expected");
+        };
+        assert!(state.begin_project_preparation(
+            open_request,
+            "project-session".into(),
+            target_id,
+            root,
+        ));
+        assert!(matches!(
+            handle_ssh_key(&mut state, &key(KeyCode::Esc)),
+            SshModalOutcome::CancelProjectOpen { request_id } if request_id == open_request
+        ));
+        assert_eq!(state.pending_project_target_id(), None);
+        assert!(!state.finish_project_preparation(open_request, Some("late failure".into())));
+    }
+
+    #[test]
+    fn advanced_use_grant_exposes_a_typed_continuation_before_settlement() {
+        let mut state = SshManagerState::new(Some("source-session".into()));
+        state.set_targets(vec![target_view("server-1", SshGrantView::NotGranted)]);
+        assert!(matches!(
+            handle_ssh_key(&mut state, &key(KeyCode::Char('m'))),
+            SshModalOutcome::Changed
+        ));
+        assert!(matches!(
+            handle_ssh_key(&mut state, &key(KeyCode::Char('u'))),
+            SshModalOutcome::Changed
+        ));
+        assert!(matches!(
+            handle_ssh_key(&mut state, &key(KeyCode::Enter)),
+            SshModalOutcome::RequestGrant { root, .. } if root == "."
+        ));
+        state.remember_local_grant_options(
+            "server-1".into(), ".".into(), SshCapabilitiesView::default(),
+            SshGrantLifetime::ProjectRule, false,
+        );
+        assert!(state.bind_local_grant_request("advanced-use-grant", Some("server-1"), Some(".")));
+        state.show_incoming_grant(
+            "source-session".into(),
+            SshIncomingGrant {
+                request_id: "advanced-use-grant".into(),
+                target_id: Some("server-1".into()),
+                root: Some("/home/builder".into()),
+                capabilities: SshCapabilitiesView::default(),
+                verified_identity: Some("builder@build.example.test:22 (SHA256:fixture)".into()),
+                reason: "Open SSH access".into(),
+            },
+        );
+        let SshModalPage::Grant(card) = &state.page else { panic!("verified grant expected") };
+        assert_eq!(card.lifetime, SshGrantLifetime::ProjectRule);
+        assert_eq!(card.root.text(), "/home/builder");
+        assert_eq!(
+            state.take_grant_follow_up("advanced-use-grant"),
+            Some(SshGrantFollowUp::UseBinding)
+        );
     }
 
     #[test]
@@ -5054,5 +6619,27 @@ mod tests {
         ));
         assert!(matches!(&state.page, SshModalPage::Manager));
         assert_eq!(state.selected, 4);
+    }
+
+    #[test]
+    fn connected_details_are_not_an_error_but_actual_failures_remain_red() {
+        let mut state = SshManagerState::new(None);
+        let mut target = target_view("server-1", SshGrantView::NotGranted);
+        target.connected = true;
+        state.set_targets(vec![target]);
+        state.open_diagnostic();
+        let area = Rect::new(0, 0, 120, 30);
+        let theme = Theme::default();
+        let SshModalPage::Diagnostic(card) = &mut state.page else { panic!("details expected") };
+        let mut buffer = Buffer::empty(area);
+        render_diagnostic(&mut buffer, area, card, &theme);
+        assert!(!buffer.content.iter().any(|cell| cell.fg == theme.accent_error));
+        assert!(buffer.content.iter().any(|cell| cell.fg == theme.accent_success));
+        state.show_error("connection lost");
+        let SshModalPage::Diagnostic(card) = &mut state.page else { panic!("failure expected") };
+        let mut buffer = Buffer::empty(area);
+        render_diagnostic(&mut buffer, area, card, &theme);
+        assert!(buffer.content.iter().any(|cell| cell.fg == theme.accent_error && cell.symbol() == "c"));
+        assert!(!buffer.content.iter().any(|cell| cell.fg == theme.accent_success));
     }
 }

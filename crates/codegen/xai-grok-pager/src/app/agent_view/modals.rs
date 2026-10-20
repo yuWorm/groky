@@ -189,6 +189,12 @@ impl AgentView {
             SshModalOutcome::Disconnect { target_id } => {
                 InputOutcome::Action(Action::DisconnectSshTarget { target_id })
             }
+            SshModalOutcome::BrowseProjectDirectory { request_id, target_id, path } =>
+                InputOutcome::Action(Action::BrowseSshProjectDirectory { request_id, target_id, path }),
+            SshModalOutcome::ChooseProjectDirectory { request_id, target_id, root, identity } =>
+                InputOutcome::Action(Action::ChooseSshProjectDirectory { request_id, target_id, root, identity }),
+            SshModalOutcome::CancelProjectOpen { request_id } =>
+                InputOutcome::Action(Action::CancelSshProjectOpen { request_id }),
             SshModalOutcome::RequestGrant {
                 target_id,
                 root,
@@ -232,17 +238,6 @@ impl AgentView {
             SshModalOutcome::RevokeBinding { binding_id } => {
                 InputOutcome::Action(Action::RevokeSshBinding { binding_id })
             }
-            SshModalOutcome::OpenProject {
-                target_id,
-                root,
-                binding_id,
-                capabilities,
-            } => InputOutcome::Action(Action::OpenSshProject {
-                target_id,
-                root,
-                binding_id,
-                capabilities,
-            }),
             SshModalOutcome::ApproveOperation {
                 approval_id,
                 approved,

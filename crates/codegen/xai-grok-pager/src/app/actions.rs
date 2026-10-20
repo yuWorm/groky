@@ -668,6 +668,19 @@ pub enum Action {
     ConnectSshTarget { target_id: String },
     /// Release the persistent manual connection hold for a target.
     DisconnectSshTarget { target_id: String },
+    /// Browse authenticated remote directories without granting model access.
+    BrowseSshProjectDirectory {
+        request_id: u64,
+        target_id: String,
+        path: Option<String>,
+    },
+    ChooseSshProjectDirectory {
+        request_id: u64,
+        target_id: String,
+        root: String,
+        identity: xai_grok_shell::ssh::SshHostIdentity,
+    },
+    CancelSshProjectOpen { request_id: u64 },
     /// Ask the local SSH service to create a human-reviewable grant request.
     RequestSshGrant {
         target_id: String,
@@ -695,14 +708,6 @@ pub enum Action {
     UseSshBinding { binding_id: String },
     /// Locally revoke a grant and wait for the worker acknowledgement before displaying confirmation.
     RevokeSshBinding { binding_id: String },
-    /// Open a local TUI session bound to an authorized remote workspace.
-    OpenSshProject {
-        target_id: String,
-        root: String,
-        /// Binding owned by the currently open source session.
-        binding_id: String,
-        capabilities: crate::views::ssh_modal::SshCapabilitiesView,
-    },
     /// Begin interactive local consent for a `groky ssh open` project session that was pre-minted
     /// before any authority is granted.
     BeginSshProjectOpen(crate::app::cli::SshProjectOpen),
@@ -2576,22 +2581,25 @@ pub enum Effect {
         client_id: u64,
         owner: SshManagerOwner,
     },
-    /// Mint an inherited binding for a pre-minted SSH project session before `session/new`.
-    SshInheritBinding {
-        source_session_id: String,
-        source_binding_id: String,
-        project_session_id: String,
+    SshBrowseProjectDirectory {
+        request_id: u64,
         target_id: String,
-        root: String,
-        capabilities: crate::views::ssh_modal::SshCapabilitiesView,
+        path: Option<String>,
         client_id: u64,
         owner: SshManagerOwner,
     },
-    /// Register an SSH project location, then request human consent for the pre-minted session.
-    SshBeginProjectGrant {
-        project: crate::app::cli::SshProjectOpen,
+    SshPrepareProjectOpen {
+        request_id: u64,
+        project_session_id: String,
+        source_session_id: Option<String>,
+        target_id: String,
+        root: String,
+        expected_identity: Option<xai_grok_shell::ssh::SshHostIdentity>,
         client_id: u64,
+        owner: SshManagerOwner,
     },
+    /// Discard a consent request whose originating manager was closed or replaced.
+    SshRejectProjectGrant { request_id: String, client_id: u64 },
     /// Start a local pager session whose remote workspace is bound solely through SSH metadata.
     OpenSshProject {
         agent_id: AgentId,
@@ -2814,38 +2822,20 @@ pub enum TaskResult {
         owner: Option<SshManagerOwner>,
         event: xai_grok_shell::ssh::SshEvent,
     },
-    /// The leader minted a binding owned by the pre-minted SSH project session.
-    SshProjectBindingInherited {
+    SshProjectDirectoryLoaded {
+        request_id: u64,
         target_id: String,
-        root: String,
-        project_session_id: String,
-        binding: xai_grok_shell::ssh::SshBinding,
         client_id: u64,
         owner: SshManagerOwner,
+        result: Result<xai_grok_shell::ssh::SshDirectoryListing, String>,
     },
-    /// The local service could not create the inherited binding for a user-opened SSH project.
-    SshProjectBindingInheritFailed {
-        source_session_id: String,
-        client_id: u64,
-        owner: SshManagerOwner,
-        error: String,
-    },
-    /// A persisted SSH project rule revalidated to a binding owned by the pre-minted session.
-    SshProjectGrantRestored {
+    SshProjectPrepared {
+        request_id: u64,
         target_id: String,
         project_session_id: String,
-        binding: xai_grok_shell::ssh::SshBinding,
         client_id: u64,
-    },
-
-
-    /// The pre-minted CLI SSH project could not register its exact remote location or request
-    /// the initial consent; no local session was created.
-    SshProjectOpenSetupFailed {
-        session_id: String,
-        client_id: u64,
-        target_id: String,
-        error: String,
+        owner: SshManagerOwner,
+        result: Result<xai_grok_shell::ssh::SshProjectPreparation, String>,
     },
     /// Third-party provider API-key login finished.
     VendorLoginComplete {

@@ -716,217 +716,60 @@ pub(crate) fn execute(
                 .await
             });
         }
-        Effect::SshBeginProjectGrant { project, client_id } => {
+        Effect::SshBrowseProjectDirectory { request_id, target_id, path, client_id, owner } => {
             tasks.spawn(async move {
                 let client_id = ssh_control_client_id(client_id).await;
-                let session_id = project.project_session_id.clone();
-                let target_id = project.target_id.clone();
-                let location = xai_grok_shell::ssh::ProjectLocation::Ssh {
-                    target_id: target_id.clone(),
-                    root: project.root.clone(),
+                let result = match ssh_control_reply(
+                    xai_grok_shell::ssh::SshControlCommand::BrowseProjectDirectories {
+                        target_id: target_id.clone(), path,
+                    }, client_id,
+                ).await {
+                    Ok((_, xai_grok_shell::ssh::SshControlReply::ProjectDirectories(listing))) => Ok(listing),
+                    Ok(_) => Err("SSH service returned an unexpected directory response.".into()),
+                    Err((_, error)) => Err(error),
                 };
-                let restored = ssh_control_reply(
-                    xai_grok_shell::ssh::SshControlCommand::RestoreProjectGrant {
-                        session_id: session_id.clone(),
-                        location: location.clone(),
-                    },
-                    client_id,
-                )
-                .await;
-                match restored {
-                    Ok((
-                        client_id,
-                        xai_grok_shell::ssh::SshControlReply::ProjectGrantRestored {
-                            binding: Some(binding),
-                        },
-                    )) if binding.session_id == session_id && binding.target_id == target_id => {
-                        TaskResult::SshProjectGrantRestored {
-                            target_id,
-                            project_session_id: session_id,
-                            binding,
-                            client_id,
-                        }
-                    }
-                    Ok((
-                        client_id,
-                        xai_grok_shell::ssh::SshControlReply::ProjectGrantRestored {
-                            binding: Some(_),
-                        },
-                    )) => TaskResult::SshProjectOpenSetupFailed {
-                        session_id,
-                        client_id,
-                        target_id,
-                        error: "SSH local service returned a binding for a different project."
-                            .into(),
-                    },
-                    Ok((
-                        client_id,
-                        xai_grok_shell::ssh::SshControlReply::ProjectGrantRestored {
-                            binding: None,
-                        },
-                    )) => {
-                        let registered = ssh_control_reply(
-                            xai_grok_shell::ssh::SshControlCommand::RegisterProjectLocation {
-                                session_id: session_id.clone(),
-                                location,
-                            },
-                            client_id,
-                        )
-                        .await;
-                        match registered {
-                            Ok((
-                                _,
-                                xai_grok_shell::ssh::SshControlReply::ProjectLocationRegistered,
-                            )) => match ssh_control_reply(
-                                xai_grok_shell::ssh::SshControlCommand::RequestGrant {
-                                    session_id: session_id.clone(),
-                                    target_id: Some(target_id.clone()),
-                                    root: Some(project.root),
-                                    capabilities: xai_grok_shell::ssh::SshCapabilities::all(),
-                                    reason: "User requested a new local SSH project.".into(),
-                                },
-                                client_id,
-                            )
-                            .await
-                            {
-                                Ok((
-                                    client_id,
-                                    xai_grok_shell::ssh::SshControlReply::GrantRequested(request),
-                                )) => TaskResult::SshControlEvent {
-                                    session_id: Some(session_id),
-                                    client_id,
-                                    owner: None,
-                                    event: xai_grok_shell::ssh::SshEvent::GrantRequested(request),
-                                },
-                                Ok((client_id, _)) => TaskResult::SshProjectOpenSetupFailed {
-                                    session_id,
-                                    client_id,
-                                    target_id,
-                                    error: "SSH local service returned an unexpected project grant response."
-                                        .into(),
-                                },
-                                Err((client_id, error)) => TaskResult::SshProjectOpenSetupFailed {
-                                    session_id,
-                                    client_id,
-                                    target_id,
-                                    error,
-                                },
-                            },
-                            Ok((client_id, _)) => TaskResult::SshProjectOpenSetupFailed {
-                                session_id,
-                                client_id,
-                                target_id,
-                                error: "SSH local service rejected the project location registration."
-                                    .into(),
-                            },
-                            Err((client_id, error)) => TaskResult::SshProjectOpenSetupFailed {
-                                session_id,
-                                client_id,
-                                target_id,
-                                error,
-                            },
-                        }
-                    }
-                    Ok((client_id, _)) => TaskResult::SshProjectOpenSetupFailed {
-                        session_id,
-                        client_id,
-                        target_id,
-                        error: "SSH local service returned an unexpected project restore response."
-                            .into(),
-                    },
-                    Err((client_id, error)) => TaskResult::SshProjectOpenSetupFailed {
-                        session_id,
-                        client_id,
-                        target_id,
-                        error,
-                    },
-                }
+                TaskResult::SshProjectDirectoryLoaded { request_id, target_id, client_id, owner, result }
             });
         }
-        Effect::SshInheritBinding {
-            source_session_id,
-            source_binding_id,
-            project_session_id,
-            target_id,
-            root,
-            capabilities,
-            client_id,
-            owner,
+        Effect::SshPrepareProjectOpen {
+            request_id, project_session_id, source_session_id, target_id, root,
+            expected_identity, client_id, owner,
         } => {
             tasks.spawn(async move {
                 let client_id = ssh_control_client_id(client_id).await;
-                let location = xai_grok_shell::ssh::ProjectLocation::Ssh {
-                    target_id: target_id.clone(),
-                    root: root.clone(),
+                let result = match ssh_control_reply(
+                    xai_grok_shell::ssh::SshControlCommand::PrepareProjectOpen {
+                        session_id: project_session_id.clone(), source_session_id,
+                        target_id: target_id.clone(), root, expected_identity, capabilities: None,
+                    }, client_id,
+                ).await {
+                    Ok((_, xai_grok_shell::ssh::SshControlReply::ProjectPrepared(preparation))) =>
+                        Ok(preparation),
+                    Ok(_) => Err("SSH service returned an unexpected project response.".into()),
+                    Err((_, error)) => Err(error),
                 };
-                let registered = ssh_control_reply(
-                    xai_grok_shell::ssh::SshControlCommand::RegisterProjectLocation {
-                        session_id: project_session_id.clone(),
-                        location,
-                    },
-                    client_id,
-                )
-                .await;
-                match registered {
-                    Ok((_, xai_grok_shell::ssh::SshControlReply::ProjectLocationRegistered)) => {}
-                    Ok((client_id, _)) => {
-                        return TaskResult::SshProjectBindingInheritFailed {
-                            source_session_id,
-                            client_id,
-                            owner,
-                            error: "SSH local service rejected the project location registration.".into(),
-                        };
-                    }
-                    Err((client_id, error)) => {
-                        return TaskResult::SshProjectBindingInheritFailed {
-                            source_session_id,
-                            client_id,
-                            owner,
-                            error,
-                        };
-                    }
+                TaskResult::SshProjectPrepared {
+                    request_id, target_id, project_session_id, client_id, owner, result,
                 }
-                match ssh_control_reply(
-                    xai_grok_shell::ssh::SshControlCommand::InheritSession {
-                        source_session_id: source_session_id.clone(),
-                        binding_id: source_binding_id,
-                        target_session_id: project_session_id.clone(),
-                        capabilities: ssh_capabilities(capabilities),
-                    },
-                    client_id,
-                )
-                .await
-                {
-                    Ok((client_id, xai_grok_shell::ssh::SshControlReply::InheritedBindings(
-                        mut bindings,
-                    ))) if bindings.len() == 1 => TaskResult::SshProjectBindingInherited {
-                        target_id,
-                        root,
-                        project_session_id,
-                        binding: bindings.pop().expect("one inherited binding"),
-                        client_id,
-                        owner,
-                    },
-                    Ok((client_id, xai_grok_shell::ssh::SshControlReply::InheritedBindings(_))) => {
-                        TaskResult::SshProjectBindingInheritFailed {
-                            source_session_id,
-                            client_id,
-                            owner,
-                            error: "SSH local service did not mint exactly one project binding.".into(),
-                        }
-                    }
-                    Ok((client_id, _)) => TaskResult::SshProjectBindingInheritFailed {
-                        source_session_id,
-                        client_id,
-                        owner,
-                        error: "SSH local service returned an unexpected project binding response.".into(),
-                    },
-                    Err((client_id, error)) => TaskResult::SshProjectBindingInheritFailed {
-                        source_session_id,
-                        client_id,
-                        owner,
-                        error,
-                    },
+            });
+        }
+        Effect::SshRejectProjectGrant { request_id, client_id } => {
+            tasks.spawn(async move {
+                let client_id = ssh_control_client_id(client_id).await;
+                if let Err((_, error)) = ssh_control_reply(
+                    xai_grok_shell::ssh::SshControlCommand::ApproveGrant(
+                        xai_grok_shell::ssh::SshGrantDecision {
+                            request_id, approved: false, target_id: None, root: None,
+                            capabilities: None, scope: xai_grok_shell::ssh::SshGrantScope::CurrentSession,
+                            make_default: false, client_id,
+                        },
+                    ), client_id,
+                ).await {
+                    tracing::warn!(%error, "could not discard closed SSH project request");
+                }
+                TaskResult::SshActionComplete {
+                    session_id: None, client_id, owner: None, target_id: None,
+                    message: None, error: None,
                 }
             });
         }

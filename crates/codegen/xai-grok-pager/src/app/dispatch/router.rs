@@ -1289,6 +1289,12 @@ fn dispatch_inner(action: Action, app: &mut AppView) -> Vec<Effect> {
         Action::DisconnectSshTarget { target_id } => {
             super::ssh::dispatch_disconnect_ssh_target(app, target_id)
         }
+        Action::BrowseSshProjectDirectory { request_id, target_id, path } =>
+            super::ssh::dispatch_browse_ssh_project_directory(app, request_id, target_id, path),
+        Action::ChooseSshProjectDirectory { request_id, target_id, root, identity } =>
+            super::ssh::dispatch_choose_ssh_project_directory(app, request_id, target_id, root, identity),
+        Action::CancelSshProjectOpen { request_id } =>
+            super::ssh::dispatch_cancel_ssh_project_open(app, request_id),
         Action::RequestSshGrant {
             target_id,
             root,
@@ -1329,12 +1335,6 @@ fn dispatch_inner(action: Action, app: &mut AppView) -> Vec<Effect> {
         Action::RevokeSshBinding { binding_id } => {
             super::ssh::dispatch_revoke_ssh_binding(app, binding_id)
         }
-        Action::OpenSshProject {
-            target_id,
-            root,
-            binding_id,
-            capabilities,
-        } => super::ssh::dispatch_open_ssh_project(app, target_id, root, binding_id, capabilities),
         Action::BeginSshProjectOpen(project) => {
             super::ssh::dispatch_begin_ssh_project_open(app, project)
         }

@@ -7,6 +7,7 @@ mod control_client;
 mod model;
 mod native_files;
 mod native_tasks;
+mod project_browser;
 mod service;
 mod tools;
 mod worker_install;
@@ -16,10 +17,11 @@ pub use control_client::{SshControlClient, SshControlClientError};
 pub use model::{
     PersistedSshGrant, PersistedSshState, ProjectSshBinding, RevokeStatus, SshAuthPrompt,
     SshAuthPromptDetail, SshAuthPromptKind, SshAuthResponse, SshConnectionState,
-    SshDispatchRequest, SshDispatchResult, SshEvent, SshGrantDecision, SshGrantRequest,
-    SshGrantScope, SshGrantStatus, SshHostKeyDecision, SshKeyboardInteractiveQuestion,
-    SshOperationApproval, SshOperationApprovalDecision, SshSessionWorkerEvent, SshTargetAccess,
-    SshTargetStatus, SshWorkerInstallDecision, SshWorkerInstallProgress, SshWorkerInstallRequest,
+    SshDirectoryEntry, SshDirectoryListing, SshDispatchRequest, SshDispatchResult, SshEvent,
+    SshGrantDecision, SshGrantRequest, SshGrantScope, SshGrantStatus, SshHostKeyDecision,
+    SshKeyboardInteractiveQuestion, SshOperationApproval, SshOperationApprovalDecision,
+    SshProjectPreparation, SshSessionWorkerEvent, SshTargetAccess, SshTargetStatus,
+    SshWorkerInstallDecision, SshWorkerInstallProgress, SshWorkerInstallRequest,
 };
 pub use service::{SessionSsh, SessionSshResource, SshServiceError};
 pub(crate) use tools::configure_default_tools;

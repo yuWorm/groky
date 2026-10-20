@@ -31,6 +31,37 @@ pub struct SshGrantRequest {
     pub client_id: Option<u64>,
 }
 
+/// A directory a local SSH project picker can navigate to. The path is a
+/// server-provided spelling and may be a symlink; project opening canonicalizes
+/// it before any authority is reused or granted.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SshDirectoryEntry {
+    pub name: String,
+    pub path: String,
+}
+
+/// A bounded, native-SFTP-only directory listing for a local project picker.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SshDirectoryListing {
+    pub target_id: String,
+    pub identity: SshHostIdentity,
+    pub path: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent: Option<String>,
+    pub directories: Vec<SshDirectoryEntry>,
+    pub truncated: bool,
+}
+
+/// The result of preparing an SSH project session. It contains either the
+/// child-owned binding that is ready for project setup or the exact, already
+/// verified consent request that must be resolved first.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", content = "data", rename_all = "snake_case")]
+pub enum SshProjectPreparation {
+    Ready(SshBinding),
+    NeedsApproval(SshGrantRequest),
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SshGrantScope {

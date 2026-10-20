@@ -71,13 +71,17 @@ fn binding(target_id: &str, root: &str) -> SshBinding {
 }
 
 fn begin_grant(app: &mut AppView, request_id: &str, target_id: &str, root: &str) {
-    let _ = dispatch_begin_ssh_project_open(app, pending_project());
+    let effects = dispatch_begin_ssh_project_open(app, pending_project());
+    let (flow_id, owner) = effects.iter().find_map(|effect| match effect {
+        Effect::SshPrepareProjectOpen { request_id, owner, .. } => Some((*request_id, *owner)),
+        _ => None,
+    }).expect("CLI starts the same project preparation as the folder picker");
     let client_id = app.ssh_client_id;
-    let _ = apply_ssh_control_event(
-        app,
-        Some(SESSION_ID.into()),
-        None,
-        SshEvent::GrantRequested(grant_request(request_id, target_id, root, client_id)),
+    let _ = crate::app::dispatch::ssh::apply_ssh_project_prepared(
+        app, owner, flow_id, TARGET_ID.into(), SESSION_ID.into(),
+        Ok(xai_grok_shell::ssh::SshProjectPreparation::NeedsApproval(
+            grant_request(request_id, target_id, root, client_id),
+        )),
     );
 }
 
@@ -387,10 +391,11 @@ fn matching_project_grant_uses_worker_canonical_root_after_user_changes_consent_
         Some(submitted_raw_root),
     );
 
+    let owner = ssh_manager_owner(&app);
     let effects = apply_ssh_control_event(
         &mut app,
         None,
-        None,
+        owner,
         SshEvent::GrantResolved {
             request_id: "request-1".into(),
             approved: true,
@@ -403,20 +408,20 @@ fn matching_project_grant_uses_worker_canonical_root_after_user_changes_consent_
         Some("/private/var/fixture/project/selected"),
         "the remote worker's canonical binding root, not either local raw path, starts the project"
     );
-    assert!(
-        app.pending_ssh_project_open.is_none(),
-        "only the matching resolution consumes the pending CLI project open"
-    );
+    assert!(app.agents.values().any(|agent| {
+        agent.ssh_project_open_session_id.as_deref() == Some(SESSION_ID)
+    }), "approval automatically starts the child without another keypress");
 }
 #[test]
 fn matching_project_grant_denial_from_global_receiver_clears_pending_open() {
     let mut app = test_app();
     begin_grant(&mut app, "request-1", TARGET_ID, RAW_ROOT);
+    let owner = ssh_manager_owner(&app);
 
     let effects = apply_ssh_control_event(
         &mut app,
         None,
-        None,
+        owner,
         SshEvent::GrantResolved {
             request_id: "request-1".into(),
             approved: false,
@@ -429,7 +434,7 @@ fn matching_project_grant_denial_from_global_receiver_clears_pending_open() {
         "a denied grant must never open the project"
     );
     assert!(
-        app.pending_ssh_project_open.is_none(),
+        app.welcome_ssh_manager.as_ref().unwrap().pending_project_session_id().is_none(),
         "the exact denied project grant must clear its one-shot pending open"
     );
     assert!(
@@ -460,9 +465,7 @@ fn unrelated_grant_resolution_does_not_clear_displayed_project_consent() {
 
     assert!(opened_project_root(&effects).is_none());
     assert_eq!(
-        app.pending_ssh_project_open
-            .as_ref()
-            .map(|project| project.project_session_id.as_str()),
+        app.welcome_ssh_manager.as_ref().unwrap().pending_project_session_id(),
         Some(SESSION_ID),
         "an unrelated request must leave the matching consent available"
     );
@@ -477,60 +480,25 @@ fn unrelated_grant_resolution_does_not_clear_displayed_project_consent() {
 }
 
 #[test]
-fn wrong_resolution_session_target_or_original_root_cannot_consume_project_open() {
+fn wrong_resolution_session_or_target_cannot_consume_project_open() {
     let cases = [
-        (
-            "wrong-session",
-            TARGET_ID,
-            RAW_ROOT,
-            "other-session",
-            TARGET_ID,
-            CANONICAL_ROOT,
-        ),
-        (
-            "wrong-target",
-            "other-target",
-            RAW_ROOT,
-            SESSION_ID,
-            "other-target",
-            CANONICAL_ROOT,
-        ),
-        (
-            "wrong-root",
-            TARGET_ID,
-            "/var/other/project",
-            SESSION_ID,
-            TARGET_ID,
-            "/private/var/other/project",
-        ),
+        ("wrong-session", "other-session", TARGET_ID),
+        ("wrong-target", SESSION_ID, "other-target"),
     ];
 
-    for (
-        request_id,
-        requested_target,
-        requested_root,
-        resolution_session,
-        binding_target,
-        binding_root,
-    ) in cases
-    {
+    for (request_id, resolution_session, binding_target) in cases {
         let mut app = test_app();
-        begin_grant(&mut app, request_id, requested_target, requested_root);
-        approve(
-            &mut app,
-            request_id,
-            Some(requested_target),
-            Some(requested_root),
-        );
-
+        begin_grant(&mut app, request_id, TARGET_ID, RAW_ROOT);
+        approve(&mut app, request_id, Some(TARGET_ID), Some(RAW_ROOT));
+        let owner = ssh_manager_owner(&app);
         let effects = apply_ssh_control_event(
             &mut app,
             Some(resolution_session.into()),
-            None,
+            owner,
             SshEvent::GrantResolved {
                 request_id: request_id.into(),
                 approved: true,
-                binding: Some(binding(binding_target, binding_root)),
+                binding: Some(binding(binding_target, CANONICAL_ROOT)),
             },
         );
 
@@ -539,7 +507,7 @@ fn wrong_resolution_session_target_or_original_root_cannot_consume_project_open(
             "{request_id} resolution must not open a different project"
         );
         assert!(
-            app.pending_ssh_project_open.is_some(),
+            app.welcome_ssh_manager.as_ref().unwrap().pending_project_session_id().is_some(),
             "{request_id} resolution must not consume the pending project"
         );
     }
@@ -556,10 +524,11 @@ fn mismatched_user_approval_tuple_cannot_consume_project_open() {
         Some(RAW_ROOT),
     );
 
+    let owner = ssh_manager_owner(&app);
     let effects = apply_ssh_control_event(
         &mut app,
         Some(SESSION_ID.into()),
-        None,
+        owner,
         SshEvent::GrantResolved {
             request_id: "request-1".into(),
             approved: true,
@@ -569,7 +538,7 @@ fn mismatched_user_approval_tuple_cannot_consume_project_open() {
 
     assert!(opened_project_root(&effects).is_none());
     assert!(
-        app.pending_ssh_project_open.is_some(),
+        app.welcome_ssh_manager.as_ref().unwrap().pending_project_session_id().is_some(),
         "a decision whose target differs from the displayed request cannot consume the project"
     );
 }
@@ -922,89 +891,44 @@ fn ssh_manager_wheel_scroll_reaches_modal_instead_of_background_transcript() {
 }
 
 #[test]
-fn inherited_project_open_is_single_flight_and_reports_setup_failure_to_source_manager() {
+fn folder_selection_is_single_flight_and_preparation_failure_can_retry() {
     let mut app = test_app_with_agent();
     let source_id = AgentId(0);
     app.active_view = ActiveView::Agent(source_id);
-    let opened = dispatch(Action::OpenSshManager, &mut app);
-    let (_, owner) = ssh_target_list_request(&opened);
-    app.agents
-        .get_mut(&source_id)
-        .unwrap()
-        .ssh_manager
-        .as_mut()
-        .unwrap()
-        .set_targets(vec![crate::views::ssh_modal::SshTargetView {
-            target_id: TARGET_ID.into(),
-            label: "Build host".into(),
-            source: "Groky config".into(),
-            effective_address: "user@example.test:22".into(),
-            connected: true,
-            connection_detail: "Connected.".into(),
-            grant: crate::views::ssh_modal::SshGrantView::Granted {
-                binding_id: "source-binding".into(),
-                root: RAW_ROOT.into(),
-                capabilities: crate::views::ssh_modal::SshCapabilitiesView::default(),
-                is_default: true,
-            },
-        }]);
-    let outcome = app.handle_input(&crossterm::event::Event::Key(KeyEvent::new(
-        KeyCode::Char('o'),
-        KeyModifiers::NONE,
-    )));
-    let crate::app::app_view::InputOutcome::Action(action) = outcome else {
-        panic!("opening the selected grant must dispatch an action: {outcome:?}");
-    };
-    let first = dispatch(action, &mut app);
-    assert!(
-        first
-            .iter()
-            .any(|effect| matches!(effect, Effect::SshInheritBinding { owner: effect_owner, .. } if *effect_owner == owner))
-    );
-    assert!(
-        dispatch(
-            Action::OpenSshProject {
-                target_id: TARGET_ID.into(),
-                root: RAW_ROOT.into(),
-                binding_id: "source-binding".into(),
-                capabilities: crate::views::ssh_modal::SshCapabilitiesView::default(),
-            },
-            &mut app,
-        )
-        .is_empty(),
-        "an in-flight inherited binding must reject repeated project opens"
-    );
-
-    dispatch(
-        Action::TaskComplete(TaskResult::SshProjectBindingInheritFailed {
-            source_session_id: SESSION_ID.into(),
-            client_id: app.ssh_client_id,
-            owner,
-            error: "missing remote worker executable".into(),
-        }),
-        &mut app,
-    );
-    assert_eq!(
-        app.agents
-            .get(&source_id)
-            .and_then(|agent| agent.ssh_manager.as_ref())
-            .and_then(|manager| manager.message.as_ref())
-            .map(|(message, is_error)| (message.as_str(), *is_error)),
-        Some(("missing remote worker executable", true))
-    );
-    assert!(
-        !dispatch(
-            Action::OpenSshProject {
-                target_id: TARGET_ID.into(),
-                root: RAW_ROOT.into(),
-                binding_id: "source-binding".into(),
-                capabilities: crate::views::ssh_modal::SshCapabilitiesView::default(),
-            },
-            &mut app,
-        )
-        .is_empty(),
-        "a terminal failure must clear the pending project-open guard"
-    );
+    dispatch(Action::OpenSshManager, &mut app);
+    let owner = ssh_manager_owner(&app).unwrap();
+    let manager = app.agents.get_mut(&source_id).unwrap().ssh_manager.as_mut().unwrap();
+    let SshModalOutcome::BrowseProjectDirectory { request_id, .. } =
+        manager.begin_project_browser(TARGET_ID.into(), None)
+    else { panic!("folder browser must request remote directories") };
+    manager.settle_project_directory(request_id, TARGET_ID, Ok(xai_grok_shell::ssh::SshDirectoryListing {
+        target_id: TARGET_ID.into(), identity: binding(TARGET_ID, RAW_ROOT).identity,
+        path: RAW_ROOT.into(), parent: Some("/var/fixture".into()),
+        directories: vec![], truncated: false,
+    }));
+    let outcome = app.handle_input(&Event::Key(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::NONE)));
+    let InputOutcome::Action(action) = outcome else { panic!("selected folder must open") };
+    let effects = dispatch(action, &mut app);
+    let (request_id, project_session_id) = effects.iter().find_map(|effect| match effect {
+        Effect::SshPrepareProjectOpen { request_id, project_session_id, owner: actual_owner, .. }
+            if *actual_owner == owner => Some((*request_id, project_session_id.clone())),
+        _ => None,
+    }).expect("folder selection prepares a child owned by its source manager");
+    assert!(dispatch(Action::ChooseSshProjectDirectory {
+        request_id, target_id: TARGET_ID.into(), root: RAW_ROOT.into(),
+        identity: binding(TARGET_ID, RAW_ROOT).identity,
+    }, &mut app).is_empty(), "double click must not mint another child");
+    dispatch(Action::TaskComplete(TaskResult::SshProjectPrepared {
+        request_id, target_id: TARGET_ID.into(), project_session_id,
+        client_id: app.ssh_client_id, owner,
+        result: Err("remote folder permission denied".into()),
+    }), &mut app);
+    let manager = app.agents.get(&source_id).unwrap().ssh_manager.as_ref().unwrap();
+    assert!(manager.pending_project_session_id().is_none());
+    app.handle_input(&Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)));
+    let outcome = app.handle_input(&Event::Key(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::NONE)));
+    let InputOutcome::Action(action) = outcome else { panic!("failed folder open must remain retryable") };
+    assert!(dispatch(action, &mut app).iter().any(|effect| matches!(effect, Effect::SshPrepareProjectOpen { .. })));
 }
 
 #[test]
@@ -1012,17 +936,8 @@ fn ssh_project_session_failure_returns_full_error_to_its_source_diagnostic() {
     let mut app = test_app_with_agent();
     let source_id = AgentId(0);
     app.active_view = ActiveView::Agent(source_id);
-    let opened = dispatch(Action::OpenSshManager, &mut app);
+    let opened = dispatch_begin_ssh_project_open(&mut app, pending_project());
     let (_, owner) = ssh_target_list_request(&opened);
-    let _ = dispatch(
-        Action::OpenSshProject {
-            target_id: TARGET_ID.into(),
-            root: RAW_ROOT.into(),
-            binding_id: "source-binding".into(),
-            capabilities: crate::views::ssh_modal::SshCapabilitiesView::default(),
-        },
-        &mut app,
-    );
 
     let child_id = AgentId(1);
     let mut child = AgentView::new(
@@ -1031,6 +946,7 @@ fn ssh_project_session_failure_returns_full_error_to_its_source_diagnostic() {
     );
     child.session.session_id = None;
     child.ssh_project_open_owner = Some(owner);
+    child.ssh_project_open_session_id = Some(SESSION_ID.into());
     app.agents.insert(child_id, child);
     app.active_view = ActiveView::Agent(child_id);
 
@@ -1044,17 +960,14 @@ fn ssh_project_session_failure_returns_full_error_to_its_source_diagnostic() {
     );
     assert!(!app.agents.contains_key(&child_id));
     assert!(matches!(app.active_view, ActiveView::Agent(id) if id == source_id));
-    assert_eq!(
-        app.agents
-            .get(&source_id)
-            .and_then(|agent| agent.ssh_manager.as_ref())
-            .and_then(|manager| manager.message.as_ref())
-            .map(|(message, is_error)| (message.as_str(), *is_error)),
-        Some((
-            "Could not open SSH project: missing remote worker executable",
-            true
-        ))
+    let area = ratatui::layout::Rect::new(0, 0, 120, 30);
+    let mut buffer = ratatui::buffer::Buffer::empty(area);
+    crate::views::ssh_modal::render_ssh_modal(
+        &mut buffer, area, app.agents.get_mut(&source_id).unwrap().ssh_manager.as_mut().unwrap(),
+        false, &crate::theme::Theme::default(),
     );
+    let visible: String = buffer.content.iter().map(|cell| cell.symbol()).collect();
+    assert!(visible.contains("missing remote worker executable"));
     assert!(
         app.agents
             .get(&source_id)
@@ -1130,7 +1043,7 @@ fn worker_fallback_keeps_its_source_actionable_through_inherited_child_bootstrap
     app.screen_mode = crate::app::ScreenMode::Minimal;
     let source_id = AgentId(0);
     app.active_view = ActiveView::Agent(source_id);
-    let opened = dispatch(Action::OpenSshManager, &mut app);
+    let opened = dispatch_begin_ssh_project_open(&mut app, pending_project());
     let (_, owner) = ssh_target_list_request(&opened);
 
     let inherited = dispatch_inherited_ssh_project(
@@ -1220,7 +1133,7 @@ fn inherited_project_success_does_not_steal_focus_after_user_leaves_source_flow(
     let mut app = test_app_with_agent();
     let source_id = AgentId(0);
     app.active_view = ActiveView::Agent(source_id);
-    let opened = dispatch(Action::OpenSshManager, &mut app);
+    let opened = dispatch_begin_ssh_project_open(&mut app, pending_project());
     let (_, owner) = ssh_target_list_request(&opened);
     let inherited = dispatch_inherited_ssh_project(
         &mut app,
@@ -1577,4 +1490,137 @@ fn resumed_worker_fallback_never_reopens_a_replaced_manager_or_steals_focus() {
         Some(replacement_owner.instance_id),
         "terminal cleanup must not close a user-created replacement"
     );
+}
+
+#[test]
+fn project_preparation_cancellation_rejects_late_consent_without_reopening() {
+    let mut app = test_app();
+    let effects = dispatch_begin_ssh_project_open(&mut app, pending_project());
+    let (request_id, owner) = effects.iter().find_map(|effect| match effect {
+        Effect::SshPrepareProjectOpen { request_id, owner, .. } => Some((*request_id, *owner)),
+        _ => None,
+    }).unwrap();
+    dispatch(Action::CancelSshProjectOpen { request_id }, &mut app);
+    let effects = dispatch(Action::TaskComplete(TaskResult::SshProjectPrepared {
+        request_id, target_id: TARGET_ID.into(), project_session_id: SESSION_ID.into(),
+        client_id: app.ssh_client_id, owner,
+        result: Ok(xai_grok_shell::ssh::SshProjectPreparation::NeedsApproval(
+            grant_request("late-grant", TARGET_ID, RAW_ROOT, app.ssh_client_id),
+        )),
+    }), &mut app);
+    assert!(effects.iter().any(|effect| matches!(effect,
+        Effect::SshRejectProjectGrant { request_id, .. } if request_id == "late-grant"
+    )));
+    assert!(app.agents.is_empty());
+    assert!(app.welcome_ssh_manager.as_ref().unwrap().grant_session_id_for("late-grant").is_none());
+}
+
+#[test]
+fn remembered_project_opens_once_and_never_on_a_replacement_manager() {
+    let mut app = test_app();
+    let effects = dispatch_begin_ssh_project_open(&mut app, pending_project());
+    let (request_id, owner) = effects.iter().find_map(|effect| match effect {
+        Effect::SshPrepareProjectOpen { request_id, owner, .. } => Some((*request_id, *owner)),
+        _ => None,
+    }).unwrap();
+    let ready = || Ok(xai_grok_shell::ssh::SshProjectPreparation::Ready(binding(TARGET_ID, CANONICAL_ROOT)));
+    let effects = crate::app::dispatch::ssh::apply_ssh_project_prepared(
+        &mut app, owner, request_id, TARGET_ID.into(), SESSION_ID.into(), ready(),
+    );
+    assert_eq!(opened_project_root(&effects).as_deref(), Some(CANONICAL_ROOT));
+    let duplicate = crate::app::dispatch::ssh::apply_ssh_project_prepared(
+        &mut app, owner, request_id, TARGET_ID.into(), SESSION_ID.into(), ready(),
+    );
+    assert!(opened_project_root(&duplicate).is_none());
+    close_ssh_manager_for_owner(&mut app, owner);
+    dispatch(Action::OpenSshManager, &mut app);
+    let replacement = ssh_manager_owner(&app).unwrap();
+    assert_ne!(owner, replacement);
+    let late = crate::app::dispatch::ssh::apply_ssh_project_prepared(
+        &mut app, owner, request_id, TARGET_ID.into(), SESSION_ID.into(), ready(),
+    );
+    assert!(opened_project_root(&late).is_none());
+    assert_eq!(ssh_manager_owner(&app), Some(replacement));
+}
+
+#[test]
+fn project_grant_broadcast_cannot_steal_the_source_manager_before_correlated_reply() {
+    let mut app = test_app();
+    dispatch_begin_ssh_project_open(&mut app, pending_project());
+    let owner = ssh_manager_owner(&app);
+    let client_id = app.ssh_client_id;
+    apply_ssh_control_event(&mut app, None, None,
+        SshEvent::GrantRequested(grant_request("broadcast", TARGET_ID, RAW_ROOT, client_id)));
+    assert_eq!(ssh_manager_owner(&app), owner);
+    assert!(app.welcome_ssh_manager.as_ref().unwrap().grant_session_id_for("broadcast").is_none());
+    assert_eq!(app.welcome_ssh_manager.as_ref().unwrap().pending_project_session_id(), Some(SESSION_ID));
+}
+
+#[test]
+fn cancelled_project_start_cannot_replace_a_new_folder_flow_on_completion() {
+    let mut app = test_app();
+    let effects = dispatch_begin_ssh_project_open(&mut app, pending_project());
+    let (request_id, owner) = effects.iter().find_map(|effect| match effect {
+        Effect::SshPrepareProjectOpen { request_id, owner, .. } => Some((*request_id, *owner)),
+        _ => None,
+    }).unwrap();
+    let effects = crate::app::dispatch::ssh::apply_ssh_project_prepared(
+        &mut app, owner, request_id, TARGET_ID.into(), SESSION_ID.into(),
+        Ok(xai_grok_shell::ssh::SshProjectPreparation::Ready(binding(TARGET_ID, RAW_ROOT))),
+    );
+    let child = effects.iter().find_map(|effect| match effect {
+        Effect::OpenSshProject { agent_id, .. } => Some(*agent_id), _ => None,
+    }).unwrap();
+    dispatch(Action::CancelSshProjectOpen { request_id }, &mut app);
+    app.welcome_ssh_manager.as_mut().unwrap().begin_project_browser(TARGET_ID.into(), None);
+    let effects = handle_session_created(&mut app, child, acp::SessionId::new(SESSION_ID), None, None);
+    assert!(!app.agents.contains_key(&child));
+    assert!(matches!(app.active_view, ActiveView::Welcome));
+    assert_eq!(ssh_manager_owner(&app), Some(owner));
+    assert!(effects.iter().any(|effect| matches!(effect, Effect::UnregisterActiveSession { session_id } if session_id.0.as_ref() == SESSION_ID)));
+}
+
+#[test]
+fn advanced_use_verifies_the_folder_and_resumes_after_canonical_consent() {
+    let mut app = test_app_with_agent();
+    let source = AgentId(0);
+    app.active_view = ActiveView::Agent(source);
+    dispatch(Action::OpenSshManager, &mut app);
+    let owner = ssh_manager_owner(&app).unwrap();
+    let manager = app.agents.get_mut(&source).unwrap().ssh_manager.as_mut().unwrap();
+    manager.set_targets(vec![crate::views::ssh_modal::SshTargetView {
+        target_id: TARGET_ID.into(), label: "Fixture".into(), source: "Fixture".into(),
+        effective_address: "fixture-user@fixture-host:22".into(), connected: false,
+        connection_detail: String::new(), grant: crate::views::ssh_modal::SshGrantView::NotGranted,
+    }]);
+    app.handle_input(&Event::Key(KeyEvent::new(KeyCode::Char('m'), KeyModifiers::NONE)));
+    app.handle_input(&Event::Key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::NONE)));
+    let InputOutcome::Action(action) =
+        app.handle_input(&Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)))
+    else { panic!("advanced use must request a grant") };
+    let effects = dispatch(action, &mut app);
+    let session_id = effects.iter().find_map(|effect| match effect {
+        Effect::SshRequestGrant { session_id, .. } => Some(session_id.clone()), _ => None,
+    }).unwrap();
+    let mut request = grant_request("advanced", TARGET_ID, ".", app.ssh_client_id);
+    request.session_id = session_id.clone();
+    request.capabilities = SshCapabilities::read_only();
+    request.verified_identity = None;
+    let effects = apply_ssh_control_event(&mut app, Some(session_id.clone()), Some(owner),
+        SshEvent::GrantRequested(request.clone()));
+    assert!(effects.iter().any(|effect| matches!(effect,
+        Effect::SshInspectGrantTarget { request_id, .. } if request_id == "advanced")));
+    request.root = Some(CANONICAL_ROOT.into());
+    request.verified_identity = Some(binding(TARGET_ID, CANONICAL_ROOT).identity);
+    apply_ssh_control_event(&mut app, Some(session_id.clone()), Some(owner),
+        SshEvent::GrantRequested(request));
+    approve(&mut app, "advanced", Some(TARGET_ID), Some(CANONICAL_ROOT));
+    let mut approved = binding(TARGET_ID, CANONICAL_ROOT);
+    approved.session_id = session_id.clone();
+    approved.capabilities = SshCapabilities::read_only();
+    let effects = apply_ssh_control_event(&mut app, Some(session_id.clone()), Some(owner),
+        SshEvent::GrantResolved { request_id: "advanced".into(), approved: true, binding: Some(approved) });
+    assert!(effects.iter().any(|effect| matches!(effect,
+        Effect::SshUseBinding { session_id: actual, binding_id, .. }
+            if actual == &session_id && binding_id == "binding-id")));
 }

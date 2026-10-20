@@ -159,14 +159,26 @@ groky checks compatibility but never overwrites or automatically updates it.
 Git, ripgrep and the project's tools must still be available remotely. The worker
 does not need an xAI login; model requests and provider credentials remain local.
 
-Open `/ssh` in a session, or press `Ctrl+S` on Welcome, to manage targets. `Enter`
-connects/disconnects, `g` requests a root-scoped grant, `u` selects the highlighted
-grant as default, `r` revokes only that grant, and `o` opens its remote project.
-Each active grant has its own row; revoking one reports any remaining grants.
-Without a grant, `u` and `o` guide you through authorization instead of failing.
-After approval, press the original action again. Target rows and footer actions are
-clickable; the wheel scrolls the list. Grant options support clicks, `Tab`/`Space`
-and the displayed `Alt` shortcuts; `PgUp`/`PgDn` inspect wrapped grant details.
+Open `/ssh` in a session, or press `Ctrl+S` on Welcome. Select a server and press
+`Enter` to connect and browse its remote folders; no worker or model access is
+needed for browsing. Use arrows/`j`/`k`, `Enter` for a child folder, `Backspace`
+for its parent, or `/` to enter a remote path. Press `o` to open the current folder.
+The first confirmation shows the verified server identity, canonical folder and
+read/write/run permissions. Approval automatically prepares the worker and opens
+the project—there is no separate grant/use/open sequence.
+
+**Remember this project** is optional and off by default. A saved permission applies
+only to the same target, host identity and exact canonical remote folder, independently
+of the local directory from which groky starts. Existing permissions are reused without
+expansion; a different folder, identity or broader permission request needs fresh consent.
+Without remembering, access lasts only for the authorized session.
+
+`c` connects/disconnects, `a` adds a target, `d` shows connection details, and `m`
+opens advanced grant/default/revocation controls. Advanced `g` requests a root-scoped
+grant, `u` selects a default (continuing automatically after any required consent),
+and `r` revokes only the selected grant. Each active grant has its own row.
+Target rows and footer actions are clickable; the wheel scrolls lists. Permission
+options support clicks and `Tab`/`Space`; `PgUp`/`PgDn` inspect wrapped details.
 Passwords, encrypted private keys, ssh-agent and keyboard-interactive authentication are supported.
 Host trust and access grants are separate confirmations. Passwords are masked and
 remembered only by explicit opt-in to the OS credential store; if that store is
@@ -181,13 +193,16 @@ Verify the new fingerprint independently before pressing `r` to replace and save
 Replacement backs up the file to `.old` (or a numbered backup), preserves unrelated
 records, and refuses stale confirmations or ambiguous/global/wildcard records.
 Those records require manual review. In the target manager, `d` opens the selected
-target's configuration, grant details and latest SSH error; long diagnostics and
-host-key details wrap and scroll. Unsupported forwarding directives are reported
+target's configuration, grant details and latest SSH error. Normal connection
+details are not errors: connected status is green and only actual failures are red.
+Long diagnostics and host-key details wrap and scroll. Unsupported forwarding directives are reported
 explicitly, not silently ignored: use system OpenSSH for forwarding, or scope those
 directives to a separate alias.
-Grant drafts can be cancelled locally with `Esc` or the close button. Grant and
-target-save failures open the full diagnostic automatically; `Esc` returns to the
-same form without discarding its fields. Target saves and project opens ignore
+Folder selection and grant drafts can be cancelled with `Esc` or the close button.
+Directory, grant and target-save failures open the full diagnostic automatically;
+`Esc` returns to the retained folder or form. Failed navigation restores the last
+valid folder, so the displayed path and the folder being opened cannot disagree.
+Target saves and project opens ignore
 repeated submissions while pending. Project startup failures return to the source
 manager with a diagnostic and allow retry. The remote worker uses a short, private
 per-user socket path so long home directories do not exceed Unix socket limits.

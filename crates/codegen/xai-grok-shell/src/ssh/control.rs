@@ -1,10 +1,11 @@
 use zeroize::Zeroize;
 
 use serde::{Deserialize, Serialize};
-use xai_grok_workspace_types::ssh::SshCapabilities;
+use xai_grok_workspace_types::ssh::{SshCapabilities, SshHostIdentity};
 
 use super::model::{
-    RevokeStatus, SshAuthResponse, SshOperationApprovalDecision, SshTargetAccess, SshTargetStatus,
+    RevokeStatus, SshAuthResponse, SshDirectoryListing, SshOperationApprovalDecision,
+    SshProjectPreparation, SshTargetAccess, SshTargetStatus,
 };
 use super::{SshGrantDecision, SshGrantRequest};
 
@@ -46,11 +47,26 @@ pub enum SshControlCommand {
         session_id: String,
         location: xai_grok_workspace_types::ssh::ProjectLocation,
     },
-    /// Restore only explicitly saved rules for this project, then verify its
-    /// exact remote root before returning a project-opening binding.
-    RestoreProjectGrant {
+    /// Browse remote project directories through authenticated native SFTP only.
+    /// This creates neither model-visible authority nor a remote worker.
+    BrowseProjectDirectories {
+        target_id: String,
+        #[serde(default)]
+        path: Option<String>,
+    },
+    /// Authenticate and canonicalize a selected remote project, then either
+    /// return child-local existing authority or an already verified consent
+    /// request. This never starts a worker.
+    PrepareProjectOpen {
         session_id: String,
-        location: xai_grok_workspace_types::ssh::ProjectLocation,
+        #[serde(default)]
+        source_session_id: Option<String>,
+        target_id: String,
+        root: String,
+        #[serde(default)]
+        expected_identity: Option<SshHostIdentity>,
+        #[serde(default)]
+        capabilities: Option<SshCapabilities>,
     },
     UseBinding {
         session_id: String,
@@ -221,9 +237,8 @@ pub enum SshControlReply {
     },
     InheritedBindings(Vec<xai_grok_workspace_types::ssh::SshBinding>),
     ProjectLocationRegistered,
-    ProjectGrantRestored {
-        binding: Option<xai_grok_workspace_types::ssh::SshBinding>,
-    },
+    ProjectDirectories(SshDirectoryListing),
+    ProjectPrepared(SshProjectPreparation),
     BindingSelected,
     BindingRevoked {
         status: RevokeStatus,
@@ -240,12 +255,30 @@ mod tests {
     use crate::leader::{ControlCommand, ControlPayload};
 
     #[test]
-    fn ssh_control_frames_preserve_nested_commands_and_non_map_replies() {
+    fn ssh_control_frames_preserve_project_picker_commands_and_replies() {
+        let identity = SshHostIdentity {
+            hostname: "build-host.example".into(),
+            port: 2222,
+            username: "build".into(),
+            fingerprint: "SHA256:verified".into(),
+        };
         for command in [
             SshControlCommand::ListConfiguredTargets,
             SshControlCommand::Connect {
                 target_id: "build-host".into(),
                 interactive: false,
+            },
+            SshControlCommand::BrowseProjectDirectories {
+                target_id: "build-host".into(),
+                path: Some("~/projects".into()),
+            },
+            SshControlCommand::PrepareProjectOpen {
+                session_id: "child-session".into(),
+                source_session_id: Some("source-session".into()),
+                target_id: "build-host".into(),
+                root: "/srv/project".into(),
+                expected_identity: Some(identity.clone()),
+                capabilities: None,
             },
         ] {
             let command = ControlCommand::Ssh(command);
@@ -258,6 +291,30 @@ mod tests {
         for reply in [
             SshControlReply::ConfiguredTargets("[{\"id\":\"build-host\"}]".into()),
             SshControlReply::SessionTargets(Vec::new()),
+            SshControlReply::ProjectDirectories(SshDirectoryListing {
+                target_id: "build-host".into(),
+                identity: identity.clone(),
+                path: "/home/build/projects".into(),
+                parent: Some("/home/build".into()),
+                directories: vec![crate::ssh::SshDirectoryEntry {
+                    name: "project".into(),
+                    path: "/home/build/projects/project".into(),
+                }],
+                truncated: false,
+            }),
+            SshControlReply::ProjectPrepared(SshProjectPreparation::NeedsApproval(
+                SshGrantRequest {
+                    id: "grant".into(),
+                    session_id: "child-session".into(),
+                    originating_session_id: Some("source-session".into()),
+                    target_id: Some("build-host".into()),
+                    root: Some("/srv/project".into()),
+                    capabilities: SshCapabilities::all(),
+                    reason: "Open selected remote project".into(),
+                    verified_identity: Some(identity),
+                    client_id: Some(7),
+                },
+            )),
         ] {
             let reply = ControlPayload::Ssh(reply);
             let frame = serde_json::to_vec(&reply).unwrap();

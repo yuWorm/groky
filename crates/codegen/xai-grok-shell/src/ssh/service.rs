@@ -30,10 +30,11 @@ use super::control::{SshControlCommand, SshControlReply};
 use super::model::{
     PersistedSshGrant, PersistedSshState, ProjectSshBinding, RevokeStatus, SshAuthPrompt,
     SshAuthPromptDetail, SshAuthPromptKind, SshAuthResponse, SshConnectionState,
-    SshDispatchRequest, SshDispatchResult, SshEvent, SshGrantDecision, SshGrantRequest,
-    SshGrantScope, SshGrantStatus, SshHostKeyDecision, SshKeyboardInteractiveQuestion,
-    SshOperationApproval, SshOperationApprovalDecision, SshSessionWorkerEvent, SshTargetAccess,
-    SshTargetStatus, SshWorkerInstallDecision, SshWorkerInstallProgress, SshWorkerInstallRequest,
+    SshDirectoryListing, SshDispatchRequest, SshDispatchResult, SshEvent, SshGrantDecision,
+    SshGrantRequest, SshGrantScope, SshGrantStatus, SshHostKeyDecision,
+    SshKeyboardInteractiveQuestion, SshOperationApproval, SshOperationApprovalDecision,
+    SshProjectPreparation, SshSessionWorkerEvent, SshTargetAccess, SshTargetStatus,
+    SshWorkerInstallDecision, SshWorkerInstallProgress, SshWorkerInstallRequest,
 };
 
 const INTERACTION_TIMEOUT: Duration = Duration::from_secs(300);
@@ -225,6 +226,9 @@ struct PendingWorkerInstall {
 struct ProjectRegistration {
     location: ProjectLocation,
     session_info: Option<crate::session::info::Info>,
+    /// Prevent generic session setup from restoring broader saved authority
+    /// after `PrepareProjectOpen` has chosen the exact project binding.
+    project_open_prepared: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -345,19 +349,42 @@ impl SessionSsh {
         location: &ProjectLocation,
     ) -> Result<(), SshServiceError> {
         let mut registrations = self.inner.project_registrations.write().await;
-        let session_info = session_info.or_else(|| {
-            registrations
-                .get(session_id)
-                .and_then(|registration| registration.session_info.clone())
+        let previous = registrations.get(session_id);
+        let session_info = session_info
+            .or_else(|| previous.and_then(|registration| registration.session_info.clone()));
+        let project_open_prepared = previous.is_some_and(|registration| {
+            registration.project_open_prepared && registration.location == *location
         });
         registrations.insert(
             session_id.to_owned(),
             ProjectRegistration {
                 location: location.clone(),
                 session_info,
+                project_open_prepared,
             },
         );
         Ok(())
+    }
+
+    async fn mark_project_open_prepared(&self, session_id: &str) {
+        if let Some(registration) = self
+            .inner
+            .project_registrations
+            .write()
+            .await
+            .get_mut(session_id)
+        {
+            registration.project_open_prepared = true;
+        }
+    }
+
+    async fn project_open_prepared(&self, session_id: &str) -> bool {
+        self.inner
+            .project_registrations
+            .read()
+            .await
+            .get(session_id)
+            .is_some_and(|registration| registration.project_open_prepared)
     }
 
     /// Recreates saved grants only for their exact originating local or SSH
@@ -370,6 +397,9 @@ impl SessionSsh {
     ) -> Result<(), SshServiceError> {
         self.register_project_location(session_id, None, location)
             .await?;
+        if self.project_open_prepared(session_id).await {
+            return Ok(());
+        }
         let mut sessions = self.inner.sessions.write().await;
         let rules = {
             let rules = self.inner.project_rules.lock().await;
@@ -438,34 +468,222 @@ impl SessionSsh {
         Ok(())
     }
 
-    async fn restore_project_grant(
+    /// Lists remote directories through native SFTP without creating model-visible
+    /// authority or starting a worker. A successful browse retains the existing
+    /// manual connection hold for subsequent picker navigation.
+    pub async fn browse_project_directories(
+        &self,
+        target_id: &str,
+        path: Option<&str>,
+        client_id: u64,
+    ) -> Result<SshDirectoryListing, SshServiceError> {
+        let lease = self
+            .acquire_native(target_id, Some(client_id), true)
+            .await?;
+        let listing = super::project_browser::browse(&lease, target_id.to_owned(), path)
+            .await
+            .map_err(SshServiceError::Native)?;
+        self.inner
+            .manual_holds
+            .lock()
+            .await
+            .insert(target_id.to_owned(), lease);
+        Ok(listing)
+    }
+
+    /// Prepares one child-owned remote project binding or emits the exact,
+    /// already verified approval request required to create it. Native
+    /// authentication and SFTP validation are deliberately workerless.
+    pub async fn prepare_project_open(
+        &self,
+        session_id: &str,
+        source_session_id: Option<&str>,
+        target_id: &str,
+        root: &str,
+        expected_identity: Option<&SshHostIdentity>,
+        capabilities: Option<SshCapabilities>,
+        client_id: u64,
+    ) -> Result<SshProjectPreparation, SshServiceError> {
+        if root.trim().is_empty() {
+            return Err(SshServiceError::RootSelectionRequired);
+        }
+        let lease = self
+            .acquire_native(target_id, Some(client_id), true)
+            .await?;
+        let identity = lease.identity().clone();
+        if expected_identity.is_some_and(|expected| expected != &identity) {
+            return Err(SshServiceError::IdentityChanged);
+        }
+        let canonical_root = super::native_files::canonical_root(&lease, root)
+            .await
+            .map_err(SshServiceError::Native)?;
+        let location = ProjectLocation::Ssh {
+            target_id: target_id.to_owned(),
+            root: canonical_root.clone(),
+        };
+        self.register_project_location(session_id, None, &location)
+            .await?;
+        self.mark_project_open_prepared(session_id).await;
+
+        if let Some(source_session_id) = source_session_id {
+            if let Some(source) = self
+                .matching_live_project_binding(
+                    source_session_id,
+                    target_id,
+                    &identity,
+                    &canonical_root,
+                    capabilities,
+                )
+                .await
+            {
+                let child_capabilities = capabilities.unwrap_or(source.capabilities);
+                let bindings = self
+                    .inherit_session(
+                        source_session_id,
+                        session_id,
+                        std::slice::from_ref(&source.id),
+                        child_capabilities,
+                    )
+                    .await?;
+                let binding = bindings
+                    .into_iter()
+                    .next()
+                    .ok_or_else(|| SshServiceError::UnknownBinding(source.id.clone()))?;
+                return Ok(SshProjectPreparation::Ready(binding));
+            }
+        }
+
+        if let Some(binding) = self
+            .restore_matching_project_rule(
+                session_id,
+                &location,
+                &identity,
+                capabilities,
+            )
+            .await?
+        {
+            return Ok(SshProjectPreparation::Ready(binding));
+        }
+
+        let request = self
+            .publish_grant_request(SshGrantRequest {
+                id: Uuid::now_v7().to_string(),
+                session_id: session_id.to_owned(),
+                originating_session_id: None,
+                target_id: Some(target_id.to_owned()),
+                root: Some(canonical_root),
+                capabilities: capabilities.unwrap_or_else(SshCapabilities::all),
+                reason: "Open selected remote project".into(),
+                verified_identity: Some(identity),
+                client_id: Some(client_id),
+            })
+            .await?;
+        Ok(SshProjectPreparation::NeedsApproval(request))
+    }
+
+    async fn matching_live_project_binding(
+        &self,
+        source_session_id: &str,
+        target_id: &str,
+        identity: &SshHostIdentity,
+        canonical_root: &str,
+        capabilities: Option<SshCapabilities>,
+    ) -> Option<SshBinding> {
+        let sessions = self.inner.sessions.read().await;
+        let state = sessions.get(source_session_id)?;
+        let matches = |binding: &SshBinding| {
+            !binding.revoked
+                && binding.capabilities.read
+                && binding.target_id == target_id
+                && binding.identity == *identity
+                && binding.root == canonical_root
+                && capabilities
+                    .map(|requested| requested.is_subset_of(binding.capabilities))
+                    .unwrap_or(true)
+        };
+        if let Some(binding) = state
+            .default_binding_id
+            .as_ref()
+            .and_then(|binding_id| state.grants.get(binding_id))
+            .map(|record| &record.persisted.binding)
+            .filter(|binding| matches(binding))
+        {
+            return Some(binding.clone());
+        }
+        state
+            .grants
+            .values()
+            .map(|record| &record.persisted.binding)
+            .filter(|binding| matches(binding))
+            .min_by(|left, right| {
+                capability_priority(left.capabilities)
+                    .cmp(&capability_priority(right.capabilities))
+                    .then_with(|| left.id.cmp(&right.id))
+            })
+            .cloned()
+    }
+
+    async fn restore_matching_project_rule(
         &self,
         session_id: &str,
         location: &ProjectLocation,
-        client_id: u64,
+        identity: &SshHostIdentity,
+        capabilities: Option<SshCapabilities>,
     ) -> Result<Option<SshBinding>, SshServiceError> {
-        let ProjectLocation::Ssh { target_id, root } = location else {
-            return Err(SshServiceError::ProjectLocationRequired);
-        };
-        self.restore_project_rules(session_id, location).await?;
-        for access in self.list_targets(session_id).await {
-            if access.target_id != *target_id || !access.capabilities.read {
-                continue;
-            }
-            let client = self
-                .project_workspace_client(session_id, &access.binding_id, Some(client_id))
-                .await?;
-            let canonical_root = match client.canonicalize_root(root).await {
-                Ok(root) => root,
-                Err(SshClientError::Remote(error)) if error.code == "invalid_path" => continue,
-                Err(error) => return Err(SshServiceError::Worker(error.to_string())),
+        let rule = {
+            let rules = self.inner.project_rules.lock().await;
+            let file = match &*rules {
+                ProjectRuleStore::Loaded(file) => file,
+                ProjectRuleStore::Invalid(error) => {
+                    return Err(SshServiceError::ProjectRuleStorage(error.clone()));
+                }
             };
-            let binding = client.binding().await;
-            if canonical_root == binding.root {
-                return Ok(Some(binding));
-            }
+            choose_matching_project_rule(file, location, identity, capabilities).cloned()
+        };
+        let Some(rule) = rule else {
+            return Ok(None);
+        };
+        let binding_capabilities = capabilities.unwrap_or(rule.capabilities);
+        let scope = if binding_capabilities == rule.capabilities {
+            SshGrantScope::ProjectRule
+        } else {
+            SshGrantScope::CurrentSession
+        };
+        let binding = SshBinding {
+            id: Uuid::now_v7().to_string(),
+            session_id: session_id.to_owned(),
+            target_id: rule.target_id.clone(),
+            identity: rule.identity.clone(),
+            root: rule.root.clone(),
+            cwd: rule.cwd.clone(),
+            capabilities: binding_capabilities,
+            epoch: 1,
+            revoked: false,
+        };
+        let persisted = PersistedSshGrant {
+            binding: binding.clone(),
+            parent_binding_id: None,
+            requires_revalidation: false,
+            scope,
+            revoke_status: None,
+            worker_bound: false,
+            worker_commands: Vec::new(),
+        };
+        let mut sessions = self.inner.sessions.write().await;
+        let state = sessions.entry(session_id.to_owned()).or_default();
+        let mut candidate = state.clone();
+        if rule.make_default
+            && scope == SshGrantScope::ProjectRule
+            && candidate.default_binding_id.is_none()
+        {
+            candidate.default_binding_id = Some(binding.id.clone());
         }
-        Ok(None)
+        candidate
+            .grants
+            .insert(binding.id.clone(), GrantRecord::new(persisted));
+        self.persist_state(session_id, &candidate).await?;
+        *state = candidate;
+        Ok(Some(binding))
     }
     async fn persist_registered_session(&self, session_id: &str) -> Result<(), SshServiceError> {
         let sessions = self.inner.sessions.read().await;
@@ -722,14 +940,31 @@ impl SessionSsh {
                     .await?;
                 Ok(SshControlReply::ProjectLocationRegistered)
             }
-            SshControlCommand::RestoreProjectGrant {
+            SshControlCommand::BrowseProjectDirectories { target_id, path } => {
+                Ok(SshControlReply::ProjectDirectories(
+                    self.browse_project_directories(&target_id, path.as_deref(), client_id)
+                        .await?,
+                ))
+            }
+            SshControlCommand::PrepareProjectOpen {
                 session_id,
-                location,
-            } => Ok(SshControlReply::ProjectGrantRestored {
-                binding: self
-                    .restore_project_grant(&session_id, &location, client_id)
-                    .await?,
-            }),
+                source_session_id,
+                target_id,
+                root,
+                expected_identity,
+                capabilities,
+            } => Ok(SshControlReply::ProjectPrepared(
+                self.prepare_project_open(
+                    &session_id,
+                    source_session_id.as_deref(),
+                    &target_id,
+                    &root,
+                    expected_identity.as_ref(),
+                    capabilities,
+                    client_id,
+                )
+                .await?,
+            )),
             SshControlCommand::UseBinding {
                 session_id,
                 binding_id,
@@ -959,9 +1194,14 @@ impl SessionSsh {
             }
         }
         let lease = self
-            .acquire(target_id.as_str(), Some(client_id), true)
+            .acquire_native(target_id.as_str(), Some(client_id), true)
             .await?;
         let identity = lease.identity().clone();
+        let canonical_root = match request.root.as_deref() {
+            Some(root) => Some(super::native_files::canonical_root(&lease, root)
+                .await.map_err(SshServiceError::Native)?),
+            None => None,
+        };
         drop(lease);
         let updated = {
             let mut sessions = self.inner.sessions.write().await;
@@ -973,6 +1213,7 @@ impl SessionSsh {
                 .get_mut(request_id)
                 .ok_or_else(|| SshServiceError::UnknownGrantRequest(request_id.to_owned()))?;
             current.target_id = Some(target_id);
+            current.root = canonical_root;
             current.verified_identity = Some(identity);
             current.client_id = Some(client_id);
             current.clone()
@@ -1019,7 +1260,7 @@ impl SessionSsh {
         let root = choose_narrower_root(&request, decision.root.as_deref())?;
         let capabilities = choose_narrower_capabilities(&request, decision.capabilities)?;
         let lease = self
-            .acquire(&target_id, Some(decision.client_id), true)
+            .acquire_native(&target_id, Some(decision.client_id), true)
             .await?;
         let identity = lease.identity().clone();
         if let Some(inspected) = &request.verified_identity {
@@ -1030,6 +1271,21 @@ impl SessionSsh {
         let canonical_root = super::native_files::canonical_root(&lease, &root)
             .await
             .map_err(SshServiceError::Native)?;
+        if let Some(requested_root) = request.root.as_deref() {
+            let within = if request.verified_identity.is_some() {
+                // Inspection/preparation returned this canonical root for explicit consent.
+                remote_path_within(&canonical_root, requested_root)
+            } else if requested_root == root {
+                true
+            } else {
+                let canonical_requested = super::native_files::canonical_root(&lease, requested_root)
+                    .await.map_err(SshServiceError::Native)?;
+                remote_path_within(&canonical_root, &canonical_requested)
+            };
+            if !within {
+                return Err(SshServiceError::GrantExpansion);
+            }
+        }
         let binding = SshBinding {
             id: Uuid::now_v7().to_string(),
             session_id: request.session_id.clone(),
@@ -2219,7 +2475,7 @@ impl SessionSsh {
         })
     }
 
-    async fn acquire(
+    async fn acquire_native(
         &self,
         target_id: &str,
         client_id: Option<u64>,
@@ -2230,10 +2486,21 @@ impl SessionSsh {
             client_id,
             interactive,
         });
-        let lease = self
-            .inner
+        self.inner
             .connections
             .acquire(target_id, interaction)
+            .await
+            .map_err(Into::into)
+    }
+
+    async fn acquire(
+        &self,
+        target_id: &str,
+        client_id: Option<u64>,
+        interactive: bool,
+    ) -> Result<ConnectionLease, SshServiceError> {
+        let lease = self
+            .acquire_native(target_id, client_id, interactive)
             .await?;
         self.sync_pending_revocations(&lease, target_id).await?;
         Ok(lease)
@@ -2803,6 +3070,62 @@ fn choose_narrower_capabilities(
     } else {
         Err(SshServiceError::GrantExpansion)
     }
+}
+
+fn choose_matching_project_rule<'a>(
+    file: &'a ProjectRuleFile,
+    location: &ProjectLocation,
+    identity: &SshHostIdentity,
+    capabilities: Option<SshCapabilities>,
+) -> Option<&'a ProjectSshRule> {
+    let default = file
+        .rules
+        .iter()
+        .filter(|rule| {
+            rule.make_default && project_rule_matches(rule, location, identity, capabilities)
+        })
+        .min_by(|left, right| project_rule_priority(left).cmp(&project_rule_priority(right)));
+    default.or_else(|| {
+        file.rules
+            .iter()
+            .filter(|rule| project_rule_matches(rule, location, identity, capabilities))
+            .min_by(|left, right| project_rule_priority(left).cmp(&project_rule_priority(right)))
+    })
+}
+
+fn project_rule_matches(
+    rule: &ProjectSshRule,
+    location: &ProjectLocation,
+    identity: &SshHostIdentity,
+    capabilities: Option<SshCapabilities>,
+) -> bool {
+    let ProjectLocation::Ssh { target_id, root } = location else {
+        return false;
+    };
+    rule.owns(location)
+        && rule.target_id == *target_id
+        && rule.root == *root
+        && rule.capabilities.read
+        && rule.identity == *identity
+        && capabilities
+            .map(|requested| requested.is_subset_of(rule.capabilities))
+            .unwrap_or(true)
+}
+
+fn project_rule_priority(rule: &ProjectSshRule) -> ((u8, u8), &str, &str, &str) {
+    (
+        capability_priority(rule.capabilities),
+        rule.cwd.as_str(),
+        rule.target_id.as_str(),
+        rule.root.as_str(),
+    )
+}
+
+fn capability_priority(capabilities: SshCapabilities) -> (u8, u8) {
+    let bits = (u8::from(capabilities.read) << 2)
+        | (u8::from(capabilities.write) << 1)
+        | u8::from(capabilities.execute);
+    (bits.count_ones() as u8, bits)
 }
 
 fn revoke_authority_tree(
@@ -3687,6 +4010,166 @@ mod tests {
                 .await,
             Err(SshServiceError::NoDefaultBinding)
         ));
+    }
+
+    #[tokio::test]
+    async fn project_open_reuses_only_the_exact_verified_saved_remote_rule() {
+        let home = tempfile::tempdir().unwrap();
+        let location = ProjectLocation::Ssh {
+            target_id: "target".into(),
+            root: "/canonical/project".into(),
+        };
+        let service = SessionSsh::new(home.path().to_owned());
+        service
+            .register_project_location("original", None, &location)
+            .await
+            .unwrap();
+        let mut remembered = binding("remembered", "original", "/canonical/project");
+        remembered.capabilities = SshCapabilities::read_only();
+        service
+            .persist_grant_state(
+                "original",
+                &SessionState::default(),
+                &remembered,
+                SshGrantScope::ProjectRule,
+                true,
+            )
+            .await
+            .unwrap();
+
+        let restored = SessionSsh::new(home.path().to_owned());
+        restored
+            .register_project_location("child", None, &location)
+            .await
+            .unwrap();
+        restored.mark_project_open_prepared("child").await;
+        let prepared = restored
+            .restore_matching_project_rule(
+                "child",
+                &location,
+                &remembered.identity,
+                Some(SshCapabilities::read_only()),
+            )
+            .await
+            .unwrap()
+            .expect("exact remembered remote project is reusable");
+        assert_eq!(prepared.root, "/canonical/project");
+        assert_eq!(prepared.capabilities, SshCapabilities::read_only());
+        assert!(restored.inner.workers.lock().await.is_empty());
+        restored
+            .restore_project_rules("child", &location)
+            .await
+            .unwrap();
+
+        let snapshot = restored.snapshot_session("child").await;
+        assert_eq!(snapshot.grants.len(), 1);
+        assert_eq!(snapshot.grants[0].binding.capabilities, SshCapabilities::read_only());
+        let changed_identity = SshHostIdentity {
+            fingerprint: "SHA256:changed".into(),
+            ..remembered.identity.clone()
+        };
+        assert!(
+            restored
+                .restore_matching_project_rule(
+                    "identity-changed",
+                    &location,
+                    &changed_identity,
+                    Some(SshCapabilities::read_only()),
+                )
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let changed_root = ProjectLocation::Ssh {
+            target_id: "target".into(),
+            root: "/canonical/other".into(),
+        };
+        assert!(
+            restored
+                .restore_matching_project_rule(
+                    "root-changed",
+                    &changed_root,
+                    &remembered.identity,
+                    Some(SshCapabilities::read_only()),
+                )
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            restored
+                .restore_matching_project_rule(
+                    "capabilities-expanded",
+                    &location,
+                    &remembered.identity,
+                    Some(SshCapabilities::all()),
+                )
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn project_open_source_reuse_is_exact_and_never_unions_capabilities() {
+        let home = tempfile::tempdir().unwrap();
+        let service = SessionSsh::new(home.path().to_owned());
+        let broad = binding("broad", "source", "/remote/project");
+        let mut narrow = binding("narrow", "source", "/remote/project");
+        narrow.capabilities = SshCapabilities::read_only();
+        service
+            .restore_session(
+                "source",
+                PersistedSshState {
+                    grants: vec![
+                        PersistedSshGrant {
+                            binding: broad.clone(),
+                            parent_binding_id: None,
+                            requires_revalidation: false,
+                            scope: SshGrantScope::CurrentSession,
+                            revoke_status: None,
+                            worker_bound: false,
+                            worker_commands: Vec::new(),
+                        },
+                        PersistedSshGrant {
+                            binding: narrow.clone(),
+                            parent_binding_id: None,
+                            requires_revalidation: false,
+                            scope: SshGrantScope::CurrentSession,
+                            revoke_status: None,
+                            worker_bound: false,
+                            worker_commands: Vec::new(),
+                        },
+                    ],
+                    ..Default::default()
+                },
+            )
+            .await;
+
+        let selected = service
+            .matching_live_project_binding(
+                "source",
+                "target",
+                &broad.identity,
+                "/remote/project",
+                None,
+            )
+            .await
+            .expect("the exact source authority is available");
+        assert_eq!(selected.id, "narrow");
+        assert_eq!(selected.capabilities, SshCapabilities::read_only());
+        assert!(
+            service
+                .matching_live_project_binding(
+                    "source",
+                    "target",
+                    &broad.identity,
+                    "/different/project",
+                    None,
+                )
+                .await
+                .is_none()
+        );
     }
 
     #[tokio::test]

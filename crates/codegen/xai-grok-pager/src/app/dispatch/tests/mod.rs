@@ -297,7 +297,6 @@ fn test_app() -> AppView {
         welcome_ssh_manager: None,
         ssh_client_id: 1,
         ssh_event_consumer_active: false,
-        pending_ssh_project_open: None,
         direct_ssh_grant_replies: Default::default(),
         welcome_doc_viewer: None,
         screen_mode: crate::app::ScreenMode::Inline,
