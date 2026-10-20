@@ -1757,6 +1757,7 @@ pub async fn run_leader_server(
                     pending_load_by_req.retain(|_, (c, _)| *c != id);
                     load_live_buffer.retain(|(c, _), _| *c != id);
                     load_replay_max_seq.retain(|(c, _), _| *c != id);
+                    control_state.ssh.clear_client_interactions(id.0).await;
                     let mut detached_sessions: Vec<String> = Vec::new();
                     let viewed: Vec<String> = session_subscribers
                         .iter()

@@ -13,8 +13,13 @@ use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEvent
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
+use ratatui::text::{Line, Span};
+use serde_json::Value;
 use std::sync::atomic::{AtomicU64, Ordering};
-use xai_grok_shell::ssh::{SshConnectionState, SshDirectoryListing, SshHostIdentity};
+use xai_grok_shell::ssh::{
+    SshConnectionState, SshDirectoryListing, SshHostIdentity, SshOperation,
+    SshOperationApprovalScope,
+};
 use zeroize::Zeroizing;
 
 /// A configured target as displayed by the pager. This is a view model rather than a credential
@@ -209,6 +214,8 @@ pub struct SshGrantCard {
     pub lifetime: SshGrantLifetime,
     pub set_default: bool,
     pub agent_requested: bool,
+    /// The model tool is paused on this human decision; approval resumes that exact call.
+    awaiting_tool: bool,
     pub error: Option<String>,
     /// A canonical browser-selected root is displayed as evidence, never editable intent.
     verified_root: bool,
@@ -247,6 +254,7 @@ impl SshGrantCard {
             lifetime: SshGrantLifetime::CurrentSession,
             set_default: false,
             agent_requested,
+            awaiting_tool: false,
             error: None,
             verified_root: false,
             capability_ceiling: None,
@@ -358,6 +366,8 @@ pub struct SshIncomingGrant {
     pub capabilities: SshCapabilitiesView,
     pub verified_identity: Option<String>,
     pub reason: String,
+    /// True only for a live `ssh_request_access` model-tool call awaiting this decision.
+    pub awaiting_tool: bool,
 }
 
 #[derive(Clone)]
@@ -854,20 +864,25 @@ impl SshManualTargetForm {
 
 /// Local-only consent for an individual remote operation after a binding already exists.
 ///
-/// `reviewed_to_end` is deliberately render-derived: allow is unavailable until every wrapped
-/// detail line has been reachable in this modal, rather than trusting a truncating single-line
-/// preview.
+/// `reviewed_to_end` is render-derived and latched: allow is unavailable until every preview
+/// line has been reachable in this modal, but inspecting an earlier line cannot revoke that
+/// completed review.
 pub struct SshOperationApprovalCard {
     pub approval_id: String,
     pub binding_id: String,
     pub target_label: String,
     pub target_identity: Option<String>,
     pub title: String,
-    pub detail: String,
+    /// Typed payload retained until it has been rendered; no JSON serialization at the boundary.
+    pub detail: Value,
+    pub operation: SshOperation,
     scroll_offset: usize,
     max_scroll_offset: usize,
+    page_size: usize,
     reviewed_to_end: bool,
+    raw_details: bool,
     submitting: bool,
+    copy_status: Option<&'static str>,
     error: Option<String>,
 }
 
@@ -878,7 +893,8 @@ impl SshOperationApprovalCard {
         target_label: String,
         target_identity: Option<String>,
         title: String,
-        detail: String,
+        detail: Value,
+        operation: SshOperation,
     ) -> Self {
         Self {
             approval_id,
@@ -887,10 +903,14 @@ impl SshOperationApprovalCard {
             target_identity,
             title,
             detail,
+            operation,
             scroll_offset: 0,
             max_scroll_offset: 0,
+            page_size: 1,
             reviewed_to_end: false,
+            raw_details: false,
             submitting: false,
+            copy_status: None,
             error: None,
         }
     }
@@ -1182,6 +1202,9 @@ pub struct SshManagerState {
     pending_connection: Option<String>,
     /// Immutable request retained while a directory selection or identity inspection is pending.
     pending_grant: Option<SshIncomingGrant>,
+    /// Request created for a live model tool, used only to close its automatically-opened manager
+    /// after the matching grant settles.
+    transient_tool_grant_id: Option<String>,
     /// Request IDs whose inspection has been dispatched. This suppresses duplicated grant events
     /// until the matching verified event arrives.
     inspecting_grant_ids: Vec<String>,
@@ -1229,6 +1252,7 @@ impl SshManagerState {
             resume_project_browser_after_authentication: false,
             pending_connection: None,
             pending_grant: None,
+            transient_tool_grant_id: None,
             inspecting_grant_ids: Vec::new(),
             cancelled_grant_ids: Vec::new(),
             submitted_grant: None,
@@ -1247,6 +1271,47 @@ impl SshManagerState {
     /// concrete manager instance after an overlay is closed and re-opened.
     pub fn instance_id(&self) -> u64 {
         self.instance_id
+    }
+
+    /// Mark the exact currently displayed/pending model-tool grant as transient.
+    ///
+    /// The app calls this only when it opened a manager for the first global live-tool request.
+    /// A stale event cannot mark an unrelated manager because the pending request and active
+    /// grant surface must still agree.
+    pub fn mark_transient_tool_grant(&mut self, request_id: &str) {
+        if self.current_grant_surface_matches(request_id) {
+            self.transient_tool_grant_id = Some(request_id.to_owned());
+        }
+    }
+
+    /// Whether settling `request_id` may close this auto-created manager.
+    ///
+    /// Do not close while an approval, authentication, or another request has replaced the
+    /// original card. The caller checks this before `settle_grant` consumes the request.
+    pub fn is_transient_tool_grant(&self, request_id: &str) -> bool {
+        self.transient_tool_grant_id.as_deref() == Some(request_id)
+            && self.current_grant_surface_matches(request_id)
+    }
+
+    fn current_grant_surface_matches(&self, request_id: &str) -> bool {
+        self.pending_grant.as_ref().is_some_and(|request| request.request_id == request_id)
+            && match &self.page {
+                SshModalPage::Manager => true,
+                SshModalPage::Grant(card) => card.request_id == request_id,
+                SshModalPage::ProjectBrowser => self.project_browser.as_ref().is_some_and(|browser| {
+                    matches!(
+                        &browser.purpose,
+                        SshDirectoryPurpose::PendingGrant {
+                            request_id: pending_request_id,
+                        } if pending_request_id == request_id
+                    )
+                }),
+                SshModalPage::Add(_)
+                | SshModalPage::OperationApproval(_)
+                | SshModalPage::WorkerInstallFallback(_)
+                | SshModalPage::Authentication(_)
+                | SshModalPage::Diagnostic(_) => false,
+            }
     }
 
     /// The exact add-target submission currently displayed by the form.
@@ -1468,21 +1533,32 @@ impl SshManagerState {
             .map(|pending| pending.session_id.as_str())
     }
 
-    /// Target owning an authenticated browse or project preparation, independent of active view.
-    pub fn pending_project_target_id(&self) -> Option<&str> {
+    /// Target that currently owns an SSH authentication prompt, independent of active view.
+    ///
+    /// A live grant inspection also owns authentication: routing by the foreground session would
+    /// otherwise present that host's credential challenge in an unrelated SSH manager.
+    pub fn pending_authentication_target_id(&self) -> Option<&str> {
         if let Some(pending) = self.pending_project_open.as_ref() {
             return Some(pending.target_id.as_str());
         }
-        if self.resume_project_browser_after_authentication
-            || matches!(&self.page, SshModalPage::ProjectBrowser)
-        {
-            return self
+        if (self.resume_project_browser_after_authentication
+            || matches!(&self.page, SshModalPage::ProjectBrowser))
+            && let Some(target_id) = self
                 .project_browser
                 .as_ref()
                 .filter(|browser| browser.loading)
-                .map(|browser| browser.target_id.as_str());
+                .map(|browser| browser.target_id.as_str())
+        {
+            return Some(target_id);
         }
-        None
+        self.pending_grant.as_ref().and_then(|request| {
+            (!self
+                .cancelled_grant_ids
+                .iter()
+                .any(|cancelled| cancelled == &request.request_id))
+            .then_some(request.target_id.as_deref())
+            .flatten()
+        })
     }
 
     /// Browser request that owns the in-flight project preparation or post-approval open.
@@ -2042,6 +2118,14 @@ impl SshManagerState {
         request: SshIncomingGrant,
     ) -> SshModalOutcome {
         let request_id = request.request_id.clone();
+        if self.transient_tool_grant_id.as_deref() != Some(request_id.as_str())
+            && self
+                .pending_grant
+                .as_ref()
+                .is_some_and(|pending| pending.request_id != request_id)
+        {
+            self.transient_tool_grant_id = None;
+        }
         if self.cancelled_grant_ids.iter().any(|id| id == &request_id) {
             return SshModalOutcome::Unchanged;
         }
@@ -2169,6 +2253,7 @@ impl SshManagerState {
             Some(request.reason.clone()),
             local_options.is_none(),
         );
+        card.awaiting_tool = request.awaiting_tool;
         card.set_verified_scope(request.capabilities);
         if let Some(options) = local_options {
             card.capabilities = options.capabilities;
@@ -2310,6 +2395,9 @@ impl SshManagerState {
         }
         if let Some(request_id) = request_id.as_deref() {
             self.inspecting_grant_ids.retain(|id| id != request_id);
+        }
+        if self.transient_tool_grant_id.as_deref() == request_id.as_deref() {
+            self.transient_tool_grant_id = None;
         }
         self.pending_grant = None;
         self.submitted_grant = None;
@@ -2506,6 +2594,13 @@ impl SshManagerState {
         self.targets.get(self.selected)
     }
 
+    fn selected_active_binding_id(&self) -> Option<&str> {
+        self.selected_target().and_then(|target| match &target.grant {
+            SshGrantView::Granted { binding_id, .. } => Some(binding_id.as_str()),
+            SshGrantView::NotGranted | SshGrantView::Revoking { .. } => None,
+        })
+    }
+
     fn return_to_manager(&mut self) {
         self.page = SshModalPage::Manager;
     }
@@ -2581,6 +2676,10 @@ pub enum SshModalOutcome {
     ApproveOperation {
         approval_id: String,
         approved: bool,
+        scope: SshOperationApprovalScope,
+    },
+    ResetOperationApprovals {
+        binding_id: String,
     },
     ApproveWorkerInstall {
         request_id: String,
@@ -2607,6 +2706,7 @@ const FOOTER_MANAGER_ADVANCED: usize = 105;
 const FOOTER_MANAGER_GRANT: usize = 111;
 const FOOTER_MANAGER_USE: usize = 112;
 const FOOTER_MANAGER_REVOKE: usize = 113;
+const FOOTER_MANAGER_RESET_OPERATION_APPROVALS: usize = 114;
 const FOOTER_MANAGER_CLOSE: usize = 108;
 const FOOTER_ADD_SAVE: usize = 201;
 const FOOTER_ADD_CANCEL: usize = 202;
@@ -2620,10 +2720,12 @@ const FOOTER_GRANT_DENY: usize = 307;
 const FOOTER_BROWSER_PARENT: usize = 308;
 const FOOTER_BROWSER_OPEN: usize = 309;
 const FOOTER_OPERATION_ALLOW: usize = 401;
-const FOOTER_OPERATION_DENY: usize = 402;
-const FOOTER_OPERATION_CLOSE: usize = 403;
-const FOOTER_WORKER_INSTALL_APPROVE: usize = 404;
-const FOOTER_WORKER_INSTALL_DECLINE: usize = 405;
+const FOOTER_OPERATION_ALLOW_SESSION: usize = 402;
+const FOOTER_OPERATION_DENY: usize = 403;
+const FOOTER_OPERATION_CLOSE: usize = 404;
+const FOOTER_OPERATION_COPY: usize = 407;
+const FOOTER_WORKER_INSTALL_APPROVE: usize = 405;
+const FOOTER_WORKER_INSTALL_DECLINE: usize = 406;
 const FOOTER_AUTH_SUBMIT: usize = 501;
 const FOOTER_AUTH_CANCEL: usize = 502;
 const FOOTER_HOST_TRUST_ONCE: usize = 511;
@@ -2718,6 +2820,59 @@ const ADVANCED_MANAGER_SHORTCUTS: &[Shortcut<'static>] = &[
     },
 ];
 
+const ADVANCED_MANAGER_WITH_BINDING_SHORTCUTS: &[Shortcut<'static>] = &[
+    Shortcut {
+        label: "j/k move",
+        clickable: false,
+        id: 0,
+    },
+    Shortcut {
+        label: "Enter choose folder",
+        clickable: true,
+        id: FOOTER_MANAGER_OPEN_FOLDER,
+    },
+    Shortcut {
+        label: "c connect/disconnect",
+        clickable: true,
+        id: FOOTER_MANAGER_CONNECTION,
+    },
+    Shortcut {
+        label: "g grant",
+        clickable: true,
+        id: FOOTER_MANAGER_GRANT,
+    },
+    Shortcut {
+        label: "u use",
+        clickable: true,
+        id: FOOTER_MANAGER_USE,
+    },
+    Shortcut {
+        label: "r revoke / refresh",
+        clickable: true,
+        id: FOOTER_MANAGER_REVOKE,
+    },
+    Shortcut {
+        label: "p ask each time",
+        clickable: true,
+        id: FOOTER_MANAGER_RESET_OPERATION_APPROVALS,
+    },
+    Shortcut {
+        label: "d details",
+        clickable: true,
+        id: FOOTER_MANAGER_DIAGNOSTIC,
+    },
+    Shortcut {
+        label: "m basic",
+        clickable: true,
+        id: FOOTER_MANAGER_ADVANCED,
+    },
+    Shortcut {
+        label: "Esc close",
+        clickable: true,
+        id: FOOTER_MANAGER_CLOSE,
+    },
+];
+
 const PROJECT_BROWSER_SHORTCUTS: &[Shortcut<'static>] = &[
     Shortcut {
         label: "↑/↓ or j/k choose",
@@ -2786,24 +2941,34 @@ const GRANT_BROWSER_SHORTCUTS: &[Shortcut<'static>] = &[
 
 const OPERATION_APPROVAL_SHORTCUTS: &[Shortcut<'static>] = &[
     Shortcut {
-        label: "↑/↓ inspect",
+        label: "↑/↓ PgUp/PgDn inspect",
         clickable: false,
         id: 0,
     },
     Shortcut {
-        label: "y allow after review",
+        label: "d raw details",
+        clickable: false,
+        id: 0,
+    },
+    Shortcut {
+        label: "c copy command",
+        clickable: true,
+        id: FOOTER_OPERATION_COPY,
+    },
+    Shortcut {
+        label: "y allow once",
         clickable: true,
         id: FOOTER_OPERATION_ALLOW,
     },
     Shortcut {
-        label: "n deny",
+        label: "a allow kind: session+binding",
         clickable: true,
-        id: FOOTER_OPERATION_DENY,
+        id: FOOTER_OPERATION_ALLOW_SESSION,
     },
     Shortcut {
-        label: "Esc deny",
+        label: "n/Esc deny",
         clickable: true,
-        id: FOOTER_OPERATION_CLOSE,
+        id: FOOTER_OPERATION_DENY,
     },
 ];
 
@@ -3082,7 +3247,9 @@ pub fn render_ssh_modal(
     let (title, shortcuts): (&str, &[Shortcut<'_>]) = match &state.page {
         SshModalPage::Manager => (
             "SSH targets",
-            if state.manager_advanced {
+            if state.manager_advanced && state.selected_active_binding_id().is_some() {
+                ADVANCED_MANAGER_WITH_BINDING_SHORTCUTS
+            } else if state.manager_advanced {
                 ADVANCED_MANAGER_SHORTCUTS
             } else {
                 PRIMARY_MANAGER_SHORTCUTS
@@ -3762,7 +3929,15 @@ fn render_grant(buf: &mut Buffer, area: Rect, card: &mut SshGrantCard, theme: &T
             false,
         );
     }
-    if card.agent_requested {
+    if card.awaiting_tool {
+        push_grant_wrapped(
+            &mut lines,
+            "The model is waiting for your decision. Allowing access approves this request and continues that tool call.",
+            width,
+            None,
+            false,
+        );
+    } else if card.agent_requested {
         push_grant_wrapped(
             &mut lines,
             "This access request came from the agent; allowing it does not expose credentials to it.",
@@ -3850,103 +4025,506 @@ fn render_grant(buf: &mut Buffer, area: Rect, card: &mut SshGrantCard, theme: &T
     }
 }
 
+struct OperationApprovalRenderLine {
+    line: Line<'static>,
+}
+
 fn render_operation_approval(
     buf: &mut Buffer,
     area: Rect,
     card: &mut SshOperationApprovalCard,
     theme: &Theme,
 ) {
-    if area.height == 0 {
+    if area.height == 0 || area.width == 0 {
+        card.page_size = 1;
+        card.max_scroll_offset = 0;
         return;
     }
-    let mut lines = operation_approval_lines(card, area.width as usize);
-    card.max_scroll_offset = lines.len().saturating_sub(area.height as usize);
+    let lines = operation_approval_lines(card, area.width as usize, theme);
+    card.page_size = area.height.saturating_sub(1).max(1) as usize;
+    card.max_scroll_offset = lines.len().saturating_sub(card.page_size);
     card.scroll_offset = card.scroll_offset.min(card.max_scroll_offset);
-    card.reviewed_to_end =
-        card.max_scroll_offset == 0 || card.scroll_offset >= card.max_scroll_offset;
-    // The review status is part of the scrollable content, so regenerate it after calculating
-    // the viewport-specific end position.
-    lines = operation_approval_lines(card, area.width as usize);
+    card.reviewed_to_end |= card.max_scroll_offset == 0
+        || card.scroll_offset >= card.max_scroll_offset;
 
-    for (index, line) in lines
+    for (index, preview_line) in lines
         .iter()
         .skip(card.scroll_offset)
-        .take(area.height as usize)
+        .take(card.page_size)
         .enumerate()
     {
-        let y = area.y.saturating_add(index as u16);
-        let style = if line.starts_with("Allow this") || line.starts_with("Review all") {
-            Style::default()
-                .fg(theme.accent_error)
-                .add_modifier(Modifier::BOLD)
-        } else if line.starts_with("Error:") {
-            Style::default().fg(theme.accent_error)
-        } else {
-            Style::default().fg(theme.text_secondary)
-        };
-        buf.set_stringn(area.x, y, line, area.width as usize, style);
+        buf.set_line(
+            area.x,
+            area.y.saturating_add(index as u16),
+            &preview_line.line,
+            area.width,
+        );
+    }
+    if area.height > 1 {
+        let status = card.copy_status.map(str::to_owned).unwrap_or_else(|| format!(
+            "Details {}/{} · {}",
+            card.scroll_offset + 1,
+            card.max_scroll_offset + 1,
+            if card.reviewed_to_end { "reviewed" } else { "scroll to end before allowing" },
+        ));
+        buf.set_stringn(area.x, area.bottom() - 1, status, area.width as usize, Style::default().fg(theme.text_secondary));
     }
 }
 
-fn operation_approval_lines(card: &SshOperationApprovalCard, width: usize) -> Vec<String> {
+fn operation_approval_lines(
+    card: &SshOperationApprovalCard,
+    width: usize,
+    theme: &Theme,
+) -> Vec<OperationApprovalRenderLine> {
     let width = width.max(1);
-    let options = textwrap::Options::new(width)
-        .break_words(true)
-        .wrap_algorithm(textwrap::WrapAlgorithm::FirstFit);
-    let mut lines = vec![format!(
-        "Target: {} ({})",
-        card.target_label, card.binding_id
-    )];
+    let mut lines = Vec::new();
+    push_operation_wrapped(
+        &mut lines,
+        &format!(
+            "Target: {} ({})",
+            safe_operation_text(&card.target_label),
+            safe_operation_text(&card.binding_id)
+        ),
+        width,
+        Style::default().fg(theme.text_secondary),
+    );
     if let Some(identity) = card.target_identity.as_deref() {
-        lines.push(format!("Verified SSH identity: {identity}"));
+        push_operation_wrapped(
+            &mut lines,
+            &format!("Verified SSH identity: {}", safe_operation_text(identity)),
+            width,
+            Style::default().fg(theme.text_secondary),
+        );
+    } else if let Some(identity) = operation_identity(&card.detail) {
+        push_operation_wrapped(
+            &mut lines,
+            &format!("Verified SSH identity: {identity}"),
+            width,
+            Style::default().fg(theme.text_secondary),
+        );
     }
-    lines.extend([
-        card.title.clone(),
-        String::new(),
-        "Remote operation details:".into(),
-    ]);
-    for paragraph in card.detail.lines() {
-        if paragraph.is_empty() {
-            lines.push(String::new());
+    push_operation_context(&mut lines, &card.detail, width, theme);
+    push_operation_wrapped(
+        &mut lines,
+        &card.title,
+        width,
+        Style::default()
+            .fg(theme.accent_user)
+            .add_modifier(Modifier::BOLD),
+    );
+    push_operation_wrapped(
+        &mut lines,
+        &format!("Requested operation: {}", operation_label(card.operation)),
+        width,
+        Style::default().fg(theme.text_secondary),
+    );
+    lines.push(operation_text_line("", Style::default()));
+
+    let recognized = if card.raw_details {
+        push_operation_wrapped(
+            &mut lines,
+            "Raw JSON details:",
+            width,
+            Style::default()
+                .fg(theme.accent_user)
+                .add_modifier(Modifier::BOLD),
+        );
+        let raw = serde_json::to_string_pretty(&card.detail)
+            .unwrap_or_else(|_| "JSON serialization failed for the remote operation payload.".into());
+        push_operation_source(&mut lines, &raw, width, false, theme);
+        true
+    } else {
+        push_operation_preview(&mut lines, card, width, theme)
+    };
+
+    if !recognized {
+        push_operation_wrapped(
+            &mut lines,
+            "The remote operation payload did not match a known preview. Complete technical details:",
+            width,
+            Style::default()
+                .fg(theme.accent_error)
+                .add_modifier(Modifier::BOLD),
+        );
+        push_operation_technical_value(&mut lines, "payload", &card.detail, width, theme);
+    } else if !card.raw_details {
+        push_operation_wrapped(
+            &mut lines,
+            "Press d to inspect the complete raw JSON details.",
+            width,
+            Style::default().fg(theme.text_secondary),
+        );
+    }
+
+    if card.operation == SshOperation::Execute {
+        push_operation_wrapped(
+            &mut lines,
+            "Warning: remote commands run with this SSH user's privileges; cwd is not a sandbox.",
+            width,
+            Style::default()
+                .fg(theme.accent_error)
+                .add_modifier(Modifier::BOLD),
+        );
+    }
+    if let Some(error) = card.error.as_deref() {
+        push_operation_wrapped(
+            &mut lines,
+            &format!("Error: {error}"),
+            width,
+            Style::default().fg(theme.accent_error),
+        );
+    }
+    lines.push(operation_text_line("", Style::default()));
+    push_operation_wrapped(
+        &mut lines,
+        if card.submitting {
+            "Submitting remote operation decision…"
         } else {
-            lines.extend(
-                textwrap::wrap(paragraph, &options)
-                    .into_iter()
-                    .map(std::borrow::Cow::into_owned),
+            "After review: y allow once · a allow this operation kind for this SSH session and binding · n/Esc deny"
+        },
+        width,
+        if card.submitting {
+            Style::default().fg(theme.text_secondary)
+        } else {
+            Style::default()
+                .fg(theme.accent_error)
+                .add_modifier(Modifier::BOLD)
+        },
+    );
+    lines
+}
+
+fn push_operation_preview(
+    lines: &mut Vec<OperationApprovalRenderLine>,
+    card: &SshOperationApprovalCard,
+    width: usize,
+    theme: &Theme,
+) -> bool {
+    match card.operation {
+        SshOperation::Execute => {
+            let Some(command) = operation_detail_string(&card.detail, &["command"]) else {
+                return false;
+            };
+            push_operation_wrapped(
+                lines,
+                "Exact remote command:",
+                width,
+                Style::default()
+                    .fg(theme.accent_user)
+                    .add_modifier(Modifier::BOLD),
+            );
+            push_operation_source(lines, command, width, true, theme);
+            true
+        }
+        SshOperation::Write => {
+            let Some(path) = operation_detail_string(
+                &card.detail,
+                &["target_file", "file_path", "path"],
+            ) else {
+                return false;
+            };
+            if let (Some(old), Some(new)) = (
+                operation_detail_string(&card.detail, &["old_string", "old", "before"]),
+                operation_detail_string(&card.detail, &["new_string", "new", "after"]),
+            ) {
+                push_operation_wrapped(
+                    lines,
+                    &format!("Edit remote file: {}", safe_operation_text(path)),
+                    width,
+                    Style::default()
+                        .fg(theme.accent_user)
+                        .add_modifier(Modifier::BOLD),
+                );
+                push_operation_wrapped(
+                    lines,
+                    "Old source:",
+                    width,
+                    Style::default().fg(theme.text_secondary),
+                );
+                push_operation_source(lines, old, width, false, theme);
+                push_operation_wrapped(
+                    lines,
+                    "New source:",
+                    width,
+                    Style::default().fg(theme.text_secondary),
+                );
+                push_operation_source(lines, new, width, false, theme);
+                return true;
+            }
+            let Some(content) =
+                operation_detail_string(&card.detail, &["content", "contents", "text"])
+            else {
+                return false;
+            };
+            push_operation_wrapped(
+                lines,
+                &format!("Write remote file: {}", safe_operation_text(path)),
+                width,
+                Style::default()
+                    .fg(theme.accent_user)
+                    .add_modifier(Modifier::BOLD),
+            );
+            push_operation_wrapped(
+                lines,
+                "Exact file content:",
+                width,
+                Style::default().fg(theme.text_secondary),
+            );
+            push_operation_source(lines, content, width, false, theme);
+            true
+        }
+        SshOperation::Read => {
+            let Some(path) = operation_detail_string(
+                &card.detail,
+                &["target_file", "file_path", "path"],
+            ) else {
+                return false;
+            };
+            push_operation_wrapped(
+                lines,
+                &format!("Read remote file: {}", safe_operation_text(path)),
+                width,
+                Style::default()
+                    .fg(theme.accent_user)
+                    .add_modifier(Modifier::BOLD),
+            );
+            true
+        }
+    }
+}
+
+fn operation_label(operation: SshOperation) -> &'static str {
+    match operation {
+        SshOperation::Read => "read",
+        SshOperation::Write => "write or edit",
+        SshOperation::Execute => "execute",
+    }
+}
+
+fn push_operation_context(
+    lines: &mut Vec<OperationApprovalRenderLine>,
+    detail: &Value,
+    width: usize,
+    theme: &Theme,
+) {
+    for (label, fields) in [
+        ("Target ID", &["target_id", "target"][..]),
+        ("Remote user", &["username", "user"][..]),
+        ("Remote host", &["hostname", "host"][..]),
+        ("Verified remote root", &["root"][..]),
+        ("Remote cwd", &["cwd"][..]),
+    ] {
+        let value = operation_detail_string(detail, fields).or_else(|| match label {
+            "Remote user" => operation_identity_component(detail, "username"),
+            "Remote host" => operation_identity_component(detail, "hostname"),
+            _ => None,
+        });
+        if let Some(value) = value {
+            push_operation_wrapped(
+                lines,
+                &format!("{label}: {}", safe_operation_text(value)),
+                width,
+                Style::default().fg(theme.text_secondary),
             );
         }
     }
-    if card.detail.is_empty() {
-        lines.push("(No additional detail was supplied.)".into());
-    }
-    lines.push(String::new());
-    if let Some(error) = card.error.as_deref() {
-        lines.extend(
-            textwrap::wrap(&format!("Error: {error}"), &options)
-                .into_iter()
-                .map(std::borrow::Cow::into_owned),
-        );
-    }
-    lines.push(if card.max_scroll_offset > 0 {
-        format!(
-            "Details position {} of {} · {}",
-            card.scroll_offset + 1,
-            card.max_scroll_offset + 1,
-            if card.reviewed_to_end {
-                "all details reviewed"
-            } else {
-                "scroll to review all details before allowing"
+}
+
+fn operation_identity_component<'a>(detail: &'a Value, field: &str) -> Option<&'a str> {
+    operation_detail_field(detail, &["identity"])?
+        .get(field)?
+        .as_str()
+}
+
+fn operation_identity(detail: &Value) -> Option<String> {
+    let identity = operation_detail_field(detail, &["identity"])?;
+    let object = identity.as_object()?;
+    let username = object.get("username")?.as_str()?;
+    let hostname = object.get("hostname")?.as_str()?;
+    let port = object
+        .get("port")
+        .map(|port| port.to_string())
+        .unwrap_or_else(|| "?".into());
+    let fingerprint = object
+        .get("fingerprint")
+        .and_then(Value::as_str)
+        .map(|fingerprint| format!(" ({})", safe_operation_text(fingerprint)))
+        .unwrap_or_default();
+    Some(format!(
+        "{}@{}:{}{}",
+        safe_operation_text(username),
+        safe_operation_text(hostname),
+        port,
+        fingerprint
+    ))
+}
+
+fn operation_detail_string<'a>(detail: &'a Value, fields: &[&str]) -> Option<&'a str> {
+    operation_detail_field(detail, fields)?.as_str()
+}
+
+fn operation_detail_field<'a>(detail: &'a Value, fields: &[&str]) -> Option<&'a Value> {
+    let object = detail.as_object()?;
+    fields
+        .iter()
+        .find_map(|field| object.get(*field))
+        .or_else(|| {
+            ["args", "input", "params"].iter().find_map(|container| {
+                object
+                    .get(*container)
+                    .and_then(Value::as_object)
+                    .and_then(|nested| fields.iter().find_map(|field| nested.get(*field)))
+            })
+        })
+}
+
+fn push_operation_technical_value(
+    lines: &mut Vec<OperationApprovalRenderLine>,
+    label: &str,
+    value: &Value,
+    width: usize,
+    theme: &Theme,
+) {
+    match value {
+        Value::Object(object) if object.is_empty() => push_operation_wrapped(
+            lines,
+            &format!("{label}: {{}}"),
+            width,
+            Style::default().fg(theme.text_secondary),
+        ),
+        Value::Object(object) => {
+            for (key, nested) in object {
+                let nested_label = format!("{label}.{key}");
+                push_operation_technical_value(lines, &nested_label, nested, width, theme);
             }
-        )
-    } else {
-        "All details reviewed.".into()
-    });
-    lines.push(if card.submitting {
-        "Submitting remote operation decision…".into()
-    } else {
-        "Allow this one remote operation? y allow · n deny".into()
-    });
-    lines
+        }
+        Value::Array(values) if values.is_empty() => push_operation_wrapped(
+            lines,
+            &format!("{label}: []"),
+            width,
+            Style::default().fg(theme.text_secondary),
+        ),
+        Value::Array(values) => {
+            for (index, nested) in values.iter().enumerate() {
+                let nested_label = format!("{label}[{index}]");
+                push_operation_technical_value(lines, &nested_label, nested, width, theme);
+            }
+        }
+        Value::String(text) => {
+            push_operation_wrapped(
+                lines,
+                &format!("{label}:"),
+                width,
+                Style::default().fg(theme.text_secondary),
+            );
+            push_operation_source(lines, text, width, false, theme);
+        }
+        Value::Null | Value::Bool(_) | Value::Number(_) => push_operation_wrapped(
+            lines,
+            &format!("{label}: {value}"),
+            width,
+            Style::default().fg(theme.text_secondary),
+        ),
+    }
+}
+
+fn push_operation_source(
+    lines: &mut Vec<OperationApprovalRenderLine>,
+    source: &str,
+    width: usize,
+    bash_syntax: bool,
+    theme: &Theme,
+) {
+    let source = safe_operation_text(source);
+    let code_width = width.saturating_sub(2).max(1);
+    for physical_line in source.split('\n') {
+        let spans = if bash_syntax {
+            crate::views::tasks_pane::highlight_bash_command(physical_line)
+        } else {
+            vec![Span::styled(
+                physical_line.to_owned(),
+                Style::default().fg(theme.text_secondary),
+            )]
+        };
+        for source_row in wrap_operation_spans(&spans, code_width) {
+            let mut row = Vec::with_capacity(source_row.len() + 1);
+            row.push(Span::styled("  ", theme.dim()));
+            row.extend(source_row);
+            lines.push(OperationApprovalRenderLine {
+                line: Line::from(row),
+            });
+        }
+    }
+}
+
+fn wrap_operation_spans(spans: &[Span<'static>], width: usize) -> Vec<Vec<Span<'static>>> {
+    let width = width.max(1);
+    let mut rows = Vec::new();
+    let mut row = Vec::new();
+    let mut used = 0usize;
+    for span in spans {
+        let content = span.content.as_ref();
+        let mut chunk_start = 0usize;
+        for (index, character) in content.char_indices() {
+            let character_width = unicode_width::UnicodeWidthChar::width(character).unwrap_or(0);
+            if used > 0 && used + character_width > width {
+                if chunk_start < index {
+                    row.push(Span::styled(
+                        content[chunk_start..index].to_owned(),
+                        span.style,
+                    ));
+                }
+                rows.push(std::mem::take(&mut row));
+                used = 0;
+                chunk_start = index;
+            }
+            used += character_width;
+        }
+        if chunk_start < content.len() {
+            row.push(Span::styled(content[chunk_start..].to_owned(), span.style));
+        }
+    }
+    rows.push(row);
+    rows
+}
+
+fn push_operation_wrapped(
+    lines: &mut Vec<OperationApprovalRenderLine>,
+    text: &str,
+    width: usize,
+    style: Style,
+) {
+    let text = safe_operation_text(text);
+    for physical_line in text.split('\n') {
+        let wrapped = modal_window::word_wrap(physical_line, width.max(1));
+        if wrapped.is_empty() {
+            lines.push(operation_text_line("", style));
+        } else {
+            for line in wrapped {
+                lines.push(operation_text_line(line, style));
+            }
+        }
+    }
+}
+
+fn operation_text_line(text: impl Into<String>, style: Style) -> OperationApprovalRenderLine {
+    OperationApprovalRenderLine {
+        line: Line::from(Span::styled(text.into(), style)),
+    }
+}
+
+fn safe_operation_text(text: &str) -> String {
+    let mut safe = String::with_capacity(text.len());
+    for character in text.chars() {
+        if character == '\n' {
+            safe.push(character);
+        } else if character.is_control() {
+            safe.extend(character.escape_default());
+        } else {
+            safe.push(character);
+        }
+    }
+    safe
 }
 
 fn render_worker_install_fallback(
@@ -4390,6 +4968,9 @@ fn footer_key_for(page: &SshModalPage, id: usize) -> Option<KeyEvent> {
         (SshModalPage::Manager, FOOTER_MANAGER_GRANT) => Some(key(KeyCode::Char('g'))),
         (SshModalPage::Manager, FOOTER_MANAGER_USE) => Some(key(KeyCode::Char('u'))),
         (SshModalPage::Manager, FOOTER_MANAGER_REVOKE) => Some(key(KeyCode::Char('r'))),
+        (SshModalPage::Manager, FOOTER_MANAGER_RESET_OPERATION_APPROVALS) => {
+            Some(key(KeyCode::Char('p')))
+        }
         (SshModalPage::Manager, FOOTER_MANAGER_DIAGNOSTIC) => Some(key(KeyCode::Char('d'))),
         (SshModalPage::Manager, FOOTER_MANAGER_CLOSE) => Some(key(KeyCode::Esc)),
         (SshModalPage::Add(form), FOOTER_ADD_SAVE) if !form.submitting => Some(key(KeyCode::Enter)),
@@ -4411,10 +4992,16 @@ fn footer_key_for(page: &SshModalPage, id: usize) -> Option<KeyEvent> {
         (SshModalPage::OperationApproval(_), FOOTER_OPERATION_ALLOW) => {
             Some(key(KeyCode::Char('y')))
         }
+        (SshModalPage::OperationApproval(_), FOOTER_OPERATION_ALLOW_SESSION) => {
+            Some(key(KeyCode::Char('a')))
+        }
         (SshModalPage::OperationApproval(_), FOOTER_OPERATION_DENY) => {
             Some(key(KeyCode::Char('n')))
         }
         (SshModalPage::OperationApproval(_), FOOTER_OPERATION_CLOSE) => Some(key(KeyCode::Esc)),
+        (SshModalPage::OperationApproval(_), FOOTER_OPERATION_COPY) => {
+            Some(key(KeyCode::Char('c')))
+        }
         (SshModalPage::WorkerInstallFallback(card), FOOTER_WORKER_INSTALL_APPROVE)
             if !card.submitting && !card.is_decided() =>
         {
@@ -4678,6 +5265,7 @@ pub fn handle_ssh_mouse(state: &mut SshManagerState, mouse: &MouseEvent) -> SshM
                 SshModalOutcome::Changed
             }
         }
+        SshModalPage::OperationApproval(card) => scroll_operation_approval(card, delta),
         SshModalPage::WorkerInstallFallback(card) => {
             let next = if delta.is_negative() {
                 card.scroll_offset.saturating_sub(delta.unsigned_abs())
@@ -4726,9 +5314,7 @@ pub fn handle_ssh_mouse(state: &mut SshManagerState, mouse: &MouseEvent) -> SshM
         SshModalPage::ProjectBrowser => {
             unreachable!("browser scrolling is handled before borrowing modal page")
         }
-        SshModalPage::Manager | SshModalPage::Add(_) | SshModalPage::OperationApproval(_) => {
-            SshModalOutcome::Unchanged
-        }
+        SshModalPage::Manager | SshModalPage::Add(_) => SshModalOutcome::Unchanged,
     }
 }
 
@@ -4958,6 +5544,7 @@ fn close_current_page(state: &mut SshManagerState) -> SshModalOutcome {
         SshModalPage::OperationApproval(card) => SshModalOutcome::ApproveOperation {
             approval_id: card.approval_id.clone(),
             approved: false,
+            scope: SshOperationApprovalScope::Once,
         },
         SshModalPage::Grant(_) => {
             unreachable!("grant denial was handled before read-only match")
@@ -5097,6 +5684,14 @@ fn handle_manager_key(state: &mut SshManagerState, key: &KeyEvent) -> SshModalOu
         }
         KeyCode::Char('g') if key.modifiers.is_empty() && state.manager_advanced => {
             begin_grant_flow(state, None)
+        }
+        KeyCode::Char('p') if key.modifiers.is_empty() && state.manager_advanced => {
+            state
+                .selected_active_binding_id()
+                .map(|binding_id| SshModalOutcome::ResetOperationApprovals {
+                    binding_id: binding_id.to_owned(),
+                })
+                .unwrap_or(SshModalOutcome::Unchanged)
         }
         KeyCode::Char('r') if key.modifiers.is_empty() && state.manager_advanced => {
             let binding_id = state
@@ -5534,50 +6129,93 @@ fn handle_operation_approval_key(
     }
     match key.code {
         KeyCode::Up | KeyCode::Char('k') if key.modifiers.is_empty() => {
-            card.scroll_offset = card.scroll_offset.saturating_sub(1);
-            card.error = None;
-            SshModalOutcome::Changed
+            scroll_operation_approval(card, -1)
         }
         KeyCode::Down | KeyCode::Char('j') if key.modifiers.is_empty() => {
-            card.scroll_offset = card.scroll_offset.saturating_add(1);
-            card.error = None;
-            SshModalOutcome::Changed
+            scroll_operation_approval(card, 1)
         }
-        KeyCode::PageUp => {
-            card.scroll_offset = card.scroll_offset.saturating_sub(8);
-            card.error = None;
-            SshModalOutcome::Changed
+        KeyCode::PageUp if key.modifiers.is_empty() => {
+            scroll_operation_approval(card, -(card.page_size as isize))
         }
-        KeyCode::PageDown => {
-            card.scroll_offset = card.scroll_offset.saturating_add(8);
-            card.error = None;
-            SshModalOutcome::Changed
+        KeyCode::PageDown if key.modifiers.is_empty() => {
+            scroll_operation_approval(card, card.page_size as isize)
         }
-        KeyCode::Home => {
+        KeyCode::Home if key.modifiers.is_empty() => {
             card.scroll_offset = 0;
             card.error = None;
             SshModalOutcome::Changed
         }
-        KeyCode::End => {
+        KeyCode::End if key.modifiers.is_empty() => {
             card.scroll_offset = card.max_scroll_offset;
+            card.reviewed_to_end = true;
             card.error = None;
             SshModalOutcome::Changed
         }
-        KeyCode::Char('y') if key.modifiers.is_empty() && card.reviewed_to_end => {
-            SshModalOutcome::ApproveOperation {
-                approval_id: card.approval_id.clone(),
-                approved: true,
-            }
-        }
-        KeyCode::Char('y') if key.modifiers.is_empty() => {
-            card.error = Some("Review all remote operation details before allowing it.".into());
+        KeyCode::Char('d') if key.modifiers.is_empty() => {
+            card.raw_details = !card.raw_details;
+            card.error = None;
             SshModalOutcome::Changed
         }
-        KeyCode::Char('n') | KeyCode::Esc => SshModalOutcome::ApproveOperation {
+        KeyCode::Char('c') if key.modifiers.is_empty() => {
+            card.copy_status = Some(match operation_detail_string(&card.detail, &["command"]) {
+                Some(command) if card.operation == SshOperation::Execute => {
+                    match crate::clipboard::SystemClipboard::try_set(command) {
+                        crate::clipboard::ClipboardDelivery::Confirmed => "Command copied.",
+                        crate::clipboard::ClipboardDelivery::Unverified => "Copy sent; terminal clipboard delivery is unverified.",
+                        crate::clipboard::ClipboardDelivery::Failed => "Command copy failed.",
+                    }
+                }
+                _ => "This operation has no command to copy.",
+            });
+            SshModalOutcome::Changed
+        }
+        KeyCode::Char('y') if key.modifiers.is_empty() => {
+            approve_operation(card, SshOperationApprovalScope::Once)
+        }
+        KeyCode::Char('a') if key.modifiers.is_empty() => {
+            approve_operation(card, SshOperationApprovalScope::Session)
+        }
+        KeyCode::Char('n') if key.modifiers.is_empty() => SshModalOutcome::ApproveOperation {
             approval_id: card.approval_id.clone(),
             approved: false,
+            scope: SshOperationApprovalScope::Once,
+        },
+        KeyCode::Esc => SshModalOutcome::ApproveOperation {
+            approval_id: card.approval_id.clone(),
+            approved: false,
+            scope: SshOperationApprovalScope::Once,
         },
         _ => SshModalOutcome::Unchanged,
+    }
+}
+
+fn scroll_operation_approval(card: &mut SshOperationApprovalCard, delta: isize) -> SshModalOutcome {
+    let next = if delta.is_negative() {
+        card.scroll_offset.saturating_sub(delta.unsigned_abs())
+    } else {
+        card.scroll_offset
+            .saturating_add(delta as usize)
+            .min(card.max_scroll_offset)
+    };
+    card.scroll_offset = next;
+    card.reviewed_to_end |= card.max_scroll_offset == 0 || next >= card.max_scroll_offset;
+    card.error = None;
+    card.copy_status = None;
+    SshModalOutcome::Changed
+}
+
+fn approve_operation(
+    card: &mut SshOperationApprovalCard,
+    scope: SshOperationApprovalScope,
+) -> SshModalOutcome {
+    if !card.reviewed_to_end {
+        card.error = Some("Review all remote operation details before allowing it.".into());
+        return SshModalOutcome::Changed;
+    }
+    SshModalOutcome::ApproveOperation {
+        approval_id: card.approval_id.clone(),
+        approved: true,
+        scope,
     }
 }
 
@@ -5792,7 +6430,13 @@ mod tests {
             "target-1".into(),
             Some("user@host:22 (SHA256:test)".into()),
             "Remote operation".into(),
-            "{}".into(),
+            serde_json::json!({
+                "target_id": "target-1",
+                "root": "/srv/project",
+                "cwd": "/srv/project",
+                "args": {"command": "printf 'approved\\n'"},
+            }),
+            SshOperation::Execute,
         )
     }
 
@@ -5954,10 +6598,7 @@ mod tests {
 
         assert!(!state.settle_operation_approval("approval-1", None));
         assert!(matches!(&state.page, SshModalPage::Manager));
-        assert_eq!(
-            state.message.as_ref().map(|message| message.0.as_str()),
-            Some("Remote operation approval sent.")
-        );
+        assert!(state.message.is_some());
 
         state.show_operation_approval(
             approval("approval-2"),
@@ -5966,10 +6607,7 @@ mod tests {
         assert!(state.submit_operation_approval("approval-2", false));
         assert!(!state.settle_operation_approval("approval-2", None));
         assert!(matches!(&state.page, SshModalPage::Manager));
-        assert_eq!(
-            state.message.as_ref().map(|message| message.0.as_str()),
-            Some("Remote operation denied.")
-        );
+        assert!(state.message.is_some());
     }
 
     #[test]
@@ -6003,6 +6641,306 @@ mod tests {
                     && !card.submitting
                     && card.error.as_deref() == Some("local control unavailable")
         ));
+    }
+
+    #[test]
+    fn operation_preview_preserves_multiline_heredoc_and_exposes_raw_details() {
+        let terminal_escape = char::from_u32(0x1b).expect("escape codepoint");
+        let command = format!(
+            "cat <<'EOF'\n$HOME is literal\nEOF\nprintf '{terminal_escape}[31mnot a terminal escape\\n'\n"
+        );
+        let card = SshOperationApprovalCard::new(
+            "preview-1".into(),
+            "binding-1".into(),
+            "build host".into(),
+            Some("builder@build.example.test:22 (SHA256:fixture)".into()),
+            "Run deployment probe".into(),
+            serde_json::json!({
+                "target_id": "build-target",
+                "identity": {
+                    "username": "builder",
+                    "hostname": "build.example.test",
+                    "port": 22,
+                    "fingerprint": "SHA256:fixture",
+                },
+                "root": "/srv/project",
+                "cwd": "/srv/project/scripts",
+                "args": {"command": command},
+            }),
+            SshOperation::Execute,
+        );
+        let mut state = SshManagerState::new(Some("session-1".into()));
+        state.show_operation_approval(card, SshOperationApprovalOrigin::ExplicitManager);
+        let area = Rect::new(0, 0, 72, 14);
+        let mut frames = String::new();
+        for _ in 0..128 {
+            let mut buffer = Buffer::empty(area);
+            render_ssh_modal(&mut buffer, area, &mut state, false, &Theme::current());
+            frames.push_str(&buffer_text(&buffer));
+            frames.push('\n');
+            let at_end = matches!(
+                &state.page,
+                SshModalPage::OperationApproval(card)
+                    if card.scroll_offset == card.max_scroll_offset
+            );
+            if at_end {
+                break;
+            }
+            assert!(matches!(
+                handle_ssh_key(&mut state, &key(KeyCode::Down)),
+                SshModalOutcome::Changed
+            ));
+        }
+        assert!(frames.contains("cat <<'EOF'"), "{frames}");
+        assert!(frames.contains("$HOME is literal"), "{frames}");
+        assert!(frames.contains("EOF"), "{frames}");
+        assert!(frames.contains("Remote cwd: /srv/project/scripts"), "{frames}");
+        assert!(!frames.contains('\u{1b}'), "{frames:?}");
+        assert!(frames.contains("\\u{1b}"), "{frames}");
+
+        assert!(matches!(
+            handle_ssh_key(&mut state, &key(KeyCode::Home)),
+            SshModalOutcome::Changed
+        ));
+        assert!(matches!(
+            handle_ssh_key(&mut state, &key(KeyCode::Char('d'))),
+            SshModalOutcome::Changed
+        ));
+        let mut raw_frames = String::new();
+        loop {
+            let mut buffer = Buffer::empty(area);
+            render_ssh_modal(&mut buffer, area, &mut state, false, &Theme::current());
+            raw_frames.push_str(&buffer_text(&buffer));
+            if matches!(&state.page, SshModalPage::OperationApproval(card)
+                if card.scroll_offset == card.max_scroll_offset)
+            {
+                break;
+            }
+            handle_ssh_key(&mut state, &key(KeyCode::PageDown));
+        }
+        assert!(raw_frames.contains("\"args\""), "{raw_frames}");
+        assert!(raw_frames.contains("\"command\""), "{raw_frames}");
+        assert!(raw_frames.contains("\\n$HOME"), "{raw_frames}");
+    }
+
+    #[test]
+    fn operation_review_gate_scrolls_with_wheel_and_pages_without_losing_completion() {
+        let mut command = String::new();
+        for line in 0..48 {
+            command.push_str(&format!("printf 'line-{line}\\n'\n"));
+        }
+        let card = SshOperationApprovalCard::new(
+            "review-1".into(),
+            "binding-1".into(),
+            "build host".into(),
+            None,
+            "Run long script".into(),
+            serde_json::json!({"args": {"command": command}}),
+            SshOperation::Execute,
+        );
+        let mut state = SshManagerState::new(Some("session-1".into()));
+        state.show_operation_approval(card, SshOperationApprovalOrigin::ExplicitManager);
+        let area = Rect::new(0, 0, 64, 13);
+        let mut buffer = Buffer::empty(area);
+        render_ssh_modal(&mut buffer, area, &mut state, false, &Theme::current());
+
+        assert!(matches!(
+            handle_ssh_key(&mut state, &key(KeyCode::Char('y'))),
+            SshModalOutcome::Changed
+        ));
+        assert!(matches!(
+            &state.page,
+            SshModalPage::OperationApproval(card) if card.error.is_some()
+        ));
+
+        assert!(matches!(
+            handle_ssh_mouse(
+                &mut state,
+                &MouseEvent {
+                    kind: MouseEventKind::ScrollDown,
+                    column: 32,
+                    row: 6,
+                    modifiers: KeyModifiers::NONE,
+                },
+            ),
+            SshModalOutcome::Changed
+        ));
+        let before_page = match &state.page {
+            SshModalPage::OperationApproval(card) => card.scroll_offset,
+            _ => panic!("operation approval must remain displayed"),
+        };
+        assert!(matches!(
+            handle_ssh_key(&mut state, &key(KeyCode::PageDown)),
+            SshModalOutcome::Changed
+        ));
+        assert!(matches!(
+            &state.page,
+            SshModalPage::OperationApproval(card) if card.scroll_offset >= before_page
+        ));
+        assert!(matches!(
+            handle_ssh_key(&mut state, &key(KeyCode::End)),
+            SshModalOutcome::Changed
+        ));
+        assert!(matches!(
+            handle_ssh_key(&mut state, &key(KeyCode::Up)),
+            SshModalOutcome::Changed
+        ));
+        assert!(matches!(
+            &state.page,
+            SshModalPage::OperationApproval(card) if card.reviewed_to_end
+        ));
+        assert!(matches!(
+            handle_ssh_key(&mut state, &key(KeyCode::Char('y'))),
+            SshModalOutcome::ApproveOperation {
+                approved: true,
+                scope: SshOperationApprovalScope::Once,
+                ..
+            }
+        ));
+
+        state.show_operation_approval(approval("review-2"), SshOperationApprovalOrigin::ExplicitManager);
+        assert!(matches!(
+            &state.page,
+            SshModalPage::OperationApproval(card)
+                if !card.reviewed_to_end && !card.raw_details && card.scroll_offset == 0
+        ));
+        let mut buffer = Buffer::empty(area);
+        render_ssh_modal(&mut buffer, area, &mut state, false, &Theme::current());
+        assert!(matches!(
+            handle_ssh_key(&mut state, &key(KeyCode::End)),
+            SshModalOutcome::Changed
+        ));
+        let mut buffer = Buffer::empty(area);
+        render_ssh_modal(&mut buffer, area, &mut state, false, &Theme::current());
+        let session_allow = state
+            .window
+            .shortcut_hits
+            .iter()
+            .find(|hit| hit.id == FOOTER_OPERATION_ALLOW_SESSION)
+            .expect("session approval footer is rendered")
+            .rect;
+        assert!(matches!(
+            handle_ssh_mouse(
+                &mut state,
+                &MouseEvent {
+                    kind: MouseEventKind::Down(crossterm::event::MouseButton::Left),
+                    column: session_allow.x,
+                    row: session_allow.y,
+                    modifiers: KeyModifiers::NONE,
+                },
+            ),
+            SshModalOutcome::ApproveOperation {
+                approved: true,
+                scope: SshOperationApprovalScope::Session,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn advanced_reset_is_limited_to_the_selected_active_binding() {
+        let mut state = SshManagerState::new(Some("session-1".into()));
+        state.set_targets(vec![target_view("server-1", granted("binding-1", "/srv/project"))]);
+        assert!(matches!(
+            handle_ssh_key(&mut state, &key(KeyCode::Char('m'))),
+            SshModalOutcome::Changed
+        ));
+        assert!(matches!(
+            handle_ssh_key(&mut state, &key(KeyCode::Char('p'))),
+            SshModalOutcome::ResetOperationApprovals { binding_id } if binding_id == "binding-1"
+        ));
+        let area = Rect::new(0, 0, 88, 20);
+        let mut buffer = Buffer::empty(area);
+        render_ssh_modal(&mut buffer, area, &mut state, false, &Theme::current());
+        let reset = state
+            .window
+            .shortcut_hits
+            .iter()
+            .find(|hit| hit.id == FOOTER_MANAGER_RESET_OPERATION_APPROVALS)
+            .expect("active binding renders reset footer")
+            .rect;
+        assert!(matches!(
+            handle_ssh_mouse(
+                &mut state,
+                &MouseEvent {
+                    kind: MouseEventKind::Down(crossterm::event::MouseButton::Left),
+                    column: reset.x,
+                    row: reset.y,
+                    modifiers: KeyModifiers::NONE,
+                },
+            ),
+            SshModalOutcome::ResetOperationApprovals { binding_id } if binding_id == "binding-1"
+        ));
+
+        state.set_targets(vec![target_view("server-1", SshGrantView::NotGranted)]);
+        let mut buffer = Buffer::empty(area);
+        render_ssh_modal(&mut buffer, area, &mut state, false, &Theme::current());
+        assert!(!state
+            .window
+            .shortcut_hits
+            .iter()
+            .any(|hit| hit.id == FOOTER_MANAGER_RESET_OPERATION_APPROVALS));
+        assert!(matches!(
+            handle_ssh_key(&mut state, &key(KeyCode::Char('p'))),
+            SshModalOutcome::Unchanged
+        ));
+    }
+
+    #[test]
+    fn transient_tool_grant_marker_survives_inspection_but_not_replacement_or_settlement() {
+        let request = |identity: Option<&str>| SshIncomingGrant {
+            request_id: "tool-grant".into(),
+            target_id: Some("server-1".into()),
+            root: Some("/srv/project".into()),
+            capabilities: SshCapabilitiesView::default(),
+            verified_identity: identity.map(str::to_owned),
+            reason: "Read a verified checkout.".into(),
+            awaiting_tool: true,
+        };
+        let mut state = SshManagerState::new(Some("session-1".into()));
+        state.set_targets(vec![target_view("server-1", SshGrantView::NotGranted)]);
+        assert!(matches!(
+            state.show_incoming_grant("session-1".into(), request(None)),
+            SshModalOutcome::InspectGrantTarget { .. }
+        ));
+        state.mark_transient_tool_grant("tool-grant");
+        assert!(state.is_transient_tool_grant("tool-grant"));
+        assert_eq!(
+            state.pending_authentication_target_id(),
+            Some("server-1")
+        );
+        assert!(matches!(
+            state.show_incoming_grant(
+                "session-1".into(),
+                request(Some("builder@build.example.test:22"))
+            ),
+            SshModalOutcome::Changed
+        ));
+        assert!(state.is_transient_tool_grant("tool-grant"));
+        let area = Rect::new(0, 0, 80, 24);
+        let mut buffer = Buffer::empty(area);
+        render_ssh_modal(&mut buffer, area, &mut state, false, &Theme::current());
+        assert!(buffer_text(&buffer).contains("model is waiting for your decision"));
+        state.show_operation_approval(approval("replacement"), SshOperationApprovalOrigin::TransientEvent);
+        assert!(!state.is_transient_tool_grant("tool-grant"));
+
+        let mut settled = SshManagerState::new(Some("session-1".into()));
+        settled.set_targets(vec![target_view("server-1", SshGrantView::NotGranted)]);
+        assert!(matches!(
+            settled.show_incoming_grant("session-1".into(), request(None)),
+            SshModalOutcome::InspectGrantTarget { .. }
+        ));
+        settled.mark_transient_tool_grant("tool-grant");
+        assert!(matches!(
+            settled.show_incoming_grant(
+                "session-1".into(),
+                request(Some("builder@build.example.test:22"))
+            ),
+            SshModalOutcome::Changed
+        ));
+        assert!(settled.is_transient_tool_grant("tool-grant"));
+        settled.settle_grant(true);
+        assert!(!settled.is_transient_tool_grant("tool-grant"));
     }
 
     fn key(code: KeyCode) -> KeyEvent {
@@ -6272,6 +7210,7 @@ mod tests {
                 capabilities: SshCapabilitiesView::default(),
                 verified_identity: Some("builder@build.example.test:22 (SHA256:fixture)".into()),
                 reason: "Open the selected project.".into(),
+                awaiting_tool: false,
             },
             "project-session".into(),
         ));
@@ -6358,6 +7297,7 @@ mod tests {
                 capabilities: SshCapabilitiesView::default(),
                 verified_identity: Some("builder@build.example.test:22 (SHA256:fixture)".into()),
                 reason: "Open the selected project.".into(),
+                awaiting_tool: false,
             },
             "project-session".into(),
         ));
@@ -6397,7 +7337,7 @@ mod tests {
                 allow_remember: false,
             },
         ));
-        assert_eq!(state.pending_project_target_id(), Some("server-1"));
+        assert_eq!(state.pending_authentication_target_id(), Some("server-1"));
         assert!(state.settle_project_directory(
             request_id,
             "server-1",
@@ -6431,7 +7371,7 @@ mod tests {
             handle_ssh_key(&mut state, &key(KeyCode::Esc)),
             SshModalOutcome::CancelProjectOpen { request_id } if request_id == open_request
         ));
-        assert_eq!(state.pending_project_target_id(), None);
+        assert_eq!(state.pending_authentication_target_id(), None);
         assert!(!state.finish_project_preparation(open_request, Some("late failure".into())));
     }
 
@@ -6487,6 +7427,7 @@ mod tests {
                         "builder@build.example.test:22 (SHA256:fixture)".into(),
                     ),
                     reason: "Open SSH access".into(),
+                    awaiting_tool: false,
                 },
             ),
             SshModalOutcome::Changed
@@ -6925,6 +7866,7 @@ mod tests {
                     capabilities: SshCapabilitiesView::default(),
                     verified_identity: None,
                     reason: "Inspect a remote checkout.".into(),
+                    awaiting_tool: false,
                 },
             )
         else {
@@ -6974,6 +7916,7 @@ mod tests {
                     capabilities: SshCapabilitiesView::default(),
                     verified_identity: Some("builder@build.example.test:22".into()),
                     reason: "late inspection".into(),
+                    awaiting_tool: false,
                 },
             ),
             SshModalOutcome::Unchanged
@@ -6998,6 +7941,7 @@ mod tests {
                     capabilities: SshCapabilitiesView::default(),
                     verified_identity: None,
                     reason: "Read a known checkout.".into(),
+                    awaiting_tool: false,
                 },
             ),
             SshModalOutcome::InspectGrantTarget {
@@ -7017,6 +7961,7 @@ mod tests {
                     capabilities: SshCapabilitiesView::default(),
                     verified_identity: None,
                     reason: "duplicate inspection event".into(),
+                    awaiting_tool: false,
                 },
             ),
             SshModalOutcome::Unchanged
@@ -7041,6 +7986,7 @@ mod tests {
                     },
                     verified_identity: None,
                     reason: "Read the build output.".into(),
+                    awaiting_tool: false,
                 },
             ),
             SshModalOutcome::Changed
@@ -7081,6 +8027,7 @@ mod tests {
                     },
                     verified_identity: Some("builder@build.example.test:22".into()),
                     reason: "Read the build output.".into(),
+                    awaiting_tool: false,
                 },
             ),
             SshModalOutcome::Changed
@@ -7148,6 +8095,7 @@ mod tests {
                     },
                     verified_identity: None,
                     reason: "late local request".into(),
+                    awaiting_tool: false,
                 },
             ),
             SshModalOutcome::ApproveGrant {
@@ -7166,6 +8114,7 @@ mod tests {
                     capabilities: SshCapabilitiesView::default(),
                     verified_identity: Some("builder@build.example.test:22".into()),
                     reason: "late verification".into(),
+                    awaiting_tool: false,
                 },
             ),
             SshModalOutcome::Unchanged

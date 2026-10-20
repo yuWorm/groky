@@ -48,6 +48,7 @@ fn grant_request(request_id: &str, target_id: &str, root: &str, client_id: u64) 
         }),
         client_id: Some(client_id),
         originating_session_id: None,
+        awaiting_tool: false,
     }
 }
 
@@ -253,6 +254,7 @@ fn cold_worktree_new_root_grant_routes_only_recorded_source_to_child() {
             verified_identity: None,
             client_id: Some(client_id),
             originating_session_id: Some(SESSION_ID.into()),
+            awaiting_tool: false,
         }),
     );
     let _ = apply_ssh_control_event(
@@ -271,6 +273,7 @@ fn cold_worktree_new_root_grant_routes_only_recorded_source_to_child() {
             verified_identity: None,
             client_id: Some(client_id),
             originating_session_id: None,
+            awaiting_tool: true,
         }),
     );
 
@@ -1688,4 +1691,98 @@ fn rootless_request_browses_in_its_owner_and_cancellation_does_not_revive_it() {
     app.handle_input(&Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)));
     assert!(app.agents.get(&source).unwrap().ssh_manager.is_none(),
         "late failure must not insert a diagnostic over the cancelled manager");
+}
+
+#[test]
+fn ssh_tool_grant_resolution_closes_its_transient_prompt_after_direct_inspection() {
+    for approved in [false, true] {
+        let mut app = test_app_with_agent();
+        let source = AgentId(0);
+        app.active_view = ActiveView::Agent(source);
+        let session_id = app.agents.get(&source).unwrap().session.session_id.as_ref().unwrap().to_string();
+        let mut request = grant_request("waiting-tool", TARGET_ID, CANONICAL_ROOT, app.ssh_client_id);
+        request.session_id = session_id.clone();
+        request.awaiting_tool = true;
+        request.verified_identity = None;
+        apply_ssh_control_event(&mut app, Some(session_id.clone()), None,
+            SshEvent::GrantRequested(request.clone()));
+        let owner = ssh_manager_owner(&app).expect("tool request must automatically open consent");
+        request.verified_identity = Some(binding(TARGET_ID, CANONICAL_ROOT).identity);
+        apply_ssh_control_event(&mut app, Some(session_id.clone()), Some(owner),
+            SshEvent::GrantRequested(request));
+        let resolved_binding = if approved {
+            approve(&mut app, "waiting-tool", Some(TARGET_ID), Some(CANONICAL_ROOT));
+            let mut granted = binding(TARGET_ID, CANONICAL_ROOT);
+            granted.session_id = session_id.clone();
+            Some(granted)
+        } else { None };
+        apply_ssh_control_event(&mut app, Some(session_id.clone()), None,
+            SshEvent::GrantResolved {
+                request_id: "waiting-tool".into(), approved, binding: resolved_binding,
+            });
+        assert!(app.agents.get(&source).unwrap().ssh_manager.is_none(),
+            "both approval and cancellation must return to the originating conversation");
+        dispatch(Action::TaskComplete(TaskResult::SshGrantInspected {
+            session_id: Some(session_id), request_id: "waiting-tool".into(),
+            client_id: app.ssh_client_id, owner, result: Err("late inspection failure".into()),
+        }), &mut app);
+        assert!(app.agents.get(&source).unwrap().ssh_manager.is_none(),
+            "a late inspection must not resurrect the resolved prompt");
+    }
+}
+
+#[test]
+fn ssh_tool_grant_resolution_preserves_an_explicit_manager() {
+    let mut app = test_app_with_agent();
+    let source = AgentId(0);
+    app.active_view = ActiveView::Agent(source);
+    dispatch(Action::OpenSshManager, &mut app);
+    let owner = ssh_manager_owner(&app).unwrap();
+    let session_id = app.agents.get(&source).unwrap().session.session_id.as_ref().unwrap().to_string();
+    let mut request = grant_request("existing-manager", TARGET_ID, CANONICAL_ROOT, app.ssh_client_id);
+    request.session_id = session_id.clone();
+    request.awaiting_tool = true;
+    apply_ssh_control_event(&mut app, Some(session_id.clone()), None, SshEvent::GrantRequested(request));
+    apply_ssh_control_event(&mut app, Some(session_id), None,
+        SshEvent::GrantResolved { request_id: "existing-manager".into(), approved: false, binding: None });
+    assert_eq!(ssh_manager_owner(&app), Some(owner));
+    assert!(app.agents.get(&source).unwrap().ssh_manager.as_ref().unwrap()
+        .grant_session_id_for("existing-manager").is_none());
+}
+
+#[test]
+fn ssh_tool_grant_authentication_stays_with_its_hidden_originating_session() {
+    let mut app = test_app_with_agent();
+    let source = AgentId(0);
+    app.active_view = ActiveView::Agent(source);
+    let session_id = app.agents.get(&source).unwrap().session.session_id.as_ref().unwrap().to_string();
+    let mut request = grant_request("auth-waiting-tool", TARGET_ID, CANONICAL_ROOT, app.ssh_client_id);
+    request.session_id = session_id.clone();
+    request.awaiting_tool = true;
+    request.verified_identity = None;
+    apply_ssh_control_event(&mut app, Some(session_id.clone()), None,
+        SshEvent::GrantRequested(request));
+    app.active_view = ActiveView::Welcome;
+    let client_id = app.ssh_client_id;
+    apply_ssh_control_event(&mut app, None, None,
+        SshEvent::Authentication(xai_grok_shell::ssh::SshAuthPrompt {
+            client_id,
+            connection_generation: 3,
+            challenge_id: "grant-password".into(),
+            target_id: TARGET_ID.into(),
+            kind: xai_grok_shell::ssh::SshAuthPromptKind::Password,
+            detail: xai_grok_shell::ssh::SshAuthPromptDetail::Secret {
+                username: "fixture-user".into(),
+                message: "Password required".into(),
+                allow_remember: false,
+            },
+        }));
+    assert!(app.welcome_ssh_manager.is_none(),
+        "a grant's password prompt must not appear on the unrelated active Welcome view");
+    let manager = app.agents.get_mut(&source).unwrap().ssh_manager.as_mut().unwrap();
+    assert!(matches!(
+        handle_ssh_key(manager, &KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
+        SshModalOutcome::AnswerAuthentication { challenge_id, connection_generation: 3, .. }
+            if challenge_id == "grant-password"
+    ));
 }

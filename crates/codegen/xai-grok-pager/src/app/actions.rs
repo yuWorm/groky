@@ -23,6 +23,12 @@ pub struct SshManagerOwner {
     pub instance_id: u64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SshGrantReplyKind {
+    Requested,
+    Resolved,
+}
+
 /// Typed error for model switch failures.
 /// Replaces the raw `String` in `TaskResult::SwitchModelComplete` so dispatch can match on the variant instead of parsing strings.
 #[derive(Debug, Clone)]
@@ -717,7 +723,10 @@ pub enum Action {
     ApproveSshOperation {
         approval_id: String,
         approved: bool,
+        scope: xai_grok_shell::ssh::SshOperationApprovalScope,
     },
+    /// Restore per-operation prompts for one current SSH binding.
+    ResetSshOperationApprovals { binding_id: String },
     /// Resolve explicit consent to download an exact managed worker build locally and upload it
     /// over the already-authenticated SSH connection.
     ApproveSshWorkerInstall {
@@ -2629,6 +2638,13 @@ pub enum Effect {
         owner: SshManagerOwner,
         approval_id: String,
         approved: bool,
+        scope: xai_grok_shell::ssh::SshOperationApprovalScope,
+    },
+    SshResetOperationApprovals {
+        session_id: String,
+        binding_id: String,
+        client_id: u64,
+        owner: SshManagerOwner,
     },
     /// Resolve one exact managed-worker local-download/upload fallback.
     SshApproveWorkerInstall {

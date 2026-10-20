@@ -3,7 +3,7 @@
 use super::ctx::{
     SwitchCause, active_agent_session_id, get_active_agent_mut, show_welcome, switch_to_agent,
 };
-use crate::app::actions::{Action, Effect, SshManagerOwner};
+use crate::app::actions::{Action, Effect, SshGrantReplyKind, SshManagerOwner};
 use crate::app::app_view::{AppView, InputOutcome};
 use crate::views::ssh_modal::SshModalOutcome;
 
@@ -82,10 +82,14 @@ fn map_ssh_modal_outcome(outcome: SshModalOutcome) -> InputOutcome {
         SshModalOutcome::ApproveOperation {
             approval_id,
             approved,
+            scope,
         } => InputOutcome::Action(Action::ApproveSshOperation {
             approval_id,
             approved,
+            scope,
         }),
+        SshModalOutcome::ResetOperationApprovals { binding_id } =>
+            InputOutcome::Action(Action::ResetSshOperationApprovals { binding_id }),
         SshModalOutcome::ApproveWorkerInstall {
             request_id,
             session_id,
@@ -194,15 +198,15 @@ pub(super) fn ssh_manager_owner_for_session(
     })
 }
 
-fn project_manager_owner_for_target(app: &AppView, target_id: &str) -> Option<SshManagerOwner> {
+fn ssh_manager_owner_for_authentication(app: &AppView, target_id: &str) -> Option<SshManagerOwner> {
     if let Some(manager) = app.welcome_ssh_manager.as_ref()
-        && manager.pending_project_target_id() == Some(target_id)
+        && manager.pending_authentication_target_id() == Some(target_id)
     {
         return Some(SshManagerOwner { agent_id: None, instance_id: manager.instance_id() });
     }
     app.agents.iter().find_map(|(agent_id, agent)| {
         agent.ssh_manager.as_ref().filter(|manager| {
-            manager.pending_project_target_id() == Some(target_id)
+            manager.pending_authentication_target_id() == Some(target_id)
         }).map(|manager| SshManagerOwner {
             agent_id: Some(*agent_id), instance_id: manager.instance_id(),
         })
@@ -467,25 +471,25 @@ pub(super) fn close_ssh_manager_for_owner(app: &mut AppView, owner: SshManagerOw
 
 const DIRECT_SSH_GRANT_REPLY_CAP: usize = 32;
 
-fn remember_direct_ssh_grant_reply(app: &mut AppView, request_id: &str) {
+fn remember_direct_ssh_grant_reply(app: &mut AppView, request_id: &str, kind: SshGrantReplyKind) {
     if app
         .direct_ssh_grant_replies
         .iter()
-        .any(|seen| seen == request_id)
+        .any(|(seen, phase)| seen == request_id && *phase == kind)
     {
         return;
     }
     app.direct_ssh_grant_replies
-        .push_back(request_id.to_owned());
+        .push_back((request_id.to_owned(), kind));
     while app.direct_ssh_grant_replies.len() > DIRECT_SSH_GRANT_REPLY_CAP {
         app.direct_ssh_grant_replies.pop_front();
     }
 }
 
-fn is_direct_ssh_grant_reply(app: &AppView, request_id: &str) -> bool {
+fn is_direct_ssh_grant_reply(app: &AppView, request_id: &str, kind: SshGrantReplyKind) -> bool {
     app.direct_ssh_grant_replies
         .iter()
-        .any(|seen| seen == request_id)
+        .any(|(seen, phase)| seen == request_id && *phase == kind)
 }
 
 /// Events are session-scoped, not modal-scoped. When a normal project receives a local SSH
@@ -787,7 +791,7 @@ pub(super) fn apply_ssh_project_prepared(
                 && request.target_id.as_deref() == Some(target_id.as_str())
                 && request.client_id == Some(app.ssh_client_id) =>
         {
-            remember_direct_ssh_grant_reply(app, &request.id);
+            remember_direct_ssh_grant_reply(app, &request.id, SshGrantReplyKind::Requested);
             let grant_request_id = request.id.clone();
             let shown = ssh_manager_for_owner_mut(app, owner).is_some_and(|manager| {
                 manager.show_project_consent(request_id, incoming_grant(request), project_session_id)
@@ -834,6 +838,7 @@ fn incoming_grant(request: xai_grok_shell::ssh::SshGrantRequest)
             "{}@{}:{} ({})", identity.username, identity.hostname, identity.port, identity.fingerprint,
         )),
         reason: request.reason,
+        awaiting_tool: request.awaiting_tool,
     }
 }
 
@@ -1153,6 +1158,7 @@ pub(super) fn dispatch_approve_ssh_operation(
     app: &mut AppView,
     approval_id: String,
     approved: bool,
+    scope: xai_grok_shell::ssh::SshOperationApprovalScope,
 ) -> Vec<Effect> {
     let Some(owner) = ssh_manager_owner(app) else {
         return vec![];
@@ -1170,7 +1176,18 @@ pub(super) fn dispatch_approve_ssh_operation(
         owner,
         approval_id,
         approved,
+        scope,
     }]
+}
+
+pub(super) fn dispatch_reset_ssh_operation_approvals(
+    app: &mut AppView, binding_id: String,
+) -> Vec<Effect> {
+    let Some(owner) = ssh_manager_owner(app) else { return vec![] };
+    let client_id = app.ssh_client_id;
+    let Some(manager) = ssh_manager_for_owner_mut(app, owner) else { return vec![] };
+    let Some(session_id) = manager.session_id.clone() else { return vec![] };
+    vec![Effect::SshResetOperationApprovals { session_id, binding_id, client_id, owner }]
 }
 
 pub(super) fn dispatch_approve_ssh_worker_install(
@@ -1364,9 +1381,14 @@ pub(super) fn apply_ssh_control_event(
     event: xai_grok_shell::ssh::SshEvent,
 ) -> Vec<Effect> {
     let client_id = app.ssh_client_id;
+    if matches!(&event, xai_grok_shell::ssh::SshEvent::GrantRequested(request)
+        if request.client_id != Some(client_id))
+    {
+        return vec![Effect::SshAwaitEvent { client_id, session_id }];
+    }
     let owner = owner.or_else(|| match &event {
         xai_grok_shell::ssh::SshEvent::Authentication(prompt) =>
-            project_manager_owner_for_target(app, &prompt.target_id),
+            ssh_manager_owner_for_authentication(app, &prompt.target_id),
         _ => None,
     });
     match &event {
@@ -1461,17 +1483,17 @@ pub(super) fn apply_ssh_control_event(
         }
         _ => {}
     }
-    let direct_grant_request_id = match &event {
-        xai_grok_shell::ssh::SshEvent::GrantRequested(request) => Some(request.id.as_str()),
-        xai_grok_shell::ssh::SshEvent::GrantResolved { request_id, .. } => {
-            Some(request_id.as_str())
-        }
+    let direct_grant_reply = match &event {
+        xai_grok_shell::ssh::SshEvent::GrantRequested(request) =>
+            Some((request.id.as_str(), SshGrantReplyKind::Requested)),
+        xai_grok_shell::ssh::SshEvent::GrantResolved { request_id, .. } =>
+            Some((request_id.as_str(), SshGrantReplyKind::Resolved)),
         _ => None,
     };
-    if let Some(request_id) = direct_grant_request_id {
+    if let Some((request_id, kind)) = direct_grant_reply {
         if owner.is_some() {
-            remember_direct_ssh_grant_reply(app, request_id);
-        } else if is_direct_ssh_grant_reply(app, request_id) {
+            remember_direct_ssh_grant_reply(app, request_id, kind);
+        } else if is_direct_ssh_grant_reply(app, request_id, kind) {
             return vec![Effect::SshAwaitEvent {
                 client_id,
                 session_id,
@@ -1516,6 +1538,10 @@ pub(super) fn apply_ssh_control_event(
         }
         _ => event_session_id.clone(),
     };
+    let transient_tool_request = matches!(
+        &event, xai_grok_shell::ssh::SshEvent::GrantRequested(request) if request.awaiting_tool
+    ) && owner.is_none()
+        && existing_ssh_manager_for_session(app, manager_session_id.as_deref()).is_none();
     let operation_approval_origin = match (&owner, &event) {
         (Some(owner), xai_grok_shell::ssh::SshEvent::OperationApproval(_)) => {
             ssh_manager_for_owner_mut(app, *owner)
@@ -1532,6 +1558,7 @@ pub(super) fn apply_ssh_control_event(
     let resolution_owner = owner
         .or_else(|| ssh_manager_owner_for_session(app, manager_session_id.as_deref()));
     let mut grant_resolution = None;
+    let mut close_tool_manager = false;
     let mut project_resolution = None;
     let mut grant_follow_up = None;
     let mut grant_continuation = SshModalOutcome::Unchanged;
@@ -1562,9 +1589,13 @@ pub(super) fn apply_ssh_control_event(
                             &request.id, request.target_id.as_deref(), request.root.as_deref(),
                         );
                     }
+                    let transient_request_id = transient_tool_request.then(|| request.id.clone());
                     grant_continuation = manager.show_incoming_grant(
                         request.session_id.clone(), incoming_grant(request),
                     );
+                    if let Some(request_id) = transient_request_id {
+                        manager.mark_transient_tool_grant(&request_id);
+                    }
                 }
             }
             xai_grok_shell::ssh::SshEvent::GrantResolved {
@@ -1594,6 +1625,7 @@ pub(super) fn apply_ssh_control_event(
                     if pending_project.is_some() {
                         project_resolution = manager.pending_project_request_id();
                     }
+                    close_tool_manager = manager.is_transient_tool_grant(&request_id);
                     manager.settle_grant(approved);
                     if !approved
                         && let Some(request_id) = project_resolution
@@ -1706,8 +1738,6 @@ pub(super) fn apply_ssh_control_event(
                 {
                     let (target_label, target_identity) =
                         operation_approval_target(&approval.detail, &approval.binding_id, manager);
-                    let detail = serde_json::to_string_pretty(&approval.detail)
-                        .unwrap_or_else(|_| "Remote operation details are unavailable.".into());
                     manager.show_operation_approval(
                         crate::views::ssh_modal::SshOperationApprovalCard::new(
                             approval.approval_id,
@@ -1715,7 +1745,8 @@ pub(super) fn apply_ssh_control_event(
                             target_label,
                             target_identity,
                             approval.title,
-                            detail,
+                            approval.detail,
+                            approval.operation,
                         ),
                         operation_approval_origin,
                     );
@@ -1735,6 +1766,12 @@ pub(super) fn apply_ssh_control_event(
                 }];
             }
         }
+    }
+    if close_tool_manager
+        && let Some(owner) = resolution_owner
+    {
+        close_ssh_manager_for_owner(app, owner);
+        return vec![Effect::SshAwaitEvent { client_id, session_id }];
     }
     if let Some((true, Some(binding))) = grant_resolution {
         if project_resolution.is_some() {

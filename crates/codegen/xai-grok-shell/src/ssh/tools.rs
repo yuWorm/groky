@@ -463,7 +463,7 @@ pub(super) struct SshRequestAccessTool;
 metadata!(
     SshRequestAccessTool,
     xai_grok_tools::types::tool::ToolKind::Other,
-    "Request human approval for a session-scoped SSH target and root. This never grants access by itself, even when ordinary operations are configured for automatic approval. Omit target and root to let the local user choose without exposing configured targets."
+    "Request human approval for a session-scoped SSH target and root. The call waits for that decision and, if approved, returns the exact narrowed binding target, root, and capabilities. It never grants access by itself, even when ordinary operations are configured for automatic approval. Omit target and root to let the local user choose without exposing configured targets."
 );
 
 impl Tool for SshRequestAccessTool {
@@ -500,22 +500,34 @@ impl Tool for SshRequestAccessTool {
         input: SshRequestAccessInput,
     ) -> Result<Self::Output, xai_tool_runtime::ToolError> {
         let resource = session_resource(&ctx).await?;
-        let request = resource
+        let cancellation = ctx
+            .get::<xai_tool_runtime::Cancellation>()
+            .map(|cancellation| cancellation.0.clone());
+        let binding = resource
             .service
-            .request_grant(
+            .request_tool_grant(
                 resource.session_id,
                 input.target,
                 input.root,
                 input.capabilities.into(),
                 input.reason,
                 resource.client_id,
+                cancellation,
             )
             .await
             .map_err(service_error)?;
-        serde_json::to_value(request)
-            .map(Into::into)
-            .map_err(|error| xai_tool_runtime::ToolError::custom("ssh", error.to_string()))
-    }
+        Ok(serde_json::json!({
+            "granted": true,
+            "binding_id": binding.id,
+            "target_id": binding.target_id,
+            "root": binding.root,
+            "cwd": binding.cwd,
+            "capabilities": binding.capabilities,
+            "identity": binding.identity,
+            "epoch": binding.epoch,
+        })
+        .into())
+}
 }
 
 #[derive(Debug, Default)]
@@ -689,6 +701,11 @@ async fn session_resource(
 
 fn service_error(error: super::SshServiceError) -> xai_tool_runtime::ToolError {
     match error {
+        super::SshServiceError::GrantCancelled => xai_tool_runtime::ToolError::cancelled(
+            xai_tool_protocol::ToolId::new("ssh_request_access")
+                .expect("static SSH tool ID is valid"),
+            "SSH access request was cancelled before a human decision granted authority.",
+        ),
         super::SshServiceError::WorkerHook { message, outcome } => {
             xai_tool_runtime::ToolError::custom(
                 "ssh",

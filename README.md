@@ -184,6 +184,23 @@ diagnostics and return to the last valid folder for retry.
 `r` revokes only the selected grant. Each active grant has its own row.
 Target rows and footer actions are clickable; the wheel scrolls lists. Permission
 options support clicks and `Tab`/`Space`; `PgUp`/`PgDn` inspect wrapped details.
+
+Model access requests open a consent dialog and wait for your decision. Approval returns
+the actual granted folder and permissions to the same tool call, so work continues without
+another chat message. Denial, cancellation, client disconnect, or session closure stops that
+request; a late approval cannot revive it.
+
+SSH operation approval shows highlighted, multiline commands or exact file contents/old-new
+edits instead of escaped JSON. Scroll with the wheel, arrows/`j`/`k`, `PgUp`/`PgDn`, or
+`Home`/`End`; `d` toggles raw details and `c` copies the exact command. After reviewing the
+full preview, choose `y` to allow once, `a` to allow that operation kind for the current
+SSH session and binding, or `n`/`Esc` to deny. Command execution and file writes have
+separate auto-approval rules. These rules do not survive session closure, grant revocation,
+or client disconnect, and are not inherited by other sessions or grants. Select the grant
+under Advanced and press `p` (“ask each time”) to reset its operation approvals.
+Auto-approval never expands access permissions or bypasses host verification; remote commands
+still run with the SSH user's privileges, and the working directory is not a sandbox.
+
 Passwords, encrypted private keys, ssh-agent and keyboard-interactive authentication are supported.
 Host trust and access grants are separate confirmations. Passwords are masked and
 remembered only by explicit opt-in to the OS credential store; if that store is

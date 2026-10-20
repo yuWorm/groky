@@ -5,7 +5,7 @@ use xai_grok_workspace_types::ssh::{SshCapabilities, SshHostIdentity};
 
 use super::model::{
     RevokeStatus, SshAuthResponse, SshDirectoryListing, SshOperationApprovalDecision,
-    SshProjectPreparation, SshTargetAccess, SshTargetStatus,
+    SshOperationApprovalScope, SshProjectPreparation, SshTargetAccess, SshTargetStatus,
 };
 use super::{SshGrantDecision, SshGrantRequest};
 
@@ -92,6 +92,11 @@ pub enum SshControlCommand {
     },
     SubmitAuthentication(SshAuthControlResponse),
     SubmitOperationApproval(SshOperationApprovalDecision),
+    ResetOperationApprovals {
+        session_id: String,
+        binding_id: String,
+    },
+
     SubmitWorkerInstall(super::SshWorkerInstallDecision),
 }
 
@@ -250,6 +255,8 @@ pub enum SshControlReply {
     TargetStatus(SshTargetStatus),
     AuthenticationAccepted,
     OperationApprovalAccepted,
+    OperationApprovalsReset,
+
     WorkerInstallAccepted,
 }
 
@@ -290,6 +297,17 @@ mod tests {
                 expected_identity: Some(identity.clone()),
                 capabilities: None,
             },
+            SshControlCommand::ResetOperationApprovals {
+                session_id: "child-session".into(),
+                binding_id: "binding".into(),
+            },
+            SshControlCommand::SubmitOperationApproval(SshOperationApprovalDecision {
+                client_id: 7,
+                approval_id: "approval".into(),
+                approved: true,
+                scope: SshOperationApprovalScope::Session,
+            }),
+
         ] {
             let command = ControlCommand::Ssh(command);
             let frame = serde_json::to_vec(&command).unwrap();
@@ -323,8 +341,12 @@ mod tests {
                     reason: "Open selected remote project".into(),
                     verified_identity: Some(identity),
                     client_id: Some(7),
+                    awaiting_tool: false,
+
                 },
             )),
+            SshControlReply::OperationApprovalsReset,
+
         ] {
             let reply = ControlPayload::Ssh(reply);
             let frame = serde_json::to_vec(&reply).unwrap();

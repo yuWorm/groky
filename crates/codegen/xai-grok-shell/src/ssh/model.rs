@@ -29,6 +29,11 @@ pub struct SshGrantRequest {
     /// The local client that must receive the approval and authentication UI.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub client_id: Option<u64>,
+    /// True only while a live model tool call is waiting for this request's
+    /// human decision. It is never restored as authority after that call ends.
+    #[serde(default)]
+    pub awaiting_tool: bool,
+
 }
 
 /// A directory a local SSH project picker can navigate to. The path is a
@@ -253,11 +258,21 @@ pub struct SshOperationApproval {
     pub detail: serde_json::Value,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SshOperationApprovalScope {
+    #[default]
+    Once,
+    Session,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SshOperationApprovalDecision {
     pub client_id: u64,
     pub approval_id: String,
     pub approved: bool,
+    #[serde(default)]
+    pub scope: SshOperationApprovalScope,
 }
 
 /// Local-only consent to download an exact worker build locally and upload it over SSH.

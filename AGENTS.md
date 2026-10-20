@@ -30,6 +30,9 @@ Next groky version after `v0.1.25`.
 - **SSH diagnostics** distinguish normal connection details from actual errors, with green connected status and wrapped, scrollable full errors that return to the retained folder or form.
 - **SSH connection status** clears completed connect/disconnect progress without replacing newer errors or another target's progress.
 - **SSH access grants** choose remote folders before permission confirmation, including requests without a directory; cancellation denies waiting requests without late popups, each active binding remains separately revocable, and default selection continues automatically after approval.
+- **SSH task continuation** waits for access approval and resumes the original tool call automatically; cancellation, session closure and client disconnect prevent late approvals from restoring access.
+- **SSH operation previews** show highlighted multiline commands and exact file changes, with mouse/keyboard scrolling, raw details and command copying.
+- **SSH operation approvals** offer allow-once or current-session approval for the exact grant and operation kind; Advanced can restore per-operation prompts without revoking access.
 - **SSH controls** offer server selection and remote folder browsing as the primary flow, with clickable rows, scrolling and keyboard-focusable permissions; grant/default/revocation controls live under Advanced.
 - **SSH target saving** prevents duplicate submissions, preserves form fields after failure, and selects the saved target with a completed status message.
 - **SSH project startup** no longer stalls on repeated pending guards, returns failures to the originating manager for retry, and isolates asynchronous results from other sessions or reopened managers.

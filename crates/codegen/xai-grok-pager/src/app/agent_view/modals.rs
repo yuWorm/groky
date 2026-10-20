@@ -245,10 +245,14 @@ impl AgentView {
             SshModalOutcome::ApproveOperation {
                 approval_id,
                 approved,
+                scope,
             } => InputOutcome::Action(Action::ApproveSshOperation {
                 approval_id,
                 approved,
+                scope,
             }),
+            SshModalOutcome::ResetOperationApprovals { binding_id } =>
+                InputOutcome::Action(Action::ResetSshOperationApprovals { binding_id }),
             SshModalOutcome::ApproveWorkerInstall {
                 request_id,
                 session_id,

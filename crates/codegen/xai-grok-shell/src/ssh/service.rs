@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Weak};
+use std::sync::{Arc, Mutex as StdMutex, Weak};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -33,8 +33,8 @@ use super::model::{
     SshDirectoryListing, SshDispatchRequest, SshDispatchResult, SshEvent, SshGrantDecision,
     SshGrantRequest, SshGrantScope, SshGrantStatus, SshHostKeyDecision,
     SshKeyboardInteractiveQuestion, SshOperationApproval, SshOperationApprovalDecision,
-    SshProjectPreparation, SshSessionWorkerEvent, SshTargetAccess, SshTargetStatus,
-    SshWorkerInstallDecision, SshWorkerInstallProgress, SshWorkerInstallRequest,
+    SshOperationApprovalScope, SshProjectPreparation, SshSessionWorkerEvent, SshTargetAccess,
+    SshTargetStatus, SshWorkerInstallDecision, SshWorkerInstallProgress, SshWorkerInstallRequest,
 };
 
 const INTERACTION_TIMEOUT: Duration = Duration::from_secs(300);
@@ -83,6 +83,18 @@ pub enum SshServiceError {
     StaleOperationApproval,
     #[error("SSH worker installation consent is stale or belongs to another client or grant")]
     StaleWorkerInstall,
+    #[error("SSH access request was denied by the local user")]
+    GrantDenied,
+    #[error("SSH access request was cancelled")]
+    GrantCancelled,
+    #[error("timed out waiting for a local SSH access decision")]
+    GrantTimedOut,
+    #[error("SSH access requires an interactive local client")]
+    InteractiveClientRequired,
+    #[error("an SSH access request is already awaiting a local decision for this session")]
+    GrantRequestPending,
+
+
     #[error("SSH transport: {0}")]
     Transport(String),
     #[error("SSH worker: {0}")]
@@ -153,7 +165,9 @@ struct SessionSshInner {
     manual_holds: Mutex<HashMap<String, ConnectionLease>>,
     auth_waiters: Mutex<HashMap<String, PendingAuthentication>>,
     session_event_sinks: Mutex<HashMap<String, broadcast::Sender<SshSessionWorkerEvent>>>,
+    grant_waiters: StdMutex<HashMap<String, PendingToolGrant>>,
     approval_waiters: Mutex<HashMap<String, PendingOperationApproval>>,
+    operation_approval_policies: Mutex<Vec<OperationApprovalPolicy>>,
     worker_install_waiters: Mutex<HashMap<String, PendingWorkerInstall>>,
     project_registrations: RwLock<HashMap<String, ProjectRegistration>>,
     project_rules_path: PathBuf,
@@ -176,7 +190,12 @@ impl SessionState {
             .map(|record| record.persisted.clone())
             .collect::<Vec<_>>();
         grants.sort_by(|left, right| left.binding.id.cmp(&right.binding.id));
-        let mut pending_requests = self.pending_requests.values().cloned().collect::<Vec<_>>();
+        let mut pending_requests = self
+            .pending_requests
+            .values()
+            .filter(|request| !request.awaiting_tool)
+            .cloned()
+            .collect::<Vec<_>>();
         pending_requests.sort_by(|left, right| left.id.cmp(&right.id));
         PersistedSshState {
             grants,
@@ -216,9 +235,82 @@ struct PendingAuthentication {
     response: oneshot::Sender<SshAuthResponse>,
 }
 
+struct PendingToolGrant {
+    session_id: String,
+    client_id: u64,
+    cancelled: Arc<AtomicBool>,
+    response: Option<oneshot::Sender<ToolGrantResolution>>,
+    /// Set after grant state commits and before the model's waiter is woken.
+    /// The wait guard removes this only after the tool observes the result.
+    delivered: Option<(String, String)>,
+}
+
+#[derive(Debug, Clone)]
+enum ToolGrantResolution {
+    Granted(SshBinding),
+    Denied,
+    Cancelled,
+    TimedOut,
+}
+
 struct PendingOperationApproval {
     client_id: u64,
+    binding: SshBinding,
+    operation: SshOperation,
     response: oneshot::Sender<bool>,
+}
+
+#[derive(Clone)]
+struct OperationApprovalPolicy {
+    client_id: u64,
+    session_id: String,
+    binding_id: String,
+    epoch: u64,
+    identity: SshHostIdentity,
+    operation: SshOperation,
+}
+
+struct ToolGrantWaitGuard {
+    service: SessionSsh,
+    request_id: String,
+    armed: bool,
+}
+
+impl ToolGrantWaitGuard {
+    fn new(service: SessionSsh, request_id: String) -> Self {
+        Self {
+            service,
+            request_id,
+            armed: true,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+        self.service
+            .inner
+            .grant_waiters
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&self.request_id);
+    }
+}
+
+impl Drop for ToolGrantWaitGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let request_id = self.request_id.clone();
+        let service = self.service.clone();
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            runtime.spawn(async move {
+                service
+                    .abandon_tool_grant(&request_id, ToolGrantResolution::Cancelled)
+                    .await;
+            });
+        }
+    }
 }
 
 struct PendingWorkerInstall {
@@ -310,7 +402,9 @@ impl SessionSsh {
                 manual_holds: Mutex::new(HashMap::new()),
                 auth_waiters: Mutex::new(HashMap::new()),
                 session_event_sinks: Mutex::new(HashMap::new()),
+                grant_waiters: StdMutex::new(HashMap::new()),
                 approval_waiters: Mutex::new(HashMap::new()),
+                operation_approval_policies: Mutex::new(Vec::new()),
                 worker_install_waiters: Mutex::new(HashMap::new()),
                 project_registrations: RwLock::new(HashMap::new()),
                 project_rules_path,
@@ -580,6 +674,7 @@ impl SessionSsh {
                 reason: "Open selected remote project".into(),
                 verified_identity: Some(identity),
                 client_id: Some(client_id),
+                awaiting_tool: false,
             })
             .await?;
         Ok(SshProjectPreparation::NeedsApproval(request))
@@ -1017,6 +1112,15 @@ impl SessionSsh {
                 self.submit_operation_approval(decision).await?;
                 Ok(SshControlReply::OperationApprovalAccepted)
             }
+            SshControlCommand::ResetOperationApprovals {
+                session_id,
+                binding_id,
+            } => {
+                self.reset_operation_approvals(&session_id, &binding_id, client_id)
+                    .await?;
+                Ok(SshControlReply::OperationApprovalsReset)
+            }
+
             SshControlCommand::SubmitWorkerInstall(decision) => {
                 if decision.client_id != client_id {
                     return Err(SshServiceError::WrongClient);
@@ -1090,6 +1194,7 @@ impl SessionSsh {
             .map(|mut request| {
                 request.verified_identity = None;
                 request.client_id = None;
+                request.awaiting_tool = false;
                 (request.id.clone(), request)
             })
             .collect();
@@ -1100,13 +1205,113 @@ impl SessionSsh {
             }
         }
         sessions.insert(
-            session_id,
+            session_id.clone(),
             SessionState {
                 grants,
                 default_binding_id: state.default_binding_id,
                 pending_requests,
             },
         );
+        drop(sessions);
+        self.inner
+            .grant_waiters
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .retain(|_, waiter| waiter.session_id != session_id);
+        self.inner
+            .approval_waiters
+            .lock()
+            .await
+            .retain(|_, waiter| waiter.binding.session_id != session_id);
+        self.inner
+            .operation_approval_policies
+            .lock()
+            .await
+            .retain(|policy| policy.session_id != session_id);
+        self.inner
+            .worker_install_waiters
+            .lock()
+            .await
+            .retain(|_, waiter| waiter.binding.session_id != session_id);
+    }
+
+    /// Removes ephemeral approvals and unanswered interaction waiters owned by
+    /// a disconnected local client. Durable SSH grants are intentionally not
+    /// affected.
+    pub async fn clear_client_interactions(&self, client_id: u64) {
+        self.inner
+            .approval_waiters
+            .lock()
+            .await
+            .retain(|_, waiter| waiter.client_id != client_id);
+        self.inner
+            .operation_approval_policies
+            .lock()
+            .await
+            .retain(|policy| policy.client_id != client_id);
+        self.inner
+            .auth_waiters
+            .lock()
+            .await
+            .retain(|_, waiter| waiter.client_id != client_id);
+        self.inner
+            .worker_install_waiters
+            .lock()
+            .await
+            .retain(|_, waiter| waiter.client_id != client_id);
+        let request_ids = {
+            let waiters = self
+                .inner
+                .grant_waiters
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            waiters
+                .iter()
+                .filter_map(|(request_id, waiter)| {
+                    (waiter.client_id == client_id).then(|| request_id.clone())
+                })
+                .collect::<Vec<_>>()
+        };
+        for request_id in request_ids {
+            self.abandon_tool_grant(&request_id, ToolGrantResolution::Cancelled)
+                .await;
+        }
+    }
+
+    /// Removes all nonpersistent approval state for a terminal session close.
+    pub async fn clear_session_interactions(&self, session_id: &str) {
+        self.inner
+            .approval_waiters
+            .lock()
+            .await
+            .retain(|_, waiter| waiter.binding.session_id != session_id);
+        self.inner
+            .operation_approval_policies
+            .lock()
+            .await
+            .retain(|policy| policy.session_id != session_id);
+        self.inner
+            .worker_install_waiters
+            .lock()
+            .await
+            .retain(|_, waiter| waiter.binding.session_id != session_id);
+        let request_ids = {
+            let waiters = self
+                .inner
+                .grant_waiters
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            waiters
+                .iter()
+                .filter_map(|(request_id, waiter)| {
+                    (waiter.session_id == session_id).then(|| request_id.clone())
+                })
+                .collect::<Vec<_>>()
+        };
+        for request_id in request_ids {
+            self.abandon_tool_grant(&request_id, ToolGrantResolution::Cancelled)
+                .await;
+        }
     }
 
     /// Creates a request only. This function cannot grant target authority and
@@ -1131,8 +1336,87 @@ impl SessionSsh {
             reason,
             verified_identity: None,
             client_id,
+            awaiting_tool: false,
+
         };
         self.publish_grant_request(request).await
+    }
+
+    /// Publishes a model-originated grant request and waits for its exact human
+    /// decision. Unlike [`Self::request_grant`], this does not return a pending
+    /// request to the model.
+    pub async fn request_tool_grant(
+        &self,
+        session_id: impl Into<String>,
+        target_id: Option<String>,
+        root: Option<String>,
+        capabilities: SshCapabilities,
+        reason: String,
+        client_id: Option<u64>,
+        cancellation: Option<tokio_util::sync::CancellationToken>,
+    ) -> Result<SshBinding, SshServiceError> {
+        let client_id = client_id.ok_or(SshServiceError::InteractiveClientRequired)?;
+        if cancellation
+            .as_ref()
+            .is_some_and(|token| token.is_cancelled())
+        {
+            return Err(SshServiceError::GrantCancelled);
+        }
+        let request = SshGrantRequest {
+            id: Uuid::now_v7().to_string(),
+            session_id: session_id.into(),
+            originating_session_id: None,
+            target_id,
+            root,
+            capabilities,
+            reason,
+            verified_identity: None,
+            client_id: Some(client_id),
+            awaiting_tool: true,
+        };
+        let receiver = self.register_tool_grant_waiter(&request).await?;
+        let mut guard = ToolGrantWaitGuard::new(self.clone(), request.id.clone());
+        if let Err(error) = self.publish_tool_grant_request(request.clone()).await {
+            self.abandon_tool_grant(&request.id, ToolGrantResolution::Cancelled).await;
+            guard.disarm();
+            return Err(error);
+        }
+        let resolution = if let Some(cancellation) = cancellation {
+            tokio::select! {
+                biased;
+                _ = cancellation.cancelled() => {
+                    self.abandon_tool_grant(&request.id, ToolGrantResolution::Cancelled).await;
+                    guard.disarm();
+                    return Err(SshServiceError::GrantCancelled);
+                }
+                result = tokio::time::timeout(INTERACTION_TIMEOUT, receiver) => match result {
+                    Ok(Ok(resolution)) => resolution,
+                    Ok(Err(_)) => ToolGrantResolution::Cancelled,
+                    Err(_) => {
+                        self.abandon_tool_grant(&request.id, ToolGrantResolution::TimedOut).await;
+                        guard.disarm();
+                        return Err(SshServiceError::GrantTimedOut);
+                    }
+                },
+            }
+        } else {
+            match tokio::time::timeout(INTERACTION_TIMEOUT, receiver).await {
+                Ok(Ok(resolution)) => resolution,
+                Ok(Err(_)) => ToolGrantResolution::Cancelled,
+                Err(_) => {
+                    self.abandon_tool_grant(&request.id, ToolGrantResolution::TimedOut).await;
+                    guard.disarm();
+                    return Err(SshServiceError::GrantTimedOut);
+                }
+            }
+        };
+        guard.disarm();
+        match resolution {
+            ToolGrantResolution::Granted(binding) => Ok(binding),
+            ToolGrantResolution::Denied => Err(SshServiceError::GrantDenied),
+            ToolGrantResolution::Cancelled => Err(SshServiceError::GrantCancelled),
+            ToolGrantResolution::TimedOut => Err(SshServiceError::GrantTimedOut),
+        }
     }
 
     pub(crate) async fn request_worktree_grant(
@@ -1165,6 +1449,8 @@ impl SessionSsh {
             capabilities: source.capabilities,
             verified_identity: None,
             client_id: Some(client_id),
+            awaiting_tool: false,
+
         })
         .await
     }
@@ -1173,6 +1459,40 @@ impl SessionSsh {
         &self,
         request: SshGrantRequest,
     ) -> Result<SshGrantRequest, SshServiceError> {
+        self.record_grant_request(&request).await?;
+        let _ = self
+            .inner
+            .events
+            .send(SshEvent::GrantRequested(request.clone()));
+        Ok(request)
+    }
+
+    async fn publish_tool_grant_request(
+        &self,
+        request: SshGrantRequest,
+    ) -> Result<(), SshServiceError> {
+        let mut sessions = self.inner.sessions.write().await;
+        let state = sessions.entry(request.session_id.clone()).or_default();
+        let mut candidate = state.clone();
+        candidate.pending_requests.insert(request.id.clone(), request.clone());
+        self.persist_state(&request.session_id, &candidate).await?;
+        // Publication and cancellation share this lock: a detached client cannot
+        // leave a newly published prompt after its waiter has already been cleared.
+        let waiters = self.inner.grant_waiters.lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !waiters.get(&request.id).is_some_and(|waiter| {
+            !waiter.cancelled.load(Ordering::Acquire)
+                && waiter.response.as_ref().is_some_and(|response| !response.is_closed())
+        }) {
+            return Err(SshServiceError::GrantCancelled);
+        }
+        *state = candidate;
+        self.inner.events.send(SshEvent::GrantRequested(request))
+            .map(|_| ())
+            .map_err(|_| SshServiceError::InteractiveClientRequired)
+    }
+
+    async fn record_grant_request(&self, request: &SshGrantRequest) -> Result<(), SshServiceError> {
         self.inner
             .sessions
             .write()
@@ -1181,12 +1501,148 @@ impl SessionSsh {
             .or_default()
             .pending_requests
             .insert(request.id.clone(), request.clone());
-        self.persist_registered_session(&request.session_id).await?;
-        let _ = self
+        self.persist_registered_session(&request.session_id).await
+    }
+
+    async fn register_tool_grant_waiter(
+        &self,
+        request: &SshGrantRequest,
+    ) -> Result<oneshot::Receiver<ToolGrantResolution>, SshServiceError> {
+        let client_id = request.client_id.ok_or(SshServiceError::InteractiveClientRequired)?;
+        let (response, receiver) = oneshot::channel();
+        let waiter = PendingToolGrant {
+            session_id: request.session_id.clone(),
+            client_id,
+            cancelled: Arc::new(AtomicBool::new(false)),
+            response: Some(response),
+            delivered: None,
+        };
+        let mut waiters = self
             .inner
-            .events
-            .send(SshEvent::GrantRequested(request.clone()));
-        Ok(request)
+            .grant_waiters
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if waiters
+            .values()
+            .any(|pending| pending.session_id == request.session_id)
+        {
+            return Err(SshServiceError::GrantRequestPending);
+        }
+        if waiters.insert(request.id.clone(), waiter).is_some() {
+            return Err(SshServiceError::RequestResolved);
+        }
+        Ok(receiver)
+    }
+
+    async fn remove_pending_grant(&self, request: &SshGrantRequest) -> Result<(), SshServiceError> {
+        let mut sessions = self.inner.sessions.write().await;
+        let state = sessions
+            .get_mut(&request.session_id)
+            .ok_or_else(|| SshServiceError::UnknownGrantRequest(request.id.clone()))?;
+        let mut candidate = state.clone();
+        candidate
+            .pending_requests
+            .remove(&request.id)
+            .ok_or(SshServiceError::RequestResolved)?;
+        self.persist_state(&request.session_id, &candidate).await?;
+        *state = candidate;
+        Ok(())
+    }
+
+    async fn finish_tool_grant(
+        &self,
+        request_id: &str,
+        resolution: ToolGrantResolution,
+    ) -> bool {
+        let (response, retained_delivery) = {
+            let mut waiters = self
+                .inner
+                .grant_waiters
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            match &resolution {
+                ToolGrantResolution::Granted(binding) => {
+                    if waiters
+                        .get(request_id)
+                        .is_some_and(|waiter| waiter.cancelled.load(Ordering::Acquire))
+                    {
+                        waiters.remove(request_id);
+                        return false;
+                    }
+                    let Some(waiter) = waiters.get_mut(request_id) else {
+                        return false;
+                    };
+                    waiter.delivered = Some((binding.session_id.clone(), binding.id.clone()));
+                    (waiter.response.take(), true)
+                }
+                _ => (
+                    waiters
+                        .remove(request_id)
+                        .map(|waiter| waiter.response)
+                        .unwrap_or(None),
+                    false,
+                ),
+            }
+        };
+        let sent = response.is_some_and(|response| response.send(resolution).is_ok());
+        if !sent && retained_delivery {
+            self.inner
+                .grant_waiters
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .remove(request_id);
+        }
+        sent
+    }
+
+    async fn tool_grant_cancelled(&self, request_id: &str) -> bool {
+        self.inner
+            .grant_waiters
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(request_id)
+            .is_some_and(|waiter| waiter.cancelled.load(Ordering::Acquire))
+    }
+
+    async fn abandon_tool_grant(&self, request_id: &str, resolution: ToolGrantResolution) {
+        let delivered = {
+            let mut waiters = self
+                .inner
+                .grant_waiters
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let Some(waiter) = waiters.get_mut(request_id) else {
+                return;
+            };
+            waiter.cancelled.store(true, Ordering::Release);
+            let delivered = waiter.delivered.take();
+            if delivered.is_some() {
+                waiters.remove(request_id);
+            }
+            delivered
+        };
+        if let Some((session_id, binding_id)) = delivered {
+            let _ = self.revoke_binding(&session_id, &binding_id).await;
+            return;
+        }
+        let Ok(_claim) = self.claim_grant_resolution(request_id) else {
+            return;
+        };
+        let Ok(request) = self.pending_request(request_id).await else {
+            let _ = self.finish_tool_grant(request_id, resolution).await;
+            return;
+        };
+        if !request.awaiting_tool {
+            return;
+        }
+        if self.remove_pending_grant(&request).await.is_ok() {
+            let _ = self.inner.events.send(SshEvent::GrantResolved {
+                request_id: request.id.clone(),
+                approved: false,
+                binding: None,
+            });
+        }
+        let _ = self.finish_tool_grant(request_id, resolution).await;
     }
 
     /// Acquires only the native connection required for a user to inspect the
@@ -1296,24 +1752,30 @@ impl SessionSsh {
         let request = self.pending_request(&decision.request_id).await?;
         self.check_request_client(&request, decision.client_id)?;
         let _claim = self.claim_grant_resolution(&decision.request_id)?;
-        if !decision.approved {
-            let mut sessions = self.inner.sessions.write().await;
-            let state = sessions
-                .get_mut(&request.session_id)
-                .ok_or_else(|| SshServiceError::UnknownGrantRequest(request.id.clone()))?;
-            let mut candidate = state.clone();
-            candidate
-                .pending_requests
-                .remove(&request.id)
-                .ok_or(SshServiceError::RequestResolved)?;
-            self.persist_state(&request.session_id, &candidate).await?;
-            *state = candidate;
-            drop(sessions);
+        if request.awaiting_tool && self.tool_grant_cancelled(&request.id).await {
+            self.remove_pending_grant(&request).await?;
             let _ = self.inner.events.send(SshEvent::GrantResolved {
-                request_id: request.id,
+                request_id: request.id.clone(),
                 approved: false,
                 binding: None,
             });
+            let _ = self
+                .finish_tool_grant(&request.id, ToolGrantResolution::Cancelled)
+                .await;
+            return Ok(None);
+        }
+        if !decision.approved {
+            self.remove_pending_grant(&request).await?;
+            let _ = self.inner.events.send(SshEvent::GrantResolved {
+                request_id: request.id.clone(),
+                approved: false,
+                binding: None,
+            });
+            if request.awaiting_tool {
+                let _ = self
+                    .finish_tool_grant(&request.id, ToolGrantResolution::Denied)
+                    .await;
+            }
             return Ok(None);
         }
 
@@ -1347,6 +1809,19 @@ impl SessionSsh {
                 return Err(SshServiceError::GrantExpansion);
             }
         }
+        if request.awaiting_tool && self.tool_grant_cancelled(&request.id).await {
+            self.remove_pending_grant(&request).await?;
+            let _ = self.inner.events.send(SshEvent::GrantResolved {
+                request_id: request.id.clone(),
+                approved: false,
+                binding: None,
+            });
+            let _ = self
+                .finish_tool_grant(&request.id, ToolGrantResolution::Cancelled)
+                .await;
+            return Ok(None);
+        }
+
         let binding = SshBinding {
             id: Uuid::now_v7().to_string(),
             session_id: request.session_id.clone(),
@@ -1392,10 +1867,18 @@ impl SessionSsh {
             *state = candidate;
         }
         let _ = self.inner.events.send(SshEvent::GrantResolved {
-            request_id: request.id,
+            request_id: request.id.clone(),
             approved: true,
             binding: Some(binding.clone()),
         });
+        if request.awaiting_tool
+            && !self
+                .finish_tool_grant(&request.id, ToolGrantResolution::Granted(binding.clone()))
+                .await
+        {
+            self.revoke_binding(&request.session_id, &binding.id).await?;
+            return Ok(None);
+        }
         Ok(Some(binding))
     }
 
@@ -1453,6 +1936,28 @@ impl SessionSsh {
             }
             affected
         };
+        self.inner
+            .approval_waiters
+            .lock()
+            .await
+            .retain(|_, waiter| {
+                !affected.iter().any(|(session_id, binding, _)| {
+                    waiter.binding.session_id == *session_id && waiter.binding.id == binding.id
+                })
+            });
+        self.inner
+            .operation_approval_policies
+            .lock()
+            .await
+            .retain(|policy| {
+                !affected.iter().any(|(session_id, binding, _)| {
+                    policy.session_id == *session_id
+                        && policy.binding_id == binding.id
+                        && policy.epoch == binding.epoch
+                        && policy.identity == binding.identity
+                })
+            });
+
         {
             let mut waiters = self.inner.worker_install_waiters.lock().await;
             waiters.retain(|_, waiter| {
@@ -1754,8 +2259,7 @@ impl SessionSsh {
         let callbacks: Arc<dyn SshClientCallbacks> = Arc::new(WorkerCallbacks {
             service: Arc::downgrade(&self.inner),
             client_id,
-            session_id: binding.session_id.clone(),
-            binding_id: binding.id.clone(),
+            binding: binding.clone(),
         });
         let mut completion_guard = operation.guard(callbacks.clone());
         let mut effects_started = false;
@@ -2219,23 +2723,89 @@ impl SessionSsh {
         &self,
         decision: SshOperationApprovalDecision,
     ) -> Result<(), SshServiceError> {
-        let waiter = {
-            let mut waiters = self.inner.approval_waiters.lock().await;
-            let current = waiters
-                .get(&decision.approval_id)
-                .ok_or(SshServiceError::StaleOperationApproval)?;
-            if current.client_id != decision.client_id {
+        // Keep the exact grant read lock through policy installation. A revoke
+        // cannot turn a stale reply into a session-level approval rule.
+        let sessions = self.inner.sessions.read().await;
+        let mut waiters = self.inner.approval_waiters.lock().await;
+        let current = waiters
+            .get(&decision.approval_id)
+            .ok_or(SshServiceError::StaleOperationApproval)?;
+        if current.client_id != decision.client_id
+            || current.response.is_closed()
+            || !sessions
+                .get(&current.binding.session_id)
+                .and_then(|state| state.grants.get(&current.binding.id))
+                .is_some_and(|record| {
+                    !record.persisted.binding.revoked
+                        && record.persisted.binding == current.binding
+                        && record.persisted.binding.capabilities.permits(current.operation)
+                })
+        {
+            return Err(SshServiceError::StaleOperationApproval);
+        }
+        let PendingOperationApproval {
+            client_id,
+            binding,
+            operation,
+            response,
+        } = waiters
+            .remove(&decision.approval_id)
+            .expect("approval was present while holding the lock");
+        if decision.approved
+            && decision.scope == SshOperationApprovalScope::Session
+            && matches!(operation, SshOperation::Write | SshOperation::Execute)
+        {
+            let mut policies = self.inner.operation_approval_policies.lock().await;
+            policies.retain(|policy| {
+                !(policy.client_id == client_id
+                    && policy.session_id == binding.session_id
+                    && policy.binding_id == binding.id
+                    && policy.epoch == binding.epoch
+                    && policy.identity == binding.identity
+                    && policy.operation == operation)
+            });
+            policies.push(OperationApprovalPolicy {
+                client_id,
+                session_id: binding.session_id,
+                binding_id: binding.id,
+                epoch: binding.epoch,
+                identity: binding.identity,
+                operation,
+            });
+            if response.send(true).is_err() {
+                policies.pop();
                 return Err(SshServiceError::StaleOperationApproval);
             }
-            waiters
-                .remove(&decision.approval_id)
-                .expect("approval was present while holding the lock")
-        };
-        waiter
-            .response
-            .send(decision.approved)
-            .map_err(|_| SshServiceError::StaleOperationApproval)
+        } else if response.send(decision.approved).is_err() {
+            return Err(SshServiceError::StaleOperationApproval);
+        }
+        Ok(())
     }
+
+    async fn reset_operation_approvals(
+        &self,
+        session_id: &str,
+        binding_id: &str,
+        client_id: u64,
+    ) -> Result<(), SshServiceError> {
+        let binding = self.binding(session_id, binding_id).await?;
+        if binding.revoked {
+            return Err(SshServiceError::RevokedBinding(binding_id.to_owned()));
+        }
+        self.inner
+            .operation_approval_policies
+            .lock()
+            .await
+            .retain(|policy| {
+                !(policy.client_id == client_id
+                    && policy.session_id == binding.session_id
+                    && policy.binding_id == binding.id
+                    && policy.epoch == binding.epoch
+                    && policy.identity == binding.identity)
+            });
+        Ok(())
+    }
+
 
     async fn submit_worker_install(
         &self,
@@ -2522,8 +3092,7 @@ impl SessionSsh {
         let callbacks: Arc<dyn SshClientCallbacks> = Arc::new(WorkerCallbacks {
             service: Arc::downgrade(&self.inner),
             client_id,
-            session_id: binding.session_id.clone(),
-            binding_id: binding.id.clone(),
+            binding: binding.clone(),
         });
         let client = SshWorkspaceClient::connect(stream, binding, callbacks).await?;
         let binding = client.binding().await;
@@ -2951,22 +3520,21 @@ impl Interaction for LocalInteractionBridge {
 struct WorkerCallbacks {
     service: Weak<SessionSshInner>,
     client_id: Option<u64>,
-    session_id: String,
-    binding_id: String,
+    binding: SshBinding,
 }
 
 #[async_trait]
 impl SshClientCallbacks for WorkerCallbacks {
     async fn on_event(&self, event: SshWorkerEvent) {
-        if !worker_event_matches_binding(&event, &self.session_id, &self.binding_id) {
+        if !worker_event_matches_binding(&event, &self.binding.session_id, &self.binding.id) {
             return;
         }
         let Some(service) = self.service.upgrade() else {
             return;
         };
         let event = SshSessionWorkerEvent {
-            session_id: self.session_id.clone(),
-            binding_id: self.binding_id.clone(),
+            session_id: self.binding.session_id.clone(),
+            binding_id: self.binding.id.clone(),
             event,
         };
         let sender = {
@@ -2981,7 +3549,7 @@ impl SshClientCallbacks for WorkerCallbacks {
     }
 
     async fn approve(&self, request: SshApprovalRequest) -> SshApprovalDecision {
-        if request.session_id != self.session_id || request.binding_id != self.binding_id {
+        if request.session_id != self.binding.session_id || request.binding_id != self.binding.id {
             return SshApprovalDecision::Deny;
         }
         let Some(service) = self.service.upgrade() else {
@@ -2990,6 +3558,14 @@ impl SshClientCallbacks for WorkerCallbacks {
         let Some(client_id) = self.client_id else {
             return SshApprovalDecision::Deny;
         };
+        if !binding_is_live_for_operation(&service, &self.binding, request.operation).await {
+            return SshApprovalDecision::Deny;
+        }
+        if matches!(request.operation, SshOperation::Write | SshOperation::Execute)
+            && operation_policy_allows(&service, &self.binding, client_id, request.operation).await
+        {
+            return SshApprovalDecision::Approve;
+        }
         let (response, receiver) = oneshot::channel();
         {
             let mut waiters = service.approval_waiters.lock().await;
@@ -2998,6 +3574,8 @@ impl SshClientCallbacks for WorkerCallbacks {
                     request.approval_id.clone(),
                     PendingOperationApproval {
                         client_id,
+                        binding: self.binding.clone(),
+                        operation: request.operation,
                         response,
                     },
                 )
@@ -3006,18 +3584,27 @@ impl SshClientCallbacks for WorkerCallbacks {
                 return SshApprovalDecision::Deny;
             }
         }
-        let _ = service
+        if service
             .events
             .send(SshEvent::OperationApproval(SshOperationApproval {
                 client_id,
                 approval_id: request.approval_id.clone(),
                 operation_id: request.operation_id,
-                binding_id: request.binding_id,
-                session_id: request.session_id,
+                binding_id: self.binding.id.clone(),
+                session_id: self.binding.session_id.clone(),
                 operation: request.operation,
                 title: request.title,
                 detail: request.detail,
-            }));
+            }))
+            .is_err()
+        {
+            service
+                .approval_waiters
+                .lock()
+                .await
+                .remove(&request.approval_id);
+            return SshApprovalDecision::Deny;
+        }
         let approved = tokio::time::timeout(INTERACTION_TIMEOUT, receiver)
             .await
             .ok()
@@ -3035,6 +3622,58 @@ impl SshClientCallbacks for WorkerCallbacks {
         }
     }
 }
+
+async fn binding_is_live_for_operation(
+    service: &SessionSshInner,
+    binding: &SshBinding,
+    operation: SshOperation,
+) -> bool {
+    service
+        .sessions
+        .read()
+        .await
+        .get(&binding.session_id)
+        .and_then(|state| state.grants.get(&binding.id))
+        .is_some_and(|record| {
+            !record.persisted.binding.revoked
+                && record.persisted.binding == *binding
+                && record.persisted.binding.capabilities.permits(operation)
+        })
+}
+
+async fn operation_policy_allows(
+    service: &SessionSshInner,
+    binding: &SshBinding,
+    client_id: u64,
+    operation: SshOperation,
+) -> bool {
+    let sessions = service.sessions.read().await;
+    let live = sessions
+        .get(&binding.session_id)
+        .and_then(|state| state.grants.get(&binding.id))
+        .is_some_and(|record| {
+            !record.persisted.binding.revoked
+                && record.persisted.binding == *binding
+                && record.persisted.binding.capabilities.permits(operation)
+        });
+    if !live {
+        return false;
+    }
+    service
+        .operation_approval_policies
+        .lock()
+        .await
+        .iter()
+        .any(|policy| {
+            policy.client_id == client_id
+                && policy.session_id == binding.session_id
+                && policy.binding_id == binding.id
+                && policy.epoch == binding.epoch
+                && policy.identity == binding.identity
+                && policy.operation == operation
+        })
+}
+
 fn worker_event_matches_binding(
     event: &SshWorkerEvent,
     session_id: &str,
@@ -3619,8 +4258,7 @@ mod tests {
         let callbacks = WorkerCallbacks {
             service: Arc::downgrade(&service.inner),
             client_id: None,
-            session_id: "session".into(),
-            binding_id: "binding".into(),
+            binding: binding("binding", "session", "/remote/project"),
         };
         assert_eq!(
             callbacks
@@ -3959,6 +4597,481 @@ mod tests {
             Err(SshServiceError::UnknownGrantRequest(_))
         ));
         assert!(service.list_targets("session").await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn tool_grant_waits_for_human_decision_and_rejects_concurrent_requests() {
+        let home = tempfile::tempdir().unwrap();
+        let service = SessionSsh::new(home.path().to_owned());
+        assert!(matches!(
+            service
+                .request_tool_grant(
+                    "headless",
+                    Some("target".into()),
+                    Some("/remote/project".into()),
+                    SshCapabilities::read_only(),
+                    "headless access".into(),
+                    None,
+                    None,
+                )
+                .await,
+            Err(SshServiceError::InteractiveClientRequired)
+        ));
+        let mut events = service.subscribe_events();
+        let waiting_service = service.clone();
+        let waiting = tokio::spawn(async move {
+            waiting_service
+                .request_tool_grant(
+                    "session",
+                    Some("target".into()),
+                    Some("/remote/project".into()),
+                    SshCapabilities::read_only(),
+                    "inspect a remote project".into(),
+                    Some(7),
+                    None,
+                )
+                .await
+        });
+        let request = match events.recv().await.unwrap() {
+            SshEvent::GrantRequested(request) => request,
+            event => panic!("expected live grant request, got {event:?}"),
+        };
+        assert!(request.awaiting_tool);
+        assert!(!waiting.is_finished(), "tool must await a human decision");
+        assert!(matches!(
+            service
+                .request_tool_grant(
+                    "session",
+                    Some("target".into()),
+                    Some("/remote/project".into()),
+                    SshCapabilities::read_only(),
+                    "duplicate request".into(),
+                    Some(7),
+                    None,
+                )
+                .await,
+            Err(SshServiceError::GrantRequestPending)
+        ));
+        assert!(service
+            .approve_grant(SshGrantDecision {
+                request_id: request.id.clone(),
+                approved: false,
+                target_id: None,
+                root: None,
+                capabilities: None,
+                scope: SshGrantScope::CurrentSession,
+                make_default: false,
+                client_id: 7,
+            })
+            .await
+            .unwrap()
+            .is_none());
+        assert!(matches!(
+            events.recv().await.unwrap(),
+            SshEvent::GrantResolved {
+                request_id,
+                approved: false,
+                binding: None,
+            } if request_id == request.id
+        ));
+        assert!(matches!(
+            waiting.await.unwrap(),
+            Err(SshServiceError::GrantDenied)
+        ));
+        assert!(service.snapshot_session("session").await.pending_requests.is_empty());
+    }
+
+    #[tokio::test]
+    async fn disconnected_tool_client_cannot_publish_a_late_grant_prompt() {
+        let home = tempfile::tempdir().unwrap();
+        let service = SessionSsh::new(home.path().to_owned());
+        let mut events = service.subscribe_events();
+        let request = SshGrantRequest {
+            id: "not-published-yet".into(),
+            session_id: "session".into(),
+            target_id: Some("target".into()),
+            root: Some("/remote/project".into()),
+            capabilities: SshCapabilities::read_only(),
+            reason: "inspect remote project".into(),
+            verified_identity: None,
+            client_id: Some(7),
+            originating_session_id: None,
+            awaiting_tool: true,
+        };
+        let receiver = service.register_tool_grant_waiter(&request).await.unwrap();
+        service.clear_client_interactions(7).await;
+        assert!(matches!(receiver.await.unwrap(), ToolGrantResolution::Cancelled));
+        assert!(matches!(
+            service.publish_tool_grant_request(request).await,
+            Err(SshServiceError::GrantCancelled)
+        ));
+        assert!(events.try_recv().is_err(), "a disconnected client must not receive a stale prompt");
+        assert!(service.snapshot_session("session").await.pending_requests.is_empty());
+    }
+
+    #[tokio::test]
+    async fn cancelling_live_tool_grant_removes_the_request_before_late_approval() {
+        let home = tempfile::tempdir().unwrap();
+        let service = SessionSsh::new(home.path().to_owned());
+        let mut events = service.subscribe_events();
+        let cancellation = tokio_util::sync::CancellationToken::new();
+        let waiting_service = service.clone();
+        let waiting_cancellation = cancellation.clone();
+        let waiting = tokio::spawn(async move {
+            waiting_service
+                .request_tool_grant(
+                    "session",
+                    Some("target".into()),
+                    Some("/remote/project".into()),
+                    SshCapabilities::read_only(),
+                    "inspect a remote project".into(),
+                    Some(7),
+                    Some(waiting_cancellation),
+                )
+                .await
+        });
+        let request = match events.recv().await.unwrap() {
+            SshEvent::GrantRequested(request) => request,
+            event => panic!("expected live grant request, got {event:?}"),
+        };
+        cancellation.cancel();
+        assert!(matches!(
+            waiting.await.unwrap(),
+            Err(SshServiceError::GrantCancelled)
+        ));
+        assert!(matches!(
+            events.recv().await.unwrap(),
+            SshEvent::GrantResolved {
+                request_id,
+                approved: false,
+                binding: None,
+            } if request_id == request.id
+        ));
+        assert!(matches!(
+            service
+                .approve_grant(SshGrantDecision {
+                    request_id: request.id,
+                    approved: true,
+                    target_id: Some("target".into()),
+                    root: Some("/remote/project".into()),
+                    capabilities: None,
+                    scope: SshGrantScope::CurrentSession,
+                    make_default: false,
+                    client_id: 7,
+                })
+                .await,
+            Err(SshServiceError::UnknownGrantRequest(_))
+        ));
+        assert!(service.list_targets("session").await.is_empty());
+    }
+    #[tokio::test]
+    async fn closing_a_session_cancels_its_live_tool_grant() {
+        let home = tempfile::tempdir().unwrap();
+        let service = SessionSsh::new(home.path().to_owned());
+        let mut events = service.subscribe_events();
+        let waiting_service = service.clone();
+        let waiting = tokio::spawn(async move {
+            waiting_service
+                .request_tool_grant(
+                    "session",
+                    Some("target".into()),
+                    Some("/remote/project".into()),
+                    SshCapabilities::read_only(),
+                    "inspect a remote project".into(),
+                    Some(7),
+                    None,
+                )
+                .await
+        });
+        let request = match events.recv().await.unwrap() {
+            SshEvent::GrantRequested(request) => request,
+            event => panic!("expected live grant request, got {event:?}"),
+        };
+
+        service.clear_session_interactions("session").await;
+
+        assert!(matches!(
+            events.recv().await.unwrap(),
+            SshEvent::GrantResolved {
+                request_id,
+                approved: false,
+                binding: None,
+            } if request_id == request.id
+        ));
+        assert!(matches!(
+            waiting.await.unwrap(),
+            Err(SshServiceError::GrantCancelled)
+        ));
+        assert!(matches!(
+            service
+                .approve_grant(SshGrantDecision {
+                    request_id: request.id,
+                    approved: true,
+                    target_id: Some("target".into()),
+                    root: Some("/remote/project".into()),
+                    capabilities: None,
+                    scope: SshGrantScope::CurrentSession,
+                    make_default: false,
+                    client_id: 7,
+                })
+                .await,
+            Err(SshServiceError::UnknownGrantRequest(_))
+        ));
+    }
+
+
+    #[tokio::test]
+    async fn dropped_live_tool_grant_future_cancels_its_pending_request() {
+        let home = tempfile::tempdir().unwrap();
+        let service = SessionSsh::new(home.path().to_owned());
+        let mut events = service.subscribe_events();
+        let waiting_service = service.clone();
+        let waiting = tokio::spawn(async move {
+            waiting_service
+                .request_tool_grant(
+                    "session",
+                    Some("target".into()),
+                    Some("/remote/project".into()),
+                    SshCapabilities::read_only(),
+                    "inspect a remote project".into(),
+                    Some(7),
+                    None,
+                )
+                .await
+        });
+        let request = match events.recv().await.unwrap() {
+            SshEvent::GrantRequested(request) => request,
+            event => panic!("expected live grant request, got {event:?}"),
+        };
+        waiting.abort();
+        assert!(waiting.await.unwrap_err().is_cancelled());
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_secs(1), events.recv())
+                .await
+                .unwrap()
+                .unwrap(),
+            SshEvent::GrantResolved {
+                request_id,
+                approved: false,
+                binding: None,
+            } if request_id == request.id
+        ));
+        assert!(service.snapshot_session("session").await.pending_requests.is_empty());
+    }
+
+    #[tokio::test]
+    async fn session_operation_approval_is_binding_scoped_and_reset_or_revoke_clears_it() {
+        let home = tempfile::tempdir().unwrap();
+        let service = SessionSsh::new(home.path().to_owned());
+        let granted = binding("binding", "session", "/remote/project");
+        service
+            .restore_session(
+                "session",
+                PersistedSshState {
+                    grants: vec![PersistedSshGrant {
+                        binding: granted.clone(),
+                        parent_binding_id: None,
+                        requires_revalidation: true,
+                        scope: SshGrantScope::CurrentSession,
+                        revoke_status: None,
+                        worker_bound: false,
+                        worker_commands: Vec::new(),
+                    }],
+                    default_binding_id: Some(granted.id.clone()),
+                    pending_requests: Vec::new(),
+                },
+            )
+            .await;
+        let (response, _receiver) = oneshot::channel();
+        service.inner.approval_waiters.lock().await.insert(
+            "foreign-client".into(),
+            PendingOperationApproval {
+                client_id: 7,
+                binding: granted.clone(),
+                operation: SshOperation::Execute,
+                response,
+            },
+        );
+        assert!(matches!(
+            service
+                .submit_operation_approval(SshOperationApprovalDecision {
+                    client_id: 8,
+                    approval_id: "foreign-client".into(),
+                    approved: true,
+                    scope: SshOperationApprovalScope::Session,
+                })
+                .await,
+            Err(SshServiceError::StaleOperationApproval)
+        ));
+        assert!(
+            !operation_policy_allows(&service.inner, &granted, 7, SshOperation::Execute).await
+        );
+        service
+            .inner
+            .approval_waiters
+            .lock()
+            .await
+            .remove("foreign-client");
+
+
+        async fn approve(
+            service: &SessionSsh,
+            binding: &SshBinding,
+            approval_id: &str,
+            scope: SshOperationApprovalScope,
+        ) {
+            let (response, receiver) = oneshot::channel();
+            service.inner.approval_waiters.lock().await.insert(
+                approval_id.into(),
+                PendingOperationApproval {
+                    client_id: 7,
+                    binding: binding.clone(),
+                    operation: SshOperation::Execute,
+                    response,
+                },
+            );
+            service
+                .submit_operation_approval(SshOperationApprovalDecision {
+                    client_id: 7,
+                    approval_id: approval_id.into(),
+                    approved: true,
+                    scope,
+                })
+                .await
+                .unwrap();
+            assert!(receiver.await.unwrap());
+        }
+
+        approve(
+            &service,
+            &granted,
+            "once",
+            SshOperationApprovalScope::Once,
+        )
+        .await;
+        assert!(
+            !operation_policy_allows(&service.inner, &granted, 7, SshOperation::Execute).await
+        );
+
+        approve(
+            &service,
+            &granted,
+            "session",
+            SshOperationApprovalScope::Session,
+        )
+        .await;
+        assert!(
+            operation_policy_allows(&service.inner, &granted, 7, SshOperation::Execute).await
+        );
+        let mut different_binding = granted.clone();
+        different_binding.id = "other-binding".into();
+        assert!(
+            !operation_policy_allows(
+                &service.inner,
+                &different_binding,
+                7,
+                SshOperation::Execute,
+            )
+            .await
+        );
+        assert!(
+            !operation_policy_allows(&service.inner, &granted, 8, SshOperation::Execute).await
+        );
+        assert!(!operation_policy_allows(&service.inner, &granted, 7, SshOperation::Write).await);
+        service.clear_client_interactions(8).await;
+        assert!(
+            operation_policy_allows(&service.inner, &granted, 7, SshOperation::Execute).await
+        );
+        service.clear_client_interactions(7).await;
+        assert!(
+            !operation_policy_allows(&service.inner, &granted, 7, SshOperation::Execute).await
+        );
+        approve(
+            &service,
+            &granted,
+            "after-client-clear",
+            SshOperationApprovalScope::Session,
+        )
+        .await;
+
+
+        assert!(matches!(
+            service
+                .control(
+                    7,
+                    SshControlCommand::ResetOperationApprovals {
+                        session_id: "session".into(),
+                        binding_id: granted.id.clone(),
+                    },
+                )
+                .await,
+            Ok(SshControlReply::OperationApprovalsReset)
+        ));
+        assert!(
+            !operation_policy_allows(&service.inner, &granted, 7, SshOperation::Execute).await
+        );
+        approve(
+            &service,
+            &granted,
+            "after-session-close",
+            SshOperationApprovalScope::Session,
+        )
+        .await;
+        service.clear_session_interactions("session").await;
+        assert!(
+            !operation_policy_allows(&service.inner, &granted, 7, SshOperation::Execute).await
+        );
+
+
+        approve(
+            &service,
+            &granted,
+            "revoke",
+            SshOperationApprovalScope::Session,
+        )
+        .await;
+        assert!(
+            operation_policy_allows(&service.inner, &granted, 7, SshOperation::Execute).await
+        );
+        let (response, _receiver) = oneshot::channel();
+        service.inner.approval_waiters.lock().await.insert(
+            "revoked-reply".into(),
+            PendingOperationApproval {
+                client_id: 7,
+                binding: granted.clone(),
+                operation: SshOperation::Execute,
+                response,
+            },
+        );
+        service.revoke_binding("session", &granted.id).await.unwrap();
+        assert!(matches!(
+            service
+                .submit_operation_approval(SshOperationApprovalDecision {
+                    client_id: 7,
+                    approval_id: "revoked-reply".into(),
+                    approved: true,
+                    scope: SshOperationApprovalScope::Session,
+                })
+                .await,
+            Err(SshServiceError::StaleOperationApproval)
+        ));
+        assert!(
+            !operation_policy_allows(&service.inner, &granted, 7, SshOperation::Execute).await
+        );
+
+        service
+            .restore_session(
+                "session",
+                PersistedSshState {
+                    grants: Vec::new(),
+                    default_binding_id: None,
+                    pending_requests: Vec::new(),
+                },
+            )
+            .await;
+        assert!(
+            !operation_policy_allows(&service.inner, &granted, 7, SshOperation::Execute).await
+        );
     }
 
     #[tokio::test]
@@ -4330,6 +5443,8 @@ mod tests {
             reason: "test".into(),
             verified_identity: Some(identity.clone()),
             client_id: Some(7),
+            awaiting_tool: false,
+
         };
 
         assert!(ensure_inspection_identity(&request, Some(&identity), &identity).is_ok());
@@ -4388,6 +5503,8 @@ mod tests {
                 reason: "retain request metadata".into(),
                 verified_identity: None,
                 client_id: Some(7),
+                awaiting_tool: false,
+
             })
             .await
             .unwrap();
@@ -4505,6 +5622,8 @@ mod tests {
             reason: "test".into(),
             verified_identity: None,
             client_id: None,
+            awaiting_tool: false,
+
         };
         assert_eq!(
             choose_narrower_root(&request, Some("/repo/subdir")).unwrap(),

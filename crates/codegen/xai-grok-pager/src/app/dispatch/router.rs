@@ -1345,7 +1345,10 @@ fn dispatch_inner(action: Action, app: &mut AppView) -> Vec<Effect> {
         Action::ApproveSshOperation {
             approval_id,
             approved,
-        } => super::ssh::dispatch_approve_ssh_operation(app, approval_id, approved),
+            scope,
+        } => super::ssh::dispatch_approve_ssh_operation(app, approval_id, approved, scope),
+        Action::ResetSshOperationApprovals { binding_id } =>
+            super::ssh::dispatch_reset_ssh_operation_approvals(app, binding_id),
         Action::ApproveSshWorkerInstall {
             request_id,
             session_id,

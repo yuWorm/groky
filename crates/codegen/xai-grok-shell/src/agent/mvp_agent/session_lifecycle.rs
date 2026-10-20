@@ -90,6 +90,10 @@ impl MvpAgent {
         if !self.hard_stop_resident(id, CancelTrigger::SessionClose) {
             return CloseOutcome::NotResident;
         }
+        if let Some(service) = &self.session_ssh {
+            service.clear_session_interactions(id.0.as_ref()).await;
+        }
+
         drop(intake_guard);
         self.remove_session_terminal(id, SessionLiveState::Completed);
         self.drain_old_session_thread_within(id, stage_budget(deadline, DRAIN_OLD_THREAD_WAIT))
@@ -118,6 +122,10 @@ impl MvpAgent {
     /// The supervisor treats a finished still-resident actor as a crash, so awaiting the subagent drain while resident races that sweep.
     /// Every wait spends from a shared [`DELETE_TOTAL_BUDGET`] so the two drains cannot stack into a toast twice as long as close's.
     pub(crate) async fn teardown_live_session_before_delete(&self, id: &acp::SessionId) {
+        if let Some(service) = &self.session_ssh {
+            service.clear_session_interactions(id.0.as_ref()).await;
+        }
+
         let deadline = tokio::time::Instant::now() + DELETE_TOTAL_BUDGET;
         let resident = self.hard_stop_resident(id, CancelTrigger::SessionDelete);
         if resident {

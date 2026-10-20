@@ -1055,10 +1055,10 @@ pub struct AppView {
     pub(crate) ssh_client_id: u64,
     /// Exactly one local-control receiver owns this pager connection's SSH event stream.
     pub(crate) ssh_event_consumer_active: bool,
-    /// Recently applied direct grant replies. The global event stream broadcasts the same
-    /// request/resolution; retaining their opaque ids prevents that duplicate from reopening a
-    /// manager the user dismissed after the direct reply.
-    pub(crate) direct_ssh_grant_replies: std::collections::VecDeque<String>,
+    /// Direct replies are deduplicated by request and phase: an inspection reply must not hide
+    /// a later tool-cancellation resolution delivered only through the event stream.
+    pub(crate) direct_ssh_grant_replies:
+        std::collections::VecDeque<(String, super::actions::SshGrantReplyKind)>,
     /// Doc viewer overlay for the welcome screen (release notes via Ctrl+L).
     pub welcome_doc_viewer: Option<crate::views::modal::ActiveModal>,
     /// Whether the pager uses fullscreen (alt-screen) or inline mode.

@@ -824,6 +824,7 @@ pub(crate) fn execute(
             client_id,
             approval_id,
             approved,
+            scope,
             owner,
         } => {
             tasks.spawn(async move {
@@ -834,6 +835,7 @@ pub(crate) fn execute(
                             client_id,
                             approval_id: approval_id.clone(),
                             approved,
+                            scope,
                         },
                     ),
                     client_id,
@@ -855,6 +857,17 @@ pub(crate) fn execute(
                         owner,
                     },
                 }
+            });
+        }
+        Effect::SshResetOperationApprovals { session_id, binding_id, client_id, owner } => {
+            tasks.spawn(async move {
+                ssh_action(
+                    Some(session_id.clone()), None, client_id, owner,
+                    xai_grok_shell::ssh::SshControlCommand::ResetOperationApprovals {
+                        session_id, binding_id,
+                    },
+                    "Session auto-approval cleared for this SSH grant; each operation will ask again.",
+                ).await
             });
         }
         Effect::SshApproveWorkerInstall {
