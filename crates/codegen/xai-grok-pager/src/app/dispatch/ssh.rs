@@ -65,9 +65,13 @@ fn map_ssh_modal_outcome(outcome: SshModalOutcome) -> InputOutcome {
         SshModalOutcome::InspectGrantTarget {
             request_id,
             target_id,
+            selected_root,
+            expected_identity,
         } => InputOutcome::Action(Action::InspectSshGrantTarget {
             request_id,
             target_id,
+            selected_root,
+            expected_identity,
         }),
         SshModalOutcome::UseBinding { binding_id } => {
             InputOutcome::Action(Action::UseSshBinding { binding_id })
@@ -945,6 +949,8 @@ pub(super) fn dispatch_inspect_ssh_grant_target(
     app: &mut AppView,
     request_id: String,
     target_id: String,
+    selected_root: Option<String>,
+    expected_identity: Option<xai_grok_shell::ssh::SshHostIdentity>,
 ) -> Vec<Effect> {
     let client_id = app.ssh_client_id;
     let Some(owner) = ssh_manager_owner(app) else {
@@ -961,6 +967,8 @@ pub(super) fn dispatch_inspect_ssh_grant_target(
         session_id,
         request_id,
         target_id,
+        selected_root,
+        expected_identity,
         client_id,
         owner,
     }]
@@ -1526,7 +1534,7 @@ pub(super) fn apply_ssh_control_event(
     let mut grant_resolution = None;
     let mut project_resolution = None;
     let mut grant_follow_up = None;
-    let mut inspect_local_grant = None;
+    let mut grant_continuation = SshModalOutcome::Unchanged;
     let manager = match owner {
         Some(owner) => ssh_manager_for_owner_mut(app, owner),
         None => match &event {
@@ -1549,23 +1557,14 @@ pub(super) fn apply_ssh_control_event(
         match event {
             xai_grok_shell::ssh::SshEvent::GrantRequested(request) => {
                 if request.client_id == Some(client_id) {
-                    if let Some(owner) = owner
-                        && manager.bind_local_grant_request(
+                    if owner.is_some() {
+                        manager.bind_local_grant_request(
                             &request.id, request.target_id.as_deref(), request.root.as_deref(),
-                        )
-                        && request.verified_identity.is_none()
-                        && let Some(target_id) = request.target_id.as_ref()
-                    {
-                        inspect_local_grant = Some(Effect::SshInspectGrantTarget {
-                            session_id: Some(request.session_id.clone()),
-                            request_id: request.id.clone(), target_id: target_id.clone(),
-                            client_id, owner,
-                        });
+                        );
                     }
-                    manager.show_incoming_grant(request.session_id.clone(), incoming_grant(request));
-                    if inspect_local_grant.is_some() {
-                        manager.show_info("Verifying the selected SSH folder before confirmation…");
-                    }
+                    grant_continuation = manager.show_incoming_grant(
+                        request.session_id.clone(), incoming_grant(request),
+                    );
                 }
             }
             xai_grok_shell::ssh::SshEvent::GrantResolved {
@@ -1769,8 +1768,33 @@ pub(super) fn apply_ssh_control_event(
             client_id,
             owner,
         });
+        match grant_continuation {
+            SshModalOutcome::BrowseProjectDirectory { request_id, target_id, path } => {
+                effects.push(Effect::SshBrowseProjectDirectory {
+                    request_id, target_id, path, client_id, owner,
+                });
+            }
+            SshModalOutcome::InspectGrantTarget {
+                request_id, target_id, selected_root, expected_identity,
+            } => {
+                effects.push(Effect::SshInspectGrantTarget {
+                    session_id: event_session_id, request_id, target_id,
+                    selected_root, expected_identity, client_id, owner,
+                });
+            }
+            SshModalOutcome::ApproveGrant {
+                request_id, approved: false, target_id, root, capabilities, lifetime, set_default,
+            } => {
+                if let Some(session_id) = event_session_id {
+                    effects.push(Effect::SshApproveGrant {
+                        session_id, request_id, approved: false, target_id, root,
+                        capabilities, lifetime, set_default, client_id, owner,
+                    });
+                }
+            }
+            _ => {}
+        }
     }
-    effects.extend(inspect_local_grant);
     effects
 }
 

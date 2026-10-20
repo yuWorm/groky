@@ -31,6 +31,10 @@ pub enum SshControlCommand {
     InspectGrantTarget {
         request_id: String,
         target_id: String,
+        #[serde(default)]
+        selected_root: Option<String>,
+        #[serde(default)]
+        expected_identity: Option<SshHostIdentity>,
     },
     ApproveGrant(SshGrantDecision),
     /// Explicitly mint a child/session-local grant from a parent grant. The
@@ -271,6 +275,12 @@ mod tests {
             SshControlCommand::BrowseProjectDirectories {
                 target_id: "build-host".into(),
                 path: Some("~/projects".into()),
+            },
+            SshControlCommand::InspectGrantTarget {
+                request_id: "grant".into(),
+                target_id: "build-host".into(),
+                selected_root: Some("/srv/project".into()),
+                expected_identity: Some(identity.clone()),
             },
             SshControlCommand::PrepareProjectOpen {
                 session_id: "child-session".into(),

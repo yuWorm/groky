@@ -1594,17 +1594,29 @@ fn advanced_use_verifies_the_folder_and_resumes_after_canonical_consent() {
         connection_detail: String::new(), grant: crate::views::ssh_modal::SshGrantView::NotGranted,
     }]);
     app.handle_input(&Event::Key(KeyEvent::new(KeyCode::Char('m'), KeyModifiers::NONE)));
-    app.handle_input(&Event::Key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::NONE)));
     let InputOutcome::Action(action) =
-        app.handle_input(&Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)))
-    else { panic!("advanced use must request a grant") };
+        app.handle_input(&Event::Key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::NONE)))
+    else { panic!("advanced use must choose a directory before requesting access") };
+    let effects = dispatch(action, &mut app);
+    let request_id = effects.iter().find_map(|effect| match effect {
+        Effect::SshBrowseProjectDirectory { request_id, .. } => Some(*request_id), _ => None,
+    }).unwrap();
+    app.agents.get_mut(&source).unwrap().ssh_manager.as_mut().unwrap()
+        .settle_project_directory(request_id, TARGET_ID, Ok(xai_grok_shell::ssh::SshDirectoryListing {
+            target_id: TARGET_ID.into(),
+            identity: binding(TARGET_ID, CANONICAL_ROOT).identity,
+            path: CANONICAL_ROOT.into(), parent: Some("/private/var/fixture".into()),
+            directories: vec![], truncated: false,
+        }));
+    let InputOutcome::Action(action) =
+        app.handle_input(&Event::Key(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::NONE)))
+    else { panic!("selected folder must request access, not create a project session") };
     let effects = dispatch(action, &mut app);
     let session_id = effects.iter().find_map(|effect| match effect {
         Effect::SshRequestGrant { session_id, .. } => Some(session_id.clone()), _ => None,
     }).unwrap();
-    let mut request = grant_request("advanced", TARGET_ID, ".", app.ssh_client_id);
+    let mut request = grant_request("advanced", TARGET_ID, CANONICAL_ROOT, app.ssh_client_id);
     request.session_id = session_id.clone();
-    request.capabilities = SshCapabilities::read_only();
     request.verified_identity = None;
     let effects = apply_ssh_control_event(&mut app, Some(session_id.clone()), Some(owner),
         SshEvent::GrantRequested(request.clone()));
@@ -1623,4 +1635,57 @@ fn advanced_use_verifies_the_folder_and_resumes_after_canonical_consent() {
     assert!(effects.iter().any(|effect| matches!(effect,
         Effect::SshUseBinding { session_id: actual, binding_id, .. }
             if actual == &session_id && binding_id == "binding-id")));
+}
+
+#[test]
+fn rootless_request_browses_in_its_owner_and_cancellation_does_not_revive_it() {
+    let mut app = test_app_with_agent();
+    let source = AgentId(0);
+    app.active_view = ActiveView::Agent(source);
+    dispatch(Action::OpenSshManager, &mut app);
+    let owner = ssh_manager_owner(&app).unwrap();
+    let session_id = app.agents.get(&source).unwrap().ssh_manager.as_ref().unwrap()
+        .session_id.clone().unwrap();
+    let mut request = grant_request("rootless", TARGET_ID, "", app.ssh_client_id);
+    request.session_id = session_id.clone();
+    request.root = None;
+    request.capabilities = SshCapabilities::read_only();
+    request.verified_identity = None;
+    let effects = apply_ssh_control_event(&mut app, Some(session_id.clone()), None,
+        SshEvent::GrantRequested(request.clone()));
+    let browse_id = effects.iter().find_map(|effect| match effect {
+        Effect::SshBrowseProjectDirectory { request_id, owner: actual, .. }
+            if actual == &owner => Some(*request_id),
+        _ => None,
+    }).expect("original request must immediately open its own folder picker");
+    let InputOutcome::Action(action) =
+        app.handle_input(&Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)))
+    else { panic!("cancelling directory selection must deny the original waiting request") };
+    let effects = dispatch(action, &mut app);
+    assert!(effects.iter().any(|effect| matches!(effect,
+        Effect::SshApproveGrant { request_id, session_id: actual, approved: false, .. }
+            if request_id == "rootless" && actual == &session_id)));
+    apply_ssh_control_event(&mut app, Some(session_id.clone()), Some(owner),
+        SshEvent::GrantResolved { request_id: "rootless".into(), approved: false, binding: None });
+    let manager = app.agents.get_mut(&source).unwrap().ssh_manager.as_mut().unwrap();
+    assert!(!manager.settle_project_directory(browse_id, TARGET_ID,
+        Ok(xai_grok_shell::ssh::SshDirectoryListing {
+            target_id: TARGET_ID.into(), identity: binding(TARGET_ID, CANONICAL_ROOT).identity,
+            path: CANONICAL_ROOT.into(), parent: None, directories: vec![], truncated: false,
+        })));
+    request.root = Some(CANONICAL_ROOT.into());
+    request.verified_identity = Some(binding(TARGET_ID, CANONICAL_ROOT).identity);
+    let effects = apply_ssh_control_event(&mut app, Some(session_id.clone()), Some(owner),
+        SshEvent::GrantRequested(request));
+    assert!(!effects.iter().any(|effect| matches!(effect,
+        Effect::SshBrowseProjectDirectory { .. } | Effect::SshInspectGrantTarget { .. })));
+    assert!(app.agents.get(&source).unwrap().ssh_manager.as_ref().unwrap()
+        .grant_session_id_for("rootless").is_none());
+    dispatch(Action::TaskComplete(TaskResult::SshGrantInspected {
+        session_id: Some(session_id), request_id: "rootless".into(),
+        client_id: app.ssh_client_id, owner, result: Err("late connection failure".into()),
+    }), &mut app);
+    app.handle_input(&Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)));
+    assert!(app.agents.get(&source).unwrap().ssh_manager.is_none(),
+        "late failure must not insert a diagnostic over the cancelled manager");
 }

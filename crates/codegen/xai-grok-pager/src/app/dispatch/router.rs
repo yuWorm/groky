@@ -1312,7 +1312,11 @@ fn dispatch_inner(action: Action, app: &mut AppView) -> Vec<Effect> {
         Action::InspectSshGrantTarget {
             request_id,
             target_id,
-        } => super::ssh::dispatch_inspect_ssh_grant_target(app, request_id, target_id),
+            selected_root,
+            expected_identity,
+        } => super::ssh::dispatch_inspect_ssh_grant_target(
+            app, request_id, target_id, selected_root, expected_identity,
+        ),
         Action::ApproveSshGrant {
             request_id,
             approved,

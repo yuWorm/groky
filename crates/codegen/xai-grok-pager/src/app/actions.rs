@@ -693,6 +693,8 @@ pub enum Action {
     InspectSshGrantTarget {
         request_id: String,
         target_id: String,
+        selected_root: Option<String>,
+        expected_identity: Option<xai_grok_shell::ssh::SshHostIdentity>,
     },
     /// Resolve a pending human SSH access request; the service independently verifies identity/root.
     ApproveSshGrant {
@@ -2551,6 +2553,8 @@ pub enum Effect {
         session_id: Option<String>,
         request_id: String,
         target_id: String,
+        selected_root: Option<String>,
+        expected_identity: Option<xai_grok_shell::ssh::SshHostIdentity>,
         client_id: u64,
         owner: SshManagerOwner,
     },
@@ -2821,6 +2825,14 @@ pub enum TaskResult {
         /// `None` belongs to the global event receiver; a direct request must retain its origin.
         owner: Option<SshManagerOwner>,
         event: xai_grok_shell::ssh::SshEvent,
+    },
+    /// Inspection is correlated to the original grant, including failure after cancellation.
+    SshGrantInspected {
+        session_id: Option<String>,
+        request_id: String,
+        client_id: u64,
+        owner: SshManagerOwner,
+        result: Result<xai_grok_shell::ssh::SshGrantRequest, String>,
     },
     SshProjectDirectoryLoaded {
         request_id: u64,

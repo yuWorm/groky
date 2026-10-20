@@ -29,7 +29,7 @@ Next groky version after `v0.1.25`.
 - **SSH host trust** correctly isolates known_hosts ports and key algorithms, and offers explicit changed-key replacement with old/new fingerprints, backups and safeguards against ambiguous records.
 - **SSH diagnostics** distinguish normal connection details from actual errors, with green connected status and wrapped, scrollable full errors that return to the retained folder or form.
 - **SSH connection status** clears completed connect/disconnect progress without replacing newer errors or another target's progress.
-- **SSH access grants** show every active binding separately, revoke only the selected binding, preserve failed forms, and automatically continue default selection after verified authorization.
+- **SSH access grants** choose remote folders before permission confirmation, including requests without a directory; cancellation denies waiting requests without late popups, each active binding remains separately revocable, and default selection continues automatically after approval.
 - **SSH controls** offer server selection and remote folder browsing as the primary flow, with clickable rows, scrolling and keyboard-focusable permissions; grant/default/revocation controls live under Advanced.
 - **SSH target saving** prevents duplicate submissions, preserves form fields after failure, and selects the saved target with a completed status message.
 - **SSH project startup** no longer stalls on repeated pending guards, returns failures to the originating manager for retry, and isolates asynchronous results from other sessions or reopened managers.

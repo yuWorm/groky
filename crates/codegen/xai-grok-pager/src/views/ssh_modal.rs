@@ -210,6 +210,10 @@ pub struct SshGrantCard {
     pub set_default: bool,
     pub agent_requested: bool,
     pub error: Option<String>,
+    /// A canonical browser-selected root is displayed as evidence, never editable intent.
+    verified_root: bool,
+    /// Incoming requests may only reduce their requested scope, never add capabilities.
+    capability_ceiling: Option<SshCapabilitiesView>,
     focus: SshGrantFocus,
     scroll_offset: usize,
     max_scroll_offset: usize,
@@ -244,6 +248,8 @@ impl SshGrantCard {
             set_default: false,
             agent_requested,
             error: None,
+            verified_root: false,
+            capability_ceiling: None,
             focus: SshGrantFocus::Root,
             scroll_offset: 0,
             max_scroll_offset: 0,
@@ -275,8 +281,17 @@ impl SshGrantCard {
             SshGrantFocus::Lifetime,
             SshGrantFocus::Default,
         ];
+        const VERIFIED_GENERAL_FOCUSES: [SshGrantFocus; 5] = [
+            SshGrantFocus::Read,
+            SshGrantFocus::Write,
+            SshGrantFocus::Execute,
+            SshGrantFocus::Lifetime,
+            SshGrantFocus::Default,
+        ];
         let focuses: &[SshGrantFocus] = if self.is_project_consent() {
             &PROJECT_FOCUSES
+        } else if self.verified_root {
+            &VERIFIED_GENERAL_FOCUSES
         } else {
             &GENERAL_FOCUSES
         };
@@ -290,6 +305,30 @@ impl SshGrantCard {
             (index + 1) % focuses.len()
         };
         self.focus = focuses[next];
+    }
+
+    fn set_verified_scope(&mut self, capabilities: SshCapabilitiesView) {
+        self.verified_root = true;
+        self.capability_ceiling = Some(capabilities);
+        self.capabilities = capabilities;
+        if self.focus == SshGrantFocus::Root {
+            self.focus = SshGrantFocus::Read;
+        }
+    }
+
+    fn capability_is_requested(&self, focus: SshGrantFocus) -> bool {
+        let Some(capabilities) = self.capability_ceiling else {
+            return true;
+        };
+        match focus {
+            SshGrantFocus::Read => capabilities.read,
+            SshGrantFocus::Write => capabilities.write,
+            SshGrantFocus::Execute => capabilities.execute,
+            SshGrantFocus::Root
+            | SshGrantFocus::Lifetime
+            | SshGrantFocus::Default
+            | SshGrantFocus::RememberProject => true,
+        }
     }
 
     fn permits_root(&self, root: &str) -> bool {
@@ -970,12 +1009,34 @@ struct ProjectDirectoryHit {
     rect: Rect,
 }
 
+/// The operation that owns the shared authenticated directory picker.
+///
+/// Project opening has a separate preparation lifecycle. Grant purposes instead retain the
+/// original request (or typed local continuation) and never create a project session.
+#[derive(Clone)]
+enum SshDirectoryPurpose {
+    ProjectOpen,
+    LocalGrant {
+        follow_up: Option<SshGrantFollowUp>,
+    },
+    PendingGrant {
+        request_id: String,
+    },
+}
+
+impl SshDirectoryPurpose {
+    fn is_project_open(&self) -> bool {
+        matches!(self, Self::ProjectOpen)
+    }
+}
+
 /// Local browser state for one authenticated remote target.
 ///
 /// It retains only directory metadata from the SSH service. The service resolves every listed
 /// path and records the verified identity; this UI never performs local filesystem lookups.
 struct SshProjectBrowser {
     target_id: String,
+    purpose: SshDirectoryPurpose,
     request_id: u64,
     open_request_id: Option<u64>,
     listing: Option<SshDirectoryListing>,
@@ -992,11 +1053,17 @@ struct SshProjectBrowser {
 }
 
 impl SshProjectBrowser {
-    fn new(target_id: String, path: Option<String>, request_id: u64) -> Self {
+    fn new(
+        target_id: String,
+        path: Option<String>,
+        request_id: u64,
+        purpose: SshDirectoryPurpose,
+    ) -> Self {
         let mut editor = LineEditor::default();
         editor.set_text(path.unwrap_or_else(|| ".".to_owned()));
         Self {
             target_id,
+            purpose,
             request_id,
             open_request_id: None,
             listing: None,
@@ -1113,9 +1180,14 @@ pub struct SshManagerState {
     resume_project_browser_after_authentication: bool,
     /// Target owning the current connect/disconnect progress message.
     pending_connection: Option<String>,
-    /// Immutable request tuple retained through the displayed consent card so resolution can
-    /// be correlated with the original target/root rather than editable card state.
+    /// Immutable request retained while a directory selection or identity inspection is pending.
     pending_grant: Option<SshIncomingGrant>,
+    /// Request IDs whose inspection has been dispatched. This suppresses duplicated grant events
+    /// until the matching verified event arrives.
+    inspecting_grant_ids: Vec<String>,
+    /// Recently denied picker requests. Keeping this bounded prevents late browse/inspection
+    /// completions from reviving a request that the user already denied.
+    cancelled_grant_ids: Vec<String>,
     /// Exact decision submitted for the displayed request, retained until its resolution.
     submitted_grant: Option<SubmittedGrantDecision>,
     /// Session actually requested by the current human-consent card. Usually this manager's
@@ -1123,6 +1195,9 @@ pub struct SshManagerState {
     pending_grant_session_id: Option<String>,
     /// Typed continuation for a local advanced grant, never inferred from rendered prose.
     pending_grant_follow_up: Option<SshGrantFollowUp>,
+    /// Local picker requests cancelled before the service assigned an ID, retained by tuple so a
+    /// late request can still be denied exactly once.
+    cancelled_local_grant_options: Vec<LocalGrantOptions>,
     settled_grant_follow_up: Option<(String, SshGrantFollowUp)>,
     local_grant_options: Option<LocalGrantOptions>,
     /// Session whose grants are shown. `None` is Welcome: connect/config actions remain usable,
@@ -1154,9 +1229,12 @@ impl SshManagerState {
             resume_project_browser_after_authentication: false,
             pending_connection: None,
             pending_grant: None,
+            inspecting_grant_ids: Vec::new(),
+            cancelled_grant_ids: Vec::new(),
             submitted_grant: None,
             pending_grant_session_id: None,
             pending_grant_follow_up: None,
+            cancelled_local_grant_options: Vec::new(),
             settled_grant_follow_up: None,
             local_grant_options: None,
             session_id,
@@ -1245,8 +1323,22 @@ impl SshManagerState {
         if self.pending_project_open.is_some() {
             return SshModalOutcome::Unchanged;
         }
+        self.begin_directory_browser(target_id, path, SshDirectoryPurpose::ProjectOpen)
+    }
+
+    fn begin_directory_browser(
+        &mut self,
+        target_id: String,
+        path: Option<String>,
+        purpose: SshDirectoryPurpose,
+    ) -> SshModalOutcome {
         let request_id = next_nonzero_id(&NEXT_PROJECT_DIRECTORY_REQUEST_ID);
-        self.project_browser = Some(SshProjectBrowser::new(target_id.clone(), path.clone(), request_id));
+        self.project_browser = Some(SshProjectBrowser::new(
+            target_id.clone(),
+            path.clone(),
+            request_id,
+            purpose,
+        ));
         self.resume_project_browser_after_authentication = false;
         self.page = SshModalPage::ProjectBrowser;
         SshModalOutcome::BrowseProjectDirectory {
@@ -1310,7 +1402,8 @@ impl SshManagerState {
             self.page = SshModalPage::ProjectBrowser;
             self.resume_project_browser_after_authentication = false;
         }
-        if let Some(error) = self.project_browser.as_ref().and_then(|browser| browser.error.clone()) {
+        let browser_error = self.project_browser.as_ref().and_then(|browser| browser.error.clone());
+        if let Some(error) = browser_error {
             self.show_error(error);
         }
         true
@@ -1530,6 +1623,13 @@ impl SshManagerState {
         lifetime: SshGrantLifetime,
         set_default: bool,
     ) {
+        if self.local_grant_options.as_ref().is_some_and(|options| {
+            options.request_id.is_none()
+                && options.target_id == target_id
+                && options.root == root
+        }) {
+            return;
+        }
         self.local_grant_options = Some(LocalGrantOptions {
             request_id: None,
             target_id,
@@ -1544,15 +1644,27 @@ impl SshManagerState {
     pub fn bind_local_grant_request(
         &mut self, request_id: &str, target_id: Option<&str>, root: Option<&str>,
     ) -> bool {
-        let Some(options) = self.local_grant_options.as_mut() else { return false };
-        if options.request_id.is_none()
+        if let Some(options) = self.local_grant_options.as_mut()
+            && options.request_id.is_none()
             && target_id == Some(options.target_id.as_str())
             && root == Some(options.root.as_str())
         {
             options.request_id = Some(request_id.to_owned());
             return true;
         }
-        false
+        let Some(options) = self
+            .cancelled_local_grant_options
+            .iter_mut()
+            .find(|options| {
+                options.request_id.is_none()
+                    && target_id == Some(options.target_id.as_str())
+                    && root == Some(options.root.as_str())
+            })
+        else {
+            return false;
+        };
+        options.request_id = Some(request_id.to_owned());
+        true
     }
 
     /// Return the pre-minted or current session that owns a displayed/pending grant request.
@@ -1562,9 +1674,19 @@ impl SshManagerState {
             .as_ref()
             .is_some_and(|request| request.request_id == request_id)
             || matches!(&self.page, SshModalPage::Grant(card) if card.request_id == request_id);
-        request_matches
-            .then(|| self.pending_grant_session_id.clone())
-            .flatten()
+        if request_matches {
+            return self.pending_grant_session_id.clone();
+        }
+        (self
+            .local_grant_options
+            .as_ref()
+            .is_some_and(|options| options.request_id.as_deref() == Some(request_id))
+            || self
+                .cancelled_local_grant_options
+                .iter()
+                .any(|options| options.request_id.as_deref() == Some(request_id)))
+        .then(|| self.session_id.clone())
+        .flatten()
     }
 
     /// Record the exact tuple sent to the service for an approved displayed grant.
@@ -1909,31 +2031,129 @@ impl SshManagerState {
         }
     }
 
-    /// Display a real agent access request only after the selected target's SSH identity was
-    /// inspected. A target/root from the initial request is intent, not consent evidence.
-    pub fn show_incoming_grant(&mut self, session_id: String, request: SshIncomingGrant) {
+    /// Display or advance a real agent access request after its SSH target has been inspected.
+    ///
+    /// Target/root values from the initial request are unverified intent. Rootless requests use
+    /// the shared picker; known roots are inspected immediately. A duplicate event never resets
+    /// a picker or a human-edited consent card.
+    pub fn show_incoming_grant(
+        &mut self,
+        session_id: String,
+        request: SshIncomingGrant,
+    ) -> SshModalOutcome {
+        let request_id = request.request_id.clone();
+        if self.cancelled_grant_ids.iter().any(|id| id == &request_id) {
+            return SshModalOutcome::Unchanged;
+        }
+        let cancelled_local_request = self
+            .cancelled_local_grant_options
+            .iter()
+            .any(|options| {
+                options.request_id.as_deref() == Some(request_id.as_str())
+                    || (options.request_id.is_none()
+                        && request.target_id.as_deref() == Some(options.target_id.as_str())
+                        && request.root.as_deref() == Some(options.root.as_str()))
+            });
+        if cancelled_local_request {
+            if let Some(options) = self.cancelled_local_grant_options.iter_mut().find(|options| {
+                options.request_id.as_deref() == Some(request_id.as_str())
+                    || (options.request_id.is_none()
+                        && request.target_id.as_deref() == Some(options.target_id.as_str())
+                        && request.root.as_deref() == Some(options.root.as_str()))
+            }) {
+                options.request_id = Some(request_id.clone());
+            }
+            self.cancelled_local_grant_options
+                .retain(|options| options.request_id.as_deref() != Some(request_id.as_str()));
+            if self.cancelled_grant_ids.len() == 16 {
+                self.cancelled_grant_ids.remove(0);
+            }
+            self.cancelled_grant_ids.push(request_id.clone());
+            self.pending_grant_session_id = Some(session_id);
+            self.pending_grant = Some(request);
+            self.submitted_grant = None;
+            return SshModalOutcome::ApproveGrant {
+                request_id,
+                approved: false,
+                target_id: None,
+                root: None,
+                capabilities: None,
+                lifetime: SshGrantLifetime::CurrentSession,
+                set_default: false,
+            };
+        }
+        if matches!(&self.page, SshModalPage::Grant(card) if card.request_id == request_id) {
+            return SshModalOutcome::Unchanged;
+        }
+        if request.verified_identity.is_none()
+            && self.pending_grant.as_ref().is_some_and(|pending| {
+                pending.request_id == request_id
+                    && (self.inspecting_grant_ids.iter().any(|id| id == &request_id)
+                        || self.project_browser.as_ref().is_some_and(|browser| {
+                            matches!(
+                                &browser.purpose,
+                                SshDirectoryPurpose::PendingGrant {
+                                    request_id: pending_request_id,
+                                } if pending_request_id == &request_id
+                            )
+                        }))
+            })
+        {
+            return SshModalOutcome::Unchanged;
+        }
+
         self.pending_grant_session_id = Some(session_id);
         self.submitted_grant = None;
         let Some(target_id) = request.target_id.as_deref() else {
             self.pending_grant = Some(request);
-            self.show_error(
-                "No SSH target was selected. Select a target and press g to review this request.",
-            );
-            return;
-        };
-        if request.verified_identity.is_none() {
-            self.pending_grant = Some(request);
             self.page = SshModalPage::Manager;
             self.show_info(
-                "Authenticate the selected SSH target before reviewing this access request; press g.",
+                "Select an SSH target, then press Enter to choose a folder for this request.",
             );
-            return;
+            return SshModalOutcome::Changed;
+        };
+        if request
+            .root
+            .as_deref()
+            .map_or(true, |root| root.trim().is_empty())
+        {
+            let target_id = target_id.to_owned();
+            self.pending_grant = Some(request);
+            return self.begin_directory_browser(
+                target_id,
+                None,
+                SshDirectoryPurpose::PendingGrant { request_id },
+            );
         }
-        let local_options = self.local_grant_options.as_ref().filter(|options| {
-            options.request_id.as_deref() == Some(request.request_id.as_str())
-                && options.target_id == target_id
-        }).cloned();
-        self.pending_grant = Some(request.clone());
+        if request.verified_identity.is_none() {
+            let target_id = target_id.to_owned();
+            self.pending_grant = Some(request);
+            self.project_browser = self
+                .project_browser
+                .take()
+                .filter(|browser| browser.purpose.is_project_open());
+            self.page = SshModalPage::Manager;
+            if !self.inspecting_grant_ids.iter().any(|id| id == &request_id) {
+                self.inspecting_grant_ids.push(request_id.clone());
+            }
+            return SshModalOutcome::InspectGrantTarget {
+                request_id,
+                target_id,
+                selected_root: None,
+                expected_identity: None,
+            };
+        }
+
+        self.inspecting_grant_ids.retain(|id| id != &request_id);
+        let local_options = self
+            .local_grant_options
+            .as_ref()
+            .filter(|options| {
+                options.request_id.as_deref() == Some(request.request_id.as_str())
+                    && options.target_id == target_id
+            })
+            .cloned();
+        let root = request.root.clone().expect("nonempty root was checked above");
         let target_label = self
             .targets
             .iter()
@@ -1941,23 +2161,28 @@ impl SshManagerState {
             .map(|target| target.label.clone())
             .unwrap_or_else(|| target_id.to_owned());
         let mut card = SshGrantCard::new(
-            request.request_id,
+            request.request_id.clone(),
             target_id.to_owned(),
             target_label,
-            request.verified_identity,
-            request.root.unwrap_or_default(),
-            Some(request.reason),
+            request.verified_identity.clone(),
+            root,
+            Some(request.reason.clone()),
             local_options.is_none(),
         );
+        card.set_verified_scope(request.capabilities);
         if let Some(options) = local_options {
             card.capabilities = options.capabilities;
             card.lifetime = options.lifetime;
             card.set_default = options.set_default;
             card.follow_up = self.pending_grant_follow_up;
-        } else {
-            card.capabilities = request.capabilities;
         }
+        self.pending_grant = Some(request);
+        self.project_browser = self
+            .project_browser
+            .take()
+            .filter(|browser| browser.purpose.is_project_open());
         self.page = SshModalPage::Grant(card);
+        SshModalOutcome::Changed
     }
 
     pub fn begin_connection_action(&mut self, target_id: &str, connect: bool) {
@@ -2083,6 +2308,9 @@ impl SshManagerState {
                 self.settled_grant_follow_up = Some((request_id, follow_up));
             }
         }
+        if let Some(request_id) = request_id.as_deref() {
+            self.inspecting_grant_ids.retain(|id| id != request_id);
+        }
         self.pending_grant = None;
         self.submitted_grant = None;
         self.pending_grant_session_id = None;
@@ -2185,6 +2413,42 @@ impl SshManagerState {
         true
     }
 
+    /// Surface an exact grant-inspection failure without allowing an old result to replace a
+    /// newer request or revive a cancelled picker.
+    pub fn fail_grant_inspection(&mut self, request_id: &str, error: String) -> bool {
+        if self.cancelled_grant_ids.iter().any(|id| id == request_id)
+            || !self
+                .pending_grant
+                .as_ref()
+                .is_some_and(|request| request.request_id == request_id)
+        {
+            return false;
+        }
+        self.inspecting_grant_ids.retain(|id| id != request_id);
+        let browser_owns_request = self.project_browser.as_ref().is_some_and(|browser| {
+            matches!(
+                &browser.purpose,
+                SshDirectoryPurpose::PendingGrant {
+                    request_id: pending_request_id,
+                } if pending_request_id == request_id
+            )
+        });
+        if browser_owns_request {
+            if let Some(browser) = self.project_browser.as_mut() {
+                browser.loading = false;
+                browser.preparing = false;
+                browser.open_request_id = None;
+                browser.notice = None;
+                browser.error = Some(error.clone());
+            }
+            self.show_error(error);
+        } else {
+            self.page = SshModalPage::Diagnostic(SshDiagnosticCard::new(error));
+            self.message = None;
+        }
+        true
+    }
+
     pub fn show_error(&mut self, error: impl Into<String>) {
         self.pending_connection = None;
         let error = error.into();
@@ -2194,8 +2458,11 @@ impl SshManagerState {
             {
                 self.resume_project_browser_after_authentication = false;
                 if let Some(browser) = self.project_browser.as_mut() {
-                    browser.loading = false;
-                    browser.preparing = false;
+                    if !browser.purpose.is_project_open() {
+                        browser.loading = false;
+                        browser.preparing = false;
+                        browser.open_request_id = None;
+                    }
                     browser.error = Some(error.clone());
                 }
                 let mut diagnostic = SshDiagnosticCard::new(error);
@@ -2288,6 +2555,8 @@ pub enum SshModalOutcome {
     InspectGrantTarget {
         request_id: String,
         target_id: String,
+        selected_root: Option<String>,
+        expected_identity: Option<SshHostIdentity>,
     },
     UseBinding {
         binding_id: String,
@@ -2477,6 +2746,39 @@ const PROJECT_BROWSER_SHORTCUTS: &[Shortcut<'static>] = &[
     },
     Shortcut {
         label: "Esc back/cancel",
+        clickable: true,
+        id: FOOTER_MANAGER_CLOSE,
+    },
+];
+
+const GRANT_BROWSER_SHORTCUTS: &[Shortcut<'static>] = &[
+    Shortcut {
+        label: "↑/↓ or j/k choose",
+        clickable: false,
+        id: 0,
+    },
+    Shortcut {
+        label: "Enter child",
+        clickable: false,
+        id: 0,
+    },
+    Shortcut {
+        label: "/ path",
+        clickable: false,
+        id: 0,
+    },
+    Shortcut {
+        label: "Backspace parent",
+        clickable: true,
+        id: FOOTER_BROWSER_PARENT,
+    },
+    Shortcut {
+        label: "o Use this folder for grants",
+        clickable: true,
+        id: FOOTER_BROWSER_OPEN,
+    },
+    Shortcut {
+        label: "Esc cancel",
         clickable: true,
         id: FOOTER_MANAGER_CLOSE,
     },
@@ -2806,7 +3108,12 @@ pub fn render_ssh_modal(
                 GRANT_SHORTCUTS
             },
         ),
-        SshModalPage::ProjectBrowser => ("Choose remote folder", PROJECT_BROWSER_SHORTCUTS),
+        SshModalPage::ProjectBrowser => state
+            .project_browser
+            .as_ref()
+            .is_some_and(|browser| browser.purpose.is_project_open())
+            .then_some(("Choose remote folder", PROJECT_BROWSER_SHORTCUTS))
+            .unwrap_or(("Choose folder for SSH grants", GRANT_BROWSER_SHORTCUTS)),
         SshModalPage::OperationApproval(_) => {
             ("SSH operation approval", OPERATION_APPROVAL_SHORTCUTS)
         }
@@ -3364,27 +3671,37 @@ fn render_grant(buf: &mut Buffer, area: Rect, card: &mut SshGrantCard, theme: &T
         None,
         false,
     );
-    push_grant_wrapped(
-        &mut lines,
-        if card.is_project_consent() {
-            format!("Project folder: {}", card.root.text())
-        } else {
-            format!("Requested remote root: {}", card.root.text())
-        },
-        width,
-        None,
-        false,
-    );
-    lines.push(GrantRenderLine {
-        text: if card.is_project_consent() {
-            "Folder (same or narrower): ".into()
-        } else {
-            "Edit root: ".into()
-        },
-        focus: Some(SshGrantFocus::Root),
-        warning: false,
-        root_editor: true,
-    });
+    if card.verified_root {
+        push_grant_wrapped(
+            &mut lines,
+            format!("Verified remote folder: {}", card.root.text()),
+            width,
+            None,
+            false,
+        );
+    } else {
+        push_grant_wrapped(
+            &mut lines,
+            if card.is_project_consent() {
+                format!("Project folder: {}", card.root.text())
+            } else {
+                format!("Requested remote root: {}", card.root.text())
+            },
+            width,
+            None,
+            false,
+        );
+        lines.push(GrantRenderLine {
+            text: if card.is_project_consent() {
+                "Folder (same or narrower): ".into()
+            } else {
+                "Edit root: ".into()
+            },
+            focus: Some(SshGrantFocus::Root),
+            warning: false,
+            root_editor: true,
+        });
+    }
     for (focus, enabled, label) in [
         (
             SshGrantFocus::Read,
@@ -3402,11 +3719,16 @@ fn render_grant(buf: &mut Buffer, area: Rect, card: &mut SshGrantCard, theme: &T
             "Run remote commands",
         ),
     ] {
+        let requested = card.capability_is_requested(focus);
         push_grant_wrapped(
             &mut lines,
-            format!("[{}] {label}", if enabled { "x" } else { " " }),
+            format!(
+                "[{}] {label}{}",
+                if enabled { "x" } else { " " },
+                if requested { "" } else { " (not requested)" }
+            ),
             width,
-            Some(focus),
+            requested.then_some(focus),
             false,
         );
     }
@@ -3463,14 +3785,6 @@ fn render_grant(buf: &mut Buffer, area: Rect, card: &mut SshGrantCard, theme: &T
     }
     if let Some(follow_up) = card.follow_up {
         push_grant_wrapped(&mut lines, follow_up.guidance(), width, None, false);
-    } else if card.request_id.is_empty() {
-        push_grant_wrapped(
-            &mut lines,
-            "Press Enter to continue to identity verification. A later card will require explicit approval of the verified identity and scope.",
-            width,
-            None,
-            false,
-        );
     } else if card.is_project_consent() {
         push_grant_wrapped(
             &mut lines,
@@ -4479,9 +4793,44 @@ fn scroll_project_browser(state: &mut SshManagerState, delta: isize) -> SshModal
     SshModalOutcome::Changed
 }
 
+fn deny_grant_once(
+    state: &mut SshManagerState,
+    request_id: String,
+    lifetime: SshGrantLifetime,
+    set_default: bool,
+) -> SshModalOutcome {
+    if state.cancelled_grant_ids.iter().any(|id| id == &request_id) {
+        return SshModalOutcome::Changed;
+    }
+    state.inspecting_grant_ids.retain(|id| id != &request_id);
+    if state.cancelled_grant_ids.len() == 16 {
+        state.cancelled_grant_ids.remove(0);
+    }
+    state.cancelled_grant_ids.push(request_id.clone());
+    SshModalOutcome::ApproveGrant {
+        request_id,
+        approved: false,
+        target_id: None,
+        root: None,
+        capabilities: None,
+        lifetime,
+        set_default,
+    }
+}
+
 fn close_current_page(state: &mut SshManagerState) -> SshModalOutcome {
     if matches!(&state.page, SshModalPage::ProjectBrowser) {
-        if let Some(pending) = state.pending_project_open.take() {
+        let purpose = state
+            .project_browser
+            .as_ref()
+            .map(|browser| browser.purpose.clone());
+        let browser_dispatched = state
+            .project_browser
+            .as_ref()
+            .is_some_and(|browser| browser.open_request_id.is_some());
+        if matches!(&purpose, Some(SshDirectoryPurpose::ProjectOpen))
+            && let Some(pending) = state.pending_project_open.take()
+        {
             if let Some(browser) = state.project_browser.as_mut() {
                 browser.preparing = false;
                 browser.open_request_id = None;
@@ -4493,7 +4842,48 @@ fn close_current_page(state: &mut SshManagerState) -> SshModalOutcome {
         }
         state.project_browser = None;
         state.page = SshModalPage::Manager;
-        return SshModalOutcome::Changed;
+        return match purpose {
+            Some(SshDirectoryPurpose::PendingGrant { request_id }) => deny_grant_once(
+                state,
+                request_id,
+                SshGrantLifetime::CurrentSession,
+                false,
+            ),
+            Some(SshDirectoryPurpose::LocalGrant { .. }) if !browser_dispatched => {
+                SshModalOutcome::Changed
+            }
+            Some(SshDirectoryPurpose::LocalGrant { .. }) => {
+                let local_options = state.local_grant_options.clone();
+                match local_options {
+                    Some(options) if options.request_id.is_none() => {
+                        if state.cancelled_local_grant_options.len() == 16 {
+                            state.cancelled_local_grant_options.remove(0);
+                        }
+                        if !state.cancelled_local_grant_options.iter().any(|cancelled| {
+                            cancelled.target_id == options.target_id && cancelled.root == options.root
+                        }) {
+                            state.cancelled_local_grant_options.push(options);
+                        }
+                        SshModalOutcome::Changed
+                    }
+                    Some(LocalGrantOptions {
+                        request_id: Some(request_id),
+                        ..
+                    }) => deny_grant_once(
+                        state,
+                        request_id,
+                        SshGrantLifetime::CurrentSession,
+                        false,
+                    ),
+                    Some(_) => SshModalOutcome::Changed,
+                    None => {
+                        state.pending_grant_follow_up = None;
+                        SshModalOutcome::Changed
+                    }
+                }
+            }
+            Some(SshDirectoryPurpose::ProjectOpen) | None => SshModalOutcome::Changed,
+        };
     }
     if let SshModalPage::Diagnostic(card) = &mut state.page {
         state.page = if let Some(grant) = card.return_grant.take() {
@@ -4505,10 +4895,6 @@ fn close_current_page(state: &mut SshManagerState) -> SshModalOutcome {
         } else {
             SshModalPage::Manager
         };
-        return SshModalOutcome::Changed;
-    }
-    if matches!(&state.page, SshModalPage::Grant(card) if card.request_id.is_empty()) {
-        state.return_to_manager();
         return SshModalOutcome::Changed;
     }
     if matches!(&state.page, SshModalPage::Add(_)) {
@@ -4544,33 +4930,38 @@ fn close_current_page(state: &mut SshManagerState) -> SshModalOutcome {
             answers: Vec::new(),
         };
     }
+    let grant_denial = match &state.page {
+        SshModalPage::Manager => state.pending_grant.as_ref().map(|request| {
+            (
+                request.request_id.clone(),
+                SshGrantLifetime::CurrentSession,
+                false,
+            )
+        }),
+        SshModalPage::Grant(card) => Some((
+            card.request_id.clone(),
+            card.lifetime,
+            card.set_default,
+        )),
+        SshModalPage::Add(_)
+        | SshModalPage::ProjectBrowser
+        | SshModalPage::OperationApproval(_)
+        | SshModalPage::WorkerInstallFallback(_)
+        | SshModalPage::Authentication(_)
+        | SshModalPage::Diagnostic(_) => None,
+    };
+    if let Some((request_id, lifetime, set_default)) = grant_denial {
+        return deny_grant_once(state, request_id, lifetime, set_default);
+    }
     match &state.page {
-        SshModalPage::Manager => state
-            .pending_grant
-            .as_ref()
-            .map(|request| SshModalOutcome::ApproveGrant {
-                request_id: request.request_id.clone(),
-                approved: false,
-                target_id: None,
-                root: None,
-                capabilities: None,
-                lifetime: SshGrantLifetime::CurrentSession,
-                set_default: false,
-            })
-            .unwrap_or(SshModalOutcome::Close),
-        SshModalPage::Grant(card) => SshModalOutcome::ApproveGrant {
-            request_id: card.request_id.clone(),
-            approved: false,
-            target_id: None,
-            root: None,
-            capabilities: None,
-            lifetime: card.lifetime,
-            set_default: card.set_default,
-        },
+        SshModalPage::Manager => SshModalOutcome::Close,
         SshModalPage::OperationApproval(card) => SshModalOutcome::ApproveOperation {
             approval_id: card.approval_id.clone(),
             approved: false,
         },
+        SshModalPage::Grant(_) => {
+            unreachable!("grant denial was handled before read-only match")
+        }
         SshModalPage::WorkerInstallFallback(_) => {
             unreachable!("worker install fallback was handled before read-only match")
         }
@@ -4589,17 +4980,50 @@ fn begin_grant_flow(
     state: &mut SshManagerState,
     follow_up: Option<SshGrantFollowUp>,
 ) -> SshModalOutcome {
-    let Some((target_id, target_label, granted_root)) = state.selected_target().map(|target| {
-        (
-            target.target_id.clone(),
-            target.label.clone(),
-            target
-                .grant
-                .granted_root()
-                .map(str::to_owned)
-                .unwrap_or_else(|| ".".to_owned()),
-        )
-    }) else {
+    if let Some(request) = state.pending_grant.as_ref().cloned() {
+        let Some(target_id) = request
+            .target_id
+            .clone()
+            .or_else(|| state.selected_target().map(|target| target.target_id.clone()))
+        else {
+            state.show_info(
+                "Select an SSH target, then press Enter to choose a folder for this request.",
+            );
+            return SshModalOutcome::Changed;
+        };
+        if request
+            .root
+            .as_deref()
+            .map_or(true, |root| root.trim().is_empty())
+        {
+            return state.begin_directory_browser(
+                target_id,
+                None,
+                SshDirectoryPurpose::PendingGrant {
+                    request_id: request.request_id,
+                },
+            );
+        }
+        if request.verified_identity.is_none() {
+            if state
+                .inspecting_grant_ids
+                .iter()
+                .any(|id| id == &request.request_id)
+            {
+                return SshModalOutcome::Unchanged;
+            }
+            state.inspecting_grant_ids.push(request.request_id.clone());
+            return SshModalOutcome::InspectGrantTarget {
+                request_id: request.request_id,
+                target_id,
+                selected_root: None,
+                expected_identity: None,
+            };
+        }
+        return SshModalOutcome::Changed;
+    }
+
+    let Some(target_id) = state.selected_target().map(|target| target.target_id.clone()) else {
         state.show_error("Select an SSH target before starting an access grant.");
         return SshModalOutcome::Changed;
     };
@@ -4607,29 +5031,11 @@ fn begin_grant_flow(
         state.show_error("Open or create a session before granting SSH access.");
         return SshModalOutcome::Changed;
     }
-    if let Some(request_id) = state
-        .pending_grant
-        .as_ref()
-        .map(|request| request.request_id.clone())
-    {
-        return SshModalOutcome::InspectGrantTarget {
-            request_id,
-            target_id,
-        };
-    }
-    let mut card = SshGrantCard::new(
-        String::new(),
+    state.begin_directory_browser(
         target_id,
-        target_label,
         None,
-        granted_root,
-        None,
-        false,
-    );
-    card.follow_up = follow_up;
-    state.pending_grant_follow_up = follow_up;
-    state.page = SshModalPage::Grant(card);
-    SshModalOutcome::Changed
+        SshDirectoryPurpose::LocalGrant { follow_up },
+    )
 }
 
 fn handle_manager_key(state: &mut SshManagerState, key: &KeyEvent) -> SshModalOutcome {
@@ -4675,6 +5081,13 @@ fn handle_manager_key(state: &mut SshManagerState, key: &KeyEvent) -> SshModalOu
             }
         }
         KeyCode::Enter => {
+            if state
+                .pending_grant
+                .as_ref()
+                .is_some_and(|request| request.target_id.is_none())
+            {
+                return begin_grant_flow(state, None);
+            }
             let Some(target_id) = state.selected_target().map(|target| target.target_id.clone())
             else {
                 state.show_error("Select an SSH target before choosing a remote folder.");
@@ -4831,28 +5244,82 @@ fn handle_project_browser_key(state: &mut SshManagerState, key: &KeyEvent) -> Ss
             }
         }
         KeyCode::Char('o') if key.modifiers.is_empty() => {
-            let request_id = next_nonzero_id(&NEXT_PROJECT_DIRECTORY_REQUEST_ID);
-            let Some(browser) = state.project_browser.as_mut() else {
+            let picker_request_id = next_nonzero_id(&NEXT_PROJECT_DIRECTORY_REQUEST_ID);
+            let Some((purpose, target_id, root, identity)) = ({
+                let Some(browser) = state.project_browser.as_mut() else {
+                    return SshModalOutcome::Unchanged;
+                };
+                if browser.loading || browser.preparing || browser.open_request_id.is_some() {
+                    return SshModalOutcome::Unchanged;
+                }
+                let Some((root, identity)) = browser
+                    .listing
+                    .as_ref()
+                    .map(|listing| (listing.path.clone(), listing.identity.clone()))
+                else {
+                    return SshModalOutcome::Unchanged;
+                };
+                browser.open_request_id = Some(picker_request_id);
+                browser.preparing = true;
+                browser.notice = Some(
+                    match &browser.purpose {
+                        SshDirectoryPurpose::ProjectOpen => "Opening this folder…",
+                        SshDirectoryPurpose::LocalGrant { .. }
+                        | SshDirectoryPurpose::PendingGrant { .. } => {
+                            "Checking this folder for an access grant…"
+                        }
+                    }
+                    .into(),
+                );
+                Some((
+                    browser.purpose.clone(),
+                    browser.target_id.clone(),
+                    root,
+                    identity,
+                ))
+            }) else {
                 return SshModalOutcome::Unchanged;
             };
-            if browser.loading || browser.preparing || browser.open_request_id.is_some() {
-                return SshModalOutcome::Unchanged;
-            }
-            let Some((root, identity)) = browser
-                .listing
-                .as_ref()
-                .map(|listing| (listing.path.clone(), listing.identity.clone()))
-            else {
-                return SshModalOutcome::Unchanged;
-            };
-            browser.open_request_id = Some(request_id);
-            browser.preparing = true;
-            browser.notice = Some("Opening this folder…".into());
-            SshModalOutcome::ChooseProjectDirectory {
-                request_id,
-                target_id: browser.target_id.clone(),
-                root,
-                identity,
+            match purpose {
+                SshDirectoryPurpose::ProjectOpen => SshModalOutcome::ChooseProjectDirectory {
+                    request_id: picker_request_id,
+                    target_id,
+                    root,
+                    identity,
+                },
+                SshDirectoryPurpose::LocalGrant { follow_up } => {
+                    state.local_grant_options = Some(LocalGrantOptions {
+                        request_id: None,
+                        target_id: target_id.clone(),
+                        root: root.clone(),
+                        capabilities: SshCapabilitiesView::default(),
+                        lifetime: SshGrantLifetime::CurrentSession,
+                        set_default: false,
+                    });
+                    state.pending_grant_follow_up = follow_up;
+                    SshModalOutcome::RequestGrant {
+                        target_id,
+                        root,
+                        capabilities: SshCapabilitiesView {
+                            read: true,
+                            write: true,
+                            execute: true,
+                        },
+                        lifetime: SshGrantLifetime::CurrentSession,
+                        set_default: false,
+                    }
+                }
+                SshDirectoryPurpose::PendingGrant { request_id } => {
+                    if !state.inspecting_grant_ids.iter().any(|id| id == &request_id) {
+                        state.inspecting_grant_ids.push(request_id.clone());
+                    }
+                    SshModalOutcome::InspectGrantTarget {
+                        request_id,
+                        target_id,
+                        selected_root: Some(root),
+                        expected_identity: Some(identity),
+                    }
+                }
             }
         }
         _ => SshModalOutcome::Unchanged,
@@ -4902,9 +5369,16 @@ fn mark_grant_edited(card: &mut SshGrantCard) {
 fn activate_grant_focus(card: &mut SshGrantCard) {
     match card.focus {
         SshGrantFocus::Root => {}
-        SshGrantFocus::Read => card.capabilities.read = !card.capabilities.read,
-        SshGrantFocus::Write => card.capabilities.write = !card.capabilities.write,
-        SshGrantFocus::Execute => card.capabilities.execute = !card.capabilities.execute,
+        SshGrantFocus::Read if card.capability_is_requested(SshGrantFocus::Read) => {
+            card.capabilities.read = !card.capabilities.read
+        }
+        SshGrantFocus::Write if card.capability_is_requested(SshGrantFocus::Write) => {
+            card.capabilities.write = !card.capabilities.write
+        }
+        SshGrantFocus::Execute if card.capability_is_requested(SshGrantFocus::Execute) => {
+            card.capabilities.execute = !card.capabilities.execute
+        }
+        SshGrantFocus::Read | SshGrantFocus::Write | SshGrantFocus::Execute => {}
         SshGrantFocus::Lifetime => card.lifetime = card.lifetime.toggle(),
         SshGrantFocus::Default => card.set_default = !card.set_default,
         SshGrantFocus::RememberProject => {
@@ -5017,7 +5491,7 @@ fn handle_grant_key(card: &mut SshGrantCard, key: &KeyEvent) -> SshModalOutcome 
                 card.error = Some("Read permission is required to open a remote project.".into());
                 return SshModalOutcome::Changed;
             }
-            if !card.request_id.is_empty() && !card.reviewed_to_end {
+            if !card.reviewed_to_end {
                 card.error = Some(
                     "Review every wrapped identity, root, reason, and capability detail before allowing this grant."
                         .into(),
@@ -5030,27 +5504,17 @@ fn handle_grant_key(card: &mut SshGrantCard, key: &KeyEvent) -> SshModalOutcome 
                 card.lifetime
             };
             let set_default = !card.is_project_consent() && card.set_default;
-            if card.request_id.is_empty() {
-                SshModalOutcome::RequestGrant {
-                    target_id: card.target_id.clone(),
-                    root: root.to_owned(),
-                    capabilities: card.capabilities,
-                    lifetime,
-                    set_default,
-                }
-            } else {
-                SshModalOutcome::ApproveGrant {
-                    request_id: card.request_id.clone(),
-                    approved: true,
-                    target_id: Some(card.target_id.clone()),
-                    root: Some(root.to_owned()),
-                    capabilities: Some(card.capabilities),
-                    lifetime,
-                    set_default,
-                }
+            SshModalOutcome::ApproveGrant {
+                request_id: card.request_id.clone(),
+                approved: true,
+                target_id: Some(card.target_id.clone()),
+                root: Some(root.to_owned()),
+                capabilities: Some(card.capabilities),
+                lifetime,
+                set_default,
             }
         }
-        _ if card.focus == SshGrantFocus::Root => {
+        _ if card.focus == SshGrantFocus::Root && !card.verified_root => {
             let outcome = card.root.handle_key(key);
             if matches!(&outcome, LineEditOutcome::TextChanged) {
                 mark_grant_edited(card);
@@ -5972,40 +6436,73 @@ mod tests {
     }
 
     #[test]
-    fn advanced_use_grant_exposes_a_typed_continuation_before_settlement() {
+    fn advanced_use_grant_chooses_a_folder_then_preserves_typed_continuation() {
         let mut state = SshManagerState::new(Some("source-session".into()));
         state.set_targets(vec![target_view("server-1", SshGrantView::NotGranted)]);
         assert!(matches!(
             handle_ssh_key(&mut state, &key(KeyCode::Char('m'))),
             SshModalOutcome::Changed
         ));
+        let SshModalOutcome::BrowseProjectDirectory { request_id, .. } =
+            handle_ssh_key(&mut state, &key(KeyCode::Char('u')))
+        else {
+            panic!("advanced use must open the shared folder picker");
+        };
+        assert!(state.settle_project_directory(
+            request_id,
+            "server-1",
+            Ok(directory_listing("server-1", "/home/builder", Some("/home"), &[])),
+        ));
         assert!(matches!(
-            handle_ssh_key(&mut state, &key(KeyCode::Char('u'))),
+            handle_ssh_key(&mut state, &key(KeyCode::Char('o'))),
+            SshModalOutcome::RequestGrant {
+                root,
+                capabilities: SshCapabilitiesView {
+                    read: true,
+                    write: true,
+                    execute: true,
+                },
+                lifetime: SshGrantLifetime::CurrentSession,
+                ..
+            } if root == "/home/builder"
+        ));
+        assert!(state.bind_local_grant_request(
+            "advanced-use-grant",
+            Some("server-1"),
+            Some("/home/builder"),
+        ));
+        assert!(matches!(
+            state.show_incoming_grant(
+                "source-session".into(),
+                SshIncomingGrant {
+                    request_id: "advanced-use-grant".into(),
+                    target_id: Some("server-1".into()),
+                    root: Some("/home/builder".into()),
+                    capabilities: SshCapabilitiesView {
+                        read: true,
+                        write: true,
+                        execute: true,
+                    },
+                    verified_identity: Some(
+                        "builder@build.example.test:22 (SHA256:fixture)".into(),
+                    ),
+                    reason: "Open SSH access".into(),
+                },
+            ),
             SshModalOutcome::Changed
         ));
-        assert!(matches!(
-            handle_ssh_key(&mut state, &key(KeyCode::Enter)),
-            SshModalOutcome::RequestGrant { root, .. } if root == "."
-        ));
-        state.remember_local_grant_options(
-            "server-1".into(), ".".into(), SshCapabilitiesView::default(),
-            SshGrantLifetime::ProjectRule, false,
-        );
-        assert!(state.bind_local_grant_request("advanced-use-grant", Some("server-1"), Some(".")));
-        state.show_incoming_grant(
-            "source-session".into(),
-            SshIncomingGrant {
-                request_id: "advanced-use-grant".into(),
-                target_id: Some("server-1".into()),
-                root: Some("/home/builder".into()),
-                capabilities: SshCapabilitiesView::default(),
-                verified_identity: Some("builder@build.example.test:22 (SHA256:fixture)".into()),
-                reason: "Open SSH access".into(),
-            },
-        );
-        let SshModalPage::Grant(card) = &state.page else { panic!("verified grant expected") };
-        assert_eq!(card.lifetime, SshGrantLifetime::ProjectRule);
+        let SshModalPage::Grant(card) = &mut state.page else {
+            panic!("verified grant expected");
+        };
+        assert_eq!(card.lifetime, SshGrantLifetime::CurrentSession);
         assert_eq!(card.root.text(), "/home/builder");
+        assert!(card.capabilities.read);
+        assert!(!card.capabilities.write);
+        assert!(matches!(
+            handle_grant_key(card, &KeyEvent::new(KeyCode::Char('w'), KeyModifiers::ALT)),
+            SshModalOutcome::Changed
+        ));
+        assert!(card.capabilities.write);
         assert_eq!(
             state.take_grant_follow_up("advanced-use-grant"),
             Some(SshGrantFollowUp::UseBinding)
@@ -6215,7 +6712,7 @@ mod tests {
     #[test]
     fn grant_controls_support_tab_space_and_alt_activation() {
         let mut card = SshGrantCard::new(
-            String::new(),
+            "request-1".into(),
             "target-1".into(),
             "Build host".into(),
             None,
@@ -6332,27 +6829,349 @@ mod tests {
     }
 
     #[test]
-    fn unsubmitted_grant_can_be_cancelled_without_a_service_decision() {
+    fn advanced_grant_mouse_flow_uses_the_shared_picker() {
         let mut state = SshManagerState::new(Some("session-1".into()));
-        state.show_grant(SshGrantCard::new(
-            String::new(),
-            "target-1".into(),
-            "Build host".into(),
-            None,
-            "/tmp",
-            None,
-            false,
+        state.set_targets(vec![target_view("server-1", SshGrantView::NotGranted)]);
+        let area = Rect::new(0, 0, 100, 30);
+        let theme = Theme::current();
+        let left_click = |rect: Rect| MouseEvent {
+            kind: MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            column: rect.x,
+            row: rect.y,
+            modifiers: KeyModifiers::NONE,
+        };
+        let mut buffer = Buffer::empty(area);
+        render_ssh_modal(&mut buffer, area, &mut state, false, &theme);
+        let advanced = state
+            .window
+            .shortcut_hits
+            .iter()
+            .find(|hit| hit.id == FOOTER_MANAGER_ADVANCED)
+            .expect("advanced footer")
+            .rect;
+        assert!(matches!(
+            handle_ssh_mouse(&mut state, &left_click(advanced)),
+            SshModalOutcome::Changed
+        ));
+        let mut buffer = Buffer::empty(area);
+        render_ssh_modal(&mut buffer, area, &mut state, false, &theme);
+        let grant = state
+            .window
+            .shortcut_hits
+            .iter()
+            .find(|hit| hit.id == FOOTER_MANAGER_GRANT)
+            .expect("advanced grant footer")
+            .rect;
+        let SshModalOutcome::BrowseProjectDirectory { request_id, .. } =
+            handle_ssh_mouse(&mut state, &left_click(grant))
+        else {
+            panic!("mouse grant must open the shared picker");
+        };
+        assert!(state.settle_project_directory(
+            request_id,
+            "server-1",
+            Ok(directory_listing("server-1", "/srv/grant", Some("/srv"), &[])),
+        ));
+        let mut buffer = Buffer::empty(area);
+        render_ssh_modal(&mut buffer, area, &mut state, false, &theme);
+        let use_folder = state
+            .window
+            .shortcut_hits
+            .iter()
+            .find(|hit| hit.id == FOOTER_BROWSER_OPEN)
+            .expect("grant picker confirmation footer")
+            .rect;
+        assert!(matches!(
+            handle_ssh_mouse(&mut state, &left_click(use_folder)),
+            SshModalOutcome::RequestGrant { root, .. } if root == "/srv/grant"
+        ));
+    }
+
+    #[test]
+    fn grant_picker_error_restores_last_folder_and_allows_retry() {
+        let mut state = SshManagerState::new(Some("source-session".into()));
+        state.set_targets(vec![target_view("server-1", SshGrantView::NotGranted)]);
+        handle_ssh_key(&mut state, &key(KeyCode::Char('m')));
+        let SshModalOutcome::BrowseProjectDirectory { request_id, .. } =
+            handle_ssh_key(&mut state, &key(KeyCode::Char('g')))
+        else { panic!("grant directory picker expected") };
+        state.settle_project_directory(request_id, "server-1",
+            Ok(directory_listing("server-1", "/srv/project", Some("/srv"), &[])));
+        handle_ssh_key(&mut state, &key(KeyCode::Char('/')));
+        for character in "/missing".chars() {
+            handle_ssh_key(&mut state, &key(KeyCode::Char(character)));
+        }
+        let SshModalOutcome::BrowseProjectDirectory { request_id, .. } =
+            handle_ssh_key(&mut state, &key(KeyCode::Enter))
+        else { panic!("manual path navigation expected") };
+        state.settle_project_directory(request_id, "server-1", Err("directory missing".into()));
+        assert!(matches!(&state.page, SshModalPage::Diagnostic(card) if card.return_browser));
+        handle_ssh_key(&mut state, &key(KeyCode::Esc));
+        assert!(matches!(handle_ssh_key(&mut state, &key(KeyCode::Char('o'))),
+            SshModalOutcome::RequestGrant { root, .. } if root == "/srv/project"));
+    }
+
+    #[test]
+    fn rootless_incoming_picker_inspects_original_request_and_cancellation_stays_terminal() {
+        let mut state = SshManagerState::new(Some("manager-session".into()));
+        state.set_targets(vec![target_view("server-1", SshGrantView::NotGranted)]);
+        let SshModalOutcome::BrowseProjectDirectory { request_id, .. } =
+            state.show_incoming_grant(
+                "source-session".into(),
+                SshIncomingGrant {
+                    request_id: "incoming-rootless".into(),
+                    target_id: Some("server-1".into()),
+                    root: None,
+                    capabilities: SshCapabilitiesView::default(),
+                    verified_identity: None,
+                    reason: "Inspect a remote checkout.".into(),
+                },
+            )
+        else {
+            panic!("rootless request must open the shared picker");
+        };
+        assert!(state.settle_project_directory(
+            request_id,
+            "server-1",
+            Ok(directory_listing("server-1", "/srv/checkout", Some("/srv"), &[])),
+        ));
+        assert!(matches!(
+            handle_ssh_key(&mut state, &key(KeyCode::Char('o'))),
+            SshModalOutcome::InspectGrantTarget {
+                request_id,
+                target_id,
+                selected_root: Some(root),
+                expected_identity: Some(identity),
+            } if request_id == "incoming-rootless"
+                && target_id == "server-1"
+                && root == "/srv/checkout"
+                && identity == remote_identity()
+        ));
+        assert!(matches!(
+            handle_ssh_key(&mut state, &key(KeyCode::Esc)),
+            SshModalOutcome::ApproveGrant {
+                request_id,
+                approved: false,
+                ..
+            } if request_id == "incoming-rootless"
+        ));
+        assert_eq!(
+            state.grant_session_id_for("incoming-rootless").as_deref(),
+            Some("source-session")
+        );
+        assert!(!state.settle_project_directory(
+            request_id,
+            "server-1",
+            Ok(directory_listing("server-1", "/srv/late", Some("/srv"), &[])),
+        ));
+        assert!(matches!(
+            state.show_incoming_grant(
+                "source-session".into(),
+                SshIncomingGrant {
+                    request_id: "incoming-rootless".into(),
+                    target_id: Some("server-1".into()),
+                    root: Some("/srv/checkout".into()),
+                    capabilities: SshCapabilitiesView::default(),
+                    verified_identity: Some("builder@build.example.test:22".into()),
+                    reason: "late inspection".into(),
+                },
+            ),
+            SshModalOutcome::Unchanged
+        ));
+        assert!(!state.fail_grant_inspection(
+            "incoming-rootless",
+            "late inspection failure".into(),
+        ));
+    }
+
+    #[test]
+    fn known_root_incoming_request_inspects_without_showing_a_draft() {
+        let mut state = SshManagerState::new(Some("manager-session".into()));
+        state.set_targets(vec![target_view("server-1", SshGrantView::NotGranted)]);
+        assert!(matches!(
+            state.show_incoming_grant(
+                "source-session".into(),
+                SshIncomingGrant {
+                    request_id: "known-root".into(),
+                    target_id: Some("server-1".into()),
+                    root: Some("/srv/known".into()),
+                    capabilities: SshCapabilitiesView::default(),
+                    verified_identity: None,
+                    reason: "Read a known checkout.".into(),
+                },
+            ),
+            SshModalOutcome::InspectGrantTarget {
+                request_id,
+                target_id,
+                selected_root: None,
+                expected_identity: None,
+            } if request_id == "known-root" && target_id == "server-1"
+        ));
+        assert!(matches!(
+            state.show_incoming_grant(
+                "source-session".into(),
+                SshIncomingGrant {
+                    request_id: "known-root".into(),
+                    target_id: Some("server-1".into()),
+                    root: Some("/srv/known".into()),
+                    capabilities: SshCapabilitiesView::default(),
+                    verified_identity: None,
+                    reason: "duplicate inspection event".into(),
+                },
+            ),
+            SshModalOutcome::Unchanged
+        ));
+    }
+
+    #[test]
+    fn missing_target_enter_uses_the_original_request_and_external_capability_ceiling() {
+        let mut state = SshManagerState::new(Some("manager-session".into()));
+        state.set_targets(vec![target_view("chosen-target", SshGrantView::NotGranted)]);
+        assert!(matches!(
+            state.show_incoming_grant(
+                "source-session".into(),
+                SshIncomingGrant {
+                    request_id: "missing-target".into(),
+                    target_id: None,
+                    root: None,
+                    capabilities: SshCapabilitiesView {
+                        read: true,
+                        write: false,
+                        execute: false,
+                    },
+                    verified_identity: None,
+                    reason: "Read the build output.".into(),
+                },
+            ),
+            SshModalOutcome::Changed
+        ));
+        let SshModalOutcome::BrowseProjectDirectory { request_id, target_id, .. } =
+            handle_ssh_key(&mut state, &key(KeyCode::Enter))
+        else {
+            panic!("Enter must choose a directory for the original request");
+        };
+        assert_eq!(target_id, "chosen-target");
+        assert!(state.settle_project_directory(
+            request_id,
+            "chosen-target",
+            Ok(directory_listing("chosen-target", "/srv/build", Some("/srv"), &[])),
+        ));
+        assert!(matches!(
+            handle_ssh_key(&mut state, &key(KeyCode::Char('o'))),
+            SshModalOutcome::InspectGrantTarget {
+                request_id,
+                target_id,
+                selected_root: Some(root),
+                ..
+            } if request_id == "missing-target"
+                && target_id == "chosen-target"
+                && root == "/srv/build"
+        ));
+        assert!(matches!(
+            state.show_incoming_grant(
+                "source-session".into(),
+                SshIncomingGrant {
+                    request_id: "external-read-only".into(),
+                    target_id: Some("chosen-target".into()),
+                    root: Some("/srv/build".into()),
+                    capabilities: SshCapabilitiesView {
+                        read: true,
+                        write: false,
+                        execute: false,
+                    },
+                    verified_identity: Some("builder@build.example.test:22".into()),
+                    reason: "Read the build output.".into(),
+                },
+            ),
+            SshModalOutcome::Changed
+        ));
+        let SshModalPage::Grant(card) = &mut state.page else {
+            panic!("verified external request must show a consent card");
+        };
+        assert!(card.verified_root);
+        assert!(matches!(
+            handle_grant_key(card, &KeyEvent::new(KeyCode::Char('w'), KeyModifiers::ALT)),
+            SshModalOutcome::Changed
+        ));
+        assert!(!card.capabilities.write);
+        let area = Rect::new(0, 0, 80, 30);
+        let mut buffer = Buffer::empty(area);
+        render_ssh_modal(&mut buffer, area, &mut state, false, &Theme::current());
+        let rendered = buffer_text(&buffer);
+        assert!(rendered.contains("Verified remote folder: /srv/build"));
+        assert!(!rendered.contains("Edit root:"));
+    }
+
+    #[test]
+    fn cancelled_local_picker_denies_a_late_request_once() {
+        let mut state = SshManagerState::new(Some("session-1".into()));
+        state.set_targets(vec![target_view("server-1", SshGrantView::NotGranted)]);
+        handle_ssh_key(&mut state, &key(KeyCode::Char('m')));
+        let SshModalOutcome::BrowseProjectDirectory { request_id, .. } =
+            handle_ssh_key(&mut state, &key(KeyCode::Char('g')))
+        else {
+            panic!("advanced grant must open the picker");
+        };
+        assert!(state.settle_project_directory(
+            request_id,
+            "server-1",
+            Ok(directory_listing("server-1", "/srv/local", Some("/srv"), &[])),
+        ));
+        assert!(matches!(
+            handle_ssh_key(&mut state, &key(KeyCode::Char('o'))),
+            SshModalOutcome::RequestGrant { .. }
         ));
         assert!(matches!(
             handle_ssh_key(&mut state, &key(KeyCode::Esc)),
             SshModalOutcome::Changed
         ));
-        assert!(matches!(&state.page, SshModalPage::Manager));
+        assert!(state.bind_local_grant_request(
+            "late-local-request",
+            Some("server-1"),
+            Some("/srv/local"),
+        ));
+        assert_eq!(
+            state.grant_session_id_for("late-local-request").as_deref(),
+            Some("session-1")
+        );
         assert!(matches!(
-            handle_ssh_key(&mut state, &key(KeyCode::Esc)),
-            SshModalOutcome::Close
+            state.show_incoming_grant(
+                "session-1".into(),
+                SshIncomingGrant {
+                    request_id: "late-local-request".into(),
+                    target_id: Some("server-1".into()),
+                    root: Some("/srv/local".into()),
+                    capabilities: SshCapabilitiesView {
+                        read: true,
+                        write: true,
+                        execute: true,
+                    },
+                    verified_identity: None,
+                    reason: "late local request".into(),
+                },
+            ),
+            SshModalOutcome::ApproveGrant {
+                request_id,
+                approved: false,
+                ..
+            } if request_id == "late-local-request"
+        ));
+        assert!(matches!(
+            state.show_incoming_grant(
+                "session-1".into(),
+                SshIncomingGrant {
+                    request_id: "late-local-request".into(),
+                    target_id: Some("server-1".into()),
+                    root: Some("/srv/local".into()),
+                    capabilities: SshCapabilitiesView::default(),
+                    verified_identity: Some("builder@build.example.test:22".into()),
+                    reason: "late verification".into(),
+                },
+            ),
+            SshModalOutcome::Unchanged
         ));
     }
+
 
     #[test]
     fn grant_failure_is_readable_and_returns_to_the_same_editable_request() {

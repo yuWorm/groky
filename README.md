@@ -174,9 +174,14 @@ expansion; a different folder, identity or broader permission request needs fres
 Without remembering, access lasts only for the authorized session.
 
 `c` connects/disconnects, `a` adds a target, `d` shows connection details, and `m`
-opens advanced grant/default/revocation controls. Advanced `g` requests a root-scoped
-grant, `u` selects a default (continuing automatically after any required consent),
-and `r` revokes only the selected grant. Each active grant has its own row.
+opens advanced grant/default/revocation controls. Advanced `g`, and `u` without an
+existing grant, first open the same folder picker. Choose a folder with `o`, then
+confirm its verified identity and permissions; local grants default to read-only.
+`u` continues default selection automatically after approval. Incoming access requests
+without a folder also use this picker, retaining their original permission ceiling.
+`Esc` cancels selection and denies a waiting request; directory errors open full
+diagnostics and return to the last valid folder for retry.
+`r` revokes only the selected grant. Each active grant has its own row.
 Target rows and footer actions are clickable; the wheel scrolls lists. Permission
 options support clicks and `Tab`/`Space`; `PgUp`/`PgDn` inspect wrapped details.
 Passwords, encrypted private keys, ssh-agent and keyboard-interactive authentication are supported.

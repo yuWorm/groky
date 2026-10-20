@@ -53,6 +53,10 @@ pub enum SshServiceError {
     TargetSelectionRequired,
     #[error("SSH root must be selected by a local user")]
     RootSelectionRequired,
+    #[error(
+        "SSH grant target inspection requires both a selected root and a browser-verified host identity"
+    )]
+    InvalidInspectionSelection,
     #[error("SSH grant decision expands the requested target, root, or capabilities")]
     GrantExpansion,
     #[error("SSH binding {0} was not found")]
@@ -906,9 +910,17 @@ impl SessionSsh {
             SshControlCommand::InspectGrantTarget {
                 request_id,
                 target_id,
+                selected_root,
+                expected_identity,
             } => Ok(SshControlReply::GrantRequested(
-                self.inspect_grant_target(&request_id, target_id, client_id)
-                    .await?,
+                self.inspect_grant_target(
+                    &request_id,
+                    target_id,
+                    selected_root,
+                    expected_identity,
+                    client_id,
+                )
+                .await?,
             )),
             SshControlCommand::ApproveGrant(decision) => {
                 if decision.client_id != client_id {
@@ -1184,41 +1196,90 @@ impl SessionSsh {
         &self,
         request_id: &str,
         target_id: String,
+        selected_root: Option<String>,
+        expected_identity: Option<SshHostIdentity>,
         client_id: u64,
     ) -> Result<SshGrantRequest, SshServiceError> {
         let request = self.pending_request(request_id).await?;
         self.check_request_client(&request, client_id)?;
-        if let Some(requested_target) = &request.target_id {
-            if requested_target != &target_id {
-                return Err(SshServiceError::GrantExpansion);
-            }
+        let target_id = choose_narrower_target(&request, Some(target_id.as_str()))?;
+        match (selected_root.as_deref(), expected_identity.as_ref()) {
+            (None, None) | (Some(_), Some(_)) => {}
+            _ => return Err(SshServiceError::InvalidInspectionSelection),
         }
+        if selected_root.as_deref().is_some_and(|root| root.trim().is_empty()) {
+            return Err(SshServiceError::RootSelectionRequired);
+        }
+
         let lease = self
             .acquire_native(target_id.as_str(), Some(client_id), true)
             .await?;
         let identity = lease.identity().clone();
-        let canonical_root = match request.root.as_deref() {
-            Some(root) => Some(super::native_files::canonical_root(&lease, root)
-                .await.map_err(SshServiceError::Native)?),
+        ensure_inspection_identity(&request, expected_identity.as_ref(), &identity)?;
+        let canonical_requested_root = match request.root.as_deref() {
+            Some(root) => Some(
+                super::native_files::canonical_root(&lease, root)
+                    .await
+                    .map_err(SshServiceError::Native)?,
+            ),
             None => None,
         };
-        drop(lease);
-        let updated = {
-            let mut sessions = self.inner.sessions.write().await;
-            let state = sessions
-                .get_mut(&request.session_id)
-                .ok_or_else(|| SshServiceError::UnknownGrantRequest(request_id.to_owned()))?;
-            let current = state
-                .pending_requests
-                .get_mut(request_id)
-                .ok_or_else(|| SshServiceError::UnknownGrantRequest(request_id.to_owned()))?;
-            current.target_id = Some(target_id);
-            current.root = canonical_root;
-            current.verified_identity = Some(identity);
-            current.client_id = Some(client_id);
-            current.clone()
+        let canonical_selected_root = match selected_root.as_deref() {
+            Some(root) => Some(
+                super::native_files::canonical_root(&lease, root)
+                    .await
+                    .map_err(SshServiceError::Native)?,
+            ),
+            None => None,
         };
-        self.persist_registered_session(&updated.session_id).await?;
+        ensure_inspection_root_within_limit(
+            canonical_selected_root.as_deref(),
+            canonical_requested_root.as_deref(),
+        )?;
+        drop(lease);
+
+        self.finish_grant_inspection(
+            &request,
+            target_id,
+            canonical_selected_root.or(canonical_requested_root),
+            identity,
+        )
+        .await
+    }
+
+    async fn finish_grant_inspection(
+        &self,
+        request: &SshGrantRequest,
+        target_id: String,
+        root: Option<String>,
+        identity: SshHostIdentity,
+    ) -> Result<SshGrantRequest, SshServiceError> {
+        ensure_inspection_identity(request, None, &identity)?;
+        let updated = SshGrantRequest {
+            target_id: Some(target_id),
+            root,
+            verified_identity: Some(identity),
+            ..request.clone()
+        };
+        let mut sessions = self.inner.sessions.write().await;
+        let state = sessions
+            .get_mut(&request.session_id)
+            .ok_or_else(|| SshServiceError::UnknownGrantRequest(request.id.clone()))?;
+        let current = state
+            .pending_requests
+            .get(&request.id)
+            .ok_or_else(|| SshServiceError::UnknownGrantRequest(request.id.clone()))?;
+        if current != request {
+            return Err(SshServiceError::RequestResolved);
+        }
+        let mut candidate = state.clone();
+        candidate
+            .pending_requests
+            .insert(updated.id.clone(), updated.clone());
+        self.persist_state(&updated.session_id, &candidate).await?;
+        *state = candidate;
+        // Publish while the request state remains locked so a concurrent denial
+        // cannot publish GrantResolved before this inspection update.
         let _ = self
             .inner
             .events
@@ -3060,6 +3121,37 @@ fn choose_narrower_root(
     Ok(root)
 }
 
+fn ensure_inspection_identity(
+    request: &SshGrantRequest,
+    expected_identity: Option<&SshHostIdentity>,
+    identity: &SshHostIdentity,
+) -> Result<(), SshServiceError> {
+    if expected_identity.is_some_and(|expected| expected != identity)
+        || request
+            .verified_identity
+            .as_ref()
+            .is_some_and(|verified| verified != identity)
+    {
+        return Err(SshServiceError::IdentityChanged);
+    }
+    Ok(())
+}
+
+/// The arguments are canonical remote paths acquired from the same native
+/// lease. A browser-selected path may only narrow an existing request limit.
+fn ensure_inspection_root_within_limit(
+    selected_root: Option<&str>,
+    requested_root: Option<&str>,
+) -> Result<(), SshServiceError> {
+    if matches!(
+        (selected_root, requested_root),
+        (Some(selected), Some(requested)) if !remote_path_within(selected, requested)
+    ) {
+        return Err(SshServiceError::GrantExpansion);
+    }
+    Ok(())
+}
+
 fn choose_narrower_capabilities(
     request: &SshGrantRequest,
     selected: Option<SshCapabilities>,
@@ -4218,6 +4310,187 @@ mod tests {
         assert!(snapshot.default_binding_id.is_none());
         assert_eq!(snapshot.grants.len(), 1);
         assert_eq!(snapshot.grants[0].binding.root, "/remote/original");
+    }
+
+    #[test]
+    fn inspection_rejects_changed_identity_or_scope_expansion() {
+        let identity = SshHostIdentity {
+            hostname: "host".into(),
+            port: 22,
+            username: "user".into(),
+            fingerprint: "fingerprint".into(),
+        };
+        let request = SshGrantRequest {
+            id: "request".into(),
+            session_id: "session".into(),
+            originating_session_id: None,
+            target_id: Some("target".into()),
+            root: Some("/canonical/project".into()),
+            capabilities: SshCapabilities::read_only(),
+            reason: "test".into(),
+            verified_identity: Some(identity.clone()),
+            client_id: Some(7),
+        };
+
+        assert!(ensure_inspection_identity(&request, Some(&identity), &identity).is_ok());
+        assert!(matches!(
+            ensure_inspection_identity(
+                &request,
+                Some(&SshHostIdentity {
+                    fingerprint: "unexpected".into(),
+                    ..identity.clone()
+                }),
+                &identity,
+            ),
+            Err(SshServiceError::IdentityChanged)
+        ));
+        assert!(matches!(
+            ensure_inspection_identity(
+                &request,
+                Some(&identity),
+                &SshHostIdentity {
+                    fingerprint: "changed".into(),
+                    ..identity.clone()
+                },
+            ),
+            Err(SshServiceError::IdentityChanged)
+        ));
+        assert!(ensure_inspection_root_within_limit(
+            Some("/canonical/project/subdir"),
+            Some("/canonical/project"),
+        )
+        .is_ok());
+        assert!(matches!(
+            ensure_inspection_root_within_limit(
+                Some("/canonical/other"),
+                Some("/canonical/project"),
+            ),
+            Err(SshServiceError::GrantExpansion)
+        ));
+        assert!(matches!(
+            choose_narrower_target(&request, Some("other-target")),
+            Err(SshServiceError::GrantExpansion)
+        ));
+    }
+
+    #[tokio::test]
+    async fn inspection_commit_retains_original_request_owner_and_scope() {
+        let home = tempfile::tempdir().unwrap();
+        let service = SessionSsh::new(home.path().to_owned());
+        let request = service
+            .publish_grant_request(SshGrantRequest {
+                id: "request".into(),
+                session_id: "session".into(),
+                originating_session_id: Some("origin".into()),
+                target_id: Some("target".into()),
+                root: Some("/requested/root".into()),
+                capabilities: SshCapabilities::read_only(),
+                reason: "retain request metadata".into(),
+                verified_identity: None,
+                client_id: Some(7),
+            })
+            .await
+            .unwrap();
+        let identity = SshHostIdentity {
+            hostname: "host".into(),
+            port: 22,
+            username: "user".into(),
+            fingerprint: "fingerprint".into(),
+        };
+
+        let updated = service
+            .finish_grant_inspection(
+                &request,
+                "target".into(),
+                Some("/requested/root/subdir".into()),
+                identity.clone(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(updated.id, request.id);
+        assert_eq!(updated.session_id, request.session_id);
+        assert_eq!(updated.originating_session_id, request.originating_session_id);
+        assert_eq!(updated.capabilities, request.capabilities);
+        assert_eq!(updated.client_id, request.client_id);
+        assert_eq!(updated.root.as_deref(), Some("/requested/root/subdir"));
+        assert_eq!(updated.verified_identity.as_ref(), Some(&identity));
+        assert!(matches!(
+            service.check_request_client(&updated, 8),
+            Err(SshServiceError::WrongClient)
+        ));
+        assert_eq!(
+            service.pending_request(&request.id).await.unwrap(),
+            updated,
+        );
+    }
+
+    #[tokio::test]
+    async fn late_inspection_result_after_denial_cannot_reopen_request() {
+        let home = tempfile::tempdir().unwrap();
+        let service = SessionSsh::new(home.path().to_owned());
+        let mut events = service.subscribe_events();
+        let request = service
+            .request_grant(
+                "session",
+                Some("target".into()),
+                Some("/requested/root".into()),
+                SshCapabilities::read_only(),
+                "inspect a remote project".into(),
+                Some(7),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            events.recv().await.unwrap(),
+            SshEvent::GrantRequested(published) if published == request
+        ));
+
+        assert!(
+            service
+                .approve_grant(SshGrantDecision {
+                    request_id: request.id.clone(),
+                    approved: false,
+                    target_id: None,
+                    root: None,
+                    capabilities: None,
+                    scope: SshGrantScope::CurrentSession,
+                    make_default: false,
+                    client_id: 7,
+                })
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(matches!(
+            events.recv().await.unwrap(),
+            SshEvent::GrantResolved {
+                request_id,
+                approved: false,
+                binding: None,
+            } if request_id == request.id
+        ));
+
+        assert!(matches!(
+            service
+                .finish_grant_inspection(
+                    &request,
+                    "target".into(),
+                    Some("/requested/root".into()),
+                    SshHostIdentity {
+                        hostname: "host".into(),
+                        port: 22,
+                        username: "user".into(),
+                        fingerprint: "fingerprint".into(),
+                    },
+                )
+                .await,
+            Err(SshServiceError::UnknownGrantRequest(_))
+        ));
+        assert!(matches!(
+            events.try_recv(),
+            Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+        ));
     }
 
     #[test]

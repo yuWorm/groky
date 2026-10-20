@@ -625,20 +625,30 @@ pub(crate) fn execute(
             session_id,
             request_id,
             target_id,
+            selected_root,
+            expected_identity,
             client_id,
             owner,
         } => {
             tasks.spawn(async move {
-                ssh_grant_reply(
-                    session_id,
-                    client_id,
-                    owner,
+                let reply = ssh_control_reply(
                     xai_grok_shell::ssh::SshControlCommand::InspectGrantTarget {
-                        request_id,
-                        target_id,
+                        request_id: request_id.clone(), target_id,
+                        selected_root, expected_identity,
                     },
-                )
-                .await
+                    client_id,
+                ).await;
+                let (client_id, result) = match reply {
+                    Ok((client_id, xai_grok_shell::ssh::SshControlReply::GrantRequested(request))) =>
+                        (client_id, Ok(request)),
+                    Ok((client_id, _)) => (client_id, Err(
+                        "SSH local service returned an unexpected grant inspection response.".into(),
+                    )),
+                    Err((client_id, error)) => (client_id, Err(error)),
+                };
+                TaskResult::SshGrantInspected {
+                    session_id, request_id, client_id, owner, result,
+                }
             });
         }
         Effect::SshApproveGrant {

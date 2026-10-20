@@ -228,9 +228,13 @@ impl AgentView {
             SshModalOutcome::InspectGrantTarget {
                 request_id,
                 target_id,
+                selected_root,
+                expected_identity,
             } => InputOutcome::Action(Action::InspectSshGrantTarget {
                 request_id,
                 target_id,
+                selected_root,
+                expected_identity,
             }),
             SshModalOutcome::UseBinding { binding_id } => {
                 InputOutcome::Action(Action::UseSshBinding { binding_id })

@@ -580,6 +580,29 @@ pub(super) fn dispatch_task_result(result: TaskResult, app: &mut AppView) -> Vec
             };
             refresh.into_iter().collect()
         }
+        TaskResult::SshGrantInspected {
+            session_id, request_id, client_id, owner, result,
+        } => {
+            app.ssh_client_id = client_id;
+            let current = session_id.is_some()
+                && super::ssh::ssh_manager_for_owner_mut(app, owner)
+                    .is_some_and(|manager| manager.grant_session_id_for(&request_id) == session_id);
+            if !current {
+                return vec![];
+            }
+            match result {
+                Ok(request) => super::ssh::apply_ssh_control_event(
+                    app, session_id, Some(owner),
+                    xai_grok_shell::ssh::SshEvent::GrantRequested(request),
+                ),
+                Err(error) => {
+                    if let Some(manager) = super::ssh::ssh_manager_for_owner_mut(app, owner) {
+                        manager.fail_grant_inspection(&request_id, error);
+                    }
+                    vec![]
+                }
+            }
+        }
         TaskResult::SshProjectDirectoryLoaded { request_id, target_id, client_id, owner, result } => {
             app.ssh_client_id = client_id;
             if let Some(manager) = super::ssh::ssh_manager_for_owner_mut(app, owner)
