@@ -46,6 +46,7 @@ bm25 = "2.3"
 bytes = { workspace = true }
 chrono = { workspace = true }
 indexmap = { workspace = true, features = ["serde"] }
+indicatif = { workspace = true }
 ignore = { workspace = true }
 jsonschema = { workspace = true }
 futures = { workspace = true }

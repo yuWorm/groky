@@ -99,6 +99,9 @@ See ~/.grok/README.md for more information.
         /// Install a specific version (e.g. 0.1.150 or 0.1.151-alpha.2).
         #[arg(long)]
         version: Option<String>,
+        /// GitHub mirror base URL for groky (default: https://gh-proxy.com); 'direct' bypasses it.
+        #[arg(long, visible_alias = "mirros", value_name = "URL")]
+        mirrors: Option<String>,
         /// Switch to the alpha release channel (faster updates, may have bugs).
         #[arg(long, conflicts_with_all = ["stable", "enterprise"])]
         alpha: bool,

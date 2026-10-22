@@ -32,3 +32,5 @@ Next groky version after `v0.1.26`.
 - **SSH access requests** distinguish cancellation, explicit denial and real connection or inspection failures, preserving the original error for the waiting tool and rejecting late approvals.
 - **/ssh** accepts a server name or target ID directly, reuses an unambiguous session grant or opens worker-free authorization, and shows matching candidates instead of guessing duplicate names.
 - **/ssh suggestions** automatically list configured servers while typing, filter by name or address, and support arrow selection, Tab completion and Enter confirmation using exact target IDs without connecting during discovery.
+- **groky update** uses `https://gh-proxy.com` for GitHub release metadata and downloads by default; `--mirrors` (alias `--mirros`) overrides the mirror per invocation, and `--mirrors direct` bypasses it without exposing GitHub tokens to mirrors.
+- **Update downloads** stream to disk with progress, speed and ETA (or downloaded bytes when size is unknown), replace the two-minute total deadline with connection/read timeouts, and remove partial binaries after interrupted transfers.

@@ -15723,6 +15723,7 @@ dependencies = [
  "ignore",
  "image",
  "indexmap",
+ "indicatif",
  "infer 0.15.0",
  "jsonschema",
  "libc",

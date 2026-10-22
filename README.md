@@ -41,7 +41,7 @@ and plugins with official `grok` via `~/.grok/` (directory links +
 `GROKY_SKIP_HOME_MIGRATE=1` to skip the copy/link step.
 
 - Pin a version: see [INSTALL.md](INSTALL.md) for Bash and PowerShell commands
-- Upgrade: run your platform's install command again
+- Upgrade: `groky update` ([mirror and progress options](INSTALL.md#update-mirrors-and-download-progress))
 - **Do not** run `curl https://x.ai/cli/install.sh` — that installs official `grok`
 
 Windows x86_64 binaries are available from v0.1.23. See
@@ -69,6 +69,11 @@ groky
 | Sign out a provider (all its accounts) | `/provider-logout` |
 | Refresh vendor model lists | `/sync-models-dev` (alias `/refresh-models`); provider picker `r`; custom model list `Ctrl+R` |
 | Update groky | `groky update` or `groky update --version 0.1.25` (Welcome: ctrl+u) |
+
+Updates use `https://gh-proxy.com` by default and show download progress.
+Use `groky update --mirrors https://your-mirror.example` to override it for
+one invocation, or `--mirrors direct` to access GitHub directly.
+`--mirros` is also accepted. See [update details](INSTALL.md#update-mirrors-and-download-progress).
 
 xAI login is unchanged (`AuthManager`, `~/.grok/auth.json`, shared with
 official `grok`). Third-party keys never go in `config.toml`; they live in

@@ -45,11 +45,41 @@ Remove-Item Env:GROKY_VERSION
 groky --version
 ```
 
-Unpinned `groky update` / the installer without a version still query
-`/releases/latest`. A `GROKY_GITHUB_TOKEN` (or `GITHUB_TOKEN`) raises that
-API quota.
+Unpinned updates and installers still query `/releases/latest`.
+For direct GitHub access, `GROKY_GITHUB_TOKEN` (or `GITHUB_TOKEN`) raises
+the API quota. Tokens are never sent to an update mirror.
 
-Re-run the same command to upgrade.
+## Update mirrors and download progress
+
+`groky update` uses `https://gh-proxy.com` by default for latest-release
+metadata, binaries, and checksum files. Automatic groky updates use the same
+default. Override the mirror for one invocation:
+
+```sh
+groky update
+groky update --mirrors https://your-mirror.example
+groky update --version 0.1.26 --mirrors https://your-mirror.example
+groky update --check --mirrors https://your-mirror.example
+groky update --mirrors direct
+```
+
+`--mirros` is an alias for `--mirrors`. The URL is a single HTTP(S) base URL;
+the updater appends `/https://github.com/...` or `/https://api.github.com/...`.
+The mirror must support these URL-prefix requests (it is not an HTTP proxy
+setting). Use a trusted mirror: it supplies the executable and its checksum.
+`direct` bypasses the mirror and permits GitHub token authentication.
+The override is not saved and does not silently fall back to another source.
+
+Interactive downloads show percentage, downloaded/total bytes, speed and ETA.
+If the server omits the size, a spinner shows downloaded bytes and speed.
+Non-interactive output has no animated bar. Downloads stream to disk and have
+30-second connection/read timeouts rather than a 120-second total deadline.
+Interrupted downloads remove the partial binary and leave the installed
+version untouched.
+
+These options apply to `groky update`, not the Bash or PowerShell first-install
+scripts above. Those scripts still access GitHub directly; re-running them
+also upgrades groky.
 
 ## Releases
 

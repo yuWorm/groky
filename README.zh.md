@@ -66,6 +66,14 @@ groky
 | 刷新供应商模型列表 | `/sync-models-dev`（别名 `/refresh-models`）；供应商列表 `r`；自定义模型列表 `Ctrl+R` |
 | 更新 groky | `groky update` 或 `groky update --version 0.1.25`（Welcome：ctrl+u） |
 
+更新默认使用 `https://gh-proxy.com`，下载时显示进度条、速度和剩余时间；
+服务端未提供文件大小时显示已下载字节数。
+`groky update --mirrors https://your-mirror.example` 可为本次更新指定镜像，
+`--mirros` 是同义参数；`--mirrors direct` 则直连 GitHub。
+镜像同时用于最新版查询、二进制和校验文件下载，GitHub Token 不会发送给镜像。
+只使用可信镜像；此参数不会保存，也不改变首次安装脚本。
+详见[更新说明](INSTALL.md#update-mirrors-and-download-progress)。
+
 xAI 登录未改（`AuthManager`、`~/.grok/auth.json`，与官方 `grok` 共用）。
 第三方密钥不进 `config.toml`，而在 `~/.groky/vendor-auth.json`。供应商
 401 会提示 `/provider-login`，不会跳 `/login`。

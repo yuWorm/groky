@@ -2,15 +2,18 @@
 //! / `update` command flow; does not call x.ai/cli.
 
 use std::fs;
-use std::io::{self, Write};
+use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use indicatif::{ProgressBar, ProgressStyle};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use tokio::io::AsyncWriteExt;
 
 const DEFAULT_REPO: &str = "yuWorm/groky";
+const DEFAULT_MIRROR: &str = "https://gh-proxy.com";
 const TTL: Duration = Duration::from_secs(30 * 60);
 const INSTALL_HINT: &str = "curl -fsSL https://raw.githubusercontent.com/yuWorm/groky/main/scripts/install-groky.sh | bash";
 
@@ -124,14 +127,16 @@ pub(crate) fn needs_update(current: &str, latest: &str) -> bool {
     }
 }
 
-pub async fn check_status() -> Result<UpdateStatus, SelfUpdateError> {
+pub async fn check_status(mirrors: Option<&str>) -> Result<UpdateStatus, SelfUpdateError> {
     let current = product_version()
         .map(str::to_owned)
         .ok_or_else(|| SelfUpdateError::Message("GROKY_VERSION is not set (dev build)".into()))?;
-    let latest = match cached_latest_if_fresh() {
+    // An explicit source must not be masked by another source's cached result.
+    let cached = mirrors.is_none().then(cached_latest_if_fresh).flatten();
+    let latest = match cached {
         Some(latest) => latest,
         None => {
-            let latest = fetch_latest().await?;
+            let latest = fetch_latest(mirrors).await?;
             write_cache(&latest);
             latest
         }
@@ -149,7 +154,7 @@ pub async fn check_background() -> BackgroundCheck {
     if auto_update_disabled().await {
         return BackgroundCheck::none();
     }
-    let Ok(status) = check_status().await else {
+    let Ok(status) = check_status(None).await else {
         return BackgroundCheck::none();
     };
     if !status.update_available {
@@ -180,10 +185,14 @@ impl BackgroundCheck {
     }
 }
 
-pub async fn install(target: Option<&str>, force: bool) -> Result<Option<String>, SelfUpdateError> {
+pub async fn install(
+    target: Option<&str>,
+    force: bool,
+    mirrors: Option<&str>,
+) -> Result<Option<String>, SelfUpdateError> {
     let latest = match target {
         Some(v) => v.trim().trim_start_matches('v').to_owned(),
-        None => fetch_latest().await?,
+        None => fetch_latest(mirrors).await?,
     };
     if let Some(current) = product_version()
         && !force
@@ -210,10 +219,10 @@ pub async fn install(target: Option<&str>, force: bool) -> Result<Option<String>
     let tmp = downloads.join(format!("{asset}.tmp"));
 
     eprintln!("  Downloading groky v{latest} ({asset})...");
-    download_file(&url, &tmp).await?;
+    download_file(&url, &tmp, mirrors, true).await?;
     // HTTP download does not keep the Release asset's +x; chmod before exec.
     chmod_unix_exec(&tmp)?;
-    if let Some(expected) = download_text(&sha_url)
+    if let Some(expected) = download_text(&sha_url, mirrors)
         .await
         .ok()
         .and_then(|s| parse_sha256(&s))
@@ -249,14 +258,14 @@ pub async fn ensure_latest_on_disk() -> Result<(Option<String>, bool), SelfUpdat
     if auto_update_disabled().await {
         return Ok((None, false));
     }
-    let status = check_status().await?;
+    let status = check_status(None).await?;
     if !status.update_available {
         return Ok((None, false));
     }
     if !is_managed_install() {
         return Ok((None, false));
     }
-    let installed = install(Some(&status.latest_version), false).await?;
+    let installed = install(Some(&status.latest_version), false, None).await?;
     Ok((installed, true))
 }
 
@@ -351,6 +360,28 @@ fn write_cache(latest: &str) {
     }
 }
 
+/// Prefix the original GitHub URL; mirrors must support both API and release URLs.
+fn github_url(url: &str, mirrors: Option<&str>) -> Result<String, SelfUpdateError> {
+    let mirror = mirrors.unwrap_or(DEFAULT_MIRROR).trim();
+    if mirror == "direct" {
+        return Ok(url.to_owned());
+    }
+    let parsed = reqwest::Url::parse(mirror)
+        .map_err(|_| SelfUpdateError::Message("--mirrors requires an HTTP(S) URL or 'direct'".into()))?;
+    if !matches!(parsed.scheme(), "https" | "http")
+        || parsed.host_str().is_none()
+        || !parsed.username().is_empty()
+        || parsed.password().is_some()
+        || parsed.query().is_some()
+        || parsed.fragment().is_some()
+    {
+        return Err(SelfUpdateError::Message(
+            "--mirrors requires an HTTP(S) base URL without credentials, query or fragment".into(),
+        ));
+    }
+    Ok(format!("{}/{url}", parsed.as_str().trim_end_matches('/')))
+}
+
 fn github_client() -> Result<reqwest::Client, SelfUpdateError> {
     reqwest::Client::builder()
         .timeout(Duration::from_secs(30))
@@ -367,12 +398,15 @@ fn auth_header() -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
-async fn github_get(url: &str) -> Result<reqwest::Response, SelfUpdateError> {
+async fn github_get(url: &str, mirrors: Option<&str>) -> Result<reqwest::Response, SelfUpdateError> {
     let client = github_client()?;
     let mut req = client
-        .get(url)
+        .get(github_url(url, mirrors)?)
         .header("Accept", "application/vnd.github+json");
-    if let Some(token) = auth_header() {
+    // Never forward a GitHub credential to a third-party mirror.
+    if mirrors.is_some_and(|mirror| mirror.trim() == "direct")
+        && let Some(token) = auth_header()
+    {
         req = req.bearer_auth(token);
     }
     req.send()
@@ -380,11 +414,14 @@ async fn github_get(url: &str) -> Result<reqwest::Response, SelfUpdateError> {
         .map_err(|e| SelfUpdateError::Message(e.to_string()))
 }
 
-async fn fetch_latest() -> Result<String, SelfUpdateError> {
+async fn fetch_latest(mirrors: Option<&str>) -> Result<String, SelfUpdateError> {
     let url = format!("https://api.github.com/repos/{}/releases/latest", repo());
-    let resp = github_get(&url).await?;
+    let resp = github_get(&url, mirrors).await?;
     let status = resp.status();
-    let body = resp.text().await.unwrap_or_default();
+    let body = resp
+        .text()
+        .await
+        .map_err(|e| SelfUpdateError::Message(e.to_string()))?;
     if !status.is_success() {
         return Err(SelfUpdateError::Message(format!(
             "GitHub latest release {status}: {}",
@@ -409,17 +446,27 @@ fn tagged_download_url(version: &str, asset: &str) -> String {
     release_download_url(&repo(), &tag, asset)
 }
 
-async fn download_file(url: &str, dest: &Path) -> Result<(), SelfUpdateError> {
+async fn download_file(
+    url: &str,
+    dest: &Path,
+    mirrors: Option<&str>,
+    with_progress: bool,
+) -> Result<(), SelfUpdateError> {
+    let url = github_url(url, mirrors)?;
     let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(120))
+        // Bound stalled connections, not the total duration of a slow download.
+        .connect_timeout(Duration::from_secs(30))
+        .read_timeout(Duration::from_secs(30))
         .user_agent(format!("groky/{}", product_version().unwrap_or("dev")))
         .build()
         .map_err(|e| SelfUpdateError::Message(e.to_string()))?;
-    let mut req = client.get(url);
-    if let Some(token) = auth_header() {
+    let mut req = client.get(&url);
+    if mirrors.is_some_and(|mirror| mirror.trim() == "direct")
+        && let Some(token) = auth_header()
+    {
         req = req.bearer_auth(token);
     }
-    let resp = req
+    let mut resp = req
         .send()
         .await
         .map_err(|e| SelfUpdateError::Message(e.to_string()))?;
@@ -429,25 +476,58 @@ async fn download_file(url: &str, dest: &Path) -> Result<(), SelfUpdateError> {
             resp.status()
         )));
     }
-    let bytes = resp
-        .bytes()
-        .await
-        .map_err(|e| SelfUpdateError::Message(e.to_string()))?;
-    let mut file = fs::File::create(dest)?;
-    file.write_all(&bytes)?;
-    file.sync_all()?;
-    Ok(())
+    let progress = if !with_progress {
+        ProgressBar::hidden()
+    } else if let Some(size) = resp.content_length() {
+        let progress = ProgressBar::new(size);
+        progress.set_style(
+            ProgressStyle::with_template(
+                "  {bar:30.cyan/dim} {percent:>3}% {bytes}/{total_bytes} {bytes_per_sec} ETA {eta}",
+            )
+            .expect("valid download progress template")
+            .progress_chars("=>-"),
+        );
+        progress
+    } else {
+        let progress = ProgressBar::new_spinner();
+        progress.set_style(
+            ProgressStyle::with_template("  {spinner:.cyan} {bytes} downloaded {bytes_per_sec}")
+                .expect("valid download progress template"),
+        );
+        progress.enable_steady_tick(Duration::from_millis(100));
+        progress
+    };
+    let result = async {
+        let mut file = tokio::fs::File::create(dest).await?;
+        while let Some(chunk) = resp
+            .chunk()
+            .await
+            .map_err(|e| SelfUpdateError::Message(e.to_string()))?
+        {
+            file.write_all(&chunk).await?;
+            progress.inc(chunk.len() as u64);
+        }
+        file.flush().await?;
+        file.sync_all().await?;
+        Ok::<_, SelfUpdateError>(())
+    }
+    .await;
+    progress.finish_and_clear();
+    if result.is_err() {
+        let _ = tokio::fs::remove_file(dest).await;
+    }
+    result
 }
 
-async fn download_text(url: &str) -> Result<String, SelfUpdateError> {
+async fn download_text(url: &str, mirrors: Option<&str>) -> Result<String, SelfUpdateError> {
     let tmp = groky_home().join("downloads").join(".sha256.tmp");
     if let Some(parent) = tmp.parent() {
         fs::create_dir_all(parent)?;
     }
-    download_file(url, &tmp).await?;
-    let text = fs::read_to_string(&tmp)?;
+    download_file(url, &tmp, mirrors, false).await?;
+    let text = fs::read_to_string(&tmp);
     let _ = fs::remove_file(&tmp);
-    Ok(text)
+    Ok(text?)
 }
 
 pub(crate) fn parse_sha256(text: &str) -> Option<String> {
@@ -456,9 +536,17 @@ pub(crate) fn parse_sha256(text: &str) -> Option<String> {
 }
 
 fn sha256_file(path: &Path) -> Result<String, SelfUpdateError> {
-    let data = fs::read(path)?;
-    let digest = Sha256::digest(&data);
-    Ok(digest.iter().map(|b| format!("{b:02x}")).collect())
+    let mut file = fs::File::open(path)?;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0; 64 * 1024];
+    loop {
+        let n = file.read(&mut buffer)?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buffer[..n]);
+    }
+    Ok(format!("{:x}", hasher.finalize()))
 }
 
 fn chmod_unix_exec(path: &Path) -> io::Result<()> {
@@ -494,6 +582,100 @@ fn smoke_test(path: &Path) -> Result<(), SelfUpdateError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mirror_preserves_github_paths_and_supports_direct_access() {
+        let api = "https://api.github.com/repos/yuWorm/groky/releases/latest";
+        let asset = "https://github.com/yuWorm/groky/releases/download/v0.1.26/groky.sha256";
+        assert_eq!(
+            github_url(api, None).unwrap(),
+            format!("https://gh-proxy.com/{api}")
+        );
+        assert_eq!(
+            github_url(asset, Some(" https://mirror.example/proxy/ ")).unwrap(),
+            format!("https://mirror.example/proxy/{asset}")
+        );
+        assert_eq!(github_url(api, Some("direct")).unwrap(), api);
+    }
+
+    #[test]
+    fn mirror_rejects_ambiguous_or_unsafe_base_urls() {
+        for mirror in [
+            "",
+            "mirror.example",
+            "file:///tmp/mirror",
+            "https://user:secret@mirror.example",
+            "https://mirror.example?url=",
+            "https://mirror.example/#fragment",
+        ] {
+            assert!(github_url("https://github.com/release", Some(mirror)).is_err());
+        }
+    }
+
+    async fn serve_download(response: &'static [u8]) -> (String, tokio::task::JoinHandle<()>) {
+        use tokio::io::AsyncReadExt;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mirror = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            let mut buffer = [0; 1024];
+            while !request.windows(4).any(|bytes| bytes == b"\r\n\r\n") {
+                let n = stream.read(&mut buffer).await.unwrap();
+                assert_ne!(n, 0);
+                request.extend_from_slice(&buffer[..n]);
+            }
+            assert!(
+                request.starts_with(b"GET /https://github.com/test/asset HTTP/1.1\r\n"),
+                "{}",
+                String::from_utf8_lossy(&request)
+            );
+            stream.write_all(response).await.unwrap();
+            stream.shutdown().await.unwrap();
+        });
+        (mirror, server)
+    }
+
+    #[tokio::test]
+    async fn download_handles_known_and_unknown_length_bodies() {
+        for response in [
+            b"HTTP/1.1 200 OK\r\nContent-Length: 11\r\nConnection: close\r\n\r\nhello world".as_slice(),
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n6\r\nhello \r\n5\r\nworld\r\n0\r\n\r\n".as_slice(),
+        ] {
+            let (mirror, server) = serve_download(response).await;
+            let dir = tempfile::tempdir().unwrap();
+            let dest = dir.path().join("asset.tmp");
+            download_file("https://github.com/test/asset", &dest, Some(&mirror), true)
+                .await
+                .unwrap();
+            server.await.unwrap();
+            assert_eq!(fs::read(&dest).unwrap(), b"hello world");
+            assert_eq!(
+                sha256_file(&dest).unwrap(),
+                "b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn interrupted_download_removes_partial_file() {
+        let (mirror, server) = serve_download(
+            b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\nConnection: close\r\n\r\npartial",
+        )
+        .await;
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("asset.tmp");
+        assert!(
+            download_file("https://github.com/test/asset", &dest, Some(&mirror), true)
+                .await
+                .is_err()
+        );
+        server.await.unwrap();
+        assert!(
+            !dest.exists(),
+            "interrupted download must not leave a partial file"
+        );
+    }
 
     #[test]
     fn release_version_rejects_git_describe() {

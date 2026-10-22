@@ -1436,7 +1436,7 @@ async fn run_agent_command(
         let update_config = update_config.clone();
         tokio::spawn(async move {
             if xai_grok_shell::compat::skip_official_auto_update() {
-                let _ = xai_grok_shell::compat::install_groky_update(None, false).await;
+                let _ = xai_grok_shell::compat::install_groky_update(None, false, None).await;
             } else {
                 auto_update::run_update_if_available(
                     auto_update::UpdateRunMode::NonBlocking,
@@ -2461,6 +2461,7 @@ async fn async_main(mut args: PagerArgs) -> Result<()> {
                 json,
                 force_reinstall,
                 version,
+                mirrors,
                 alpha,
                 stable,
                 enterprise,
@@ -2474,8 +2475,13 @@ async fn async_main(mut args: PagerArgs) -> Result<()> {
                     let trigger = resolve_update_trigger(trigger.as_deref(), auto);
                     if xai_grok_shell::compat::skip_official_auto_update() {
                         let _ = (channel_switch, trigger);
-                        return run_groky_update_command(check, json, force_reinstall, version)
-                            .await;
+                        return run_groky_update_command(
+                            check, json, force_reinstall, version, mirrors,
+                        )
+                        .await;
+                    }
+                    if mirrors.is_some() {
+                        anyhow::bail!("--mirrors is only supported by groky update");
                     }
                     return run_update_command(
                         check,
@@ -2689,7 +2695,7 @@ async fn finish_update_on_exit(
             eprintln!("{reason}");
         }
         if xai_grok_shell::compat::skip_official_auto_update() {
-            xai_grok_shell::compat::install_groky_update(None, false)
+            xai_grok_shell::compat::install_groky_update(None, false, None)
                 .await
                 .is_ok()
         } else {
@@ -2833,6 +2839,7 @@ async fn run_groky_update_command(
     json: bool,
     force_reinstall: bool,
     version: Option<String>,
+    mirrors: Option<String>,
 ) -> Result<()> {
     if json && !check {
         anyhow::bail!("--json requires --check");
@@ -2841,7 +2848,7 @@ async fn run_groky_update_command(
         if version.is_some() {
             anyhow::bail!("--version cannot be used with --check");
         }
-        let status = xai_grok_shell::compat::check_status()
+        let status = xai_grok_shell::compat::check_status(mirrors.as_deref())
             .await
             .map_err(|e| anyhow::anyhow!("{e}"))?;
         if json {
@@ -2864,7 +2871,13 @@ async fn run_groky_update_command(
         }
         return Ok(());
     }
-    match xai_grok_shell::compat::install_groky_update(version.as_deref(), force_reinstall).await {
+    match xai_grok_shell::compat::install_groky_update(
+        version.as_deref(),
+        force_reinstall,
+        mirrors.as_deref(),
+    )
+    .await
+    {
         Ok(Some(installed)) => {
             signal_leaders_to_relaunch(&installed).await;
             Ok(())
