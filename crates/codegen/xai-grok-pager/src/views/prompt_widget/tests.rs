@@ -1482,6 +1482,144 @@
         assert!(!snap.open);
     }
 
+    fn ssh_candidate(display: &str, id: &str) -> crate::slash::command::ArgItem {
+        crate::slash::command::ArgItem {
+            display: display.to_owned(),
+            match_text: format!("{display} {id}"),
+            insert_text: id.to_owned(),
+            description: "fixture target".to_owned(),
+        }
+    }
+
+    #[test]
+    fn ssh_target_load_rejects_a_stale_entry_generation() {
+        let models = crate::acp::model_state::ModelState::default();
+        let mut pw = PromptWidget::new();
+
+        pw.set_text("/ssh ");
+        pw.set_cursor(pw.text().len());
+        pw.refresh_slash(&models);
+        let first_generation = pw
+            .begin_ssh_target_load(41)
+            .expect("entering /ssh args starts one load");
+
+        pw.set_text("plain text");
+        pw.set_cursor(pw.text().len());
+        pw.refresh_slash(&models);
+
+        pw.set_text("/remote ");
+        pw.set_cursor(pw.text().len());
+        pw.refresh_slash(&models);
+        let second_generation = pw
+            .begin_ssh_target_load(42)
+            .expect("re-entering through the alias starts a fresh load");
+        assert_ne!(first_generation, second_generation);
+
+        assert!(
+            !pw.apply_ssh_target_candidates(
+                41,
+                first_generation,
+                vec![ssh_candidate("stale host", "stale-id")],
+                &models,
+            ),
+            "an earlier entry must not populate the replacement /remote prompt"
+        );
+        assert!(pw.apply_ssh_target_candidates(
+            42,
+            second_generation,
+            vec![ssh_candidate("current host", "current-id")],
+            &models,
+        ));
+        assert!(
+            pw.slash_snapshot()
+                .matches
+                .iter()
+                .any(|row| row.insert_text == "current-id")
+        );
+    }
+
+    #[test]
+    fn ssh_target_load_filters_the_query_typed_while_it_was_pending() {
+        let models = crate::acp::model_state::ModelState::default();
+        let mut pw = PromptWidget::new();
+
+        pw.set_text("/ssh ");
+        pw.set_cursor(pw.text().len());
+        pw.refresh_slash(&models);
+        let generation = pw
+            .begin_ssh_target_load(9)
+            .expect("entering /ssh args starts one load");
+
+        pw.set_text("/ssh prod");
+        pw.set_cursor(pw.text().len());
+        pw.refresh_slash(&models);
+
+        assert!(pw.apply_ssh_target_candidates(
+            9,
+            generation,
+            vec![
+                ssh_candidate("production", "prod-id"),
+                ssh_candidate("staging", "stage-id"),
+            ],
+            &models,
+        ));
+        let matches = pw.slash_snapshot().matches;
+        assert_eq!(matches.len(), 1, "the later query filters the arriving catalog");
+        assert_eq!(matches[0].insert_text, "prod-id");
+    }
+
+    #[test]
+    fn ssh_target_load_populates_an_escaped_catalog_without_reopening_it() {
+        let models = crate::acp::model_state::ModelState::default();
+        let mut pw = PromptWidget::new();
+
+        pw.set_text("/ssh ");
+        pw.set_cursor(pw.text().len());
+        pw.refresh_slash(&models);
+        let generation = pw
+            .begin_ssh_target_load(13)
+            .expect("entering /ssh args starts one load");
+        assert_eq!(
+            pw.handle_key(&KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
+            PromptEvent::Ignored
+        );
+
+        assert!(pw.apply_ssh_target_candidates(
+            13,
+            generation,
+            vec![ssh_candidate("production", "prod-id")],
+            &models,
+        ));
+        assert!(
+            !pw.slash_open(),
+            "an Esc dismissal must survive a late catalog response"
+        );
+        pw.set_text("/ssh prod");
+        pw.set_cursor(pw.text().len());
+        pw.refresh_slash(&models);
+        assert!(pw.slash_open(), "editing after Esc reopens the cached suggestions");
+        assert_eq!(pw.slash_snapshot().selection().unwrap().insert_text, "prod-id");
+        assert!(!pw.ssh_target_load_pending(), "the edit reuses the loaded catalog");
+    }
+
+    #[test]
+    fn ssh_target_load_keeps_an_empty_catalog_non_selectable() {
+        let models = crate::acp::model_state::ModelState::default();
+        let mut pw = PromptWidget::new();
+
+        pw.set_text("/ssh ");
+        pw.set_cursor(pw.text().len());
+        pw.refresh_slash(&models);
+        let generation = pw
+            .begin_ssh_target_load(17)
+            .expect("entering /ssh args starts one load");
+
+        assert!(pw.apply_ssh_target_candidates(17, generation, Vec::new(), &models));
+        let snap = pw.slash_snapshot();
+        assert!(snap.matches.is_empty());
+        assert!(!snap.open, "an empty local catalog must not create a fake row");
+    }
+
     #[test]
     fn sync_acp_commands_updates_registry_and_refreshes() {
         let mut pw = PromptWidget::new();

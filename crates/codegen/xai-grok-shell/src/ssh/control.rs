@@ -1,8 +1,8 @@
 use zeroize::Zeroize;
 
 use serde::{Deserialize, Serialize};
+use xai_grok_ssh::SshTarget;
 use xai_grok_workspace_types::ssh::{SshCapabilities, SshHostIdentity};
-
 use super::model::{
     RevokeStatus, SshAuthResponse, SshDirectoryListing, SshOperationApprovalDecision,
     SshOperationApprovalScope, SshProjectPreparation, SshTargetAccess, SshTargetStatus,
@@ -16,6 +16,17 @@ use super::{SshGrantDecision, SshGrantRequest};
 #[serde(tag = "kind", content = "data", rename_all = "snake_case")]
 pub enum SshControlCommand {
     ListConfiguredTargets,
+    /// Atomically replace an existing manual target when its full original
+    /// snapshot still matches. Imported aliases are read-only.
+    UpdateTarget {
+        expected: SshTarget,
+        replacement: SshTarget,
+    },
+    /// Atomically remove an existing manual target when its full original
+    /// snapshot still matches. Imported aliases are read-only.
+    RemoveTarget {
+        expected: SshTarget,
+    },
     ListSessionTargets {
         session_id: String,
     },
@@ -37,6 +48,19 @@ pub enum SshControlCommand {
         expected_identity: Option<SshHostIdentity>,
     },
     ApproveGrant(SshGrantDecision),
+    /// Cancel a pending grant without treating it as a user denial. The local
+    /// client and exact session/request ownership are checked by the service.
+    CancelGrant {
+        session_id: String,
+        request_id: String,
+    },
+    /// Terminally fail a pending grant after local inspection or browsing
+    /// fails. The original waiting tool receives this diagnostic unchanged.
+    FailGrant {
+        session_id: String,
+        request_id: String,
+        error: String,
+    },
     /// Explicitly mint a child/session-local grant from a parent grant. The
     /// requested capability ceiling may only narrow the parent binding.
     InheritSession {
@@ -235,14 +259,20 @@ impl From<SshAuthControlResponse> for SshAuthResponse {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", content = "data", rename_all = "snake_case")]
 pub enum SshControlReply {
-    /// Serialized configured targets are a UI-only listing; model tools use
-    /// SessionTargets, which filters to grants. The raw JSON keeps this pack
-    /// independent of native config implementation details.
+    /// Serialized configured targets are a UI-only listing. Model tools use
+    /// `SessionSsh::discover_targets`, which projects safe metadata plus
+    /// current-session access without serializing raw target records.
     ConfiguredTargets(String),
     SessionTargets(Vec<SshTargetAccess>),
     GrantRequested(SshGrantRequest),
     GrantResolved {
         binding: Option<xai_grok_workspace_types::ssh::SshBinding>,
+    },
+    GrantCancelled {
+        request_id: String,
+    },
+    GrantFailed {
+        request_id: String,
     },
     InheritedBindings(Vec<xai_grok_workspace_types::ssh::SshBinding>),
     ProjectLocationRegistered,
@@ -256,6 +286,8 @@ pub enum SshControlReply {
     AuthenticationAccepted,
     OperationApprovalAccepted,
     OperationApprovalsReset,
+    TargetUpdated(SshTarget),
+    TargetRemoved(SshTarget),
 
     WorkerInstallAccepted,
 }
@@ -289,6 +321,15 @@ mod tests {
                 selected_root: Some("/srv/project".into()),
                 expected_identity: Some(identity.clone()),
             },
+            SshControlCommand::CancelGrant {
+                session_id: "child-session".into(),
+                request_id: "grant".into(),
+            },
+            SshControlCommand::FailGrant {
+                session_id: "child-session".into(),
+                request_id: "grant".into(),
+                error: "native inspection failed".into(),
+            },
             SshControlCommand::PrepareProjectOpen {
                 session_id: "child-session".into(),
                 source_session_id: Some("source-session".into()),
@@ -308,6 +349,27 @@ mod tests {
                 scope: SshOperationApprovalScope::Session,
             }),
 
+        ] {
+            let command = ControlCommand::Ssh(command);
+            let frame = serde_json::to_vec(&command).unwrap();
+            assert_eq!(
+                serde_json::from_slice::<ControlCommand>(&frame).unwrap(),
+                command
+            );
+        }
+
+        let mut target = xai_grok_ssh::SshTarget::new("build-host.example");
+        target.id = "build-host".into();
+        let mut replacement = target.clone();
+        replacement.label = "Updated build host".into();
+        for command in [
+            SshControlCommand::UpdateTarget {
+                expected: target.clone(),
+                replacement: replacement.clone(),
+            },
+            SshControlCommand::RemoveTarget {
+                expected: target.clone(),
+            },
         ] {
             let command = ControlCommand::Ssh(command);
             let frame = serde_json::to_vec(&command).unwrap();
@@ -346,7 +408,14 @@ mod tests {
                 },
             )),
             SshControlReply::OperationApprovalsReset,
-
+            SshControlReply::GrantCancelled {
+                request_id: "grant".into(),
+            },
+            SshControlReply::GrantFailed {
+                request_id: "grant".into(),
+            },
+            SshControlReply::TargetUpdated(replacement),
+            SshControlReply::TargetRemoved(target),
         ] {
             let reply = ControlPayload::Ssh(reply);
             let frame = serde_json::to_vec(&reply).unwrap();

@@ -454,6 +454,65 @@ impl ConnectionManager {
         Ok(())
     }
 
+    /// Invalidate one target's pooled connection and forget its current pool
+    /// identity. Existing leases become stale and a future acquire resolves a
+    /// fresh effective configuration instead of reusing old authority.
+    pub async fn invalidate(&self, target_id: &str) -> Result<(), SshError> {
+        let entry = {
+            let mut pool = lock(&self.inner.pool);
+            let Some(key) = pool.targets.remove(target_id) else {
+                return Ok(());
+            };
+            pool.entries.get(&key).cloned()
+        };
+        if let Some(entry) = entry {
+            entry.disconnect().await;
+        }
+        Ok(())
+    }
+
+    /// Re-resolve every target with a live pool association and invalidate only
+    /// entries whose effective native connection identity changed or can no
+    /// longer be resolved. This is the refresh path for externally edited SSH
+    /// files; failures are invalidations so callers fail closed.
+    pub async fn invalidate_changed_targets(&self) -> Vec<String> {
+        let known_targets = {
+            let pool = lock(&self.inner.pool);
+            pool.targets
+                .iter()
+                .map(|(target_id, key)| (target_id.clone(), key.clone()))
+                .collect::<Vec<_>>()
+        };
+        let mut invalidated = Vec::new();
+        for (target_id, expected_key) in known_targets {
+            let current_key = ConnectionPlan::resolve(&self.inner.targets, &target_id)
+                .map(|plan| PoolKey::from_plan(&plan))
+                .ok();
+            if current_key.as_ref() == Some(&expected_key) {
+                continue;
+            }
+            let removed = {
+                let mut pool = lock(&self.inner.pool);
+                if pool.targets.get(&target_id) != Some(&expected_key) {
+                    None
+                } else {
+                    let key = pool
+                        .targets
+                        .remove(&target_id)
+                        .expect("the matching target mapping is still present");
+                    Some(pool.entries.get(&key).cloned())
+                }
+            };
+            if let Some(entry) = removed {
+                if let Some(entry) = entry {
+                    entry.disconnect().await;
+                }
+                invalidated.push(target_id);
+            }
+        }
+        invalidated
+    }
+
     /// Delete all credential-store values associated with the target's current
     /// configured credential reference. A missing or unavailable platform store
     /// is reported safely; no file fallback is used.
@@ -1013,6 +1072,10 @@ struct ConnectionSecurityKey {
     username: String,
     port: u16,
     credential_context: String,
+    /// Worker argv participates in target reuse even though native transport
+    /// authentication does not consume it. Reusing a live worker after an
+    /// external argv edit would otherwise retain stale remote authority.
+    worker_command: Vec<String>,
     identity_files: Vec<MaterialKey>,
     agent: AgentKey,
     known_hosts: KnownHostsKey,
@@ -1054,6 +1117,7 @@ impl ConnectionSecurityKey {
                 .credential_ref
                 .clone()
                 .unwrap_or_else(|| config.target.id.clone()),
+            worker_command: config.target.worker_command.clone(),
             identity_files: config
                 .identity_files
                 .iter()
@@ -2616,10 +2680,11 @@ fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 #[cfg(test)]
 mod tests {
     use super::{
-        ConnectionEntry, ConnectionFailure, ConnectionSecurityKey, EntryState, FileRevision,
-        MAX_INITIAL_COMMAND_BYTES, MAX_INITIAL_COMMAND_EVENTS, MaterialKey, SshCommandEvent,
-        command_event, failure_category, lock, posix_rename_payload, preferred_algorithms,
-        queue_initial_command_event,
+        ConnectionEntry, ConnectionFailure, ConnectionManager, ConnectionPhase,
+        ConnectionPlan, ConnectionSecurityKey, EntryState, FileRevision,
+        MAX_INITIAL_COMMAND_BYTES, MAX_INITIAL_COMMAND_EVENTS, MaterialKey,
+        PoolKey, SshCommandEvent, command_event, failure_category, lock,
+        posix_rename_payload, preferred_algorithms, queue_initial_command_event,
     };
     use crate::auth::SshError;
     use crate::config::{
@@ -2744,6 +2809,48 @@ mod tests {
         resolved.send_env.push("LANG".to_owned());
         let after_send_env_change = ConnectionSecurityKey::from_config(&resolved);
         assert!(after_config_change != after_send_env_change);
+
+        resolved.target.worker_command.push("--updated".to_owned());
+        let after_worker_command_change = ConnectionSecurityKey::from_config(&resolved);
+        assert!(after_send_env_change != after_worker_command_change);
+    }
+
+    #[tokio::test]
+    async fn external_target_change_invalidates_existing_pool_association() {
+        let directory = tempdir().expect("temporary directory");
+        fs::write(
+            directory.path().join("config.toml"),
+            "[ssh.targets.target]\nhost = \"first.example.test\"\n",
+        )
+        .expect("target fixture");
+        let manager = ConnectionManager::new(directory.path().to_owned());
+        let plan = ConnectionPlan::resolve(&manager.inner.targets, "target")
+            .expect("resolve target");
+        let key = PoolKey::from_plan(&plan);
+        let entry = Arc::new(ConnectionEntry::new());
+        entry.generation.store(1, Ordering::Release);
+        *lock(&entry.state) = EntryState::Connected {
+            identity: identity("SHA256:first"),
+        };
+        {
+            let mut pool = lock(&manager.inner.pool);
+            pool.targets.insert("target".to_owned(), key.clone());
+            pool.entries.insert(key, Arc::clone(&entry));
+        }
+
+        fs::write(
+            directory.path().join("config.toml"),
+            "[ssh.targets.target]\nhost = \"second.example.test\"\n",
+        )
+        .expect("external target update");
+
+        assert_eq!(
+            manager.invalidate_changed_targets().await,
+            vec!["target".to_owned()]
+        );
+        assert_eq!(entry.phase(), ConnectionPhase::Disconnected);
+        assert_eq!(entry.generation.load(Ordering::Acquire), 2);
+        assert!(!lock(&manager.inner.pool).targets.contains_key("target"));
     }
 
     #[test]

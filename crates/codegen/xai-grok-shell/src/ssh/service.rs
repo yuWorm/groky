@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, Weak};
 use std::time::Duration;
 
@@ -11,9 +11,9 @@ use zeroize::Zeroize;
 use tokio::sync::{Mutex, RwLock, broadcast, oneshot};
 use uuid::Uuid;
 use xai_grok_ssh::{
-    ConnectionLease, ConnectionManager, ConnectionPhase, HostKeyDecision, HostKeyPrompt,
-    Interaction, InteractionError, KeyboardInteractivePrompt, Secret, SecretKind, SecretPrompt,
-    SshError, TargetStore,
+    ConfigError, ConnectionLease, ConnectionManager, ConnectionPhase, HostKeyDecision,
+    HostKeyPrompt, Interaction, InteractionError, KeyboardInteractivePrompt, Secret, SecretKind,
+    SecretPrompt, SshError, TargetSource, TargetStore,
 };
 use xai_grok_tools::types::output::{ToolOutput, ToolRunResult};
 use xai_grok_workspace_client::ssh::{SshClientCallbacks, SshClientError, SshWorkspaceClient};
@@ -34,7 +34,8 @@ use super::model::{
     SshGrantRequest, SshGrantScope, SshGrantStatus, SshHostKeyDecision,
     SshKeyboardInteractiveQuestion, SshOperationApproval, SshOperationApprovalDecision,
     SshOperationApprovalScope, SshProjectPreparation, SshSessionWorkerEvent, SshTargetAccess,
-    SshTargetStatus, SshWorkerInstallDecision, SshWorkerInstallProgress, SshWorkerInstallRequest,
+    SshTargetCandidate, SshTargetCandidateSource, SshTargetDiscovery, SshTargetStatus,
+    SshWorkerInstallDecision, SshWorkerInstallProgress, SshWorkerInstallRequest,
 };
 
 const INTERACTION_TIMEOUT: Duration = Duration::from_secs(300);
@@ -49,6 +50,15 @@ pub enum SshServiceError {
     WrongClient,
     #[error("SSH request is already resolved")]
     RequestResolved,
+    #[error("target_not_found: SSH target `{0}` is not configured")]
+    TargetNotFound(String),
+    #[error(
+        "ambiguous_target: SSH target reference `{reference}` matches multiple configured targets; retry with an exact target_id: {candidate_ids:?}"
+    )]
+    AmbiguousConfiguredTarget {
+        reference: String,
+        candidate_ids: Vec<String>,
+    },
     #[error("SSH target must be selected by a local user")]
     TargetSelectionRequired,
     #[error("SSH root must be selected by a local user")]
@@ -87,6 +97,8 @@ pub enum SshServiceError {
     GrantDenied,
     #[error("SSH access request was cancelled")]
     GrantCancelled,
+    #[error("SSH access request failed: {0}")]
+    GrantFailed(String),
     #[error("timed out waiting for a local SSH access decision")]
     GrantTimedOut,
     #[error("SSH access requires an interactive local client")]
@@ -157,6 +169,12 @@ struct SessionSshInner {
     home: PathBuf,
     targets: TargetStore,
     connections: ConnectionManager,
+    /// Monotonically changes before local authority is invalidated for a
+    /// connection-relevant target mutation.
+    target_config_epoch: AtomicU64,
+    /// Serializes only target mutation and authority commit points. It is never
+    /// held while waiting for SSH, a worker, or human interaction.
+    target_commit: Mutex<()>,
     sessions: RwLock<HashMap<String, SessionState>>,
     resolution_claims: std::sync::Mutex<HashSet<String>>,
     workers: Mutex<HashMap<String, Arc<WorkerConnection>>>,
@@ -225,11 +243,14 @@ struct WorkerConnection {
     binding: SshBinding,
     client: SshWorkspaceClient,
     client_id: Option<u64>,
+    target_epoch: u64,
     // The lease, rather than the worker channel, owns the shared native connection lifetime.
     _lease: ConnectionLease,
 }
 
 struct PendingAuthentication {
+    target_id: String,
+    target_epoch: u64,
     client_id: u64,
     connection_generation: u64,
     response: oneshot::Sender<SshAuthResponse>,
@@ -250,12 +271,14 @@ enum ToolGrantResolution {
     Granted(SshBinding),
     Denied,
     Cancelled,
+    Failed(String),
     TimedOut,
 }
 
 struct PendingOperationApproval {
     client_id: u64,
     binding: SshBinding,
+    target_epoch: u64,
     operation: SshOperation,
     response: oneshot::Sender<bool>,
 }
@@ -316,6 +339,7 @@ impl Drop for ToolGrantWaitGuard {
 struct PendingWorkerInstall {
     client_id: u64,
     binding: SshBinding,
+    target_epoch: u64,
     response: oneshot::Sender<bool>,
 }
 #[derive(Clone)]
@@ -394,6 +418,8 @@ impl SessionSsh {
                 targets: TargetStore::new(home.clone()),
                 connections: ConnectionManager::new(home.clone()),
                 home,
+                target_config_epoch: AtomicU64::new(0),
+                target_commit: Mutex::new(()),
                 sessions: RwLock::new(HashMap::new()),
                 resolution_claims: std::sync::Mutex::new(HashSet::new()),
                 workers: Mutex::new(HashMap::new()),
@@ -420,6 +446,14 @@ impl SessionSsh {
 
     pub fn subscribe_events(&self) -> broadcast::Receiver<SshEvent> {
         self.inner.events.subscribe()
+    }
+
+    fn target_config_epoch(&self) -> u64 {
+        self.inner.target_config_epoch.load(Ordering::Acquire)
+    }
+
+    fn advance_target_config_epoch(&self) {
+        self.inner.target_config_epoch.fetch_add(1, Ordering::AcqRel);
     }
 
     /// Subscribe to worker-originated progress and operation updates for one
@@ -575,17 +609,25 @@ impl SessionSsh {
         path: Option<&str>,
         client_id: u64,
     ) -> Result<SshDirectoryListing, SshServiceError> {
+        let target_id = self.canonical_target_id(target_id)?;
+        let target_epoch = self.target_config_epoch();
         let lease = self
-            .acquire_native(target_id, Some(client_id), true)
+            .acquire_native(&target_id, Some(client_id), true)
             .await?;
-        let listing = super::project_browser::browse(&lease, target_id.to_owned(), path)
+        let listing = super::project_browser::browse(&lease, target_id.clone(), path)
             .await
             .map_err(SshServiceError::Native)?;
-        self.inner
-            .manual_holds
-            .lock()
-            .await
-            .insert(target_id.to_owned(), lease);
+        {
+            let _commit = self.inner.target_commit.lock().await;
+            if self.target_config_epoch() != target_epoch {
+                return Err(SshServiceError::StaleInvocation);
+            }
+            self.inner
+                .manual_holds
+                .lock()
+                .await
+                .insert(target_id, lease);
+        }
         Ok(listing)
     }
 
@@ -602,11 +644,14 @@ impl SessionSsh {
         capabilities: Option<SshCapabilities>,
         client_id: u64,
     ) -> Result<SshProjectPreparation, SshServiceError> {
+        self.refresh_external_target_changes().await?;
+        let target_id = self.canonical_target_id(target_id)?;
         if root.trim().is_empty() {
             return Err(SshServiceError::RootSelectionRequired);
         }
+        let target_epoch = self.target_config_epoch();
         let lease = self
-            .acquire_native(target_id, Some(client_id), true)
+            .acquire_native_after_refresh(&target_id, Some(client_id), true)
             .await?;
         let identity = lease.identity().clone();
         if expected_identity.is_some_and(|expected| expected != &identity) {
@@ -615,6 +660,10 @@ impl SessionSsh {
         let canonical_root = super::native_files::canonical_root(&lease, root)
             .await
             .map_err(SshServiceError::Native)?;
+        let _commit = self.inner.target_commit.lock().await;
+        if self.target_config_epoch() != target_epoch {
+            return Err(SshServiceError::StaleInvocation);
+        }
         let location = ProjectLocation::Ssh {
             target_id: target_id.to_owned(),
             root: canonical_root.clone(),
@@ -627,7 +676,7 @@ impl SessionSsh {
             if let Some(source) = self
                 .matching_live_project_binding(
                     source_session_id,
-                    target_id,
+                    &target_id,
                     &identity,
                     &canonical_root,
                     capabilities,
@@ -977,11 +1026,20 @@ impl SessionSsh {
     ) -> Result<SshControlReply, SshServiceError> {
         match command {
             SshControlCommand::ListConfiguredTargets => {
-                let targets = self.list_configured_targets()?;
+                let targets = self.list_configured_targets().await?;
                 let encoded = serde_json::to_string(&targets)
                     .map_err(|error| SshServiceError::Configuration(error.to_string()))?;
                 Ok(SshControlReply::ConfiguredTargets(encoded))
             }
+            SshControlCommand::UpdateTarget {
+                expected,
+                replacement,
+            } => Ok(SshControlReply::TargetUpdated(
+                self.update_target(expected, replacement).await?,
+            )),
+            SshControlCommand::RemoveTarget { expected } => Ok(SshControlReply::TargetRemoved(
+                self.remove_target(expected).await?,
+            )),
             SshControlCommand::ListSessionTargets { session_id } => Ok(
                 SshControlReply::SessionTargets(self.list_targets(&session_id).await),
             ),
@@ -1024,6 +1082,22 @@ impl SessionSsh {
                 Ok(SshControlReply::GrantResolved {
                     binding: self.approve_grant(decision).await?,
                 })
+            }
+            SshControlCommand::CancelGrant {
+                session_id,
+                request_id,
+            } => {
+                self.cancel_grant(&session_id, &request_id, client_id).await?;
+                Ok(SshControlReply::GrantCancelled { request_id })
+            }
+            SshControlCommand::FailGrant {
+                session_id,
+                request_id,
+                error,
+            } => {
+                self.fail_grant(&session_id, &request_id, client_id, error)
+                    .await?;
+                Ok(SshControlReply::GrantFailed { request_id })
             }
             SshControlCommand::InheritSession {
                 source_session_id,
@@ -1096,7 +1170,7 @@ impl SessionSsh {
                 self.disconnect_target(&target_id).await?,
             )),
             SshControlCommand::ConnectionStatus { target_id } => Ok(SshControlReply::TargetStatus(
-                self.connection_status(&target_id).await,
+                self.connection_status(&target_id).await?,
             )),
             SshControlCommand::SubmitAuthentication(response) => {
                 if response.client_id != client_id {
@@ -1131,15 +1205,110 @@ impl SessionSsh {
         }
     }
 
-    pub fn list_configured_targets(&self) -> Result<Vec<xai_grok_ssh::SshTarget>, SshServiceError> {
-        self.inner
+    /// Re-read all persisted and imported targets, invalidating active authority
+    /// whenever an external SSH configuration change alters an effective native
+    /// connection identity or makes it unresolvable.
+    pub async fn list_configured_targets(
+        &self,
+    ) -> Result<Vec<xai_grok_ssh::SshTarget>, SshServiceError> {
+        let targets = self
+            .inner
             .targets
             .list()
-            .map_err(|error| SshServiceError::Configuration(error.to_string()))
+            .map_err(|error| SshServiceError::Configuration(error.to_string()))?;
+        self.invalidate_changed_target_authority_inner().await?;
+        Ok(targets)
     }
 
-    /// Returns only active grants. It must be used by model-facing `ssh_targets`,
-    /// never `list_configured_targets`.
+    /// Resolve externally supplied target text before it can enter persisted
+    /// request state or an authority comparison. This never opens a connection.
+    fn canonical_target_id(&self, reference: &str) -> Result<String, SshServiceError> {
+        self.inner
+            .targets
+            .canonical_id(reference)
+            .map_err(|error| match error {
+                ConfigError::TargetNotFound(_) => SshServiceError::TargetNotFound(reference.into()),
+                ConfigError::AmbiguousTarget {
+                    reference,
+                    candidate_ids,
+                } => SshServiceError::AmbiguousConfiguredTarget {
+                    reference,
+                    candidate_ids,
+                },
+                error => SshServiceError::Configuration(error.to_string()),
+            })
+    }
+
+    /// Safely update a manual target from its UI snapshot. A label-only change
+    /// retains active access, while any connection or worker setting change
+    /// disconnects the target and revokes its grants before returning.
+    pub async fn update_target(
+        &self,
+        expected: xai_grok_ssh::SshTarget,
+        replacement: xai_grok_ssh::SshTarget,
+    ) -> Result<xai_grok_ssh::SshTarget, SshServiceError> {
+        let connection_changed = target_connection_settings_changed(&expected, &replacement);
+        let updated = {
+            let _commit = self.inner.target_commit.lock().await;
+            let updated = self
+                .inner
+                .targets
+                .update(expected, replacement)
+                .map_err(|error| SshServiceError::Configuration(error.to_string()))?;
+            if connection_changed {
+                self.advance_target_config_epoch();
+            }
+            updated
+        };
+        if connection_changed {
+            self.invalidate_target_authority_inner(&updated.id).await?;
+        }
+        Ok(updated)
+    }
+
+    /// Safely remove a manual target from its UI snapshot and immediately
+    /// invalidate every connection and grant that names it.
+    pub async fn remove_target(
+        &self,
+        expected: xai_grok_ssh::SshTarget,
+    ) -> Result<xai_grok_ssh::SshTarget, SshServiceError> {
+        let removed = {
+            let _commit = self.inner.target_commit.lock().await;
+            let removed = self
+                .inner
+                .targets
+                .remove_expected(expected)
+                .map_err(|error| SshServiceError::Configuration(error.to_string()))?;
+            self.advance_target_config_epoch();
+            removed
+        };
+        self.invalidate_target_authority_inner(&removed.id).await?;
+        Ok(removed)
+    }
+
+    /// Check externally managed OpenSSH files before native acquisition. An
+    /// already-running worker must never survive a changed effective target.
+    async fn refresh_external_target_changes(&self) -> Result<(), SshServiceError> {
+        self.invalidate_changed_target_authority_inner().await
+    }
+
+    async fn invalidate_changed_target_authority_inner(&self) -> Result<(), SshServiceError> {
+        let changed = self.inner.connections.invalidate_changed_targets().await;
+        if changed.is_empty() {
+            return Ok(());
+        }
+        {
+            let _commit = self.inner.target_commit.lock().await;
+            self.advance_target_config_epoch();
+        }
+        for target_id in changed {
+            self.invalidate_target_authority_inner(&target_id).await?;
+        }
+        Ok(())
+    }
+
+    /// Returns only active grants. It remains the grant-only internal listing
+    /// used by authority checks and management callers.
     pub async fn list_targets(&self, session_id: &str) -> Vec<SshTargetAccess> {
         let session = self.inner.sessions.read().await;
         let Some(state) = session.get(session_id) else {
@@ -1166,6 +1335,41 @@ impl SessionSsh {
             .collect::<Vec<_>>();
         accesses.sort_by(|left, right| left.binding_id.cmp(&right.binding_id));
         accesses
+    }
+
+    /// Discover configured target metadata safe for model output, paired only
+    /// with existing grants from `session_id`. Discovery neither acquires a
+    /// connection nor creates authority.
+    pub async fn discover_targets(
+        &self,
+        session_id: &str,
+    ) -> Result<SshTargetDiscovery, SshServiceError> {
+        let configured = self.list_configured_targets().await?;
+        let mut access_by_target = HashMap::new();
+        for access in self.list_targets(session_id).await {
+            access_by_target
+                .entry(access.target_id.clone())
+                .or_insert_with(Vec::new)
+                .push(access);
+        }
+        let mut targets = configured
+            .into_iter()
+            .map(|target| {
+                let source = match target.source {
+                    TargetSource::User => SshTargetCandidateSource::Manual,
+                    TargetSource::Imported { .. } => SshTargetCandidateSource::Imported,
+                };
+                SshTargetCandidate {
+                    access: access_by_target.remove(&target.id).unwrap_or_default(),
+                    target_id: target.id,
+                    label: target.label,
+                    host: target.host,
+                    source,
+                }
+            })
+            .collect::<Vec<_>>();
+        targets.sort_by(|left, right| left.target_id.cmp(&right.target_id));
+        Ok(SshTargetDiscovery { targets })
     }
 
     pub async fn snapshot_session(&self, session_id: &str) -> PersistedSshState {
@@ -1326,6 +1530,10 @@ impl SessionSsh {
         reason: String,
         client_id: Option<u64>,
     ) -> Result<SshGrantRequest, SshServiceError> {
+        let target_id = target_id
+            .as_deref()
+            .map(|reference| self.canonical_target_id(reference))
+            .transpose()?;
         let request = SshGrantRequest {
             id: Uuid::now_v7().to_string(),
             session_id: session_id.into(),
@@ -1362,6 +1570,10 @@ impl SessionSsh {
         {
             return Err(SshServiceError::GrantCancelled);
         }
+        let target_id = target_id
+            .as_deref()
+            .map(|reference| self.canonical_target_id(reference))
+            .transpose()?;
         let request = SshGrantRequest {
             id: Uuid::now_v7().to_string(),
             session_id: session_id.into(),
@@ -1415,6 +1627,7 @@ impl SessionSsh {
             ToolGrantResolution::Granted(binding) => Ok(binding),
             ToolGrantResolution::Denied => Err(SshServiceError::GrantDenied),
             ToolGrantResolution::Cancelled => Err(SshServiceError::GrantCancelled),
+            ToolGrantResolution::Failed(error) => Err(SshServiceError::GrantFailed(error)),
             ToolGrantResolution::TimedOut => Err(SshServiceError::GrantTimedOut),
         }
     }
@@ -1636,13 +1849,89 @@ impl SessionSsh {
             return;
         }
         if self.remove_pending_grant(&request).await.is_ok() {
-            let _ = self.inner.events.send(SshEvent::GrantResolved {
-                request_id: request.id.clone(),
-                approved: false,
-                binding: None,
-            });
+            let event = match &resolution {
+                ToolGrantResolution::Cancelled => SshEvent::GrantCancelled {
+                    request_id: request.id.clone(),
+                    session_id: request.session_id.clone(),
+                    client_id: request.client_id.unwrap_or_default(),
+                },
+                ToolGrantResolution::Failed(error) => SshEvent::GrantFailed {
+                    request_id: request.id.clone(),
+                    session_id: request.session_id.clone(),
+                    client_id: request.client_id.unwrap_or_default(),
+                    error: error.clone(),
+                },
+                ToolGrantResolution::Granted(_)
+                | ToolGrantResolution::Denied
+                | ToolGrantResolution::TimedOut => SshEvent::GrantResolved {
+                    request_id: request.id.clone(),
+                    approved: false,
+                    binding: None,
+                },
+            };
+            let _ = self.inner.events.send(event);
         }
         let _ = self.finish_tool_grant(request_id, resolution).await;
+    }
+
+    /// Cancel one pending request only when the caller owns its exact session,
+    /// client, and request ID. Cancellation is terminal and never becomes a
+    /// generic denied decision.
+    pub async fn cancel_grant(
+        &self,
+        session_id: &str,
+        request_id: &str,
+        client_id: u64,
+    ) -> Result<(), SshServiceError> {
+        let request = self.pending_request(request_id).await?;
+        self.check_terminal_grant_owner(&request, session_id, client_id)?;
+        let _claim = self.claim_grant_resolution(request_id)?;
+        self.remove_pending_grant(&request).await?;
+        let _ = self.inner.events.send(SshEvent::GrantCancelled {
+            request_id: request.id.clone(),
+            session_id: request.session_id.clone(),
+            client_id,
+        });
+        if request.awaiting_tool {
+            let _ = self
+                .finish_tool_grant(&request.id, ToolGrantResolution::Cancelled)
+                .await;
+        }
+        Ok(())
+    }
+
+    /// Fail one pending request after a local inspection could not complete.
+    /// The supplied diagnostic is delivered to the original waiting tool and
+    /// is intentionally distinct from the user's explicit denial.
+    pub async fn fail_grant(
+        &self,
+        session_id: &str,
+        request_id: &str,
+        client_id: u64,
+        error: String,
+    ) -> Result<(), SshServiceError> {
+        let error = error.trim().to_owned();
+        if error.is_empty() {
+            return Err(SshServiceError::GrantFailed(
+                "local SSH inspection failed without a diagnostic".to_owned(),
+            ));
+        }
+        let request = self.pending_request(request_id).await?;
+        self.check_terminal_grant_owner(&request, session_id, client_id)?;
+        let _claim = self.claim_grant_resolution(request_id)?;
+        self.remove_pending_grant(&request).await?;
+        let _ = self.inner.events.send(SshEvent::GrantFailed {
+            request_id: request.id.clone(),
+            session_id: request.session_id.clone(),
+            client_id,
+            error: error.clone(),
+        });
+        if request.awaiting_tool {
+            let _ = self
+                .finish_tool_grant(&request.id, ToolGrantResolution::Failed(error))
+                .await;
+        }
+        Ok(())
     }
 
     /// Acquires only the native connection required for a user to inspect the
@@ -1656,9 +1945,11 @@ impl SessionSsh {
         expected_identity: Option<SshHostIdentity>,
         client_id: u64,
     ) -> Result<SshGrantRequest, SshServiceError> {
+        self.refresh_external_target_changes().await?;
         let request = self.pending_request(request_id).await?;
         self.check_request_client(&request, client_id)?;
-        let target_id = choose_narrower_target(&request, Some(target_id.as_str()))?;
+        let selected_target_id = self.canonical_target_id(&target_id)?;
+        let target_id = choose_narrower_target(&request, Some(&selected_target_id))?;
         match (selected_root.as_deref(), expected_identity.as_ref()) {
             (None, None) | (Some(_), Some(_)) => {}
             _ => return Err(SshServiceError::InvalidInspectionSelection),
@@ -1667,8 +1958,9 @@ impl SessionSsh {
             return Err(SshServiceError::RootSelectionRequired);
         }
 
+        let target_epoch = self.target_config_epoch();
         let lease = self
-            .acquire_native(target_id.as_str(), Some(client_id), true)
+            .acquire_native_after_refresh(target_id.as_str(), Some(client_id), true)
             .await?;
         let identity = lease.identity().clone();
         ensure_inspection_identity(&request, expected_identity.as_ref(), &identity)?;
@@ -1699,6 +1991,7 @@ impl SessionSsh {
             target_id,
             canonical_selected_root.or(canonical_requested_root),
             identity,
+            target_epoch,
         )
         .await
     }
@@ -1709,7 +2002,12 @@ impl SessionSsh {
         target_id: String,
         root: Option<String>,
         identity: SshHostIdentity,
+        target_epoch: u64,
     ) -> Result<SshGrantRequest, SshServiceError> {
+        let _commit = self.inner.target_commit.lock().await;
+        if self.target_config_epoch() != target_epoch {
+            return Err(SshServiceError::StaleInvocation);
+        }
         ensure_inspection_identity(request, None, &identity)?;
         let updated = SshGrantRequest {
             target_id: Some(target_id),
@@ -1749,15 +2047,16 @@ impl SessionSsh {
         &self,
         decision: SshGrantDecision,
     ) -> Result<Option<SshBinding>, SshServiceError> {
+        self.refresh_external_target_changes().await?;
         let request = self.pending_request(&decision.request_id).await?;
         self.check_request_client(&request, decision.client_id)?;
         let _claim = self.claim_grant_resolution(&decision.request_id)?;
         if request.awaiting_tool && self.tool_grant_cancelled(&request.id).await {
             self.remove_pending_grant(&request).await?;
-            let _ = self.inner.events.send(SshEvent::GrantResolved {
+            let _ = self.inner.events.send(SshEvent::GrantCancelled {
                 request_id: request.id.clone(),
-                approved: false,
-                binding: None,
+                session_id: request.session_id.clone(),
+                client_id: request.client_id.unwrap_or_default(),
             });
             let _ = self
                 .finish_tool_grant(&request.id, ToolGrantResolution::Cancelled)
@@ -1779,11 +2078,17 @@ impl SessionSsh {
             return Ok(None);
         }
 
-        let target_id = choose_narrower_target(&request, decision.target_id.as_deref())?;
+        let selected_target_id = decision
+            .target_id
+            .as_deref()
+            .map(|reference| self.canonical_target_id(reference))
+            .transpose()?;
+        let target_id = choose_narrower_target(&request, selected_target_id.as_deref())?;
         let root = choose_narrower_root(&request, decision.root.as_deref())?;
         let capabilities = choose_narrower_capabilities(&request, decision.capabilities)?;
+        let target_epoch = self.target_config_epoch();
         let lease = self
-            .acquire_native(&target_id, Some(decision.client_id), true)
+            .acquire_native_after_refresh(&target_id, Some(decision.client_id), true)
             .await?;
         let identity = lease.identity().clone();
         if let Some(inspected) = &request.verified_identity {
@@ -1811,10 +2116,10 @@ impl SessionSsh {
         }
         if request.awaiting_tool && self.tool_grant_cancelled(&request.id).await {
             self.remove_pending_grant(&request).await?;
-            let _ = self.inner.events.send(SshEvent::GrantResolved {
+            let _ = self.inner.events.send(SshEvent::GrantCancelled {
                 request_id: request.id.clone(),
-                approved: false,
-                binding: None,
+                session_id: request.session_id.clone(),
+                client_id: request.client_id.unwrap_or_default(),
             });
             let _ = self
                 .finish_tool_grant(&request.id, ToolGrantResolution::Cancelled)
@@ -1843,6 +2148,10 @@ impl SessionSsh {
             worker_commands: Vec::new(),
         };
         {
+            let _commit = self.inner.target_commit.lock().await;
+            if self.target_config_epoch() != target_epoch {
+                return Err(SshServiceError::StaleInvocation);
+            }
             let mut sessions = self.inner.sessions.write().await;
             let state = sessions.entry(request.session_id.clone()).or_default();
             let mut candidate = state.clone();
@@ -2131,6 +2440,7 @@ impl SessionSsh {
         root: &str,
         capabilities: SshCapabilities,
     ) -> Result<ProjectSshBinding, SshServiceError> {
+        let target_id = self.canonical_target_id(target_id)?;
         let sessions = self.inner.sessions.read().await;
         let state = sessions
             .get(session_id)
@@ -2260,6 +2570,7 @@ impl SessionSsh {
             service: Arc::downgrade(&self.inner),
             client_id,
             binding: binding.clone(),
+            target_epoch: self.target_config_epoch(),
         });
         let mut completion_guard = operation.guard(callbacks.clone());
         let mut effects_started = false;
@@ -2515,12 +2826,16 @@ impl SessionSsh {
             .map_err(Into::into)
     }
 
-    pub async fn connection_status(&self, target_id: &str) -> SshTargetStatus {
-        SshTargetStatus {
-            target_id: target_id.to_owned(),
-            connection: self.connection_state(target_id),
+    pub async fn connection_status(
+        &self,
+        target_id: &str,
+    ) -> Result<SshTargetStatus, SshServiceError> {
+        let target_id = self.canonical_target_id(target_id)?;
+        Ok(SshTargetStatus {
+            connection: self.connection_state(&target_id),
+            target_id,
             detail: None,
-        }
+        })
     }
 
     fn connection_state(&self, target_id: &str) -> SshConnectionState {
@@ -2543,23 +2858,31 @@ impl SessionSsh {
         client_id: u64,
         interactive: bool,
     ) -> Result<SshTargetStatus, SshServiceError> {
+        let target_id = self.canonical_target_id(target_id)?;
+        let target_epoch = self.target_config_epoch();
         let lease = self
-            .acquire(target_id, Some(client_id), interactive)
+            .acquire(&target_id, Some(client_id), interactive)
             .await?;
         let identity = lease.identity();
         let status = SshTargetStatus {
-            target_id: target_id.to_owned(),
+            target_id: target_id.clone(),
             connection: SshConnectionState::Connected,
             detail: Some(format!(
                 "connected as {}@{}:{}",
                 identity.username, identity.hostname, identity.port
             )),
         };
-        self.inner
-            .manual_holds
-            .lock()
-            .await
-            .insert(target_id.to_owned(), lease);
+        {
+            let _commit = self.inner.target_commit.lock().await;
+            if self.target_config_epoch() != target_epoch {
+                return Err(SshServiceError::StaleInvocation);
+            }
+            self.inner
+                .manual_holds
+                .lock()
+                .await
+                .insert(target_id, lease);
+        }
         let _ = self
             .inner
             .events
@@ -2571,15 +2894,16 @@ impl SessionSsh {
         &self,
         target_id: &str,
     ) -> Result<SshTargetStatus, SshServiceError> {
+        let target_id = self.canonical_target_id(target_id)?;
         self.inner
             .workers
             .lock()
             .await
             .retain(|_, worker| worker.binding.target_id != target_id);
-        self.inner.manual_holds.lock().await.remove(target_id);
-        self.inner.connections.disconnect(target_id).await?;
+        self.inner.manual_holds.lock().await.remove(&target_id);
+        self.inner.connections.disconnect(&target_id).await?;
         let status = SshTargetStatus {
-            target_id: target_id.to_owned(),
+            target_id,
             connection: SshConnectionState::Disconnected,
             detail: None,
         };
@@ -2588,6 +2912,83 @@ impl SessionSsh {
             .events
             .send(SshEvent::TargetStatus(status.clone()));
         Ok(status)
+    }
+
+    /// The target epoch makes pre-mutation authentication and worker work
+    /// stale before this cleanup runs. This method performs no nested target
+    /// commit locking, so it can disconnect and revoke without delaying I/O.
+    async fn invalidate_target_authority_inner(
+        &self,
+        target_id: &str,
+    ) -> Result<(), SshServiceError> {
+        self.inner
+            .auth_waiters
+            .lock()
+            .await
+            .retain(|_, waiter| waiter.target_id != target_id);
+        self.inner
+            .workers
+            .lock()
+            .await
+            .retain(|_, worker| worker.binding.target_id != target_id);
+        self.inner.manual_holds.lock().await.remove(target_id);
+        self.inner.connections.invalidate(target_id).await?;
+
+        let cancelled_requests = {
+            let mut sessions = self.inner.sessions.write().await;
+            let session_ids = sessions.keys().cloned().collect::<Vec<_>>();
+            let mut cancelled = Vec::new();
+            for session_id in session_ids {
+                let Some(state) = sessions.get_mut(&session_id) else {
+                    continue;
+                };
+                let mut candidate = state.clone();
+                let requests = candidate
+                    .pending_requests
+                    .values()
+                    .filter(|request| request.target_id.as_deref() == Some(target_id))
+                    .cloned()
+                    .collect::<Vec<_>>();
+                if requests.is_empty() {
+                    continue;
+                }
+                candidate.pending_requests.retain(|request_id, _| {
+                    !requests.iter().any(|request| request.id == *request_id)
+                });
+                self.persist_state(&session_id, &candidate).await?;
+                *state = candidate;
+                cancelled.extend(requests);
+            }
+            cancelled
+        };
+        for request in cancelled_requests {
+            let _ = self.inner.events.send(SshEvent::GrantCancelled {
+                request_id: request.id.clone(),
+                session_id: request.session_id.clone(),
+                client_id: request.client_id.unwrap_or_default(),
+            });
+            let _ = self
+                .finish_tool_grant(&request.id, ToolGrantResolution::Cancelled)
+                .await;
+        }
+
+        let bindings = {
+            let sessions = self.inner.sessions.read().await;
+            sessions
+                .iter()
+                .flat_map(|(session_id, state)| {
+                    state.grants.values().filter_map(move |record| {
+                        (!record.persisted.binding.revoked
+                            && record.persisted.binding.target_id == target_id)
+                            .then(|| (session_id.clone(), record.persisted.binding.id.clone()))
+                    })
+                })
+                .collect::<Vec<_>>()
+        };
+        for (session_id, binding_id) in bindings {
+            self.revoke_binding(&session_id, &binding_id).await?;
+        }
+        Ok(())
     }
 
     /// Flush locally persisted revoke tombstones after a target has been
@@ -2706,6 +3107,7 @@ impl SessionSsh {
                 .ok_or(SshServiceError::StaleAuthentication)?;
             if current.client_id != response.client_id
                 || current.connection_generation != response.connection_generation
+                || current.target_epoch != self.target_config_epoch()
             {
                 return Err(SshServiceError::StaleAuthentication);
             }
@@ -2731,6 +3133,7 @@ impl SessionSsh {
             .get(&decision.approval_id)
             .ok_or(SshServiceError::StaleOperationApproval)?;
         if current.client_id != decision.client_id
+            || current.target_epoch != self.target_config_epoch()
             || current.response.is_closed()
             || !sessions
                 .get(&current.binding.session_id)
@@ -2746,6 +3149,7 @@ impl SessionSsh {
         let PendingOperationApproval {
             client_id,
             binding,
+            target_epoch,
             operation,
             response,
         } = waiters
@@ -2756,6 +3160,9 @@ impl SessionSsh {
             && matches!(operation, SshOperation::Write | SshOperation::Execute)
         {
             let mut policies = self.inner.operation_approval_policies.lock().await;
+            if self.target_config_epoch() != target_epoch {
+                return Err(SshServiceError::StaleOperationApproval);
+            }
             policies.retain(|policy| {
                 !(policy.client_id == client_id
                     && policy.session_id == binding.session_id
@@ -2819,6 +3226,7 @@ impl SessionSsh {
             .get(&decision.request_id)
             .ok_or(SshServiceError::StaleWorkerInstall)?;
         if waiter.client_id != decision.client_id
+            || waiter.target_epoch != self.target_config_epoch()
             || waiter.binding.session_id != decision.session_id
             || waiter.binding.id != decision.binding_id
             || !sessions
@@ -2854,6 +3262,21 @@ impl SessionSsh {
         client_id: u64,
     ) -> Result<(), SshServiceError> {
         if request.client_id.is_some_and(|owner| owner != client_id) {
+            return Err(SshServiceError::WrongClient);
+        }
+        Ok(())
+    }
+
+    fn check_terminal_grant_owner(
+        &self,
+        request: &SshGrantRequest,
+        session_id: &str,
+        client_id: u64,
+    ) -> Result<(), SshServiceError> {
+        if request.session_id != session_id {
+            return Err(SshServiceError::UnknownGrantRequest(request.id.clone()));
+        }
+        if request.client_id != Some(client_id) {
             return Err(SshServiceError::WrongClient);
         }
         Ok(())
@@ -2898,39 +3321,55 @@ impl SessionSsh {
         session_id: &str,
         target: Option<&str>,
     ) -> Result<SshBinding, SshServiceError> {
+        if let Some(selector) = target {
+            let direct_binding = {
+                let sessions = self.inner.sessions.read().await;
+                let state = sessions
+                    .get(session_id)
+                    .ok_or(SshServiceError::NoDefaultBinding)?;
+                state
+                    .grants
+                    .get(selector)
+                    .map(|record| record.persisted.binding.clone())
+            };
+            let binding = if let Some(binding) = direct_binding {
+                binding
+            } else {
+                let target_id = self.canonical_target_id(selector)?;
+                let sessions = self.inner.sessions.read().await;
+                let state = sessions
+                    .get(session_id)
+                    .ok_or(SshServiceError::NoDefaultBinding)?;
+                let mut matches = state
+                    .grants
+                    .values()
+                    .filter(|record| {
+                        !record.persisted.binding.revoked
+                            && record.persisted.binding.target_id == target_id
+                    })
+                    .map(|record| record.persisted.binding.clone());
+                let first = matches.next().ok_or(SshServiceError::GrantRequired)?;
+                if matches.next().is_some() {
+                    return Err(SshServiceError::AmbiguousTarget(target_id));
+                }
+                first
+            };
+            if binding.revoked {
+                return Err(SshServiceError::RevokedBinding(binding.id));
+            }
+            return Ok(binding);
+        }
+
         let sessions = self.inner.sessions.read().await;
         let state = sessions
             .get(session_id)
             .ok_or(SshServiceError::NoDefaultBinding)?;
-        let binding = match target {
-            Some(selector) => {
-                if let Some(record) = state.grants.get(selector) {
-                    record.persisted.binding.clone()
-                } else {
-                    let mut matches = state
-                        .grants
-                        .values()
-                        .filter(|record| {
-                            !record.persisted.binding.revoked
-                                && record.persisted.binding.target_id == selector
-                        })
-                        .map(|record| record.persisted.binding.clone());
-                    let first = matches
-                        .next()
-                        .ok_or_else(|| SshServiceError::GrantRequired)?;
-                    if matches.next().is_some() {
-                        return Err(SshServiceError::AmbiguousTarget(selector.to_owned()));
-                    }
-                    first
-                }
-            }
-            None => state
-                .default_binding_id
-                .as_ref()
-                .and_then(|binding_id| state.grants.get(binding_id))
-                .map(|record| record.persisted.binding.clone())
-                .ok_or(SshServiceError::NoDefaultBinding)?,
-        };
+        let binding = state
+            .default_binding_id
+            .as_ref()
+            .and_then(|binding_id| state.grants.get(binding_id))
+            .map(|record| record.persisted.binding.clone())
+            .ok_or(SshServiceError::NoDefaultBinding)?;
         if binding.revoked {
             return Err(SshServiceError::RevokedBinding(binding.id));
         }
@@ -2961,10 +3400,17 @@ impl SessionSsh {
         binding: &SshBinding,
         client_id: Option<u64>,
     ) -> Result<Arc<WorkerConnection>, SshServiceError> {
+        self.refresh_external_target_changes().await?;
+        let target_epoch = self.target_config_epoch();
+        let current = self.binding(&binding.session_id, &binding.id).await?;
+        if current != *binding || current.revoked {
+            return Err(SshServiceError::StaleInvocation);
+        }
         if let Some(worker) = self.inner.workers.lock().await.get(&binding.id).cloned() {
             if worker.client.is_connected()
-                && worker.binding.epoch == binding.epoch
+                && worker.binding == *binding
                 && worker.client_id == client_id
+                && worker.target_epoch == target_epoch
             {
                 return Ok(worker);
             }
@@ -2977,34 +3423,60 @@ impl SessionSsh {
                 .clone()
         };
         let _guard = lock.lock().await;
+        if self.target_config_epoch() != target_epoch {
+            return Err(SshServiceError::StaleInvocation);
+        }
         if let Some(worker) = self.inner.workers.lock().await.get(&binding.id).cloned() {
             if worker.client.is_connected()
-                && worker.binding.epoch == binding.epoch
+                && worker.binding == *binding
                 && worker.client_id == client_id
+                && worker.target_epoch == target_epoch
             {
                 return Ok(worker);
             }
         }
         let lease = self
-            .acquire(&binding.target_id, client_id, client_id.is_some())
+            .acquire_native_after_refresh(&binding.target_id, client_id, client_id.is_some())
             .await?;
+        self.sync_pending_revocations(&lease, &binding.target_id).await?;
         if lease.identity() != &binding.identity {
             return Err(SshServiceError::IdentityChanged);
         }
-        let worker = self.open_worker(lease, binding.clone(), client_id).await?;
+        let worker = self
+            .open_worker(lease, binding.clone(), client_id, target_epoch)
+            .await?;
         if worker.binding.root != binding.root || worker.binding.cwd != binding.cwd {
             return Err(SshServiceError::CanonicalRootChanged);
         }
         let worker = Arc::new(worker);
-        let sessions = self.inner.sessions.read().await;
-        let current = sessions
-            .get(&binding.session_id)
-            .and_then(|state| state.grants.get(&binding.id))
-            .map(|record| record.persisted.binding.clone());
+        let current = {
+            // This is the final local-authority commit point after all worker
+            // setup I/O. A target mutation can neither race the insertion nor
+            // leave this new worker reachable with an old target epoch.
+            let _commit = self.inner.target_commit.lock().await;
+            if self.target_config_epoch() != target_epoch {
+                None
+            } else {
+                let sessions = self.inner.sessions.read().await;
+                let current = sessions
+                    .get(&binding.session_id)
+                    .and_then(|state| state.grants.get(&binding.id))
+                    .map(|record| record.persisted.binding.clone());
+                if current.as_ref() == Some(binding)
+                    && current.as_ref().is_some_and(|binding| !binding.revoked)
+                {
+                    self.inner
+                        .workers
+                        .lock()
+                        .await
+                        .insert(binding.id.clone(), worker.clone());
+                }
+                current
+            }
+        };
         if current.as_ref() != Some(binding)
             || current.as_ref().is_some_and(|binding| binding.revoked)
         {
-            drop(sessions);
             let epoch = current
                 .as_ref()
                 .map_or(binding.epoch.saturating_add(1), |current| {
@@ -3020,12 +3492,6 @@ impl SessionSsh {
             }
             return Err(SshServiceError::StaleInvocation);
         }
-        self.inner
-            .workers
-            .lock()
-            .await
-            .insert(binding.id.clone(), worker.clone());
-        drop(sessions);
         self.mark_revalidated(&binding.session_id, &binding.id)
             .await;
         Ok(worker)
@@ -3036,7 +3502,11 @@ impl SessionSsh {
         lease: ConnectionLease,
         binding: SshBinding,
         client_id: Option<u64>,
+        target_epoch: u64,
     ) -> Result<WorkerConnection, SshServiceError> {
+        if self.target_config_epoch() != target_epoch {
+            return Err(SshServiceError::StaleInvocation);
+        }
         let resolved = self
             .inner
             .targets
@@ -3049,6 +3519,7 @@ impl SessionSsh {
                 client_id,
                 binding: binding.clone(),
                 request_id: Uuid::now_v7().to_string(),
+                target_epoch,
             };
             let result =
                 super::worker_install::prepare_worker(&lease, &self.inner.home, &interaction).await;
@@ -3060,6 +3531,9 @@ impl SessionSsh {
         // Record managed executables before sending authority. An interrupted handshake
         // can still bind a daemon. Never copy potentially secret custom argv into session state.
         {
+            // This is a local authority commit; do not let a target mutation
+            // advance its epoch between the check below and persistence.
+            let _commit = self.inner.target_commit.lock().await;
             let mut sessions = self.inner.sessions.write().await;
             let state = sessions
                 .get_mut(&binding.session_id)
@@ -3069,7 +3543,10 @@ impl SessionSsh {
                 .grants
                 .get_mut(&binding.id)
                 .ok_or_else(|| SshServiceError::UnknownBinding(binding.id.clone()))?;
-            if record.persisted.binding != binding || binding.revoked {
+            if record.persisted.binding != binding
+                || binding.revoked
+                || self.target_config_epoch() != target_epoch
+            {
                 return Err(SshServiceError::StaleInvocation);
             }
             if managed {
@@ -3093,6 +3570,7 @@ impl SessionSsh {
             service: Arc::downgrade(&self.inner),
             client_id,
             binding: binding.clone(),
+            target_epoch,
         });
         let client = SshWorkspaceClient::connect(stream, binding, callbacks).await?;
         let binding = client.binding().await;
@@ -3100,12 +3578,24 @@ impl SessionSsh {
             binding,
             client,
             client_id,
+            target_epoch,
             command: command_args,
             _lease: lease,
         })
     }
 
     async fn acquire_native(
+        &self,
+        target_id: &str,
+        client_id: Option<u64>,
+        interactive: bool,
+    ) -> Result<ConnectionLease, SshServiceError> {
+        self.refresh_external_target_changes().await?;
+        self.acquire_native_after_refresh(target_id, client_id, interactive)
+            .await
+    }
+
+    async fn acquire_native_after_refresh(
         &self,
         target_id: &str,
         client_id: Option<u64>,
@@ -3231,6 +3721,18 @@ impl SessionSsh {
     }
 }
 
+fn target_connection_settings_changed(
+    expected: &xai_grok_ssh::SshTarget,
+    replacement: &xai_grok_ssh::SshTarget,
+) -> bool {
+    expected.host != replacement.host
+        || expected.user != replacement.user
+        || expected.port != replacement.port
+        || expected.identity_files != replacement.identity_files
+        || expected.credential_ref != replacement.credential_ref
+        || expected.worker_command != replacement.worker_command
+}
+
 fn is_default_worker_command(command: &[String]) -> bool {
     command
         .iter()
@@ -3243,6 +3745,7 @@ struct WorkerInstallBridge {
     client_id: Option<u64>,
     binding: SshBinding,
     request_id: String,
+    target_epoch: u64,
 }
 
 impl WorkerInstallBridge {
@@ -3304,12 +3807,14 @@ impl super::worker_install::WorkerInstallInteraction for WorkerInstallBridge {
         let (response, receiver) = oneshot::channel();
         {
             let sessions = service.sessions.read().await;
-            if !sessions
-                .get(&self.binding.session_id)
-                .and_then(|state| state.grants.get(&self.binding.id))
-                .is_some_and(|record| {
-                    !record.persisted.binding.revoked && record.persisted.binding == self.binding
-                })
+            if service.target_config_epoch.load(Ordering::Acquire) != self.target_epoch
+                || !sessions
+                    .get(&self.binding.session_id)
+                    .and_then(|state| state.grants.get(&self.binding.id))
+                    .is_some_and(|record| {
+                        !record.persisted.binding.revoked
+                            && record.persisted.binding == self.binding
+                    })
             {
                 return Err("SSH grant changed during worker installation".into());
             }
@@ -3318,6 +3823,7 @@ impl super::worker_install::WorkerInstallInteraction for WorkerInstallBridge {
                 PendingWorkerInstall {
                     client_id,
                     binding: self.binding.clone(),
+                    target_epoch: self.target_epoch,
                     response,
                 },
             );
@@ -3355,13 +3861,14 @@ impl super::worker_install::WorkerInstallInteraction for WorkerInstallBridge {
         match decision {
             Ok(Ok(approved)) => {
                 let sessions = service.sessions.read().await;
-                if !sessions
-                    .get(&self.binding.session_id)
-                    .and_then(|state| state.grants.get(&self.binding.id))
-                    .is_some_and(|record| {
-                        !record.persisted.binding.revoked
-                            && record.persisted.binding == self.binding
-                    })
+                if service.target_config_epoch.load(Ordering::Acquire) != self.target_epoch
+                    || !sessions
+                        .get(&self.binding.session_id)
+                        .and_then(|state| state.grants.get(&self.binding.id))
+                        .is_some_and(|record| {
+                            !record.persisted.binding.revoked
+                                && record.persisted.binding == self.binding
+                        })
                 {
                     return Err(
                         "SSH grant changed while waiting for worker installation consent".into(),
@@ -3521,6 +4028,7 @@ struct WorkerCallbacks {
     service: Weak<SessionSshInner>,
     client_id: Option<u64>,
     binding: SshBinding,
+    target_epoch: u64,
 }
 
 #[async_trait]
@@ -3558,7 +4066,9 @@ impl SshClientCallbacks for WorkerCallbacks {
         let Some(client_id) = self.client_id else {
             return SshApprovalDecision::Deny;
         };
-        if !binding_is_live_for_operation(&service, &self.binding, request.operation).await {
+        if service.target_config_epoch.load(Ordering::Acquire) != self.target_epoch
+            || !binding_is_live_for_operation(&service, &self.binding, request.operation).await
+        {
             return SshApprovalDecision::Deny;
         }
         if matches!(request.operation, SshOperation::Write | SshOperation::Execute)
@@ -3575,6 +4085,7 @@ impl SshClientCallbacks for WorkerCallbacks {
                     PendingOperationApproval {
                         client_id,
                         binding: self.binding.clone(),
+                        target_epoch: self.target_epoch,
                         operation: request.operation,
                         response,
                     },
@@ -3707,6 +4218,8 @@ async fn await_auth_response(
             .insert(
                 challenge_id.clone(),
                 PendingAuthentication {
+                    target_id: prompt.target_id.clone(),
+                    target_epoch: service.target_config_epoch.load(Ordering::Acquire),
                     client_id,
                     connection_generation,
                     response,
@@ -4259,6 +4772,7 @@ mod tests {
             service: Arc::downgrade(&service.inner),
             client_id: None,
             binding: binding("binding", "session", "/remote/project"),
+            target_epoch: service.target_config_epoch(),
         };
         assert_eq!(
             callbacks
@@ -4281,6 +4795,7 @@ mod tests {
             client_id: None,
             binding: binding("binding", "session", "/remote/project"),
             request_id: "install".into(),
+            target_epoch: service.target_config_epoch(),
         };
         assert!(
             installer
@@ -4310,6 +4825,339 @@ mod tests {
         }
     }
 
+    fn write_manual_target(home: &std::path::Path, id: &str, label: &str, host: &str) {
+        std::fs::write(
+            home.join("config.toml"),
+            format!(
+                "[ssh.targets.{id}]\nlabel = {label:?}\nhost = {host:?}\ncredential_ref = \"secret-reference\"\nidentity_files = [\"/private/identity\"]\nworker_command = [\"secret-worker\", \"--token\", \"secret-argv\"]\n"
+            ),
+        )
+        .expect("write target configuration");
+    }
+
+    #[tokio::test]
+    async fn discovery_lists_safe_configured_metadata_without_granting_or_leaking_sessions() {
+        let home = tempfile::tempdir().unwrap();
+        write_manual_target(
+            home.path(),
+            "manual-discovery-id",
+            "manual-discovery-label",
+            "manual-discovery-host.invalid",
+        );
+        let service = SessionSsh::new(home.path().to_owned());
+        let mut other_binding = binding("other-binding", "other-session", "/remote/project");
+        other_binding.target_id = "manual-discovery-id".into();
+        service
+            .restore_session(
+                "other-session",
+                PersistedSshState {
+                    grants: vec![PersistedSshGrant {
+                        binding: other_binding,
+                        parent_binding_id: None,
+                        requires_revalidation: false,
+                        scope: SshGrantScope::CurrentSession,
+                        revoke_status: None,
+                        worker_bound: false,
+                        worker_commands: Vec::new(),
+                    }],
+                    ..Default::default()
+                },
+            )
+            .await;
+
+        let fresh = service.discover_targets("fresh-session").await.unwrap();
+        let candidate = fresh
+            .targets
+            .iter()
+            .find(|candidate| candidate.target_id == "manual-discovery-id")
+            .expect("manual target appears in discovery");
+        assert_eq!(candidate.label, "manual-discovery-label");
+        assert_eq!(candidate.host, "manual-discovery-host.invalid");
+        assert_eq!(candidate.source, SshTargetCandidateSource::Manual);
+        assert!(candidate.access.is_empty(), "discovery must not grant access");
+        assert!(service.list_targets("fresh-session").await.is_empty());
+        let serialized = serde_json::to_string(candidate).unwrap();
+        for secret_configuration in [
+            "secret-reference",
+            "/private/identity",
+            "secret-worker",
+            "secret-argv",
+        ] {
+            assert!(!serialized.contains(secret_configuration));
+        }
+
+        let other = service.discover_targets("other-session").await.unwrap();
+        let other_candidate = other
+            .targets
+            .iter()
+            .find(|candidate| candidate.target_id == "manual-discovery-id")
+            .expect("manual target appears for the granted session");
+        assert_eq!(other_candidate.access.len(), 1);
+        assert_eq!(other_candidate.access[0].binding_id, "other-binding");
+    }
+
+    #[tokio::test]
+    async fn named_tool_grant_canonicalizes_a_unique_manual_label_before_publication() {
+        let home = tempfile::tempdir().unwrap();
+        write_manual_target(
+            home.path(),
+            "manual-canonical-id",
+            "manual-canonical-label",
+            "manual-canonical-host.invalid",
+        );
+        let service = SessionSsh::new(home.path().to_owned());
+        let mut events = service.subscribe_events();
+        let waiting_service = service.clone();
+        let waiting = tokio::spawn(async move {
+            waiting_service
+                .request_tool_grant(
+                    "session",
+                    Some("manual-canonical-label".into()),
+                    Some("/remote/project".into()),
+                    SshCapabilities::read_only(),
+                    "inspect configured host".into(),
+                    Some(7),
+                    None,
+                )
+                .await
+        });
+        let request = match events.recv().await.unwrap() {
+            SshEvent::GrantRequested(request) => request,
+            event => panic!("expected grant request, got {event:?}"),
+        };
+        assert_eq!(request.target_id.as_deref(), Some("manual-canonical-id"));
+        service
+            .cancel_grant("session", &request.id, 7)
+            .await
+            .unwrap();
+        assert!(matches!(
+            waiting.await.unwrap(),
+            Err(SshServiceError::GrantCancelled)
+        ));
+    }
+
+    #[tokio::test]
+    async fn named_tool_grant_rejects_missing_or_ambiguous_target_before_opening_a_prompt() {
+        let home = tempfile::tempdir().unwrap();
+        std::fs::write(
+            home.path().join("config.toml"),
+            r#"
+                [ssh.targets.first]
+                label = "duplicate-target-label-20261021"
+                host = "first.example.test"
+
+                [ssh.targets.second]
+                label = "duplicate-target-label-20261021"
+                host = "second.example.test"
+            "#,
+        )
+        .unwrap();
+        let service = SessionSsh::new(home.path().to_owned());
+        let mut events = service.subscribe_events();
+        assert!(matches!(
+            service
+                .request_tool_grant(
+                    "session",
+                    Some("missing target".into()),
+                    None,
+                    SshCapabilities::read_only(),
+                    "missing target".into(),
+                    Some(7),
+                    None,
+                )
+                .await,
+            Err(SshServiceError::TargetNotFound(reference)) if reference == "missing target"
+        ));
+        assert!(matches!(
+            service
+                .request_tool_grant(
+                    "session",
+                    Some("duplicate-target-label-20261021".into()),
+                    None,
+                    SshCapabilities::read_only(),
+                    "ambiguous target".into(),
+                    Some(7),
+                    None,
+                )
+                .await,
+            Err(SshServiceError::AmbiguousConfiguredTarget {
+                reference,
+                candidate_ids,
+            }) if reference == "duplicate-target-label-20261021"
+                && candidate_ids == vec!["first".to_owned(), "second".to_owned()]
+        ));
+        assert!(events.try_recv().is_err(), "rejected names must not open a prompt");
+        assert!(service.snapshot_session("session").await.pending_requests.is_empty());
+    }
+
+    #[tokio::test]
+    async fn terminal_control_paths_preserve_owner_and_original_tool_error() {
+        let home = tempfile::tempdir().unwrap();
+        let service = SessionSsh::new(home.path().to_owned());
+        let mut events = service.subscribe_events();
+
+        let waiting_service = service.clone();
+        let cancelled = tokio::spawn(async move {
+            waiting_service
+                .request_tool_grant(
+                    "session",
+                    None,
+                    Some("/remote/project".into()),
+                    SshCapabilities::read_only(),
+                    "cancelled request".into(),
+                    Some(7),
+                    None,
+                )
+                .await
+        });
+        let cancelled_request = match events.recv().await.unwrap() {
+            SshEvent::GrantRequested(request) => request,
+            event => panic!("expected grant request, got {event:?}"),
+        };
+        assert!(matches!(
+            service
+                .control(
+                    8,
+                    SshControlCommand::CancelGrant {
+                        session_id: "session".into(),
+                        request_id: cancelled_request.id.clone(),
+                    }
+                )
+                .await,
+            Err(SshServiceError::WrongClient)
+        ));
+        assert!(matches!(
+            service
+                .control(
+                    7,
+                    SshControlCommand::CancelGrant {
+                        session_id: "different-session".into(),
+                        request_id: cancelled_request.id.clone(),
+                    }
+                )
+                .await,
+            Err(SshServiceError::UnknownGrantRequest(request_id))
+                if request_id == cancelled_request.id
+        ));
+        assert!(matches!(
+            service
+                .control(
+                    7,
+                    SshControlCommand::CancelGrant {
+                        session_id: "session".into(),
+                        request_id: cancelled_request.id.clone(),
+                    }
+                )
+                .await,
+            Ok(SshControlReply::GrantCancelled { request_id })
+                if request_id == cancelled_request.id
+        ));
+        assert!(matches!(
+            events.recv().await.unwrap(),
+            SshEvent::GrantCancelled {
+                request_id,
+                session_id,
+                client_id,
+            } if request_id == cancelled_request.id && session_id == "session" && client_id == 7
+        ));
+        assert!(matches!(
+            cancelled.await.unwrap(),
+            Err(SshServiceError::GrantCancelled)
+        ));
+        assert!(matches!(
+            service
+                .approve_grant(SshGrantDecision {
+                    request_id: cancelled_request.id,
+                    approved: false,
+                    target_id: None,
+                    root: None,
+                    capabilities: None,
+                    scope: SshGrantScope::CurrentSession,
+                    make_default: false,
+                    client_id: 7,
+                })
+                .await,
+            Err(SshServiceError::UnknownGrantRequest(_))
+        ));
+
+        let waiting_service = service.clone();
+        let failed = tokio::spawn(async move {
+            waiting_service
+                .request_tool_grant(
+                    "session",
+                    None,
+                    Some("/remote/project".into()),
+                    SshCapabilities::read_only(),
+                    "failed inspection".into(),
+                    Some(7),
+                    None,
+                )
+                .await
+        });
+        let failed_request = match events.recv().await.unwrap() {
+            SshEvent::GrantRequested(request) => request,
+            event => panic!("expected grant request, got {event:?}"),
+        };
+        assert!(matches!(
+            service
+                .control(
+                    8,
+                    SshControlCommand::FailGrant {
+                        session_id: "session".into(),
+                        request_id: failed_request.id.clone(),
+                        error: "SSH configuration failed at candidate-fixture".into(),
+                    }
+                )
+                .await,
+            Err(SshServiceError::WrongClient)
+        ));
+        assert!(matches!(
+            service
+                .control(
+                    7,
+                    SshControlCommand::FailGrant {
+                        session_id: "session".into(),
+                        request_id: failed_request.id.clone(),
+                        error: "SSH configuration failed at candidate-fixture".into(),
+                    }
+                )
+                .await,
+            Ok(SshControlReply::GrantFailed { request_id }) if request_id == failed_request.id
+        ));
+        assert!(matches!(
+            events.recv().await.unwrap(),
+            SshEvent::GrantFailed {
+                request_id,
+                session_id,
+                client_id,
+                error,
+            } if request_id == failed_request.id
+                && session_id == "session"
+                && client_id == 7
+                && error == "SSH configuration failed at candidate-fixture"
+        ));
+        assert!(matches!(
+            failed.await.unwrap(),
+            Err(SshServiceError::GrantFailed(error))
+                if error == "SSH configuration failed at candidate-fixture"
+        ));
+        assert!(matches!(
+            service
+                .approve_grant(SshGrantDecision {
+                    request_id: failed_request.id,
+                    approved: false,
+                    target_id: None,
+                    root: None,
+                    capabilities: None,
+                    scope: SshGrantScope::CurrentSession,
+                    make_default: false,
+                    client_id: 7,
+                })
+                .await,
+            Err(SshServiceError::UnknownGrantRequest(_))
+        ));
+    }
+
     async fn worker_install_fixture() -> (tempfile::TempDir, SessionSsh, WorkerInstallBridge) {
         let home = tempfile::tempdir().unwrap();
         let service = SessionSsh::new(home.path().to_owned());
@@ -4336,6 +5184,7 @@ mod tests {
             client_id: Some(7),
             binding: granted,
             request_id: "install".into(),
+            target_epoch: service.target_config_epoch(),
         };
         (home, service, bridge)
     }
@@ -4607,7 +5456,7 @@ mod tests {
             service
                 .request_tool_grant(
                     "headless",
-                    Some("target".into()),
+                    None,
                     Some("/remote/project".into()),
                     SshCapabilities::read_only(),
                     "headless access".into(),
@@ -4623,7 +5472,7 @@ mod tests {
             waiting_service
                 .request_tool_grant(
                     "session",
-                    Some("target".into()),
+                    None,
                     Some("/remote/project".into()),
                     SshCapabilities::read_only(),
                     "inspect a remote project".into(),
@@ -4642,7 +5491,7 @@ mod tests {
             service
                 .request_tool_grant(
                     "session",
-                    Some("target".into()),
+                    None,
                     Some("/remote/project".into()),
                     SshCapabilities::read_only(),
                     "duplicate request".into(),
@@ -4721,7 +5570,7 @@ mod tests {
             waiting_service
                 .request_tool_grant(
                     "session",
-                    Some("target".into()),
+                    None,
                     Some("/remote/project".into()),
                     SshCapabilities::read_only(),
                     "inspect a remote project".into(),
@@ -4741,11 +5590,11 @@ mod tests {
         ));
         assert!(matches!(
             events.recv().await.unwrap(),
-            SshEvent::GrantResolved {
+            SshEvent::GrantCancelled {
                 request_id,
-                approved: false,
-                binding: None,
-            } if request_id == request.id
+                session_id,
+                client_id,
+            } if request_id == request.id && session_id == "session" && client_id == 7
         ));
         assert!(matches!(
             service
@@ -4774,7 +5623,7 @@ mod tests {
             waiting_service
                 .request_tool_grant(
                     "session",
-                    Some("target".into()),
+                    None,
                     Some("/remote/project".into()),
                     SshCapabilities::read_only(),
                     "inspect a remote project".into(),
@@ -4792,11 +5641,11 @@ mod tests {
 
         assert!(matches!(
             events.recv().await.unwrap(),
-            SshEvent::GrantResolved {
+            SshEvent::GrantCancelled {
                 request_id,
-                approved: false,
-                binding: None,
-            } if request_id == request.id
+                session_id,
+                client_id,
+            } if request_id == request.id && session_id == "session" && client_id == 7
         ));
         assert!(matches!(
             waiting.await.unwrap(),
@@ -4830,7 +5679,7 @@ mod tests {
             waiting_service
                 .request_tool_grant(
                     "session",
-                    Some("target".into()),
+                    None,
                     Some("/remote/project".into()),
                     SshCapabilities::read_only(),
                     "inspect a remote project".into(),
@@ -4850,11 +5699,11 @@ mod tests {
                 .await
                 .unwrap()
                 .unwrap(),
-            SshEvent::GrantResolved {
+            SshEvent::GrantCancelled {
                 request_id,
-                approved: false,
-                binding: None,
-            } if request_id == request.id
+                session_id,
+                client_id,
+            } if request_id == request.id && session_id == "session" && client_id == 7
         ));
         assert!(service.snapshot_session("session").await.pending_requests.is_empty());
     }
@@ -4888,6 +5737,7 @@ mod tests {
             PendingOperationApproval {
                 client_id: 7,
                 binding: granted.clone(),
+                target_epoch: service.target_config_epoch(),
                 operation: SshOperation::Execute,
                 response,
             },
@@ -4926,6 +5776,7 @@ mod tests {
                 PendingOperationApproval {
                     client_id: 7,
                     binding: binding.clone(),
+                    target_epoch: service.target_config_epoch(),
                     operation: SshOperation::Execute,
                     response,
                 },
@@ -5039,6 +5890,7 @@ mod tests {
             PendingOperationApproval {
                 client_id: 7,
                 binding: granted.clone(),
+                target_epoch: service.target_config_epoch(),
                 operation: SshOperation::Execute,
                 response,
             },
@@ -5521,6 +6373,7 @@ mod tests {
                 "target".into(),
                 Some("/requested/root/subdir".into()),
                 identity.clone(),
+                service.target_config_epoch(),
             )
             .await
             .unwrap();
@@ -5550,7 +6403,7 @@ mod tests {
         let request = service
             .request_grant(
                 "session",
-                Some("target".into()),
+                None,
                 Some("/requested/root".into()),
                 SshCapabilities::read_only(),
                 "inspect a remote project".into(),
@@ -5600,6 +6453,7 @@ mod tests {
                         username: "user".into(),
                         fingerprint: "fingerprint".into(),
                     },
+                    service.target_config_epoch(),
                 )
                 .await,
             Err(SshServiceError::UnknownGrantRequest(_))
@@ -5826,6 +6680,135 @@ mod tests {
         assert_eq!(
             service.snapshot_session("recovery").await.grants[0].revoke_status,
             Some(SshGrantStatus::RevokedConfirmed)
+        );
+    }
+
+    #[tokio::test]
+    async fn target_control_preserves_label_only_access_and_revokes_changed_or_deleted_targets() {
+        let home = tempfile::tempdir().unwrap();
+        let service = SessionSsh::new(home.path().to_owned());
+        let mut target = xai_grok_ssh::SshTarget::new("first.example.test");
+        target.id = "target".into();
+        target.label = "First host".into();
+        let target = service.inner.targets.upsert(target).unwrap();
+        let granted = binding("binding", "session", "/repo");
+        service
+            .restore_session(
+                "session",
+                PersistedSshState {
+                    grants: vec![PersistedSshGrant {
+                        binding: granted.clone(),
+                        parent_binding_id: None,
+                        requires_revalidation: true,
+                        scope: SshGrantScope::CurrentSession,
+                        revoke_status: None,
+                        worker_bound: false,
+                        worker_commands: Vec::new(),
+                    }],
+                    default_binding_id: Some(granted.id.clone()),
+                    pending_requests: Vec::new(),
+                },
+            )
+            .await;
+
+        let mut label_update = target.clone();
+        label_update.label = "Renamed host".into();
+        assert!(matches!(
+            service
+                .control(
+                    7,
+                    SshControlCommand::UpdateTarget {
+                        expected: target.clone(),
+                        replacement: label_update.clone(),
+                    },
+                )
+                .await,
+            Ok(SshControlReply::TargetUpdated(updated)) if updated == label_update
+        ));
+        assert_eq!(service.list_targets("session").await.len(), 1);
+
+        let (response, receiver) = oneshot::channel();
+        service.inner.approval_waiters.lock().await.insert(
+            "old-approval".into(),
+            PendingOperationApproval {
+                client_id: 7,
+                binding: granted.clone(),
+                target_epoch: service.target_config_epoch(),
+                operation: SshOperation::Execute,
+                response,
+            },
+        );
+        let mut connection_update = label_update.clone();
+        connection_update.host = "second.example.test".into();
+        assert!(matches!(
+            service
+                .control(
+                    7,
+                    SshControlCommand::UpdateTarget {
+                        expected: label_update,
+                        replacement: connection_update.clone(),
+                    },
+                )
+                .await,
+            Ok(SshControlReply::TargetUpdated(updated)) if updated == connection_update
+        ));
+        assert!(service.list_targets("session").await.is_empty());
+        assert!(receiver.await.is_err());
+        assert!(matches!(
+            service
+                .control(
+                    7,
+                    SshControlCommand::SubmitOperationApproval(
+                        SshOperationApprovalDecision {
+                            client_id: 7,
+                            approval_id: "old-approval".into(),
+                            approved: true,
+                            scope: SshOperationApprovalScope::Session,
+                        },
+                    ),
+                )
+                .await,
+            Err(SshServiceError::StaleOperationApproval)
+        ));
+
+        let deleted_grant = binding("deleted-binding", "deleted-session", "/repo");
+        service
+            .restore_session(
+                "deleted-session",
+                PersistedSshState {
+                    grants: vec![PersistedSshGrant {
+                        binding: deleted_grant.clone(),
+                        parent_binding_id: None,
+                        requires_revalidation: true,
+                        scope: SshGrantScope::CurrentSession,
+                        revoke_status: None,
+                        worker_bound: false,
+                        worker_commands: Vec::new(),
+                    }],
+                    default_binding_id: Some(deleted_grant.id.clone()),
+                    pending_requests: Vec::new(),
+                },
+            )
+            .await;
+        assert!(matches!(
+            service
+                .control(
+                    7,
+                    SshControlCommand::RemoveTarget {
+                        expected: connection_update,
+                    },
+                )
+                .await,
+            Ok(SshControlReply::TargetRemoved(removed)) if removed.id == "target"
+        ));
+        assert!(service.list_targets("deleted-session").await.is_empty());
+        assert!(
+            service
+                .inner
+                .targets
+                .get("target")
+                .unwrap()
+                .is_none()
         );
     }
 }

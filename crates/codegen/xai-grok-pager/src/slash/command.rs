@@ -154,10 +154,12 @@ pub struct AppCtx<'a> {
     /// Saved or built-in workflow definitions advertised by the shell (`_meta.workflowSource`).
     /// Backs `/workflow` argument suggestions.
     pub saved_workflows: &'a [WorkflowChoice],
+    /// Configured SSH targets for `/ssh` and its `/remote` alias.
+    /// Owned by the controller so completion performs no I/O.
+    pub ssh_candidates: &'a [ArgItem],
     /// Live session runs.
     /// Backs `/workflow pause|resume|stop|save` name suggestions so a manage verb never auto-picks a run.
     pub workflow_runs: &'a [WorkflowRunChoice],
-    /// Effective render mode of this process (gates `/minimal` and `/fullscreen` visibility).
     /// Same source of truth as [`CommandExecCtx::screen_mode`], carried by the owning [`SlashController`](crate::slash::SlashController).
     pub(crate) screen_mode: crate::app::ScreenMode,
     /// Current session title for `/rename` ghost-prefill (`display_name`, else `generated_session_title`).

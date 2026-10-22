@@ -257,10 +257,19 @@ pub enum ConfigError {
     GrokyToml { path: PathBuf, message: String },
     #[error("invalid SSH target: {0}")]
     InvalidTarget(String),
-    #[error("SSH target `{0}` was not found")]
+    #[error("target_not_found: SSH target `{0}` was not found")]
     TargetNotFound(String),
+    #[error(
+        "ambiguous_target: SSH target reference `{reference}` matches multiple configured targets; use one exact target_id: {candidate_ids:?}"
+    )]
+    AmbiguousTarget {
+        reference: String,
+        candidate_ids: Vec<String>,
+    },
     #[error("imported SSH alias `{0}` is read-only; create a user target to override it")]
     ImmutableImportedTarget(String),
+    #[error("SSH target `{0}` was changed or removed before this edit could be saved")]
+    StaleTarget(String),
     #[error("invalid SSH configuration at {path}:{line}: {message}")]
     InvalidSshConfig {
         path: PathBuf,

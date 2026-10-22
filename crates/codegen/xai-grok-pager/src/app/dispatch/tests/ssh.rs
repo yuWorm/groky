@@ -858,14 +858,17 @@ fn ssh_manager_wheel_scroll_reaches_modal_instead_of_background_transcript() {
         .unwrap();
     manager.set_targets(
         (0..20)
-            .map(|index| crate::views::ssh_modal::SshTargetView {
-                target_id: format!("target-{index}"),
-                label: format!("Host {index}"),
-                source: "Groky config".into(),
-                effective_address: "user@example.test:22".into(),
-                connected: false,
-                connection_detail: "Not connected.".into(),
-                grant: crate::views::ssh_modal::SshGrantView::NotGranted,
+            .map(|index| {
+                let mut target = xai_grok_ssh::SshTarget::new(format!("target-{index}"));
+                target.id = format!("target-{index}");
+                target.label = format!("Host {index}");
+                crate::views::ssh_modal::SshTargetView::from_target(
+                    target,
+                    "user@example.test:22".into(),
+                    false,
+                    "Not connected.".into(),
+                    crate::views::ssh_modal::SshGrantView::NotGranted,
+                )
             })
             .collect(),
     );
@@ -1585,22 +1588,101 @@ fn cancelled_project_start_cannot_replace_a_new_folder_flow_on_completion() {
 }
 
 #[test]
-fn advanced_use_verifies_the_folder_and_resumes_after_canonical_consent() {
+fn direct_ssh_selection_cannot_resume_in_a_replacement_manager() {
+    let mut app = test_app_with_agent();
+    app.active_view = ActiveView::Agent(AgentId(0));
+    let initial = dispatch(Action::SelectSshTarget { reference: "Fixture".into() }, &mut app);
+    let (session_id, owner) = ssh_target_list_request(&initial);
+    let mut target = xai_grok_ssh::SshTarget::new(TARGET_ID);
+    target.id = TARGET_ID.into();
+    target.label = "Fixture".into();
+    let targets = vec![crate::views::ssh_modal::SshTargetView::from_target(
+        target, "user@host:22".into(), false, String::new(),
+        crate::views::ssh_modal::SshGrantView::NotGranted,
+    )];
+    let client_id = app.ssh_client_id;
+    let effects = dispatch(Action::TaskComplete(TaskResult::SshTargetsLoaded {
+        session_id: session_id.clone(), client_id, owner, targets: targets.clone(), error: None,
+    }), &mut app);
+    assert!(matches!(effects.as_slice(), [Effect::SshBrowseProjectDirectory {
+        target_id, owner: actual_owner, ..
+    }] if target_id == TARGET_ID && actual_owner == &owner));
+    dispatch(Action::OpenSshManager, &mut app);
+    let late = dispatch(Action::TaskComplete(TaskResult::SshTargetsLoaded {
+        session_id, client_id, owner, targets, error: None,
+    }), &mut app);
+    assert!(late.is_empty());
+    assert_ne!(ssh_manager_owner(&app), Some(owner));
+}
+
+#[test]
+fn enter_defaults_the_selected_existing_binding_without_requesting_access() {
+    let mut app = test_app_with_agent();
+    let source = AgentId(0);
+    app.active_view = ActiveView::Agent(source);
+    dispatch(Action::OpenSshManager, &mut app);
+    let owner = ssh_manager_owner(&app).unwrap();
+    let session_id = app.agents.get(&source).unwrap().session.session_id.as_ref().unwrap().to_string();
+    let mut target = xai_grok_ssh::SshTarget::new(TARGET_ID);
+    target.id = TARGET_ID.into();
+    target.label = "Fixture".into();
+    app.agents.get_mut(&source).unwrap().ssh_manager.as_mut().unwrap().set_targets(vec![
+        crate::views::ssh_modal::SshTargetView::from_target(
+            target,
+            "fixture-user@fixture-host:22".into(),
+            false,
+            String::new(),
+            crate::views::ssh_modal::SshGrantView::Granted {
+                binding_id: "existing-binding".into(),
+                root: CANONICAL_ROOT.into(),
+                capabilities: crate::views::ssh_modal::SshCapabilitiesView::default(),
+                is_default: false,
+            },
+        ),
+    ]);
+    let InputOutcome::Action(action) =
+        app.handle_input(&Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)))
+    else { panic!("a granted selected candidate must become the default directly") };
+    assert!(matches!(action, Action::UseSshBinding { ref binding_id } if binding_id == "existing-binding"));
+    let effects = dispatch(action, &mut app);
+    assert!(effects.iter().any(|effect| matches!(
+        effect,
+        Effect::SshUseBinding {
+            session_id: actual,
+            binding_id,
+            owner: actual_owner,
+            ..
+        } if actual == &session_id && binding_id == "existing-binding" && actual_owner == &owner
+    )));
+    assert!(effects.iter().all(|effect| !matches!(
+        effect,
+        Effect::SshRequestGrant { .. }
+            | Effect::SshInspectGrantTarget { .. }
+            | Effect::SshBrowseProjectDirectory { .. }
+    )));
+}
+
+#[test]
+fn enter_authorizes_a_manual_selection_then_defaults_its_approved_binding() {
     let mut app = test_app_with_agent();
     let source = AgentId(0);
     app.active_view = ActiveView::Agent(source);
     dispatch(Action::OpenSshManager, &mut app);
     let owner = ssh_manager_owner(&app).unwrap();
     let manager = app.agents.get_mut(&source).unwrap().ssh_manager.as_mut().unwrap();
-    manager.set_targets(vec![crate::views::ssh_modal::SshTargetView {
-        target_id: TARGET_ID.into(), label: "Fixture".into(), source: "Fixture".into(),
-        effective_address: "fixture-user@fixture-host:22".into(), connected: false,
-        connection_detail: String::new(), grant: crate::views::ssh_modal::SshGrantView::NotGranted,
-    }]);
-    app.handle_input(&Event::Key(KeyEvent::new(KeyCode::Char('m'), KeyModifiers::NONE)));
+    let mut target = xai_grok_ssh::SshTarget::new(TARGET_ID);
+    target.id = TARGET_ID.into();
+    target.label = "Fixture".into();
+    manager.set_targets(vec![crate::views::ssh_modal::SshTargetView::from_target(
+        target,
+        "fixture-user@fixture-host:22".into(),
+        false,
+        String::new(),
+        crate::views::ssh_modal::SshGrantView::NotGranted,
+    )]);
     let InputOutcome::Action(action) =
-        app.handle_input(&Event::Key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::NONE)))
-    else { panic!("advanced use must choose a directory before requesting access") };
+        app.handle_input(&Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)))
+    else { panic!("a manual selection must choose a folder before requesting access") };
     let effects = dispatch(action, &mut app);
     let request_id = effects.iter().find_map(|effect| match effect {
         Effect::SshBrowseProjectDirectory { request_id, .. } => Some(*request_id), _ => None,
@@ -1664,13 +1746,18 @@ fn rootless_request_browses_in_its_owner_and_cancellation_does_not_revive_it() {
     }).expect("original request must immediately open its own folder picker");
     let InputOutcome::Action(action) =
         app.handle_input(&Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)))
-    else { panic!("cancelling directory selection must deny the original waiting request") };
+    else { panic!("cancelling directory selection must cancel the original waiting request") };
     let effects = dispatch(action, &mut app);
     assert!(effects.iter().any(|effect| matches!(effect,
-        Effect::SshApproveGrant { request_id, session_id: actual, approved: false, .. }
+        Effect::SshCancelGrant { request_id, session_id: actual, .. }
             if request_id == "rootless" && actual == &session_id)));
+    let client_id = app.ssh_client_id;
     apply_ssh_control_event(&mut app, Some(session_id.clone()), Some(owner),
-        SshEvent::GrantResolved { request_id: "rootless".into(), approved: false, binding: None });
+        SshEvent::GrantCancelled {
+            request_id: "rootless".into(),
+            session_id: session_id.clone(),
+            client_id,
+        });
     let manager = app.agents.get_mut(&source).unwrap().ssh_manager.as_mut().unwrap();
     assert!(!manager.settle_project_directory(browse_id, TARGET_ID,
         Ok(xai_grok_shell::ssh::SshDirectoryListing {
@@ -1692,6 +1779,77 @@ fn rootless_request_browses_in_its_owner_and_cancellation_does_not_revive_it() {
     app.handle_input(&Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)));
     assert!(app.agents.get(&source).unwrap().ssh_manager.is_none(),
         "late failure must not insert a diagnostic over the cancelled manager");
+}
+
+#[test]
+fn owned_grant_failure_reports_the_original_tool_and_rejects_stale_reopen() {
+    let mut app = test_app_with_agent();
+    let source = AgentId(0);
+    app.active_view = ActiveView::Agent(source);
+    dispatch(Action::OpenSshManager, &mut app);
+    let owner = ssh_manager_owner(&app).unwrap();
+    let session_id = app.agents.get(&source).unwrap().ssh_manager.as_ref().unwrap()
+        .session_id.clone().unwrap();
+    let mut request = grant_request("inspection-failed", TARGET_ID, CANONICAL_ROOT, app.ssh_client_id);
+    request.session_id = session_id.clone();
+    request.verified_identity = None;
+    let effects = apply_ssh_control_event(
+        &mut app,
+        Some(session_id.clone()),
+        None,
+        SshEvent::GrantRequested(request.clone()),
+    );
+    assert!(effects.iter().any(|effect| matches!(
+        effect,
+        Effect::SshInspectGrantTarget { request_id, .. } if request_id == "inspection-failed"
+    )));
+    let effects = dispatch(
+        Action::TaskComplete(TaskResult::SshGrantInspected {
+            session_id: Some(session_id.clone()),
+            request_id: "inspection-failed".into(),
+            client_id: app.ssh_client_id,
+            owner,
+            result: Err("remote configuration rejected the selected target".into()),
+        }),
+        &mut app,
+    );
+    assert!(effects.iter().any(|effect| matches!(
+        effect,
+        Effect::SshFailGrant {
+            session_id: actual,
+            request_id,
+            error,
+            owner: actual_owner,
+            ..
+        } if actual == &session_id
+            && request_id == "inspection-failed"
+            && error == "remote configuration rejected the selected target"
+            && actual_owner == &owner
+    )));
+    let client_id = app.ssh_client_id;
+    apply_ssh_control_event(
+        &mut app,
+        None,
+        None,
+        SshEvent::GrantFailed {
+            request_id: "inspection-failed".into(),
+            session_id: session_id.clone(),
+            client_id,
+            error: "remote configuration rejected the selected target".into(),
+        },
+    );
+    assert!(app.agents.get(&source).unwrap().ssh_manager.as_ref().unwrap()
+        .grant_session_id_for("inspection-failed").is_none());
+    let effects = apply_ssh_control_event(
+        &mut app,
+        Some(session_id),
+        None,
+        SshEvent::GrantRequested(request),
+    );
+    assert!(!effects.iter().any(|effect| matches!(
+        effect,
+        Effect::SshBrowseProjectDirectory { .. } | Effect::SshInspectGrantTarget { .. }
+    )));
 }
 
 #[test]

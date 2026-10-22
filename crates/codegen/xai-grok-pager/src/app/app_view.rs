@@ -508,6 +508,11 @@ pub struct AppView {
     /// Monotonically increasing counter for agent ID allocation.
     /// IDs are never reused after `shift_remove`, to avoid collisions.
     pub next_agent_id: usize,
+    /// Globally unique identity for async `/ssh` completion catalog requests.
+    ///
+    /// A prompt-local entry epoch rejects normal stale responses; this ID also rejects a response
+    /// from a prompt instance replaced under the same `AgentId`.
+    pub(crate) next_ssh_completion_request_id: u64,
     /// Available/selected models (shared across agents).
     pub models: ModelState,
     /// Keybinding definitions.
@@ -1372,6 +1377,7 @@ impl AppView {
             auth_return_view: None,
             agents: IndexMap::new(),
             next_agent_id: 0,
+            next_ssh_completion_request_id: 1,
             models,
             registry: ActionRegistry::defaults(),
             settings_registry: Arc::new(crate::settings::SettingsRegistry::defaults()),
@@ -2235,6 +2241,54 @@ impl AppView {
     }
 }
 impl AppView {
+    /// Move newly-entered `/ssh` and `/remote` argument loads onto the same top-level effect
+    /// queue that the event loop drains after every input event.
+    ///
+    /// The prompt marks only the entry edge as pending, so query keystrokes filter its eventual
+    /// catalog without repeatedly parsing local SSH configuration.
+    fn drain_ssh_target_completion_requests(&mut self) {
+        let mut request_id = self.next_ssh_completion_request_id;
+        let mut effects = Vec::new();
+
+        for (agent_id, agent) in &mut self.agents {
+            if !agent.prompt.ssh_target_load_pending() {
+                continue;
+            }
+            let Some(entry_generation) = agent.prompt.begin_ssh_target_load(request_id) else {
+                continue;
+            };
+            effects.push(super::actions::Effect::SshCompletionTargets {
+                owner: super::actions::SshCompletionOwner::Agent(*agent_id),
+                session_id: agent.session.session_id.as_ref().map(|id| id.0.to_string()),
+                session_binding_epoch: Some(agent.session_binding_epoch),
+                request_id,
+                entry_generation,
+            });
+            request_id = request_id
+                .checked_add(1)
+                .expect("SSH completion request ID space exhausted");
+        }
+
+        if let Some(dashboard) = self.dashboard.as_mut()
+            && dashboard.dispatch.ssh_target_load_pending()
+            && let Some(entry_generation) = dashboard.dispatch.begin_ssh_target_load(request_id)
+        {
+            effects.push(super::actions::Effect::SshCompletionTargets {
+                owner: super::actions::SshCompletionOwner::Dashboard,
+                session_id: None,
+                session_binding_epoch: None,
+                request_id,
+                entry_generation,
+            });
+            request_id = request_id
+                .checked_add(1)
+                .expect("SSH completion request ID space exhausted");
+        }
+
+        self.next_ssh_completion_request_id = request_id;
+        self.pending_effects.extend(effects);
+    }
+
     /// Handle a terminal event. Routes through the input layer stack:
     /// Pending action check (double-press confirmation)
     /// Quit always goes through double-press confirmation, even when escalated from agent-level (e.g., Ctrl-C while cancelling).
@@ -2809,6 +2863,20 @@ impl AppView {
                 }
             }
         };
+        // The dashboard's Esc cascade can move focus before its dispatch widget receives the key.
+        // Mark a loading `/ssh` catalog dismissed here as well, so its eventual result cannot
+        // reopen the dropdown behind the user's back.
+        if matches!(self.active_view, ActiveView::AgentDashboard)
+            && let Event::Key(key) = ev
+            && key.kind != KeyEventKind::Release
+            && key.code == crossterm::event::KeyCode::Esc
+            && key.modifiers.is_empty()
+            && let Some(dashboard) = self.dashboard.as_mut()
+        {
+            dashboard.dispatch.slash_close();
+        }
+
+        self.drain_ssh_target_completion_requests();
         if let InputOutcome::Action(Action::Quit) = &outcome {
             return self.apply_quit_confirmation(key_event);
         }

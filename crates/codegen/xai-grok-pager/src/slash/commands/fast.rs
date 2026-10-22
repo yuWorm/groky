@@ -150,6 +150,7 @@ mod tests {
             usage_command_visible: true,
             workflows_available: false,
             saved_workflows: &[],
+            ssh_candidates: &[],
             workflow_runs: &[],
             screen_mode: crate::app::ScreenMode::Inline,
             current_title: None,

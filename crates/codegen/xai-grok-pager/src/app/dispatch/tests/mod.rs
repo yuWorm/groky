@@ -93,6 +93,7 @@ fn test_app() -> AppView {
         auth_return_view: None,
         agents: IndexMap::new(),
         next_agent_id: 0,
+        next_ssh_completion_request_id: 1,
         models: ModelState::default(),
         registry: crate::actions::ActionRegistry::defaults(),
         settings_registry: std::sync::Arc::new(crate::settings::SettingsRegistry::defaults()),

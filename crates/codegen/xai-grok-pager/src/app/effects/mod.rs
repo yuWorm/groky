@@ -525,6 +525,24 @@ pub(crate) fn execute(
                 });
             meta.auth_abort_handle = Some((request_seq, abort_handle));
         }
+        Effect::SshCompletionTargets {
+            owner,
+            session_id,
+            session_binding_epoch,
+            request_id,
+            entry_generation,
+        } => {
+            tasks.spawn(async move {
+                load_ssh_completion_targets(
+                    owner,
+                    session_id,
+                    session_binding_epoch,
+                    request_id,
+                    entry_generation,
+                )
+                .await
+            });
+        }
         Effect::SshListTargets {
             session_id,
             client_id,
@@ -553,6 +571,74 @@ pub(crate) fn execute(
                     submission_id,
                     result,
                     owner,
+                }
+            });
+        }
+        Effect::SshUpdateTarget {
+            session_id,
+            client_id,
+            submission_id,
+            owner,
+            expected,
+            replacement,
+        } => {
+            tasks.spawn(async move {
+                let (client_id, result) = match ssh_control_reply(
+                    xai_grok_shell::ssh::SshControlCommand::UpdateTarget {
+                        expected,
+                        replacement,
+                    },
+                    client_id,
+                )
+                .await
+                {
+                    Ok((client_id, xai_grok_shell::ssh::SshControlReply::TargetUpdated(target))) => {
+                        (client_id, Ok(target))
+                    }
+                    Ok((client_id, _)) => (
+                        client_id,
+                        Err("SSH local service returned an unexpected target update response.".into()),
+                    ),
+                    Err((client_id, error)) => (client_id, Err(error)),
+                };
+                TaskResult::SshTargetUpdated {
+                    session_id,
+                    client_id,
+                    owner,
+                    submission_id,
+                    result,
+                }
+            });
+        }
+        Effect::SshRemoveTarget {
+            session_id,
+            client_id,
+            submission_id,
+            owner,
+            expected,
+        } => {
+            tasks.spawn(async move {
+                let (client_id, result) = match ssh_control_reply(
+                    xai_grok_shell::ssh::SshControlCommand::RemoveTarget { expected },
+                    client_id,
+                )
+                .await
+                {
+                    Ok((client_id, xai_grok_shell::ssh::SshControlReply::TargetRemoved(target))) => {
+                        (client_id, Ok(target))
+                    }
+                    Ok((client_id, _)) => (
+                        client_id,
+                        Err("SSH local service returned an unexpected target removal response.".into()),
+                    ),
+                    Err((client_id, error)) => (client_id, Err(error)),
+                };
+                TaskResult::SshTargetRemoved {
+                    session_id,
+                    client_id,
+                    owner,
+                    submission_id,
+                    result,
                 }
             });
         }
@@ -648,6 +734,83 @@ pub(crate) fn execute(
                 };
                 TaskResult::SshGrantInspected {
                     session_id, request_id, client_id, owner, result,
+                }
+            });
+        }
+        Effect::SshCancelGrant {
+            session_id,
+            request_id,
+            client_id,
+            owner,
+        } => {
+            tasks.spawn(async move {
+                let client_id = ssh_control_client_id(client_id).await;
+                let error = match ssh_control_reply(
+                    xai_grok_shell::ssh::SshControlCommand::CancelGrant {
+                        session_id: session_id.clone(),
+                        request_id: request_id.clone(),
+                    },
+                    client_id,
+                )
+                .await
+                {
+                    Ok((
+                        _,
+                        xai_grok_shell::ssh::SshControlReply::GrantCancelled {
+                            request_id: acknowledged_request_id,
+                        },
+                    )) if acknowledged_request_id == request_id => None,
+                    Ok((_, _)) => Some(
+                        "SSH local service returned an unexpected grant cancellation response."
+                            .into(),
+                    ),
+                    Err((_, error)) => Some(error),
+                };
+                TaskResult::SshGrantCancellationAcknowledged {
+                    session_id,
+                    request_id,
+                    client_id,
+                    owner,
+                    error,
+                }
+            });
+        }
+        Effect::SshFailGrant {
+            session_id,
+            request_id,
+            error,
+            client_id,
+            owner,
+        } => {
+            tasks.spawn(async move {
+                let client_id = ssh_control_client_id(client_id).await;
+                let acknowledgement_error = match ssh_control_reply(
+                    xai_grok_shell::ssh::SshControlCommand::FailGrant {
+                        session_id: session_id.clone(),
+                        request_id: request_id.clone(),
+                        error,
+                    },
+                    client_id,
+                )
+                .await
+                {
+                    Ok((
+                        _,
+                        xai_grok_shell::ssh::SshControlReply::GrantFailed {
+                            request_id: acknowledged_request_id,
+                        },
+                    )) if acknowledged_request_id == request_id => None,
+                    Ok((_, _)) => Some(
+                        "SSH local service returned an unexpected grant failure response.".into(),
+                    ),
+                    Err((_, error)) => Some(error),
+                };
+                TaskResult::SshGrantFailureAcknowledged {
+                    session_id,
+                    request_id,
+                    client_id,
+                    owner,
+                    error: acknowledgement_error,
                 }
             });
         }
@@ -6191,6 +6354,37 @@ async fn ssh_grant_decision(
         },
     }
 }
+async fn load_ssh_completion_targets(
+    owner: actions::SshCompletionOwner,
+    session_id: Option<String>,
+    session_binding_epoch: Option<u32>,
+    request_id: u64,
+    entry_generation: u64,
+) -> TaskResult {
+    match crate::app::ssh_control::load_targets(session_id.as_deref()).await {
+        Ok((client_id, targets)) => TaskResult::SshCompletionTargetsLoaded {
+            owner,
+            session_id,
+            session_binding_epoch,
+            client_id: Some(client_id),
+            request_id,
+            entry_generation,
+            targets,
+            error: None,
+        },
+        Err(error) => TaskResult::SshCompletionTargetsLoaded {
+            owner,
+            session_id,
+            session_binding_epoch,
+            client_id: None,
+            request_id,
+            entry_generation,
+            targets: Vec::new(),
+            error: Some(format!("SSH local service: {error:#}")),
+        },
+    }
+}
+
 
 async fn load_ssh_targets(
     session_id: Option<String>,

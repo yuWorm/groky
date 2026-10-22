@@ -143,8 +143,36 @@ pub struct PersistedSshState {
     pub pending_requests: Vec<SshGrantRequest>,
 }
 
-/// Granted target data that can safely be shown to the model. Configured but
-/// ungranted targets are deliberately not represented here.
+/// Safe configured-target metadata plus this session's existing authority.
+/// It never carries a transport target record, credential reference, identity
+/// file, resolved SSH configuration, or worker command.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SshTargetDiscovery {
+    pub targets: Vec<SshTargetCandidate>,
+}
+
+/// One configured target that a model may name in a later access request.
+/// `target_id` is the only selector that authority-bearing code persists.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SshTargetCandidate {
+    pub target_id: String,
+    pub label: String,
+    pub host: String,
+    pub source: SshTargetCandidateSource,
+    /// Active grants for the current session only. Discovering a target never
+    /// adds an entry here and never grants authority.
+    pub access: Vec<SshTargetAccess>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SshTargetCandidateSource {
+    Manual,
+    Imported,
+}
+
+/// Granted target data that can safely be shown to the model. It is included
+/// only in the current session's configured-target discovery result.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SshTargetAccess {
     pub binding_id: String,
@@ -230,6 +258,20 @@ pub enum SshEvent {
         request_id: String,
         approved: bool,
         binding: Option<SshBinding>,
+    },
+    /// The original tool call was cancelled before a grant could be approved.
+    GrantCancelled {
+        request_id: String,
+        session_id: String,
+        client_id: u64,
+    },
+    /// Local inspection or approval failed; `error` is returned to the
+    /// original waiting tool rather than being converted to a denial.
+    GrantFailed {
+        request_id: String,
+        session_id: String,
+        client_id: u64,
+        error: String,
     },
     BindingRevoked {
         session_id: String,

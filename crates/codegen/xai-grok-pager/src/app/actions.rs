@@ -23,10 +23,22 @@ pub struct SshManagerOwner {
     pub instance_id: u64,
 }
 
+/// Prompt surface that owns an asynchronous `/ssh` completion catalog request.
+///
+/// The owner travels with the request rather than deriving from an `AgentId`: the dashboard
+/// prompt is global, and a late result must never be installed in whichever agent is active.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SshCompletionOwner {
+    Agent(AgentId),
+    Dashboard,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SshGrantReplyKind {
     Requested,
     Resolved,
+    Cancelled,
+    Failed,
 }
 
 /// Typed error for model switch failures.
@@ -663,11 +675,24 @@ pub enum Action {
     },
     /// Open the local SSH target and authorization manager. Works before provider login.
     OpenSshManager,
+    /// Select a configured SSH target by exact name or ID, then authorize/use it in this session.
+    SelectSshTarget { reference: String },
     /// Reload configured targets and current-session SSH grant/connection status.
     RefreshSshTargets,
     /// Save a manually configured SSH target; no credential material is included.
     AddSshTarget {
         draft: crate::views::ssh_modal::SshManualTargetDraft,
+        submission_id: u64,
+    },
+    /// Replace a manual SSH target only if its full prior snapshot still matches.
+    UpdateSshTarget {
+        expected: xai_grok_ssh::SshTarget,
+        replacement: xai_grok_ssh::SshTarget,
+        submission_id: u64,
+    },
+    /// Delete a manual SSH target only if its full prior snapshot still matches.
+    RemoveSshTarget {
+        expected: xai_grok_ssh::SshTarget,
         submission_id: u64,
     },
     /// Acquire or retain a manual connection through the persistent local SSH service.
@@ -712,6 +737,8 @@ pub enum Action {
         lifetime: crate::views::ssh_modal::SshGrantLifetime,
         set_default: bool,
     },
+    /// Cancel a pending model request without treating the cancellation as a denial.
+    CancelSshGrant { request_id: String },
     /// Select a granted target as this session's default for explicit `ssh_*` tools.
     UseSshBinding { binding_id: String },
     /// Locally revoke a grant and wait for the worker acknowledgement before displaying confirmation.
@@ -2518,6 +2545,18 @@ pub enum Effect {
         terminal: crate::terminal::TerminalContext,
         request: crate::slash::command::DoctorRequest,
     },
+    /// Load configured SSH targets for one prompt-local `/ssh` completion entry.
+    ///
+    /// This reads local configuration only; it neither opens the SSH manager nor connects.
+    SshCompletionTargets {
+        owner: SshCompletionOwner,
+        session_id: Option<String>,
+        /// Agent binding that supplied `session_id`; `None` for the sessionless dashboard.
+        session_binding_epoch: Option<u32>,
+        request_id: u64,
+        entry_generation: u64,
+    },
+
     /// Fetch target configuration plus local connection and session-grant state from SSH control.
     SshListTargets {
         session_id: Option<String>,
@@ -2531,6 +2570,23 @@ pub enum Effect {
         submission_id: u64,
         owner: SshManagerOwner,
         draft: crate::views::ssh_modal::SshManualTargetDraft,
+    },
+    /// Replace a manually configured target through the local SSH control service.
+    SshUpdateTarget {
+        session_id: Option<String>,
+        client_id: u64,
+        submission_id: u64,
+        owner: SshManagerOwner,
+        expected: xai_grok_ssh::SshTarget,
+        replacement: xai_grok_ssh::SshTarget,
+    },
+    /// Remove a manually configured target through the local SSH control service.
+    SshRemoveTarget {
+        session_id: Option<String>,
+        client_id: u64,
+        submission_id: u64,
+        owner: SshManagerOwner,
+        expected: xai_grok_ssh::SshTarget,
     },
     /// Acquire a retained manual connection through the persistent local SSH service.
     SshConnect {
@@ -2579,6 +2635,21 @@ pub enum Effect {
         capabilities: Option<crate::views::ssh_modal::SshCapabilitiesView>,
         lifetime: crate::views::ssh_modal::SshGrantLifetime,
         set_default: bool,
+    },
+    /// Cancel an owned pending model request without broadening or denying its grant.
+    SshCancelGrant {
+        session_id: String,
+        request_id: String,
+        client_id: u64,
+        owner: SshManagerOwner,
+    },
+    /// Report an owned inspection or directory failure to the original waiting tool.
+    SshFailGrant {
+        session_id: String,
+        request_id: String,
+        error: String,
+        client_id: u64,
+        owner: SshManagerOwner,
     },
     /// Set the explicit default SSH binding for the session.
     SshUseBinding {
@@ -2784,6 +2855,17 @@ pub enum WorkspaceWriteCompletion {
 #[derive(Debug)]
 #[allow(clippy::large_enum_variant)]
 pub enum TaskResult {
+    /// Local SSH target catalog for one prompt-local `/ssh` completion entry.
+    SshCompletionTargetsLoaded {
+        owner: SshCompletionOwner,
+        session_id: Option<String>,
+        session_binding_epoch: Option<u32>,
+        client_id: Option<u64>,
+        request_id: u64,
+        entry_generation: u64,
+        targets: Vec<crate::views::ssh_modal::SshTargetView>,
+        error: Option<String>,
+    },
     /// Local SSH target and grant status loaded without provider/model authentication.
     SshTargetsLoaded {
         session_id: Option<String>,
@@ -2813,6 +2895,22 @@ pub enum TaskResult {
         target_id: Option<String>,
         message: Option<String>,
         error: Option<String>,
+    },
+    /// A manual SSH target update completed.
+    SshTargetUpdated {
+        session_id: Option<String>,
+        client_id: u64,
+        owner: SshManagerOwner,
+        submission_id: u64,
+        result: Result<xai_grok_ssh::SshTarget, String>,
+    },
+    /// A manual SSH target removal completed.
+    SshTargetRemoved {
+        session_id: Option<String>,
+        client_id: u64,
+        owner: SshManagerOwner,
+        submission_id: u64,
+        result: Result<xai_grok_ssh::SshTarget, String>,
     },
     /// A correlated local-control acknowledgement for a remote operation decision.
     SshOperationApprovalComplete {
@@ -2849,6 +2947,22 @@ pub enum TaskResult {
         client_id: u64,
         owner: SshManagerOwner,
         result: Result<xai_grok_shell::ssh::SshGrantRequest, String>,
+    },
+    /// The local control service acknowledged a cancellation; the terminal event settles the UI.
+    SshGrantCancellationAcknowledged {
+        session_id: String,
+        request_id: String,
+        client_id: u64,
+        owner: SshManagerOwner,
+        error: Option<String>,
+    },
+    /// The local control service acknowledged a failure report; the terminal event settles the UI.
+    SshGrantFailureAcknowledged {
+        session_id: String,
+        request_id: String,
+        client_id: u64,
+        owner: SshManagerOwner,
+        error: Option<String>,
     },
     SshProjectDirectoryLoaded {
         request_id: u64,

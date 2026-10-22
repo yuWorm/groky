@@ -26,3 +26,9 @@ Voice: `**Lead** rest.` Lead is the noun the user already knows (`/default`, `Re
 
 Next groky version after `v0.1.26`.
 
+- **SSH target management** supports editing and confirmed deletion of manual targets in both SSH managers, preserves IDs and untouched settings, and invalidates changed connections and grants; imported OpenSSH targets remain read-only with source-file guidance and external refresh.
+- **SSH access** makes worker-free authorization the default in chat and connection-only the default without a session; remote projects have a separate explicit entry with worker requirements shown before approval.
+- **SSH server selection** lists configured manual and OpenSSH candidates for tools, resolves exact names safely, and makes `/ssh` selections the session default after approval without installing a worker.
+- **SSH access requests** distinguish cancellation, explicit denial and real connection or inspection failures, preserving the original error for the waiting tool and rejecting late approvals.
+- **/ssh** accepts a server name or target ID directly, reuses an unambiguous session grant or opens worker-free authorization, and shows matching candidates instead of guessing duplicate names.
+- **/ssh suggestions** automatically list configured servers while typing, filter by name or address, and support arrow selection, Tab completion and Enter confirmation using exact target IDs without connecting during discovery.

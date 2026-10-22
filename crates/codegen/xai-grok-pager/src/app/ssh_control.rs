@@ -198,12 +198,6 @@ impl SshControlBackend {
                     }),
                 },
             };
-            let source = match &target.source {
-                xai_grok_ssh::TargetSource::User => "Groky config".into(),
-                xai_grok_ssh::TargetSource::Imported { path, line } => {
-                    format!("OpenSSH {}:{line}", path.display())
-                }
-            };
             let connected = matches!(status.connection, SshConnectionState::Connected);
             let connection_detail = status.detail.unwrap_or_else(|| match status.connection {
                 SshConnectionState::Disconnected => "Not connected.".into(),
@@ -213,25 +207,17 @@ impl SshControlBackend {
                 SshConnectionState::Failed => "Connection failed.".into(),
             });
             let mut grants = grants_by_target.remove(&target.id).unwrap_or_default().into_iter();
-            let view = SshTargetView {
-                target_id: target.id,
-                label: target.label,
-                source,
+            let view = SshTargetView::from_target(
+                target,
                 effective_address,
                 connected,
                 connection_detail,
-                grant: grants.next_back().unwrap_or(SshGrantView::NotGranted),
-            };
+                grants.next_back().unwrap_or(SshGrantView::NotGranted),
+            );
             for grant in grants {
-                views.push(SshTargetView {
-                    target_id: view.target_id.clone(),
-                    label: view.label.clone(),
-                    source: view.source.clone(),
-                    effective_address: view.effective_address.clone(),
-                    connected: view.connected,
-                    connection_detail: view.connection_detail.clone(),
-                    grant,
-                });
+                let mut grant_view = view.clone();
+                grant_view.grant = grant;
+                views.push(grant_view);
             }
             views.push(view);
         }

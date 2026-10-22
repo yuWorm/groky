@@ -20,6 +20,22 @@ fn map_ssh_modal_outcome(outcome: SshModalOutcome) -> InputOutcome {
             draft,
             submission_id,
         }),
+        SshModalOutcome::UpdateTarget {
+            expected,
+            replacement,
+            submission_id,
+        } => InputOutcome::Action(Action::UpdateSshTarget {
+            expected,
+            replacement,
+            submission_id,
+        }),
+        SshModalOutcome::RemoveTarget {
+            expected,
+            submission_id,
+        } => InputOutcome::Action(Action::RemoveSshTarget {
+            expected,
+            submission_id,
+        }),
         SshModalOutcome::Connect { target_id } => {
             InputOutcome::Action(Action::ConnectSshTarget { target_id })
         }
@@ -62,6 +78,9 @@ fn map_ssh_modal_outcome(outcome: SshModalOutcome) -> InputOutcome {
             lifetime,
             set_default,
         }),
+        SshModalOutcome::CancelGrant { request_id } => {
+            InputOutcome::Action(Action::CancelSshGrant { request_id })
+        }
         SshModalOutcome::InspectGrantTarget {
             request_id,
             target_id,
@@ -683,6 +702,16 @@ pub(super) fn dispatch_open_ssh_manager(app: &mut AppView) -> Vec<Effect> {
     effects
 }
 
+pub(super) fn dispatch_select_ssh_target(app: &mut AppView, reference: String) -> Vec<Effect> {
+    let effects = dispatch_open_ssh_manager(app);
+    if let Some(owner) = ssh_manager_owner(app)
+        && let Some(manager) = ssh_manager_for_owner_mut(app, owner)
+    {
+        manager.queue_target_reference(reference);
+    }
+    effects
+}
+
 /// CLI and interactive entry share the same correlated project preparation and consent.
 pub(super) fn dispatch_begin_ssh_project_open(
     app: &mut AppView,
@@ -878,6 +907,56 @@ pub(super) fn dispatch_add_ssh_target(
     }]
 }
 
+pub(super) fn dispatch_update_ssh_target(
+    app: &mut AppView,
+    expected: xai_grok_ssh::SshTarget,
+    replacement: xai_grok_ssh::SshTarget,
+    submission_id: u64,
+) -> Vec<Effect> {
+    let client_id = app.ssh_client_id;
+    let Some(owner) = ssh_manager_owner(app) else {
+        return vec![];
+    };
+    let Some(manager) = ssh_manager_for_owner_mut(app, owner) else {
+        return vec![];
+    };
+    if manager.target_update_submission_id() != Some(submission_id) {
+        return vec![];
+    }
+    vec![Effect::SshUpdateTarget {
+        session_id: manager.session_id.clone(),
+        client_id,
+        submission_id,
+        owner,
+        expected,
+        replacement,
+    }]
+}
+
+pub(super) fn dispatch_remove_ssh_target(
+    app: &mut AppView,
+    expected: xai_grok_ssh::SshTarget,
+    submission_id: u64,
+) -> Vec<Effect> {
+    let client_id = app.ssh_client_id;
+    let Some(owner) = ssh_manager_owner(app) else {
+        return vec![];
+    };
+    let Some(manager) = ssh_manager_for_owner_mut(app, owner) else {
+        return vec![];
+    };
+    if manager.target_remove_submission_id() != Some(submission_id) {
+        return vec![];
+    }
+    vec![Effect::SshRemoveTarget {
+        session_id: manager.session_id.clone(),
+        client_id,
+        submission_id,
+        owner,
+        expected,
+    }]
+}
+
 pub(super) fn dispatch_connect_ssh_target(app: &mut AppView, target_id: String) -> Vec<Effect> {
     let client_id = app.ssh_client_id;
     let Some(owner) = ssh_manager_owner(app) else {
@@ -1020,6 +1099,28 @@ pub(super) fn dispatch_approve_ssh_grant(
         capabilities,
         lifetime,
         set_default,
+    }]
+}
+
+pub(super) fn dispatch_cancel_ssh_grant(
+    app: &mut AppView,
+    request_id: String,
+) -> Vec<Effect> {
+    let client_id = app.ssh_client_id;
+    let Some(owner) = ssh_manager_owner(app) else {
+        return vec![];
+    };
+    let Some(manager) = ssh_manager_for_owner_mut(app, owner) else {
+        return vec![];
+    };
+    let Some(session_id) = manager.grant_session_id_for(&request_id) else {
+        return vec![];
+    };
+    vec![Effect::SshCancelGrant {
+        session_id,
+        request_id,
+        client_id,
+        owner,
     }]
 }
 
@@ -1381,9 +1482,21 @@ pub(super) fn apply_ssh_control_event(
     event: xai_grok_shell::ssh::SshEvent,
 ) -> Vec<Effect> {
     let client_id = app.ssh_client_id;
-    if matches!(&event, xai_grok_shell::ssh::SshEvent::GrantRequested(request)
-        if request.client_id != Some(client_id))
-    {
+    let event_targets_this_client = match &event {
+        xai_grok_shell::ssh::SshEvent::GrantRequested(request) => {
+            request.client_id == Some(client_id)
+        }
+        xai_grok_shell::ssh::SshEvent::GrantCancelled {
+            client_id: event_client_id,
+            ..
+        }
+        | xai_grok_shell::ssh::SshEvent::GrantFailed {
+            client_id: event_client_id,
+            ..
+        } => *event_client_id == client_id,
+        _ => true,
+    };
+    if !event_targets_this_client {
         return vec![Effect::SshAwaitEvent { client_id, session_id }];
     }
     let owner = owner.or_else(|| match &event {
@@ -1488,6 +1601,10 @@ pub(super) fn apply_ssh_control_event(
             Some((request.id.as_str(), SshGrantReplyKind::Requested)),
         xai_grok_shell::ssh::SshEvent::GrantResolved { request_id, .. } =>
             Some((request_id.as_str(), SshGrantReplyKind::Resolved)),
+        xai_grok_shell::ssh::SshEvent::GrantCancelled { request_id, .. } =>
+            Some((request_id.as_str(), SshGrantReplyKind::Cancelled)),
+        xai_grok_shell::ssh::SshEvent::GrantFailed { request_id, .. } =>
+            Some((request_id.as_str(), SshGrantReplyKind::Failed)),
         _ => None,
     };
     if let Some((request_id, kind)) = direct_grant_reply {
@@ -1502,7 +1619,9 @@ pub(super) fn apply_ssh_control_event(
     }
     let event_session_id = match &event {
         xai_grok_shell::ssh::SshEvent::GrantRequested(request) => Some(request.session_id.clone()),
-        xai_grok_shell::ssh::SshEvent::BindingRevoked { session_id, .. } => {
+        xai_grok_shell::ssh::SshEvent::GrantCancelled { session_id, .. }
+        | xai_grok_shell::ssh::SshEvent::GrantFailed { session_id, .. }
+        | xai_grok_shell::ssh::SshEvent::BindingRevoked { session_id, .. } => {
             Some(session_id.clone())
         }
         xai_grok_shell::ssh::SshEvent::OperationApproval(approval) => {
@@ -1533,7 +1652,9 @@ pub(super) fn apply_ssh_control_event(
             worktree_source_session_for_grant(app, request, client_id)
                 .or_else(|| event_session_id.clone())
         }
-        xai_grok_shell::ssh::SshEvent::GrantResolved { request_id, .. } => {
+        xai_grok_shell::ssh::SshEvent::GrantResolved { request_id, .. }
+        | xai_grok_shell::ssh::SshEvent::GrantCancelled { request_id, .. }
+        | xai_grok_shell::ssh::SshEvent::GrantFailed { request_id, .. } => {
             manager_session_for_grant(app, request_id).unwrap_or_else(|| event_session_id.clone())
         }
         _ => event_session_id.clone(),
@@ -1559,6 +1680,7 @@ pub(super) fn apply_ssh_control_event(
         .or_else(|| ssh_manager_owner_for_session(app, manager_session_id.as_deref()));
     let mut grant_resolution = None;
     let mut close_tool_manager = false;
+    let mut terminal_grant_failed = false;
     let mut project_resolution = None;
     let mut grant_follow_up = None;
     let mut grant_continuation = SshModalOutcome::Unchanged;
@@ -1567,7 +1689,9 @@ pub(super) fn apply_ssh_control_event(
         None => match &event {
             xai_grok_shell::ssh::SshEvent::TargetStatus(_)
             | xai_grok_shell::ssh::SshEvent::BindingRevoked { .. }
-            | xai_grok_shell::ssh::SshEvent::GrantResolved { .. } => {
+            | xai_grok_shell::ssh::SshEvent::GrantResolved { .. }
+            | xai_grok_shell::ssh::SshEvent::GrantCancelled { .. }
+            | xai_grok_shell::ssh::SshEvent::GrantFailed { .. } => {
                 existing_ssh_manager_for_session_mut(app, manager_session_id.as_deref())
             }
             xai_grok_shell::ssh::SshEvent::GrantRequested(_)
@@ -1639,6 +1763,38 @@ pub(super) fn apply_ssh_control_event(
                     );
                 }
             }
+            xai_grok_shell::ssh::SshEvent::GrantCancelled {
+                request_id,
+                session_id: grant_session_id,
+                client_id: grant_client_id,
+            } => {
+                if grant_client_id == client_id
+                    && manager.grant_session_id_for(&request_id).as_deref()
+                        == Some(grant_session_id.as_str())
+                {
+                    let close = manager.is_transient_tool_grant(&request_id);
+                    if manager.settle_grant_cancellation(&request_id) {
+                        close_tool_manager = close;
+                    }
+                }
+            }
+            xai_grok_shell::ssh::SshEvent::GrantFailed {
+                request_id,
+                session_id: grant_session_id,
+                client_id: grant_client_id,
+                error,
+            } => {
+                if grant_client_id == client_id
+                    && manager.grant_session_id_for(&request_id).as_deref()
+                        == Some(grant_session_id.as_str())
+                {
+                    let close = manager.is_transient_tool_grant(&request_id);
+                    if manager.settle_grant_failure(&request_id, error) {
+                        close_tool_manager = close;
+                        terminal_grant_failed = true;
+                    }
+                }
+            }
             xai_grok_shell::ssh::SshEvent::BindingRevoked {
                 session_id: event_session_id,
                 binding_id,
@@ -1698,6 +1854,9 @@ pub(super) fn apply_ssh_control_event(
         && let Some(owner) = resolution_owner
     {
         close_ssh_manager_for_owner(app, owner);
+        return vec![Effect::SshAwaitEvent { client_id, session_id }];
+    }
+    if terminal_grant_failed {
         return vec![Effect::SshAwaitEvent { client_id, session_id }];
     }
     if let Some((true, Some(binding))) = grant_resolution {

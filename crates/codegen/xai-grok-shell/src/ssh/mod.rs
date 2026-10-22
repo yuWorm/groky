@@ -21,7 +21,8 @@ pub use model::{
     SshGrantDecision, SshGrantRequest, SshGrantScope, SshGrantStatus, SshHostKeyDecision,
     SshKeyboardInteractiveQuestion, SshOperationApproval, SshOperationApprovalDecision,
     SshOperationApprovalScope, SshProjectPreparation, SshSessionWorkerEvent, SshTargetAccess,
-    SshTargetStatus, SshWorkerInstallDecision, SshWorkerInstallProgress, SshWorkerInstallRequest,
+    SshTargetCandidate, SshTargetCandidateSource, SshTargetDiscovery, SshTargetStatus,
+    SshWorkerInstallDecision, SshWorkerInstallProgress, SshWorkerInstallRequest,
 };
 pub use service::{SessionSsh, SessionSshResource, SshServiceError};
 pub(crate) use tools::configure_default_tools;

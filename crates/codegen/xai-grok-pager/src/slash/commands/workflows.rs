@@ -54,6 +54,7 @@ mod tests {
                 usage_command_visible: true,
                 workflows_available: available,
                 saved_workflows: &[],
+                ssh_candidates: &[],
                 workflow_runs: &[],
                 screen_mode: crate::app::ScreenMode::Fullscreen,
                 current_title: None,

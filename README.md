@@ -138,12 +138,23 @@ groky ssh disconnect dev
 ```
 
 The standalone manager reuses `/ssh` controls without opening a chat or requiring
-model/provider login. It can add targets, connect/disconnect, inspect diagnostics,
-and browse remote folders. Choosing a project hands its verified identity and
+model/provider login. It can add, edit, and delete manual targets, connect/disconnect,
+inspect diagnostics, and browse remote folders. Choosing a project hands its verified identity and
 canonical folder to the full TUI; access approval and worker preparation belong
 to that final project session. Session grant/default controls are unavailable in
 the standalone manager. Closing it does not disconnect explicitly retained
 connections; use `ssh disconnect` to release them.
+`Enter` only connects the selected server; pressing it again does not disconnect.
+Use `/ssh` inside a chat for worker-free session access. `o open project (worker)`
+is a separate, explicit action; `ssh open ...` still opens a remote project directly.
+
+In both managers, `e` edits the selected manual target and `x` opens a deletion
+confirmation; footer actions are clickable. Editing preserves the target ID and
+settings not exposed by the form. Label-only edits retain access; changing connection
+or worker settings, or deleting a target, disconnects it and revokes its grants.
+Imported OpenSSH targets are read-only: edit or remove their entries in the displayed
+source file externally, then use Advanced → `r` refresh (without a selected grant).
+Refresh reloads external changes and invalidates connections whose effective configuration changed.
 
 Interactive entry points require both stdin and stdout to be terminals.
 `ssh list`, `ssh disconnect`, `ssh add HOST ...`, and ordinary `ssh connect TARGET`
@@ -177,13 +188,39 @@ groky checks compatibility but never overwrites or automatically updates it.
 Git, ripgrep and the project's tools must still be available remotely. The worker
 does not need an xAI login; model requests and provider credentials remain local.
 
-Open `/ssh` in a session, or press `Ctrl+S` on Welcome. Select a server and press
-`Enter` to connect and browse its remote folders; no worker or model access is
-needed for browsing. Use arrows/`j`/`k`, `Enter` for a child folder, `Backspace`
-for its parent, or `/` to enter a remote path. Press `o` to open the current folder.
-The first confirmation shows the verified server identity, canonical folder and
-read/write/run permissions. Approval automatically prepares the worker and opens
-the project—there is no separate grant/use/open sequence.
+Open `/ssh` in a local chat to **choose the SSH server for that session**. Candidate
+rows show a stable target ID and configuration source. Select a server and press
+`Enter`, choose a remote folder, then approve the required permissions. The approved
+binding automatically becomes this session's SSH default; `Enter` on an already
+granted row selects that exact binding without requesting another grant.
+This uses native SSH/SFTP, does not install or start a worker, and keeps the current
+chat and local workspace. `g` separately requests access without changing the default.
+
+Typing `/ssh ` (or `/remote `) opens server suggestions automatically, without
+pressing Enter. Type to filter by name, host, address or ID; rows show the address,
+configuration source and stable ID. Use `↑`/`↓` to select, `Tab` to complete the
+exact ID without connecting, or `Enter` to confirm the selected server. `Esc`
+hides suggestions. Leaving and re-entering the command reloads configured targets;
+loading and filtering the catalog never connect, grant access or start a worker.
+
+To submit a server reference directly rather than accept a suggestion, enter
+`/ssh <server name or target ID>`, dismiss suggestions with `Esc`, then press Enter.
+For example, `/ssh build-server` or `/ssh QA storage`; names containing spaces
+need no quotes. Stable IDs take precedence over exact
+OpenSSH aliases, then unique labels/hosts. A single existing grant is selected
+directly; otherwise the same folder/consent flow applies. Duplicate names show
+matching candidates, and multiple grants require choosing the intended folder.
+Unknown names leave the server chooser open without connecting to a guessed target.
+
+To **open a remote project**, select `o open project (worker)` in the manager.
+The folder picker and consent dialog explicitly mark this as requiring a worker.
+Approval prepares the matching worker and opens a separate remote project session.
+Welcome (`Ctrl+S`) has no active chat, so its default `Enter` action only connects.
+
+Both folder pickers use arrows/`j`/`k`, `Enter` for a child folder, `Backspace`
+for its parent, and `/` for a remote path. `o` confirms the current folder for the
+chosen purpose: session authorization or project opening. Browsing alone grants
+no model access and starts no worker.
 
 **Remember this project** is optional and off by default. A saved permission applies
 only to the same target, host identity and exact canonical remote folder, independently
@@ -192,13 +229,15 @@ expansion; a different folder, identity or broader permission request needs fres
 Without remembering, access lasts only for the authorized session.
 
 `c` connects/disconnects, `a` adds a target, `d` shows connection details, and `m`
-opens advanced grant/default/revocation controls. Advanced `g`, and `u` without an
-existing grant, first open the same folder picker. Choose a folder with `o`, then
-confirm its verified identity and permissions; local grants default to read-only.
+opens advanced default/revocation controls. `g` is also available on the basic page
+for session authorization; advanced `u` without an existing grant opens that same
+access-folder picker. Manual grants default to read-only.
 `u` continues default selection automatically after approval. Incoming access requests
 without a folder also use this picker, retaining their original permission ceiling.
-`Esc` cancels selection and denies a waiting request; directory errors open full
-diagnostics and return to the last valid folder for retry.
+`Esc` cancels a waiting request; `n`, `Ctrl+d` or the consent dialog's deny action
+explicitly rejects it. Lookup, connection and inspection failures return their real
+errors to the waiting tool instead of reporting user denial. Directory errors open
+full diagnostics and retain the last valid folder for retry.
 `r` revokes only the selected grant. Each active grant has its own row.
 Target rows and footer actions are clickable; the wheel scrolls lists. Permission
 options support clicks and `Tab`/`Space`; `PgUp`/`PgDn` inspect wrapped details.
@@ -259,8 +298,13 @@ There are two execution modes:
 - **Explicit SSH tools in any session:** `ssh_read`, `ssh_write`, `ssh_edit`,
   `ssh_search` and `ssh_run` take an optional `target`. An explicit target wins;
   otherwise a user-selected SSH default is required. This default never redirects
-  ordinary local tools. `ssh_targets` lists only the current session's grants;
-  `ssh_request_access` asks the user for a grant rather than granting itself access.
+  ordinary local tools. `ssh_targets` discovers configured manual and OpenSSH
+  candidates with safe metadata and each candidate's current-session grants;
+  discovery itself grants no access and exposes no credentials. Prefer the returned
+  `target_id`; exact imported aliases and unique exact labels/hosts are also accepted.
+  Ambiguous names return candidate IDs rather than choosing a similar server.
+  `ssh_request_access` waits for user approval and returns the actual approved binding
+  to the original tool call; it cannot grant itself access.
   These tools stay workerless even inside an SSH project; they do not load remote
   project instructions, skills or hooks. File reads support UTF-8 text and line
   ranges, not image/PDF decoding. Read output and existing-file write/edit

@@ -56,7 +56,7 @@ use crate::app::acp_handler::task_view_by_session_id;
 use crate::app::actions::{
     Action, ClipboardPasteCompletion, ClipboardPasteContext, ClipboardPasteFailure,
     ClipboardPasteTarget, DoctorFixTarget, DoctorPlanningOutcome, Effect, ProbedAttachment,
-    SubagentKillOutcome, TaskResult,
+    SshCompletionOwner, SubagentKillOutcome, TaskResult,
 };
 use crate::app::agent::AgentId;
 use crate::app::agent_view::AgentDeferredSend;
@@ -538,6 +538,96 @@ pub(super) fn dispatch_task_result(result: TaskResult, app: &mut AppView) -> Vec
         TaskResult::WithPinnedMemoryMode { .. } | TaskResult::WithSshProjectLocation { .. } => {
             unreachable!("task-result wrappers are removed before task-result dispatch")
         }
+        TaskResult::SshCompletionTargetsLoaded {
+            owner,
+            session_id,
+            session_binding_epoch,
+            client_id,
+            request_id,
+            entry_generation,
+            targets,
+            error,
+        } => {
+            let applied_client_id = match owner {
+                SshCompletionOwner::Agent(agent_id) => {
+                    let Some(agent) = app.agents.get_mut(&agent_id) else {
+                        return vec![];
+                    };
+                    if agent
+                        .session
+                        .session_id
+                        .as_ref()
+                        .map(|id| id.0.as_ref())
+                        != session_id.as_deref()
+                        || session_binding_epoch != Some(agent.session_binding_epoch)
+                    {
+                        return vec![];
+                    }
+
+                    match error {
+                        Some(error) => {
+                            if agent
+                                .prompt
+                                .reject_ssh_target_load(request_id, entry_generation)
+                            {
+                                agent.show_toast(&error);
+                            }
+                            None
+                        }
+                        None => {
+                            let candidates = crate::slash::commands::ssh::target_candidates(targets);
+                            agent
+                                .prompt
+                                .apply_ssh_target_candidates(
+                                    request_id,
+                                    entry_generation,
+                                    candidates,
+                                    &agent.session.models,
+                                )
+                                .then_some(client_id)
+                                .flatten()
+                        }
+                    }
+                }
+                SshCompletionOwner::Dashboard => {
+                    if session_id.is_some() || session_binding_epoch.is_some() {
+                        return vec![];
+                    }
+                    let Some(dashboard) = app.dashboard.as_mut() else {
+                        return vec![];
+                    };
+
+                    match error {
+                        Some(error) => {
+                            if dashboard
+                                .dispatch
+                                .reject_ssh_target_load(request_id, entry_generation)
+                            {
+                                dashboard.set_error_toast(&error);
+                            }
+                            None
+                        }
+                        None => {
+                            let candidates = crate::slash::commands::ssh::target_candidates(targets);
+                            dashboard
+                                .dispatch
+                                .apply_ssh_target_candidates(
+                                    request_id,
+                                    entry_generation,
+                                    candidates,
+                                    &dashboard.models,
+                                )
+                                .then_some(client_id)
+                                .flatten()
+                        }
+                    }
+                }
+            };
+            if let Some(client_id) = applied_client_id {
+                app.ssh_client_id = client_id;
+            }
+            vec![]
+        }
         TaskResult::SshTargetsLoaded {
             session_id,
             client_id,
@@ -551,7 +641,23 @@ pub(super) fn dispatch_task_result(result: TaskResult, app: &mut AppView) -> Vec
             {
                 match error {
                     Some(error) => manager.show_error(error),
-                    None => manager.set_targets(targets),
+                    None => {
+                        manager.set_targets(targets);
+                        match manager.continue_target_reference() {
+                            crate::views::ssh_modal::SshModalOutcome::BrowseProjectDirectory {
+                                request_id, target_id, path,
+                            } => return vec![Effect::SshBrowseProjectDirectory {
+                                request_id, target_id, path, client_id, owner,
+                            }],
+                            crate::views::ssh_modal::SshModalOutcome::UseBinding { binding_id } => {
+                                return vec![Effect::SshUseBinding {
+                                    session_id: session_id.expect("direct selection requires a session"),
+                                    binding_id, client_id, owner,
+                                }];
+                            }
+                            _ => {}
+                        }
+                    }
                 }
             }
             vec![]
@@ -580,6 +686,54 @@ pub(super) fn dispatch_task_result(result: TaskResult, app: &mut AppView) -> Vec
             };
             refresh.into_iter().collect()
         }
+        TaskResult::SshTargetUpdated {
+            session_id,
+            client_id,
+            owner,
+            submission_id,
+            result,
+        } => {
+            app.ssh_client_id = client_id;
+            let succeeded = result.is_ok();
+            let refresh = if let Some(manager) = super::ssh::ssh_manager_for_owner_mut(app, owner)
+                && manager.session_id == session_id
+                && manager.settle_target_update_for_submission(submission_id, result)
+                && succeeded
+            {
+                Some(Effect::SshListTargets {
+                    session_id: manager.session_id.clone(),
+                    client_id,
+                    owner,
+                })
+            } else {
+                None
+            };
+            refresh.into_iter().collect()
+        }
+        TaskResult::SshTargetRemoved {
+            session_id,
+            client_id,
+            owner,
+            submission_id,
+            result,
+        } => {
+            app.ssh_client_id = client_id;
+            let succeeded = result.is_ok();
+            let refresh = if let Some(manager) = super::ssh::ssh_manager_for_owner_mut(app, owner)
+                && manager.session_id == session_id
+                && manager.settle_target_remove_for_submission(submission_id, result)
+                && succeeded
+            {
+                Some(Effect::SshListTargets {
+                    session_id: manager.session_id.clone(),
+                    client_id,
+                    owner,
+                })
+            } else {
+                None
+            };
+            refresh.into_iter().collect()
+        }
         TaskResult::SshGrantInspected {
             session_id, request_id, client_id, owner, result,
         } => {
@@ -596,21 +750,76 @@ pub(super) fn dispatch_task_result(result: TaskResult, app: &mut AppView) -> Vec
                     xai_grok_shell::ssh::SshEvent::GrantRequested(request),
                 ),
                 Err(error) => {
-                    if let Some(manager) = super::ssh::ssh_manager_for_owner_mut(app, owner) {
-                        manager.fail_grant_inspection(&request_id, error);
-                    }
-                    vec![]
+                    let Some(session_id) = session_id else {
+                        return vec![];
+                    };
+                    let failed = super::ssh::ssh_manager_for_owner_mut(app, owner)
+                        .is_some_and(|manager| manager.fail_pending_grant(&request_id, error.clone()));
+                    failed
+                        .then(|| Effect::SshFailGrant {
+                            session_id,
+                            request_id,
+                            error,
+                            client_id,
+                            owner,
+                        })
+                        .into_iter()
+                        .collect()
                 }
             }
         }
+        TaskResult::SshGrantCancellationAcknowledged {
+            session_id,
+            request_id,
+            client_id,
+            owner,
+            error,
+        } => {
+            app.ssh_client_id = client_id;
+            if let Some(error) = error
+                && let Some(manager) = super::ssh::ssh_manager_for_owner_mut(app, owner)
+                && manager.grant_session_id_for(&request_id).as_deref() == Some(session_id.as_str())
+            {
+                manager.restore_cancelled_grant(&request_id, error);
+            }
+            vec![]
+        }
+        TaskResult::SshGrantFailureAcknowledged {
+            client_id,
+            owner: _,
+            session_id: _,
+            request_id: _,
+            error: _,
+        } => {
+            app.ssh_client_id = client_id;
+            vec![]
+        }
         TaskResult::SshProjectDirectoryLoaded { request_id, target_id, client_id, owner, result } => {
             app.ssh_client_id = client_id;
-            if let Some(manager) = super::ssh::ssh_manager_for_owner_mut(app, owner)
-                && manager.settle_project_directory(request_id, &target_id, result)
-            {
-                return vec![Effect::SshListTargets {
-                    session_id: manager.session_id.clone(), client_id, owner,
-                }];
+            let failure = result.as_ref().err().cloned();
+            if let Some(manager) = super::ssh::ssh_manager_for_owner_mut(app, owner) {
+                let pending_grant = failure.as_ref().and_then(|_| {
+                    manager.pending_grant_for_directory_request(request_id, &target_id)
+                });
+                if manager.settle_project_directory(request_id, &target_id, result) {
+                    let mut effects = vec![Effect::SshListTargets {
+                        session_id: manager.session_id.clone(),
+                        client_id,
+                        owner,
+                    }];
+                    if let (Some((session_id, request_id)), Some(error)) = (pending_grant, failure)
+                        && manager.fail_pending_grant(&request_id, error.clone())
+                    {
+                        effects.push(Effect::SshFailGrant {
+                            session_id,
+                            request_id,
+                            error,
+                            client_id,
+                            owner,
+                        });
+                    }
+                    return effects;
+                }
             }
             vec![]
         }

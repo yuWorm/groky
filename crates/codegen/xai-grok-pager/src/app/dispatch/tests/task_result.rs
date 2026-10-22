@@ -51,6 +51,194 @@ fn live_session_kind_distinguishes_missing_conversation_and_build_matches() {
     );
 }
 
+#[test]
+fn ssh_completion_results_require_the_current_prompt_entry_and_session() {
+    let mut app = test_app_with_agent();
+    let id = AgentId(0);
+    let original_session = "test-session".to_owned();
+    let (stale_generation, current_generation) = {
+        let agent = app.agents.get_mut(&id).expect("fixture agent");
+        agent.prompt.set_text("/ssh ");
+        agent.prompt.set_cursor(agent.prompt.text().len());
+        agent.prompt.refresh_slash(&agent.session.models);
+        let stale = agent
+            .prompt
+            .begin_ssh_target_load(71)
+            .expect("first SSH entry starts a load");
+
+        agent.prompt.set_text("ordinary draft");
+        agent.prompt.set_cursor(agent.prompt.text().len());
+        agent.prompt.refresh_slash(&agent.session.models);
+        agent.prompt.set_text("/remote ");
+        agent.prompt.set_cursor(agent.prompt.text().len());
+        agent.prompt.refresh_slash(&agent.session.models);
+        let current = agent
+            .prompt
+            .begin_ssh_target_load(72)
+            .expect("alias re-entry starts a replacement load");
+        (stale, current)
+    };
+
+    let stale = dispatch(
+        Action::TaskComplete(TaskResult::SshCompletionTargetsLoaded {
+            owner: crate::app::actions::SshCompletionOwner::Agent(id),
+            session_id: Some(original_session.clone()),
+            session_binding_epoch: Some(0),
+            client_id: None,
+            request_id: 71,
+            entry_generation: stale_generation,
+            targets: Vec::new(),
+            error: Some("stale SSH load".into()),
+        }),
+        &mut app,
+    );
+    assert!(stale.is_empty());
+    assert!(expect_agent(&app, id).toast.is_none());
+
+    app.agents
+        .get_mut(&id)
+        .unwrap()
+        .bind_session_id("replacement-session".into());
+    let replaced_session = dispatch(
+        Action::TaskComplete(TaskResult::SshCompletionTargetsLoaded {
+            owner: crate::app::actions::SshCompletionOwner::Agent(id),
+            session_id: Some(original_session.clone()),
+            session_binding_epoch: Some(0),
+            client_id: None,
+            request_id: 72,
+            entry_generation: current_generation,
+            targets: Vec::new(),
+            error: Some("old session SSH load".into()),
+        }),
+        &mut app,
+    );
+    assert!(replaced_session.is_empty());
+    assert!(expect_agent(&app, id).toast.is_none());
+
+    let rebound_epoch = {
+        let agent = app.agents.get_mut(&id).expect("fixture agent");
+        agent.bind_session_id(original_session.clone().into());
+        agent.session_binding_epoch
+    };
+    let rebound_session = dispatch(
+        Action::TaskComplete(TaskResult::SshCompletionTargetsLoaded {
+            owner: crate::app::actions::SshCompletionOwner::Agent(id),
+            session_id: Some(original_session.clone()),
+            session_binding_epoch: Some(0),
+            client_id: None,
+            request_id: 72,
+            entry_generation: current_generation,
+            targets: Vec::new(),
+            error: Some("rebound session SSH load".into()),
+        }),
+        &mut app,
+    );
+    assert!(rebound_session.is_empty());
+    assert!(expect_agent(&app, id).toast.is_none());
+
+    let (fresh_generation, fresh_epoch) = {
+        let agent = app.agents.get_mut(&id).expect("fixture agent");
+        assert_eq!(agent.session_binding_epoch, rebound_epoch);
+        agent.prompt.set_text("ordinary draft");
+        agent.prompt.set_cursor(agent.prompt.text().len());
+        agent.prompt.refresh_slash(&agent.session.models);
+        agent.prompt.set_text("/remote ");
+        agent.prompt.set_cursor(agent.prompt.text().len());
+        agent.prompt.refresh_slash(&agent.session.models);
+        let fresh = agent
+            .prompt
+            .begin_ssh_target_load(73)
+            .expect("re-entering after a session replacement starts a fresh load");
+        (fresh, agent.session_binding_epoch)
+    };
+    let current = dispatch(
+        Action::TaskComplete(TaskResult::SshCompletionTargetsLoaded {
+            owner: crate::app::actions::SshCompletionOwner::Agent(id),
+            session_id: Some(original_session),
+            session_binding_epoch: Some(fresh_epoch),
+            client_id: None,
+            request_id: 73,
+            entry_generation: fresh_generation,
+            targets: Vec::new(),
+            error: Some("current SSH load".into()),
+        }),
+        &mut app,
+    );
+    assert!(current.is_empty());
+    assert_eq!(
+        expect_agent(&app, id).toast.as_ref().map(|(message, _)| message.as_str()),
+        Some("current SSH load")
+    );
+}
+
+#[test]
+fn ssh_completion_result_cannot_cross_a_replaced_prompt_under_the_same_agent() {
+    let mut app = test_app_with_agent();
+    let id = AgentId(0);
+    let session_id = "test-session".to_owned();
+    let old_entry_generation = {
+        let agent = app.agents.get_mut(&id).expect("fixture agent");
+        agent.prompt.set_text("/ssh ");
+        agent.prompt.set_cursor(agent.prompt.text().len());
+        agent.prompt.refresh_slash(&agent.session.models);
+        agent
+            .prompt
+            .begin_ssh_target_load(101)
+            .expect("original prompt enters SSH target completion")
+    };
+
+    let replacement_entry_generation = {
+        let agent = app.agents.get_mut(&id).expect("fixture agent");
+        agent.prompt = crate::views::prompt_widget::PromptWidget::new();
+        agent.prompt.set_text("/ssh ");
+        agent.prompt.set_cursor(agent.prompt.text().len());
+        agent.prompt.refresh_slash(&agent.session.models);
+        agent
+            .prompt
+            .begin_ssh_target_load(102)
+            .expect("replacement prompt enters SSH target completion")
+    };
+    assert_eq!(
+        old_entry_generation, replacement_entry_generation,
+        "a new prompt starts its local generation again, so request IDs must identify it"
+    );
+
+    let stale = dispatch(
+        Action::TaskComplete(TaskResult::SshCompletionTargetsLoaded {
+            owner: crate::app::actions::SshCompletionOwner::Agent(id),
+            session_id: Some(session_id.clone()),
+            session_binding_epoch: Some(0),
+            client_id: None,
+            request_id: 101,
+            entry_generation: old_entry_generation,
+            targets: Vec::new(),
+            error: Some("old prompt SSH load".into()),
+        }),
+        &mut app,
+    );
+    assert!(stale.is_empty());
+    assert!(expect_agent(&app, id).toast.is_none());
+
+    let current = dispatch(
+        Action::TaskComplete(TaskResult::SshCompletionTargetsLoaded {
+            owner: crate::app::actions::SshCompletionOwner::Agent(id),
+            session_id: Some(session_id),
+            session_binding_epoch: Some(0),
+            client_id: None,
+            request_id: 102,
+            entry_generation: replacement_entry_generation,
+            targets: Vec::new(),
+            error: Some("replacement prompt SSH load".into()),
+        }),
+        &mut app,
+    );
+    assert!(current.is_empty());
+    assert_eq!(
+        expect_agent(&app, id).toast.as_ref().map(|(message, _)| message.as_str()),
+        Some("replacement prompt SSH load")
+    );
+}
+
 fn doctor_target(app: &AppView, id: AgentId) -> crate::app::actions::DoctorFixTarget {
     let agent = &expect_agent(app, id);
     crate::app::actions::DoctorFixTarget {

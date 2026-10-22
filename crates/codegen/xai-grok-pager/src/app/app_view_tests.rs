@@ -81,6 +81,7 @@ pub(crate) fn test_app() -> AppView {
         auth_return_view: None,
         agents: indexmap::IndexMap::new(),
         next_agent_id: 0,
+        next_ssh_completion_request_id: 1,
         models: ModelState::default(),
         registry: ActionRegistry::defaults(),
         settings_registry: std::sync::Arc::new(crate::settings::SettingsRegistry::defaults()),
@@ -388,6 +389,120 @@ pub(crate) fn test_app_with_agent() -> AppView {
         super::super::dispatch::SwitchCause::Load,
     );
     app
+}
+
+#[test]
+fn entering_ssh_arguments_queues_one_catalog_load_across_query_keystrokes() {
+    let mut app = test_app_with_agent();
+    app.agents
+        .get_mut(&super::super::agent::AgentId(0))
+        .expect("fixture agent")
+        .active_pane = crate::views::agent::ActivePane::Prompt;
+
+    for ch in "/ssh ".chars() {
+        let _ = app.handle_input(&Event::Key(KeyEvent::new(
+            KeyCode::Char(ch),
+            KeyModifiers::NONE,
+        )));
+    }
+
+    let requests = app
+        .pending_effects
+        .iter()
+        .filter_map(|effect| match effect {
+            crate::app::actions::Effect::SshCompletionTargets {
+                owner: crate::app::actions::SshCompletionOwner::Agent(agent_id),
+                session_id,
+                session_binding_epoch,
+                request_id,
+                entry_generation,
+            } => Some((
+                *agent_id,
+                session_id.as_deref(),
+                *session_binding_epoch,
+                *request_id,
+                *entry_generation,
+            )),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        requests,
+        vec![(
+            super::super::agent::AgentId(0),
+            Some("test-session"),
+            Some(0),
+            1,
+            1
+        )]
+    );
+
+    app.pending_effects.clear();
+    let _ = app.handle_input(&Event::Key(KeyEvent::new(
+        KeyCode::Char('p'),
+        KeyModifiers::NONE,
+    )));
+    assert!(
+        app.pending_effects
+            .iter()
+            .all(|effect| !matches!(effect, crate::app::actions::Effect::SshCompletionTargets { .. })),
+        "typing the target query must filter locally instead of reloading SSH configuration"
+    );
+}
+
+#[test]
+fn dashboard_ssh_arguments_queue_a_dashboard_owned_catalog_load() {
+    let mut app = test_app();
+    app.active_view = ActiveView::AgentDashboard;
+    app.dashboard = Some(crate::views::dashboard::DashboardState::new());
+
+    for ch in "/remote ".chars() {
+        let _ = app.handle_input(&Event::Key(KeyEvent::new(
+            KeyCode::Char(ch),
+            KeyModifiers::NONE,
+        )));
+    }
+
+    assert!(matches!(
+        app.pending_effects.as_slice(),
+        [crate::app::actions::Effect::SshCompletionTargets {
+            owner: crate::app::actions::SshCompletionOwner::Dashboard,
+            session_id: None,
+            session_binding_epoch: None,
+            request_id: 1,
+            entry_generation: 1,
+        }]
+    ));
+}
+
+#[test]
+fn dashboard_esc_keeps_a_late_ssh_catalog_from_reopening_the_dispatch_menu() {
+    let mut app = test_app();
+    app.active_view = ActiveView::AgentDashboard;
+    app.dashboard = Some(crate::views::dashboard::DashboardState::new());
+
+    for ch in "/ssh ".chars() {
+        let _ = app.handle_input(&Event::Key(KeyEvent::new(
+            KeyCode::Char(ch),
+            KeyModifiers::NONE,
+        )));
+    }
+    app.pending_effects.clear();
+    let _ = app.handle_input(&Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)));
+
+    let dashboard = app.dashboard.as_mut().expect("dashboard");
+    assert!(dashboard.dispatch.apply_ssh_target_candidates(
+        1,
+        1,
+        vec![crate::slash::command::ArgItem {
+            display: "production".into(),
+            match_text: "production host".into(),
+            insert_text: "production".into(),
+            description: "host".into(),
+        }],
+        &dashboard.models,
+    ));
+    assert!(!dashboard.dispatch.slash_open());
 }
 #[test]
 fn dashboard_x11_primary_provenance_bypasses_unrelated_clipboard_image() {

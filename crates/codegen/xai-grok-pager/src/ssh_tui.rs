@@ -125,6 +125,14 @@ enum UiMessage {
         submission_id: u64,
         result: std::result::Result<String, String>,
     },
+    TargetUpdated {
+        submission_id: u64,
+        result: std::result::Result<xai_grok_ssh::SshTarget, String>,
+    },
+    TargetRemoved {
+        submission_id: u64,
+        result: std::result::Result<xai_grok_ssh::SshTarget, String>,
+    },
     ConnectionSettled {
         generation: u64,
         client_id: u64,
@@ -286,6 +294,52 @@ impl StandaloneSshRunner {
         });
     }
 
+
+    fn update_target(
+        &mut self,
+        expected: xai_grok_ssh::SshTarget,
+        replacement: xai_grok_ssh::SshTarget,
+        submission_id: u64,
+    ) {
+        let backend = Arc::clone(&self.backend);
+        let tx = self.messages_tx.clone();
+        self.jobs.spawn(async move {
+            let result = match backend
+                .request(SshControlCommand::UpdateTarget {
+                    expected,
+                    replacement,
+                })
+                .await
+            {
+                Ok((_, SshControlReply::TargetUpdated(target))) => Ok(target),
+                Ok((_, _)) => Err("SSH local service returned an unexpected target update response.".into()),
+                Err(error) => Err(format!("{error:#}")),
+            };
+            let _ = tx.send(UiMessage::TargetUpdated {
+                submission_id,
+                result,
+            });
+        });
+    }
+
+    fn remove_target(&mut self, expected: xai_grok_ssh::SshTarget, submission_id: u64) {
+        let backend = Arc::clone(&self.backend);
+        let tx = self.messages_tx.clone();
+        self.jobs.spawn(async move {
+            let result = match backend
+                .request(SshControlCommand::RemoveTarget { expected })
+                .await
+            {
+                Ok((_, SshControlReply::TargetRemoved(target))) => Ok(target),
+                Ok((_, _)) => Err("SSH local service returned an unexpected target removal response.".into()),
+                Err(error) => Err(format!("{error:#}")),
+            };
+            let _ = tx.send(UiMessage::TargetRemoved {
+                submission_id,
+                result,
+            });
+        });
+    }
     fn start_connection(&mut self, target_id: String, connect: bool, exit_when_connected: bool) {
         let generation = Self::next_generation(&mut self.connection_generation);
         self.state.begin_connection_action(&target_id, connect);
@@ -429,6 +483,21 @@ impl StandaloneSshRunner {
                 self.save_target(draft, submission_id);
                 LoopAction::Continue
             }
+            SshModalOutcome::UpdateTarget {
+                expected,
+                replacement,
+                submission_id,
+            } => {
+                self.update_target(expected, replacement, submission_id);
+                LoopAction::Continue
+            }
+            SshModalOutcome::RemoveTarget {
+                expected,
+                submission_id,
+            } => {
+                self.remove_target(expected, submission_id);
+                LoopAction::Continue
+            }
             SshModalOutcome::Connect { target_id } => {
                 let exit_when_connected = self.connect_only_target.as_deref() == Some(target_id.as_str());
                 self.start_connection(target_id, true, exit_when_connected);
@@ -462,6 +531,7 @@ impl StandaloneSshRunner {
             // also prevents a future modal change from turning this surface into a grant engine.
             SshModalOutcome::RequestGrant { .. }
             | SshModalOutcome::ApproveGrant { .. }
+            | SshModalOutcome::CancelGrant { .. }
             | SshModalOutcome::InspectGrantTarget { .. }
             | SshModalOutcome::UseBinding { .. }
             | SshModalOutcome::RevokeBinding { .. }
@@ -470,7 +540,7 @@ impl StandaloneSshRunner {
             | SshModalOutcome::ResetOperationApprovals { .. }
             | SshModalOutcome::ApproveWorkerInstall { .. } => {
                 self.state
-                    .show_error("SSH access grants are unavailable until a project is opened.");
+                    .show_error("Authorize SSH tools from /ssh inside a chat session; no remote project or worker is required.");
                 LoopAction::Continue
             }
             SshModalOutcome::AnswerAuthentication {
@@ -548,6 +618,32 @@ impl StandaloneSshRunner {
                 if self
                     .state
                     .settle_target_add_for_submission(submission_id, result)
+                {
+                    self.refresh_targets();
+                }
+            }
+            UiMessage::TargetUpdated {
+                submission_id,
+                result,
+            } => {
+                let succeeded = result.is_ok();
+                if self
+                    .state
+                    .settle_target_update_for_submission(submission_id, result)
+                    && succeeded
+                {
+                    self.refresh_targets();
+                }
+            }
+            UiMessage::TargetRemoved {
+                submission_id,
+                result,
+            } => {
+                let succeeded = result.is_ok();
+                if self
+                    .state
+                    .settle_target_remove_for_submission(submission_id, result)
+                    && succeeded
                 {
                     self.refresh_targets();
                 }
@@ -649,6 +745,8 @@ impl StandaloneSshRunner {
             // client/session by constructing a card in this temporary manager.
             SshEvent::GrantRequested(_)
             | SshEvent::GrantResolved { .. }
+            | SshEvent::GrantCancelled { .. }
+            | SshEvent::GrantFailed { .. }
             | SshEvent::BindingRevoked { .. }
             | SshEvent::Worker(_)
             | SshEvent::OperationApproval(_)

@@ -358,6 +358,8 @@ pub struct SlashController {
     /// Original session/Grok usage access; external auth still permits provider quotas.
     usage_command_visible: bool,
     workflows_available: bool,
+    /// Configured SSH target argument rows, injected by the prompt lifecycle.
+    ssh_candidates: Vec<ArgItem>,
     /// Session run handles for `/workflow` manage-verb autocomplete.
     workflow_runs: Vec<crate::slash::command::WorkflowRunChoice>,
     /// Effective render mode of this process, immutable after startup (it only changes via a full `/minimal`-`/fullscreen` re-exec).
@@ -401,6 +403,7 @@ impl SlashController {
             billing_surface_visible: true,
             usage_command_visible: true,
             workflows_available: false,
+            ssh_candidates: Vec::new(),
             workflow_runs: Vec::new(),
             screen_mode: crate::app::ScreenMode::Fullscreen,
             current_title: None,
@@ -467,6 +470,11 @@ impl SlashController {
         &self.workflow_runs
     }
 
+    /// Replace the configured SSH target catalog used by `/ssh` completion.
+    pub(crate) fn set_ssh_candidates(&mut self, candidates: Vec<ArgItem>) {
+        self.ssh_candidates = candidates;
+    }
+
     /// Record the process's effective screen mode (see the field doc).
     pub(crate) fn set_screen_mode(&mut self, mode: crate::app::ScreenMode) {
         self.screen_mode = mode;
@@ -497,6 +505,7 @@ impl SlashController {
             usage_command_visible: self.usage_command_visible,
             workflows_available: self.workflows_available,
             saved_workflows: self.registry.saved_workflows(),
+            ssh_candidates: &self.ssh_candidates,
             workflow_runs: &self.workflow_runs,
             screen_mode: self.screen_mode,
             current_title: self.current_title.as_deref(),
@@ -3815,5 +3824,89 @@ mod tests {
             reg.get_for_dispatch("theme").map(|cmd| cmd.name()),
             Some("theme")
         );
+    }
+
+    fn ssh_arg(display: &str, target_id: &str, host: &str, address: &str) -> ArgItem {
+        ArgItem {
+            display: display.into(),
+            match_text: format!("{display} {host} {target_id} {address}"),
+            insert_text: target_id.into(),
+            description: format!("{address} · Groky config · {target_id}"),
+        }
+    }
+
+    #[test]
+    fn ssh_argument_completion_filters_labels_and_inserts_stable_ids_for_aliases() {
+        let mut ctrl = SlashController::with_builtins(std::path::PathBuf::from("."));
+        ctrl.set_ssh_candidates(vec![
+            ssh_arg(
+                "Build Server",
+                "target-east",
+                "build-east",
+                "builder@build-east.example.test:2222",
+            ),
+            ssh_arg(
+                "Build Server",
+                "target-west",
+                "build-west",
+                "builder@build-west.example.test:2222",
+            ),
+            ssh_arg(
+                "Archive Server",
+                "target-archive",
+                "archive",
+                "ops@archive.example.test:22",
+            ),
+        ]);
+        let state = SlashState::default();
+        let models = ModelState::default();
+
+        ctrl.refresh(&state, "/ssh ", 5, &models);
+        let snapshot = state.snapshot();
+        assert!(snapshot.open);
+        assert_eq!(
+            snapshot
+                .matches
+                .iter()
+                .map(|row| (row.display.as_str(), row.insert_text.as_str()))
+                .collect::<Vec<_>>(),
+            vec![
+                ("Build Server", "target-east"),
+                ("Build Server", "target-west"),
+                ("Archive Server", "target-archive"),
+            ]
+        );
+
+        let text = "/ssh build server";
+        ctrl.refresh(&state, text, text.len(), &models);
+        let snapshot = state.snapshot();
+        assert_eq!(
+            snapshot
+                .matches
+                .iter()
+                .map(|row| row.insert_text.as_str())
+                .collect::<Vec<_>>(),
+            vec!["target-east", "target-west"],
+        );
+
+        for text in ["/ssh target-west", "/remote target-west"] {
+            ctrl.refresh(&state, text, text.len(), &models);
+            let snapshot = state.snapshot();
+            assert!(snapshot.open, "exact ID did not complete for {text:?}");
+            assert_eq!(
+                snapshot.selection().map(|row| row.insert_text.as_str()),
+                Some("target-west"),
+                "completion must replace a duplicate label with its stable target ID for {text:?}",
+            );
+        }
+
+        let text = "/ssh qqqqq";
+        ctrl.refresh(&state, text, text.len(), &models);
+        let snapshot = state.snapshot();
+        assert!(!snapshot.open);
+        assert!(snapshot.matches.is_empty());
+        assert!(is_command_complete(text, ctrl.registry()));
+        assert!(is_command_complete("/ssh", ctrl.registry()));
+        assert!(is_command_complete("/remote", ctrl.registry()));
     }
 }

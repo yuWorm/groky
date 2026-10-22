@@ -581,3 +581,199 @@ fn resolver_falls_back_to_os_user_when_pty_clears_environment() {
 
     assert_eq!(username, "pty-user");
 }
+
+#[test]
+fn manual_target_update_preserves_stable_id_and_extension_fields() {
+    let fixture = Fixture::new("", "");
+    fs::write(
+        fixture.home.join("config.toml"),
+        r#"
+            [ssh.targets.build]
+            host = "old.example.test"
+            label = "Old label"
+            identity_files = ["~/.ssh/first", "~/.ssh/second"]
+            credential_ref = "keychain:ssh/build"
+            worker_command = ["custom-worker", "--stdio"]
+            extension = "keep"
+        "#,
+    )
+    .expect("write target");
+    let expected = fixture
+        .store
+        .get("build")
+        .expect("read target")
+        .expect("target exists");
+    let mut replacement = expected.clone();
+    replacement.label = "New label".to_owned();
+    replacement.host = "new.example.test".to_owned();
+
+    let updated = fixture
+        .store
+        .update(expected.clone(), replacement.clone())
+        .expect("update target");
+
+    assert_eq!(updated, replacement);
+    assert_eq!(updated.id, expected.id);
+    assert_eq!(
+        updated.identity_files,
+        vec![PathBuf::from("~/.ssh/first"), PathBuf::from("~/.ssh/second")]
+    );
+    assert_eq!(updated.credential_ref.as_deref(), Some("keychain:ssh/build"));
+    assert_eq!(updated.worker_command, vec!["custom-worker", "--stdio"]);
+    let value: toml::Value = toml::from_str(
+        &fs::read_to_string(fixture.home.join("config.toml")).expect("read updated config"),
+    )
+    .expect("parse updated config");
+    assert_eq!(
+        value["ssh"]["targets"]["build"]["extension"].as_str(),
+        Some("keep")
+    );
+}
+
+#[test]
+fn manual_target_mutations_reject_imported_and_stale_snapshots() {
+    let fixture = Fixture::new("Host imported\n    HostName imported.example.test\n", "");
+    let original = fixture.target("manual", "manual.example.test");
+    fixture.store.upsert(original.clone()).expect("save target");
+    let stale = fixture
+        .store
+        .get("manual")
+        .expect("read target")
+        .expect("target exists");
+    let mut externally_changed = stale.clone();
+    externally_changed.label = "Changed elsewhere".to_owned();
+    fixture
+        .store
+        .upsert(externally_changed.clone())
+        .expect("simulate another editor");
+    let mut replacement = stale.clone();
+    replacement.label = "Our edit".to_owned();
+
+    assert!(matches!(
+        fixture.store.update(stale.clone(), replacement),
+        Err(ConfigError::StaleTarget(id)) if id == "manual"
+    ));
+    assert!(matches!(
+        fixture.store.remove_expected(stale),
+        Err(ConfigError::StaleTarget(id)) if id == "manual"
+    ));
+    let imported = fixture
+        .store
+        .get("imported")
+        .expect("read imported target")
+        .expect("imported target exists");
+    assert!(matches!(
+        fixture.store.update(imported.clone(), imported.clone()),
+        Err(ConfigError::ImmutableImportedTarget(id)) if id == imported.id
+    ));
+    assert!(matches!(
+        fixture.store.remove_expected(imported.clone()),
+        Err(ConfigError::ImmutableImportedTarget(id)) if id == imported.id
+    ));
+    assert_eq!(
+        fixture
+            .store
+            .remove_expected(externally_changed.clone())
+            .expect("remove current target"),
+        externally_changed
+    );
+    assert!(matches!(
+        fixture.store.remove_expected(externally_changed),
+        Err(ConfigError::StaleTarget(id)) if id == "manual"
+    ));
+}
+
+#[test]
+fn imported_targets_are_reloaded_after_external_ssh_config_changes() {
+    let fixture = Fixture::new("Host first\n    HostName first.example.test\n", "");
+    let initial = fixture.store.list().expect("list initial imports");
+    assert!(initial.iter().any(|target| {
+        target.host == "first"
+            && matches!(&target.source, TargetSource::Imported { path, line: 1 } if path == &fixture.user_config)
+    }));
+
+    fs::write(
+        &fixture.user_config,
+        "Host second\n    HostName second.example.test\n",
+    )
+    .expect("externally rewrite SSH config");
+    let refreshed = fixture.store.list().expect("reload rewritten imports");
+
+    assert!(!refreshed.iter().any(|target| target.host == "first"));
+    assert!(refreshed.iter().any(|target| {
+        target.host == "second"
+            && matches!(&target.source, TargetSource::Imported { path, line: 1 } if path == &fixture.user_config)
+    }));
+}
+
+#[test]
+fn target_reference_resolves_manual_labels_and_imported_aliases_to_stable_ids() {
+    let fixture = Fixture::new("Host imported-alias\n    HostName imported.example.test\n", "");
+    let mut manual = fixture.target("candidate-manual", "candidate-fixture");
+    manual.label = "QA storage".to_owned();
+    fixture.store.upsert(manual).expect("save manual target");
+
+    assert_eq!(
+        fixture
+            .store
+            .canonical_id("QA storage")
+            .expect("manual label resolves"),
+        "candidate-manual"
+    );
+    assert_eq!(
+        fixture
+            .store
+            .canonical_id("imported-alias")
+            .expect("imported alias resolves"),
+        "imported:imported-alias"
+    );
+}
+
+#[test]
+fn target_reference_prefers_exact_id_and_rejects_duplicate_labels_or_hosts() {
+    let fixture = Fixture::new("", "");
+    let mut exact = fixture.target("candidate-id", "exact.example.test");
+    exact.label = "Exact target".to_owned();
+    fixture.store.upsert(exact).expect("save exact target");
+
+    let mut competing_label = fixture.target("other-target", "other.example.test");
+    competing_label.label = "candidate-id".to_owned();
+    fixture
+        .store
+        .upsert(competing_label)
+        .expect("save competing label");
+    assert_eq!(
+        fixture
+            .store
+            .canonical_id("candidate-id")
+            .expect("stable id wins over a label"),
+        "candidate-id"
+    );
+
+    for id in ["duplicate-label-a", "duplicate-label-b"] {
+        let mut target = fixture.target(id, &format!("{id}.example.test"));
+        target.label = "Duplicate label".to_owned();
+        fixture.store.upsert(target).expect("save duplicate label");
+    }
+    assert!(matches!(
+        fixture.store.canonical_id("Duplicate label"),
+        Err(ConfigError::AmbiguousTarget {
+            reference,
+            candidate_ids,
+        }) if reference == "Duplicate label"
+            && candidate_ids == vec!["duplicate-label-a".to_owned(), "duplicate-label-b".to_owned()]
+    ));
+
+    for id in ["duplicate-host-a", "duplicate-host-b"] {
+        let target = fixture.target(id, "same.example.test");
+        fixture.store.upsert(target).expect("save duplicate host");
+    }
+    assert!(matches!(
+        fixture.store.canonical_id("same.example.test"),
+        Err(ConfigError::AmbiguousTarget {
+            reference,
+            candidate_ids,
+        }) if reference == "same.example.test"
+            && candidate_ids == vec!["duplicate-host-a".to_owned(), "duplicate-host-b".to_owned()]
+    ));
+}

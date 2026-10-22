@@ -15,26 +15,72 @@ use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use serde_json::Value;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::{
+    borrow::Cow,
+    sync::atomic::{AtomicU64, Ordering},
+};
 use xai_grok_shell::ssh::{
     SshConnectionState, SshDirectoryListing, SshHostIdentity, SshOperation,
     SshOperationApprovalScope,
 };
 use zeroize::Zeroizing;
 
-/// A configured target as displayed by the pager. This is a view model rather than a credential
-/// or transport type so the modal cannot accidentally retain authentication material.
+/// A configured target as displayed by the pager. This view retains its exact, non-secret
+/// configuration snapshot so a manual edit can preserve fields the compact form does not expose.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SshTargetView {
     pub target_id: String,
     pub label: String,
-    /// User target, imported OpenSSH alias, or system OpenSSH alias.
-    pub source: String,
+    /// Full target snapshot—including typed source provenance—for optimistic concurrency.
+    pub target: xai_grok_ssh::SshTarget,
     /// Resolved `user@host:port` (or an explicit resolver error category), never a secret.
     pub effective_address: String,
     pub connected: bool,
     pub connection_detail: String,
     pub grant: SshGrantView,
+}
+
+impl SshTargetView {
+    pub fn from_target(
+        target: xai_grok_ssh::SshTarget,
+        effective_address: String,
+        connected: bool,
+        connection_detail: String,
+        grant: SshGrantView,
+    ) -> Self {
+        Self {
+            target_id: target.id.clone(),
+            label: target.label.clone(),
+            target,
+            effective_address,
+            connected,
+            connection_detail,
+            grant,
+        }
+    }
+
+    fn source_display(&self) -> Cow<'_, str> {
+        match &self.target.source {
+            xai_grok_ssh::TargetSource::User => Cow::Borrowed("Groky config"),
+            xai_grok_ssh::TargetSource::Imported { path, line } => {
+                Cow::Owned(format!("OpenSSH read-only {}:{line}", path.display()))
+            }
+        }
+    }
+
+    fn is_manual(&self) -> bool {
+        matches!(&self.target.source, xai_grok_ssh::TargetSource::User)
+    }
+
+    fn read_only_message(&self) -> Option<String> {
+        let xai_grok_ssh::TargetSource::Imported { path, line } = &self.target.source else {
+            return None;
+        };
+        Some(format!(
+            "This OpenSSH target is read-only. Edit {} at line {line} externally, then refresh.",
+            path.display()
+        ))
+    }
 }
 
 /// The local session authorization state shown for one target.
@@ -302,6 +348,11 @@ impl SshGrantCard {
             &VERIFIED_GENERAL_FOCUSES
         } else {
             &GENERAL_FOCUSES
+        };
+        let focuses = if self.follow_up.is_some() && !self.is_project_consent() {
+            &focuses[..focuses.len() - 1]
+        } else {
+            focuses
         };
         let index = focuses
             .iter()
@@ -773,6 +824,8 @@ struct SshManualTargetForm {
     port: LineEditor,
     identity_file: LineEditor,
     worker_command: LineEditor,
+    /// `Some` means this is an edit and carries the exact optimistic-concurrency precondition.
+    expected: Option<xai_grok_ssh::SshTarget>,
     active: ManualTargetField,
     error: Option<String>,
     field_hits: Vec<(ManualTargetField, Rect)>,
@@ -789,6 +842,7 @@ impl Default for SshManualTargetForm {
             port: LineEditor::default(),
             identity_file: LineEditor::default(),
             worker_command: LineEditor::default(),
+            expected: None,
             active: ManualTargetField::Host,
             error: None,
             field_hits: Vec::new(),
@@ -798,7 +852,61 @@ impl Default for SshManualTargetForm {
     }
 }
 
+fn format_worker_command(arguments: &[String]) -> String {
+    let capacity = arguments
+        .iter()
+        .map(|argument| {
+            argument.len()
+                + 2
+                + argument
+                    .bytes()
+                    .filter(|character| matches!(*character, b'\\' | b'"'))
+                    .count()
+        })
+        .sum::<usize>()
+        .saturating_add(arguments.len().saturating_sub(1));
+    let mut command = String::with_capacity(capacity);
+    for (index, argument) in arguments.iter().enumerate() {
+        if index > 0 {
+            command.push(' ');
+        }
+        command.push('"');
+        for character in argument.chars() {
+            if matches!(character, '\\' | '"') {
+                command.push('\\');
+            }
+            command.push(character);
+        }
+        command.push('"');
+    }
+    command
+}
+
 impl SshManualTargetForm {
+    fn editing(expected: xai_grok_ssh::SshTarget) -> Self {
+        let mut form = Self {
+            expected: Some(expected.clone()),
+            ..Self::default()
+        };
+        form.host.set_text(expected.host);
+        form.label.set_text(expected.label);
+        form.user.set_text(expected.user.unwrap_or_default());
+        form.port
+            .set_text(expected.port.map_or_else(String::new, |port| port.to_string()));
+        form.identity_file.set_text(
+            expected
+                .identity_files
+                .first()
+                .map_or_else(String::new, |path| path.display().to_string()),
+        );
+        form.worker_command.set_text(format_worker_command(&expected.worker_command));
+        form
+    }
+
+    fn is_editing(&self) -> bool {
+        self.expected.is_some()
+    }
+
     fn editor(&self, field: ManualTargetField) -> &LineEditor {
         match field {
             ManualTargetField::Host => &self.host,
@@ -851,15 +959,65 @@ impl SshManualTargetForm {
             worker_command: optional(self.worker_command.text()),
         })
     }
-
-    fn start_submit(&mut self) -> Result<(SshManualTargetDraft, u64), String> {
+    fn replacement(&self, expected: &xai_grok_ssh::SshTarget) -> Result<xai_grok_ssh::SshTarget, String> {
         let draft = self.draft()?;
-        let submission_id = next_nonzero_id(&NEXT_TARGET_ADD_SUBMISSION_ID);
+        let mut replacement = expected.clone();
+        replacement.host = draft.host.clone();
+        replacement.label = draft.label.unwrap_or(draft.host);
+        replacement.user = draft.user;
+        replacement.port = draft.port;
+        match draft.identity_file {
+            Some(identity_file) => {
+                let identity_file = std::path::PathBuf::from(identity_file);
+                if let Some(first) = replacement.identity_files.first_mut() {
+                    *first = identity_file;
+                } else {
+                    replacement.identity_files.push(identity_file);
+                }
+            }
+            None if !replacement.identity_files.is_empty() => {
+                replacement.identity_files.remove(0);
+            }
+            None => {}
+        }
+        replacement.worker_command = match draft.worker_command {
+            Some(worker_command) => xai_grok_ssh::parse_worker_command(&worker_command)
+                .map_err(|error| error.to_string())?,
+            None => xai_grok_ssh::default_worker_command(),
+        };
+        Ok(replacement)
+    }
+
+    fn start_submit(&mut self) -> Result<TargetFormSubmission, String> {
+        let submission_id = next_nonzero_id(&NEXT_TARGET_MUTATION_SUBMISSION_ID);
+        let submission = match self.expected.as_ref() {
+            Some(expected) => TargetFormSubmission::Update {
+                expected: expected.clone(),
+                replacement: self.replacement(expected)?,
+                submission_id,
+            },
+            None => TargetFormSubmission::Add {
+                draft: self.draft()?,
+                submission_id,
+            },
+        };
         self.submitting = true;
         self.submission_id = Some(submission_id);
         self.error = None;
-        Ok((draft, submission_id))
+        Ok(submission)
     }
+}
+
+enum TargetFormSubmission {
+    Add {
+        draft: SshManualTargetDraft,
+        submission_id: u64,
+    },
+    Update {
+        expected: xai_grok_ssh::SshTarget,
+        replacement: xai_grok_ssh::SshTarget,
+        submission_id: u64,
+    },
 }
 
 /// Local-only consent for an individual remote operation after a binding already exists.
@@ -1148,9 +1306,42 @@ struct SubmittedOperationApproval {
     origin: SshOperationApprovalOrigin,
 }
 
+struct SshDeleteConfirmation {
+    expected: xai_grok_ssh::SshTarget,
+    label: String,
+    connected: bool,
+    has_active_grants: bool,
+    submitting: bool,
+    submission_id: Option<u64>,
+    error: Option<String>,
+}
+
+impl SshDeleteConfirmation {
+    fn new(expected: xai_grok_ssh::SshTarget, connected: bool, has_active_grants: bool) -> Self {
+        Self {
+            label: expected.label.clone(),
+            expected,
+            connected,
+            has_active_grants,
+            submitting: false,
+            submission_id: None,
+            error: None,
+        }
+    }
+
+    fn start_submit(&mut self) -> u64 {
+        let submission_id = next_nonzero_id(&NEXT_TARGET_MUTATION_SUBMISSION_ID);
+        self.submitting = true;
+        self.submission_id = Some(submission_id);
+        self.error = None;
+        submission_id
+    }
+}
+
 enum SshModalPage {
     Manager,
     Add(SshManualTargetForm),
+    ConfirmDelete(SshDeleteConfirmation),
     Grant(SshGrantCard),
     ProjectBrowser,
     OperationApproval(SshOperationApprovalCard),
@@ -1167,7 +1358,7 @@ struct ManagerRowHit {
 }
 
 static NEXT_MANAGER_INSTANCE_ID: AtomicU64 = AtomicU64::new(1);
-static NEXT_TARGET_ADD_SUBMISSION_ID: AtomicU64 = AtomicU64::new(1);
+static NEXT_TARGET_MUTATION_SUBMISSION_ID: AtomicU64 = AtomicU64::new(1);
 static NEXT_PROJECT_DIRECTORY_REQUEST_ID: AtomicU64 = AtomicU64::new(1);
 
 fn next_nonzero_id(counter: &AtomicU64) -> u64 {
@@ -1192,7 +1383,11 @@ pub struct SshManagerState {
     manager_visible_rows: usize,
     manager_row_hits: Vec<ManagerRowHit>,
     manager_advanced: bool,
-    pending_added_target_id: Option<String>,
+    pending_target_selection_id: Option<String>,
+    pending_target_reference: Option<String>,
+    /// Removed targets stay retired locally so an older target-list completion cannot resurrect
+    /// a just-deleted target before the authoritative refresh arrives.
+    retired_target_ids: Vec<String>,
     project_browser: Option<SshProjectBrowser>,
     /// The request tuple that owns a preparation, grant, and subsequent project lifecycle.
     pending_project_open: Option<PendingProjectOpen>,
@@ -1210,8 +1405,8 @@ pub struct SshManagerState {
     /// Request IDs whose inspection has been dispatched. This suppresses duplicated grant events
     /// until the matching verified event arrives.
     inspecting_grant_ids: Vec<String>,
-    /// Recently denied picker requests. Keeping this bounded prevents late browse/inspection
-    /// completions from reviving a request that the user already denied.
+    /// Recently cancelled or terminally failed picker requests. Keeping this bounded prevents
+    /// late browse/inspection completions from reviving a request with no remaining owner.
     cancelled_grant_ids: Vec<String>,
     /// Exact decision submitted for the displayed request, retained until its resolution.
     submitted_grant: Option<SubmittedGrantDecision>,
@@ -1248,7 +1443,9 @@ impl SshManagerState {
             manager_visible_rows: 0,
             manager_row_hits: Vec::new(),
             manager_advanced: false,
-            pending_added_target_id: None,
+            pending_target_selection_id: None,
+            pending_target_reference: None,
+            retired_target_ids: Vec::new(),
             project_browser: None,
             pending_project_open: None,
             resume_project_browser_after_authentication: false,
@@ -1310,6 +1507,7 @@ impl SshManagerState {
                     )
                 }),
                 SshModalPage::Add(_)
+                | SshModalPage::ConfirmDelete(_)
                 | SshModalPage::OperationApproval(_)
                 | SshModalPage::WorkerInstallFallback(_)
                 | SshModalPage::Authentication(_)
@@ -1317,23 +1515,37 @@ impl SshManagerState {
             }
     }
 
+    fn target_form_submission_id(&self, editing: bool) -> Option<u64> {
+        match &self.page {
+            SshModalPage::Add(form) if form.submitting && form.is_editing() == editing => {
+                form.submission_id
+            }
+            _ => None,
+        }
+    }
+
     /// The exact add-target submission currently displayed by the form.
     pub fn target_add_submission_id(&self) -> Option<u64> {
-        match &self.page {
-            SshModalPage::Add(form) if form.submitting => form.submission_id,
-            SshModalPage::Manager
-            | SshModalPage::Add(_)
-            | SshModalPage::Grant(_)
-            | SshModalPage::ProjectBrowser
-            | SshModalPage::OperationApproval(_)
-            | SshModalPage::WorkerInstallFallback(_)
-            | SshModalPage::Authentication(_)
-            | SshModalPage::Diagnostic(_) => None,
-        }
+        self.target_form_submission_id(false)
     }
 
     pub fn target_add_is_submitting(&self) -> bool {
         self.target_add_submission_id().is_some()
+    }
+
+    pub fn target_update_submission_id(&self) -> Option<u64> {
+        self.target_form_submission_id(true)
+    }
+
+    pub fn target_update_is_submitting(&self) -> bool {
+        self.target_update_submission_id().is_some()
+    }
+
+    pub fn target_remove_submission_id(&self) -> Option<u64> {
+        match &self.page {
+            SshModalPage::ConfirmDelete(card) if card.submitting => card.submission_id,
+            _ => None,
+        }
     }
 
     /// Correlated variant for lifecycle dispatch. Prefer this when the task result carries the
@@ -1360,7 +1572,7 @@ impl SshManagerState {
                 let SshModalPage::Add(form) = &mut self.page else {
                     return false;
                 };
-                if !form.submitting {
+                if !form.submitting || form.is_editing() {
                     return false;
                 }
                 form.submitting = false;
@@ -1372,14 +1584,94 @@ impl SshManagerState {
         let SshModalPage::Add(form) = &self.page else {
             return false;
         };
-        if !form.submitting {
+        if !form.submitting || form.is_editing() {
             return false;
         }
-        self.pending_added_target_id = Some(saved_target_id);
+        self.retired_target_ids.retain(|id| id != &saved_target_id);
+        self.pending_target_selection_id = Some(saved_target_id);
         self.loading = true;
         self.page = SshModalPage::Manager;
         self.show_info("SSH target saved.");
         true
+    }
+
+    pub fn settle_target_update_for_submission(
+        &mut self,
+        submission_id: u64,
+        result: Result<xai_grok_ssh::SshTarget, String>,
+    ) -> bool {
+        if self.target_update_submission_id() != Some(submission_id) {
+            return false;
+        }
+        match result {
+            Err(error) => {
+                let SshModalPage::Add(form) = &mut self.page else {
+                    return false;
+                };
+                form.submitting = false;
+                form.submission_id = None;
+                form.error = Some(error);
+                true
+            }
+            Ok(target) => {
+                let SshModalPage::Add(form) = &self.page else {
+                    return false;
+                };
+                if !form.submitting || !form.is_editing() {
+                    return false;
+                }
+                self.pending_target_selection_id = Some(target.id.clone());
+                for view in self
+                    .targets
+                    .iter_mut()
+                    .filter(|view| view.target_id == target.id)
+                {
+                    view.target_id = target.id.clone();
+                    view.label = target.label.clone();
+                    view.target = target.clone();
+                }
+                self.loading = true;
+                self.page = SshModalPage::Manager;
+                self.show_info("SSH target updated.");
+                true
+            }
+        }
+    }
+
+    pub fn settle_target_remove_for_submission(
+        &mut self,
+        submission_id: u64,
+        result: Result<xai_grok_ssh::SshTarget, String>,
+    ) -> bool {
+        if self.target_remove_submission_id() != Some(submission_id) {
+            return false;
+        }
+        match result {
+            Err(error) => {
+                let SshModalPage::ConfirmDelete(card) = &mut self.page else {
+                    return false;
+                };
+                card.submitting = false;
+                card.submission_id = None;
+                card.error = Some(error);
+                true
+            }
+            Ok(target) => {
+                if !self.retired_target_ids.iter().any(|id| id == &target.id) {
+                    self.retired_target_ids.push(target.id.clone());
+                }
+                self.targets.retain(|view| view.target_id != target.id);
+                self.selected = self.selected.min(self.targets.len().saturating_sub(1));
+                self.manager_scroll_offset = self.manager_scroll_offset.min(
+                    self.targets
+                        .len()
+                        .saturating_sub(self.manager_visible_rows.max(1)),
+                );
+                self.page = SshModalPage::Manager;
+                self.show_info("SSH target deleted; active connections and grants were revoked.");
+                true
+            }
+        }
     }
 
     /// Start the authenticated remote-directory chooser for a selected target.
@@ -1475,6 +1767,34 @@ impl SshManagerState {
             self.show_error(error);
         }
         true
+    }
+
+    /// Return the exact pending model request that owns this directory load.
+    ///
+    /// The browser request itself has no model authority. This tuple only lets dispatch settle
+    /// the original request with a real browse error after the current manager/target/request
+    /// correlation has been verified.
+    pub fn pending_grant_for_directory_request(
+        &self,
+        directory_request_id: u64,
+        target_id: &str,
+    ) -> Option<(String, String)> {
+        let browser = self.project_browser.as_ref()?;
+        let SshDirectoryPurpose::PendingGrant { request_id } = &browser.purpose else {
+            return None;
+        };
+        (browser.request_id == directory_request_id
+            && browser.target_id == target_id
+            && self
+                .pending_grant
+                .as_ref()
+                .is_some_and(|request| request.request_id == *request_id))
+        .then(|| {
+            self.pending_grant_session_id
+                .as_ref()
+                .map(|session_id| (session_id.clone(), request_id.clone()))
+        })
+        .flatten()
     }
 
     /// True only while this manager still owns a browser selection or preparation tuple.
@@ -1587,6 +1907,45 @@ impl SshManagerState {
         true
     }
 
+    pub fn queue_target_reference(&mut self, reference: String) {
+        self.pending_target_reference = Some(reference);
+    }
+
+    /// Consume direct selection only after this manager has its session and target snapshot.
+    pub fn continue_target_reference(&mut self) -> SshModalOutcome {
+        if self.loading || self.session_id.is_none() {
+            return SshModalOutcome::Unchanged;
+        }
+        let Some(reference) = self.pending_target_reference.take() else {
+            return SshModalOutcome::Unchanged;
+        };
+        let target_id = match xai_grok_ssh::TargetStore::resolve_configured_reference(
+            &reference, self.targets.iter().map(|view| &view.target),
+        ) {
+            Ok(Some(target)) => target.id.clone(),
+            Ok(None) => {
+                self.show_info("SSH target not found. Select a configured server below, or use a full name / ID.");
+                return SshModalOutcome::Changed;
+            }
+            Err(xai_grok_ssh::ConfigError::AmbiguousTarget { candidate_ids, .. }) => {
+                self.targets.retain(|view| candidate_ids.contains(&view.target_id));
+                self.selected = 0;
+                self.show_info("Multiple matching servers. Choose the intended candidate by its ID below.");
+                return SshModalOutcome::Changed;
+            }
+            Err(error) => {
+                self.show_error(error.to_string());
+                return SshModalOutcome::Changed;
+            }
+        };
+        self.select_target_id(&target_id);
+        if self.targets.iter().filter(|view| view.target_id == target_id).count() > 1 {
+            self.show_info("This server has multiple access bindings. Select the intended folder and press Enter.");
+            return SshModalOutcome::Changed;
+        }
+        handle_manager_key(self, &KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+    }
+
     /// Browser request that owns the in-flight project preparation or post-approval open.
     pub fn pending_project_request_id(&self) -> Option<u64> {
         self.pending_project_open
@@ -1688,8 +2047,25 @@ impl SshManagerState {
         if self.resume_project_browser_after_authentication {
             self.return_after_authentication();
         }
-        if matches!(&self.page, SshModalPage::Grant(card) if card.project.as_ref().is_some_and(|project| project.request_id == request_id)) {
+        let grants_project = matches!(
+            &self.page,
+            SshModalPage::Grant(card)
+                if card.project.as_ref().is_some_and(|project| project.request_id == request_id)
+        );
+        let diagnostic_wraps_project = matches!(
+            &self.page,
+            SshModalPage::Diagnostic(card)
+                if card.return_grant.as_ref().is_some_and(|grant| {
+                    grant.project.as_ref().is_some_and(|project| project.request_id == request_id)
+                })
+        );
+        if grants_project {
             self.page = SshModalPage::ProjectBrowser;
+        } else if diagnostic_wraps_project
+            && let SshModalPage::Diagnostic(card) = &mut self.page
+        {
+            card.return_grant = None;
+            card.return_browser = self.project_browser.is_some();
         }
         if let Some(error) = error {
             self.show_error(error);
@@ -1857,6 +2233,16 @@ impl SshManagerState {
     }
 
     pub fn set_targets(&mut self, mut targets: Vec<SshTargetView>) {
+        // Once a refresh observes the deletion, a later externally re-created target with
+        // the same ID must be visible again; these guards are not a persistent hide list.
+        self.retired_target_ids
+            .retain(|id| targets.iter().any(|target| &target.target_id == id));
+        targets.retain(|target| {
+            !self
+                .retired_target_ids
+                .iter()
+                .any(|retired| retired == &target.target_id)
+        });
         let selected_key = self.selected_target().map(|target| {
             (
                 target.target_id.clone(),
@@ -1900,15 +2286,15 @@ impl SshManagerState {
         }
 
         self.targets = targets;
-        let pending_added_target_id = self.pending_added_target_id.clone();
-        if let Some(target_id) = pending_added_target_id
+        let pending_target_selection_id = self.pending_target_selection_id.clone();
+        if let Some(target_id) = pending_target_selection_id
             && let Some(index) = self
                 .targets
                 .iter()
                 .position(|target| target.target_id == target_id)
         {
             self.selected = index;
-            self.pending_added_target_id = None;
+            self.pending_target_selection_id = None;
         } else if let Some((target_id, binding_id)) = selected_key {
             self.selected = self
                 .targets
@@ -2175,22 +2561,11 @@ impl SshManagerState {
             }
             self.cancelled_local_grant_options
                 .retain(|options| options.request_id.as_deref() != Some(request_id.as_str()));
-            if self.cancelled_grant_ids.len() == 16 {
-                self.cancelled_grant_ids.remove(0);
-            }
-            self.cancelled_grant_ids.push(request_id.clone());
+            self.remember_terminal_grant_id(&request_id);
             self.pending_grant_session_id = Some(session_id);
             self.pending_grant = Some(request);
             self.submitted_grant = None;
-            return SshModalOutcome::ApproveGrant {
-                request_id,
-                approved: false,
-                target_id: None,
-                root: None,
-                capabilities: None,
-                lifetime: SshGrantLifetime::CurrentSession,
-                set_default: false,
-            };
+            return SshModalOutcome::CancelGrant { request_id };
         }
         if matches!(&self.page, SshModalPage::Grant(card) if card.request_id == request_id) {
             return SshModalOutcome::Unchanged;
@@ -2451,6 +2826,122 @@ impl SshManagerState {
         });
     }
 
+    /// Return the project preparation tied to the exact displayed grant, if any.
+    fn project_preparation_for_grant(&self, request_id: &str) -> Option<u64> {
+        let grant = match &self.page {
+            SshModalPage::Grant(card) => Some(card),
+            SshModalPage::Diagnostic(card) => card.return_grant.as_ref(),
+            _ => None,
+        };
+        match grant {
+            Some(card) if card.request_id == request_id => {
+                card.project.as_ref().map(|project| project.request_id)
+            }
+            _ => None,
+        }
+    }
+
+    /// Remember a terminal request so a stale event cannot recreate its grant surface.
+    fn remember_terminal_grant_id(&mut self, request_id: &str) {
+        if self.cancelled_grant_ids.iter().any(|id| id == request_id) {
+            return;
+        }
+        if self.cancelled_grant_ids.len() == 16 {
+            self.cancelled_grant_ids.remove(0);
+        }
+        self.cancelled_grant_ids.push(request_id.to_owned());
+    }
+
+    /// Clear only the exact model request once the service has terminally settled it.
+    fn clear_terminal_grant(&mut self, request_id: &str) -> bool {
+        if !self
+            .pending_grant
+            .as_ref()
+            .is_some_and(|request| request.request_id == request_id)
+        {
+            return false;
+        }
+        self.inspecting_grant_ids.retain(|id| id != request_id);
+        if self.transient_tool_grant_id.as_deref() == Some(request_id) {
+            self.transient_tool_grant_id = None;
+        }
+        self.pending_grant = None;
+        self.submitted_grant = None;
+        self.pending_grant_session_id = None;
+        self.pending_grant_follow_up = None;
+        self.local_grant_options = None;
+        self.settled_grant_follow_up = None;
+        true
+    }
+
+    /// Finish an exact cancellation without treating it as an explicit human denial.
+    pub fn settle_grant_cancellation(&mut self, request_id: &str) -> bool {
+        let project_request_id = self.project_preparation_for_grant(request_id);
+        if !self.clear_terminal_grant(request_id) {
+            return false;
+        }
+        self.remember_terminal_grant_id(request_id);
+        self.project_browser = self.project_browser.take().filter(|browser| {
+            !matches!(
+                &browser.purpose,
+                SshDirectoryPurpose::PendingGrant {
+                    request_id: pending_request_id,
+                } if pending_request_id == request_id
+            )
+        });
+        if let Some(project_request_id) = project_request_id {
+            self.finish_project_preparation(project_request_id, None);
+        }
+        self.page = SshModalPage::Manager;
+        self.show_info("SSH access request cancelled.");
+        true
+    }
+
+    /// Keep the original request live when its cancellation command could not be delivered.
+    pub fn restore_cancelled_grant(&mut self, request_id: &str, error: String) -> bool {
+        if !self
+            .pending_grant
+            .as_ref()
+            .is_some_and(|request| request.request_id == request_id)
+        {
+            return false;
+        }
+        self.cancelled_grant_ids.retain(|id| id != request_id);
+        self.show_error(error);
+        true
+    }
+
+    /// Finish an exact service failure while retaining its diagnostic surface.
+    pub fn settle_grant_failure(&mut self, request_id: &str, error: String) -> bool {
+        let project_request_id = self.project_preparation_for_grant(request_id);
+        if !self.clear_terminal_grant(request_id) {
+            return false;
+        }
+        self.remember_terminal_grant_id(request_id);
+        if let Some(project_request_id) = project_request_id {
+            self.finish_project_preparation(project_request_id, Some(error));
+            return true;
+        }
+        self.project_browser = self.project_browser.take().filter(|browser| {
+            !matches!(
+                &browser.purpose,
+                SshDirectoryPurpose::PendingGrant {
+                    request_id: pending_request_id,
+                } if pending_request_id == request_id
+            )
+        });
+        if let SshModalPage::Diagnostic(card) = &mut self.page {
+            // The diagnostic may have wrapped the in-progress card before the service sent its
+            // terminal failure. Returning from it must never revive that settled request.
+            card.return_grant = None;
+            card.return_browser = false;
+        } else {
+            self.page = SshModalPage::Diagnostic(SshDiagnosticCard::new(error));
+            self.message = None;
+        }
+        true
+    }
+
     /// Take the typed continuation for the exact advanced grant, before or after settlement.
     pub fn take_grant_follow_up(&mut self, request_id: &str) -> Option<SshGrantFollowUp> {
         if self
@@ -2513,7 +3004,7 @@ impl SshManagerState {
                 "Label: {}\nTarget ID: {}\nSource: {}\nResolved address: {}\nConnection detail: {}\n\n{}",
                 target.label,
                 target.target_id,
-                target.source,
+                target.source_display(),
                 target.effective_address,
                 target.connection_detail,
                 grant,
@@ -2528,9 +3019,9 @@ impl SshManagerState {
         true
     }
 
-    /// Surface an exact grant-inspection failure without allowing an old result to replace a
+    /// Surface an exact pending-grant failure without allowing an old result to replace a
     /// newer request or revive a cancelled picker.
-    pub fn fail_grant_inspection(&mut self, request_id: &str, error: String) -> bool {
+    pub fn fail_pending_grant(&mut self, request_id: &str, error: String) -> bool {
         if self.cancelled_grant_ids.iter().any(|id| id == request_id)
             || !self
                 .pending_grant
@@ -2654,6 +3145,15 @@ pub enum SshModalOutcome {
         draft: SshManualTargetDraft,
         submission_id: u64,
     },
+    UpdateTarget {
+        expected: xai_grok_ssh::SshTarget,
+        replacement: xai_grok_ssh::SshTarget,
+        submission_id: u64,
+    },
+    RemoveTarget {
+        expected: xai_grok_ssh::SshTarget,
+        submission_id: u64,
+    },
     Connect {
         target_id: String,
     },
@@ -2675,6 +3175,10 @@ pub enum SshModalOutcome {
         capabilities: Option<SshCapabilitiesView>,
         lifetime: SshGrantLifetime,
         set_default: bool,
+    },
+    /// Cancel a pending model request without recording an explicit denial.
+    CancelGrant {
+        request_id: String,
     },
     InspectGrantTarget {
         request_id: String,
@@ -2728,15 +3232,20 @@ pub enum SshModalOutcome {
 }
 
 const FOOTER_MANAGER_OPEN_FOLDER: usize = 101;
+const FOOTER_MANAGER_PROJECT: usize = 109;
 const FOOTER_MANAGER_CONNECTION: usize = 102;
 const FOOTER_MANAGER_ADD: usize = 103;
 const FOOTER_MANAGER_DIAGNOSTIC: usize = 104;
 const FOOTER_MANAGER_ADVANCED: usize = 105;
 const FOOTER_MANAGER_GRANT: usize = 111;
+const FOOTER_MANAGER_EDIT: usize = 106;
+const FOOTER_MANAGER_DELETE: usize = 107;
 const FOOTER_MANAGER_USE: usize = 112;
 const FOOTER_MANAGER_REVOKE: usize = 113;
 const FOOTER_MANAGER_RESET_OPERATION_APPROVALS: usize = 114;
 const FOOTER_MANAGER_CLOSE: usize = 108;
+const FOOTER_DELETE_CONFIRM: usize = 203;
+const FOOTER_DELETE_CANCEL: usize = 204;
 const FOOTER_ADD_SAVE: usize = 201;
 const FOOTER_ADD_CANCEL: usize = 202;
 const FOOTER_GRANT_READ: usize = 301;
@@ -2763,43 +3272,75 @@ const FOOTER_HOST_REPLACE: usize = 513;
 const FOOTER_HOST_REJECT: usize = 514;
 const FOOTER_DIAGNOSTIC_CLOSE: usize = 601;
 
-const PRIMARY_MANAGER_SHORTCUTS: &[Shortcut<'static>] = &[
-    Shortcut {
-        label: "j/k move",
-        clickable: false,
-        id: 0,
-    },
-    Shortcut {
-        label: "Enter choose folder",
-        clickable: true,
-        id: FOOTER_MANAGER_OPEN_FOLDER,
-    },
-    Shortcut {
-        label: "c connect/disconnect",
-        clickable: true,
-        id: FOOTER_MANAGER_CONNECTION,
-    },
-    Shortcut {
-        label: "a add",
-        clickable: true,
-        id: FOOTER_MANAGER_ADD,
-    },
-    Shortcut {
-        label: "d details",
-        clickable: true,
-        id: FOOTER_MANAGER_DIAGNOSTIC,
-    },
-    Shortcut {
-        label: "m advanced",
-        clickable: true,
-        id: FOOTER_MANAGER_ADVANCED,
-    },
-    Shortcut {
-        label: "Esc close",
-        clickable: true,
-        id: FOOTER_MANAGER_CLOSE,
-    },
-];
+const PRIMARY_MANAGER_SHORTCUTS: &[Shortcut<'static>] = &primary_manager_shortcuts(true, false);
+const PRIMARY_MANAGER_WITH_BINDING_SHORTCUTS: &[Shortcut<'static>] =
+    &primary_manager_shortcuts(true, true);
+const STANDALONE_PRIMARY_MANAGER_SHORTCUTS: &[Shortcut<'static>] =
+    &primary_manager_shortcuts(false, false);
+
+const fn primary_manager_shortcuts(
+    has_session: bool,
+    selected_binding: bool,
+) -> [Shortcut<'static>; 10] {
+    [
+        Shortcut {
+            label: "j/k move",
+            clickable: false,
+            id: 0,
+        },
+        Shortcut {
+            label: if !has_session {
+                "Enter connect"
+            } else if selected_binding {
+                "Enter set session default"
+            } else {
+                "Enter choose access folder"
+            },
+            clickable: true,
+            id: FOOTER_MANAGER_OPEN_FOLDER,
+        },
+        Shortcut {
+            label: "o open project (worker)",
+            clickable: true,
+            id: FOOTER_MANAGER_PROJECT,
+        },
+        Shortcut {
+            label: "c connect/disconnect",
+            clickable: true,
+            id: FOOTER_MANAGER_CONNECTION,
+        },
+        Shortcut {
+            label: "a add",
+            clickable: true,
+            id: FOOTER_MANAGER_ADD,
+        },
+        Shortcut {
+            label: "e edit",
+            clickable: true,
+            id: FOOTER_MANAGER_EDIT,
+        },
+        Shortcut {
+            label: "x delete",
+            clickable: true,
+            id: FOOTER_MANAGER_DELETE,
+        },
+        Shortcut {
+            label: "d details",
+            clickable: true,
+            id: FOOTER_MANAGER_DIAGNOSTIC,
+        },
+        Shortcut {
+            label: "m advanced",
+            clickable: true,
+            id: FOOTER_MANAGER_ADVANCED,
+        },
+        Shortcut {
+            label: "Esc close",
+            clickable: true,
+            id: FOOTER_MANAGER_CLOSE,
+        },
+    ]
+}
 
 const ADVANCED_MANAGER_SHORTCUTS: &[Shortcut<'static>] = &[
     Shortcut {
@@ -2808,9 +3349,14 @@ const ADVANCED_MANAGER_SHORTCUTS: &[Shortcut<'static>] = &[
         id: 0,
     },
     Shortcut {
-        label: "Enter choose folder",
+        label: "Enter choose access folder",
         clickable: true,
         id: FOOTER_MANAGER_OPEN_FOLDER,
+    },
+    Shortcut {
+        label: "o open project (worker)",
+        clickable: true,
+        id: FOOTER_MANAGER_PROJECT,
     },
     Shortcut {
         label: "c connect/disconnect",
@@ -2821,6 +3367,16 @@ const ADVANCED_MANAGER_SHORTCUTS: &[Shortcut<'static>] = &[
         label: "g grant",
         clickable: true,
         id: FOOTER_MANAGER_GRANT,
+    },
+    Shortcut {
+        label: "e edit",
+        clickable: true,
+        id: FOOTER_MANAGER_EDIT,
+    },
+    Shortcut {
+        label: "x delete",
+        clickable: true,
+        id: FOOTER_MANAGER_DELETE,
     },
     Shortcut {
         label: "u use",
@@ -2856,9 +3412,14 @@ const ADVANCED_MANAGER_WITH_BINDING_SHORTCUTS: &[Shortcut<'static>] = &[
         id: 0,
     },
     Shortcut {
-        label: "Enter choose folder",
+        label: "Enter set session default",
         clickable: true,
         id: FOOTER_MANAGER_OPEN_FOLDER,
+    },
+    Shortcut {
+        label: "o open project (worker)",
+        clickable: true,
+        id: FOOTER_MANAGER_PROJECT,
     },
     Shortcut {
         label: "c connect/disconnect",
@@ -2879,6 +3440,16 @@ const ADVANCED_MANAGER_WITH_BINDING_SHORTCUTS: &[Shortcut<'static>] = &[
         label: "r revoke / refresh",
         clickable: true,
         id: FOOTER_MANAGER_REVOKE,
+    },
+    Shortcut {
+        label: "e edit",
+        clickable: true,
+        id: FOOTER_MANAGER_EDIT,
+    },
+    Shortcut {
+        label: "x delete",
+        clickable: true,
+        id: FOOTER_MANAGER_DELETE,
     },
     Shortcut {
         label: "p ask each time",
@@ -2913,9 +3484,14 @@ const STANDALONE_ADVANCED_MANAGER_SHORTCUTS: &[Shortcut<'static>] = &[
         id: 0,
     },
     Shortcut {
-        label: "Enter choose folder",
+        label: "Enter connect",
         clickable: true,
         id: FOOTER_MANAGER_OPEN_FOLDER,
+    },
+    Shortcut {
+        label: "o open project (worker)",
+        clickable: true,
+        id: FOOTER_MANAGER_PROJECT,
     },
     Shortcut {
         label: "c connect/disconnect",
@@ -2933,6 +3509,16 @@ const STANDALONE_ADVANCED_MANAGER_SHORTCUTS: &[Shortcut<'static>] = &[
         id: FOOTER_MANAGER_REVOKE,
     },
     Shortcut {
+        label: "e edit",
+        clickable: true,
+        id: FOOTER_MANAGER_EDIT,
+    },
+    Shortcut {
+        label: "x delete",
+        clickable: true,
+        id: FOOTER_MANAGER_DELETE,
+    },
+    Shortcut {
         label: "d details",
         clickable: true,
         id: FOOTER_MANAGER_DIAGNOSTIC,
@@ -2946,6 +3532,19 @@ const STANDALONE_ADVANCED_MANAGER_SHORTCUTS: &[Shortcut<'static>] = &[
         label: "Esc close",
         clickable: true,
         id: FOOTER_MANAGER_CLOSE,
+    },
+];
+
+const DELETE_SHORTCUTS: &[Shortcut<'static>] = &[
+    Shortcut {
+        label: "Enter delete",
+        clickable: true,
+        id: FOOTER_DELETE_CONFIRM,
+    },
+    Shortcut {
+        label: "Esc cancel",
+        clickable: true,
+        id: FOOTER_DELETE_CANCEL,
     },
 ];
 
@@ -3222,11 +3821,6 @@ const GRANT_SHORTCUTS: &[Shortcut<'static>] = &[
         id: FOOTER_GRANT_LIFETIME,
     },
     Shortcut {
-        label: "Alt+d default",
-        clickable: true,
-        id: FOOTER_GRANT_DEFAULT,
-    },
-    Shortcut {
         label: "PgUp/PgDn inspect",
         clickable: false,
         id: 0,
@@ -3242,9 +3836,14 @@ const GRANT_SHORTCUTS: &[Shortcut<'static>] = &[
         id: FOOTER_GRANT_ALLOW,
     },
     Shortcut {
-        label: "Esc deny",
+        label: "n/Ctrl+d/click deny · Esc cancel",
         clickable: true,
         id: FOOTER_GRANT_DENY,
+    },
+    Shortcut {
+        label: "Alt+d default",
+        clickable: true,
+        id: FOOTER_GRANT_DEFAULT,
     },
 ];
 
@@ -3265,7 +3864,7 @@ const PROJECT_GRANT_SHORTCUTS: &[Shortcut<'static>] = &[
         id: FOOTER_GRANT_ALLOW,
     },
     Shortcut {
-        label: "Esc deny",
+        label: "n/Ctrl+d/click deny · Esc cancel",
         clickable: true,
         id: FOOTER_GRANT_DENY,
     },
@@ -3314,6 +3913,7 @@ pub fn render_ssh_modal(
         SshModalPage::Add(form) => form.field_hits.clear(),
         SshModalPage::Grant(card) => card.control_hits.clear(),
         SshModalPage::Manager
+        | SshModalPage::ConfirmDelete(_)
         | SshModalPage::ProjectBrowser
         | SshModalPage::OperationApproval(_)
         | SshModalPage::WorkerInstallFallback(_)
@@ -3325,30 +3925,45 @@ pub fn render_ssh_modal(
             "SSH targets",
             if state.session_id.is_none() && state.manager_advanced {
                 STANDALONE_ADVANCED_MANAGER_SHORTCUTS
+            } else if state.manager_advanced && state.pending_grant.is_some() {
+                ADVANCED_MANAGER_SHORTCUTS
             } else if state.manager_advanced && state.selected_active_binding_id().is_some() {
                 ADVANCED_MANAGER_WITH_BINDING_SHORTCUTS
             } else if state.manager_advanced {
                 ADVANCED_MANAGER_SHORTCUTS
+            } else if state.session_id.is_none() && state.pending_grant.is_none() {
+                STANDALONE_PRIMARY_MANAGER_SHORTCUTS
+            } else if state.pending_grant.is_some() {
+                PRIMARY_MANAGER_SHORTCUTS
+            } else if state.selected_active_binding_id().is_some() {
+                PRIMARY_MANAGER_WITH_BINDING_SHORTCUTS
             } else {
                 PRIMARY_MANAGER_SHORTCUTS
             },
         ),
         SshModalPage::Add(form) => (
-            "Add SSH target",
+            if form.is_editing() {
+                "Edit SSH target"
+            } else {
+                "Add SSH target"
+            },
             if form.submitting {
                 ADD_SUBMITTING_SHORTCUTS
             } else {
                 ADD_SHORTCUTS
             },
         ),
+        SshModalPage::ConfirmDelete(_) => ("Delete SSH target", DELETE_SHORTCUTS),
         SshModalPage::Grant(card) => (
             if card.is_project_consent() {
-                "Open remote project"
+                "Open remote project (requires worker)"
             } else {
-                "SSH access grant"
+                "Authorize SSH access (no worker)"
             },
             if card.is_project_consent() {
                 PROJECT_GRANT_SHORTCUTS
+            } else if card.follow_up.is_some() {
+                &GRANT_SHORTCUTS[..GRANT_SHORTCUTS.len() - 1]
             } else {
                 GRANT_SHORTCUTS
             },
@@ -3357,8 +3972,8 @@ pub fn render_ssh_modal(
             .project_browser
             .as_ref()
             .is_some_and(|browser| browser.purpose.is_project_open())
-            .then_some(("Choose remote folder", PROJECT_BROWSER_SHORTCUTS))
-            .unwrap_or(("Choose folder for SSH grants", GRANT_BROWSER_SHORTCUTS)),
+            .then_some(("Choose project folder (requires worker)", PROJECT_BROWSER_SHORTCUTS))
+            .unwrap_or(("Choose SSH access folder (no worker)", GRANT_BROWSER_SHORTCUTS)),
         SshModalPage::OperationApproval(_) => {
             ("SSH operation approval", OPERATION_APPROVAL_SHORTCUTS)
         }
@@ -3406,6 +4021,7 @@ pub fn render_ssh_modal(
     } else {
         match &mut state.page {
             SshModalPage::Add(form) => render_add(buf, content, form, theme),
+            SshModalPage::ConfirmDelete(card) => render_delete_confirmation(buf, content, card, theme),
             SshModalPage::Grant(card) => render_grant(buf, content, card, theme),
             SshModalPage::ProjectBrowser => {
                 if let Some(browser) = state.project_browser.as_mut() {
@@ -3478,7 +4094,7 @@ fn render_manager(buf: &mut Buffer, area: Rect, state: &mut SshManagerState, the
             Style::default().fg(theme.text_secondary)
         };
         let prefix = if selected { "› " } else { "  " };
-        let line = format!("{prefix}{}  [{}]", target.label, target.source);
+        let line = format!("{prefix}{}  [{}]", target.label, target.source_display());
         buf.set_stringn(area.x, y, line, area.width as usize, base);
         let connection = if target.connected {
             "connected"
@@ -3506,7 +4122,7 @@ fn render_manager(buf: &mut Buffer, area: Rect, state: &mut SshManagerState, the
         buf.set_stringn(
             area.x,
             y.saturating_add(2),
-            format!("  {}", target.connection_detail),
+            format!("  ID {} · {}", target.target_id, target.connection_detail),
             area.width as usize,
             if target.connected {
                 Style::default().fg(theme.accent_success)
@@ -3862,6 +4478,51 @@ fn render_add(buf: &mut Buffer, area: Rect, form: &mut SshManualTargetForm, them
     }
 }
 
+fn render_delete_confirmation(
+    buf: &mut Buffer,
+    area: Rect,
+    card: &SshDeleteConfirmation,
+    theme: &Theme,
+) {
+    let impact = match (card.connected, card.has_active_grants) {
+        (true, true) => "The active SSH connection will be disconnected and active grants will be revoked.",
+        (true, false) => "The active SSH connection will be disconnected.",
+        (false, true) => "Active SSH grants will be revoked.",
+        (false, false) => "This target has no active connection or grants.",
+    };
+    let status = card.error.as_deref().or_else(|| card.submitting.then_some("Deleting target…"));
+    let mut lines = vec![
+        format!("Delete SSH target “{}”?", card.label),
+        "This removes its Groky-managed configuration. This cannot be undone here.".into(),
+        impact.into(),
+    ];
+    if let Some(status) = status {
+        lines.push(status.into());
+    }
+    let width = area.width as usize;
+    let mut y = area.y;
+    for (index, line) in lines.iter().enumerate() {
+        let style = if index == 0 {
+            Style::default()
+                .fg(theme.accent_error)
+                .add_modifier(Modifier::BOLD)
+        } else if card.error.is_some() && index + 1 == lines.len() {
+            Style::default()
+                .fg(theme.accent_error)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(theme.text_secondary)
+        };
+        for wrapped in modal_window::word_wrap(line, width.max(1)) {
+            if y >= area.bottom() {
+                return;
+            }
+            buf.set_stringn(area.x, y, wrapped, width, style);
+            y = y.saturating_add(1);
+        }
+    }
+}
+
 struct GrantRenderLine {
     text: String,
     focus: Option<SshGrantFocus>,
@@ -3900,6 +4561,17 @@ fn render_grant(buf: &mut Buffer, area: Rect, card: &mut SshGrantCard, theme: &T
             format!("Server: {}", card.target_label)
         } else {
             format!("Target: {} ({})", card.target_label, card.target_id)
+        },
+        width,
+        None,
+        false,
+    );
+    push_grant_wrapped(
+        &mut lines,
+        if card.is_project_consent() {
+            "Opens a separate remote project session. Requires a matching remote worker; Groky installs it when supported."
+        } else {
+            "Allows SSH tools in this session. Uses SSH/SFTP directly; no remote worker is installed."
         },
         width,
         None,
@@ -4000,10 +4672,16 @@ fn render_grant(buf: &mut Buffer, area: Rect, card: &mut SshGrantCard, theme: &T
             &mut lines,
             format!(
                 "Default SSH target: {}",
-                if card.set_default { "yes" } else { "no" }
+                if card.follow_up.is_some() {
+                    "yes (selected after approval)"
+                } else if card.set_default {
+                    "yes"
+                } else {
+                    "no"
+                }
             ),
             width,
-            Some(SshGrantFocus::Default),
+            card.follow_up.is_none().then_some(SshGrantFocus::Default),
             false,
         );
     }
@@ -5015,6 +5693,9 @@ pub fn handle_ssh_key(state: &mut SshManagerState, key: &KeyEvent) -> SshModalOu
     if matches!(&state.page, SshModalPage::Manager) {
         return handle_manager_key(state, key);
     }
+    if matches!(&state.page, SshModalPage::ConfirmDelete(_)) {
+        return handle_delete_key(state, key);
+    }
     if matches!(&state.page, SshModalPage::ProjectBrowser) {
         return handle_project_browser_key(state, key);
     }
@@ -5025,8 +5706,8 @@ pub fn handle_ssh_key(state: &mut SshManagerState, key: &KeyEvent) -> SshModalOu
         SshModalPage::WorkerInstallFallback(card) => handle_worker_install_fallback_key(card, key),
         SshModalPage::Authentication(card) => handle_authentication_key(card, key),
         SshModalPage::Diagnostic(card) => handle_diagnostic_key(card, key),
-        SshModalPage::Manager | SshModalPage::ProjectBrowser => {
-            unreachable!("manager and browser are handled before borrowing modal page")
+        SshModalPage::Manager | SshModalPage::ConfirmDelete(_) | SshModalPage::ProjectBrowser => {
+            unreachable!("manager, deletion, and browser pages are handled before borrowing modal page")
         }
     };
     if matches!(&outcome, SshModalOutcome::AnswerAuthentication { .. }) {
@@ -5038,10 +5719,14 @@ pub fn handle_ssh_key(state: &mut SshManagerState, key: &KeyEvent) -> SshModalOu
 fn footer_key_for(page: &SshModalPage, id: usize) -> Option<KeyEvent> {
     let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
     let alt = |code| KeyEvent::new(code, KeyModifiers::ALT);
+    let ctrl = |code| KeyEvent::new(code, KeyModifiers::CONTROL);
     match (page, id) {
         (SshModalPage::Manager, FOOTER_MANAGER_OPEN_FOLDER) => Some(key(KeyCode::Enter)),
+        (SshModalPage::Manager, FOOTER_MANAGER_PROJECT) => Some(key(KeyCode::Char('o'))),
         (SshModalPage::Manager, FOOTER_MANAGER_CONNECTION) => Some(key(KeyCode::Char('c'))),
         (SshModalPage::Manager, FOOTER_MANAGER_ADD) => Some(key(KeyCode::Char('a'))),
+        (SshModalPage::Manager, FOOTER_MANAGER_EDIT) => Some(key(KeyCode::Char('e'))),
+        (SshModalPage::Manager, FOOTER_MANAGER_DELETE) => Some(key(KeyCode::Char('x'))),
         (SshModalPage::Manager, FOOTER_MANAGER_ADVANCED) => Some(key(KeyCode::Char('m'))),
         (SshModalPage::Manager, FOOTER_MANAGER_GRANT) => Some(key(KeyCode::Char('g'))),
         (SshModalPage::Manager, FOOTER_MANAGER_USE) => Some(key(KeyCode::Char('u'))),
@@ -5053,6 +5738,12 @@ fn footer_key_for(page: &SshModalPage, id: usize) -> Option<KeyEvent> {
         (SshModalPage::Manager, FOOTER_MANAGER_CLOSE) => Some(key(KeyCode::Esc)),
         (SshModalPage::Add(form), FOOTER_ADD_SAVE) if !form.submitting => Some(key(KeyCode::Enter)),
         (SshModalPage::Add(_), FOOTER_ADD_CANCEL) => Some(key(KeyCode::Esc)),
+        (SshModalPage::ConfirmDelete(card), FOOTER_DELETE_CONFIRM) if !card.submitting => {
+            Some(key(KeyCode::Enter))
+        }
+        (SshModalPage::ConfirmDelete(card), FOOTER_DELETE_CANCEL) if !card.submitting => {
+            Some(key(KeyCode::Esc))
+        }
         (SshModalPage::Grant(_), FOOTER_GRANT_READ) => Some(alt(KeyCode::Char('r'))),
         (SshModalPage::Grant(_), FOOTER_GRANT_WRITE) => Some(alt(KeyCode::Char('w'))),
         (SshModalPage::Grant(_), FOOTER_GRANT_EXECUTE) => Some(alt(KeyCode::Char('x'))),
@@ -5063,7 +5754,7 @@ fn footer_key_for(page: &SshModalPage, id: usize) -> Option<KeyEvent> {
             Some(alt(KeyCode::Char('d')))
         }
         (SshModalPage::Grant(_), FOOTER_GRANT_ALLOW) => Some(key(KeyCode::Enter)),
-        (SshModalPage::Grant(_), FOOTER_GRANT_DENY) => Some(key(KeyCode::Esc)),
+        (SshModalPage::Grant(_), FOOTER_GRANT_DENY) => Some(ctrl(KeyCode::Char('d'))),
         (SshModalPage::ProjectBrowser, FOOTER_BROWSER_PARENT) => Some(key(KeyCode::Backspace)),
         (SshModalPage::ProjectBrowser, FOOTER_BROWSER_OPEN) => Some(key(KeyCode::Char('o'))),
         (SshModalPage::ProjectBrowser, FOOTER_MANAGER_CLOSE) => Some(key(KeyCode::Esc)),
@@ -5187,6 +5878,7 @@ pub fn handle_ssh_paste(state: &mut SshManagerState, text: &str) -> SshModalOutc
         }
         SshModalPage::Grant(_)
         | SshModalPage::Manager
+        | SshModalPage::ConfirmDelete(_)
         | SshModalPage::OperationApproval(_)
         | SshModalPage::WorkerInstallFallback(_)
         | SshModalPage::Diagnostic(_) => return SshModalOutcome::Unchanged,
@@ -5308,6 +6000,7 @@ pub fn handle_ssh_mouse(state: &mut SshManagerState, mouse: &MouseEvent) -> SshM
                 unreachable!("browser mouse rows are handled before borrowing modal page")
             }
             SshModalPage::Manager
+            | SshModalPage::ConfirmDelete(_)
             | SshModalPage::Add(_)
             | SshModalPage::OperationApproval(_)
             | SshModalPage::WorkerInstallFallback(_)
@@ -5392,7 +6085,9 @@ pub fn handle_ssh_mouse(state: &mut SshManagerState, mouse: &MouseEvent) -> SshM
         SshModalPage::ProjectBrowser => {
             unreachable!("browser scrolling is handled before borrowing modal page")
         }
-        SshModalPage::Manager | SshModalPage::Add(_) => SshModalOutcome::Unchanged,
+        SshModalPage::Manager | SshModalPage::ConfirmDelete(_) | SshModalPage::Add(_) => {
+            SshModalOutcome::Unchanged
+        }
     }
 }
 
@@ -5457,29 +6152,14 @@ fn scroll_project_browser(state: &mut SshManagerState, delta: isize) -> SshModal
     SshModalOutcome::Changed
 }
 
-fn deny_grant_once(
-    state: &mut SshManagerState,
-    request_id: String,
-    lifetime: SshGrantLifetime,
-    set_default: bool,
-) -> SshModalOutcome {
+
+fn cancel_grant_once(state: &mut SshManagerState, request_id: String) -> SshModalOutcome {
     if state.cancelled_grant_ids.iter().any(|id| id == &request_id) {
         return SshModalOutcome::Changed;
     }
     state.inspecting_grant_ids.retain(|id| id != &request_id);
-    if state.cancelled_grant_ids.len() == 16 {
-        state.cancelled_grant_ids.remove(0);
-    }
-    state.cancelled_grant_ids.push(request_id.clone());
-    SshModalOutcome::ApproveGrant {
-        request_id,
-        approved: false,
-        target_id: None,
-        root: None,
-        capabilities: None,
-        lifetime,
-        set_default,
-    }
+    state.remember_terminal_grant_id(&request_id);
+    SshModalOutcome::CancelGrant { request_id }
 }
 
 fn close_current_page(state: &mut SshManagerState) -> SshModalOutcome {
@@ -5507,12 +6187,9 @@ fn close_current_page(state: &mut SshManagerState) -> SshModalOutcome {
         state.project_browser = None;
         state.page = SshModalPage::Manager;
         return match purpose {
-            Some(SshDirectoryPurpose::PendingGrant { request_id }) => deny_grant_once(
-                state,
-                request_id,
-                SshGrantLifetime::CurrentSession,
-                false,
-            ),
+            Some(SshDirectoryPurpose::PendingGrant { request_id }) => {
+                cancel_grant_once(state, request_id)
+            }
             Some(SshDirectoryPurpose::LocalGrant { .. }) if !browser_dispatched => {
                 SshModalOutcome::Changed
             }
@@ -5533,12 +6210,7 @@ fn close_current_page(state: &mut SshManagerState) -> SshModalOutcome {
                     Some(LocalGrantOptions {
                         request_id: Some(request_id),
                         ..
-                    }) => deny_grant_once(
-                        state,
-                        request_id,
-                        SshGrantLifetime::CurrentSession,
-                        false,
-                    ),
+                    }) => cancel_grant_once(state, request_id),
                     Some(_) => SshModalOutcome::Changed,
                     None => {
                         state.pending_grant_follow_up = None;
@@ -5548,6 +6220,10 @@ fn close_current_page(state: &mut SshManagerState) -> SshModalOutcome {
             }
             Some(SshDirectoryPurpose::ProjectOpen) | None => SshModalOutcome::Changed,
         };
+    }
+    if matches!(&state.page, SshModalPage::ConfirmDelete(_)) {
+        state.return_to_manager();
+        return SshModalOutcome::Changed;
     }
     if let SshModalPage::Diagnostic(card) = &mut state.page {
         state.page = if let Some(grant) = card.return_grant.take() {
@@ -5594,28 +6270,22 @@ fn close_current_page(state: &mut SshManagerState) -> SshModalOutcome {
             answers: Vec::new(),
         };
     }
-    let grant_denial = match &state.page {
-        SshModalPage::Manager => state.pending_grant.as_ref().map(|request| {
-            (
-                request.request_id.clone(),
-                SshGrantLifetime::CurrentSession,
-                false,
-            )
-        }),
-        SshModalPage::Grant(card) => Some((
-            card.request_id.clone(),
-            card.lifetime,
-            card.set_default,
-        )),
+    let grant_cancellation = match &state.page {
+        SshModalPage::Manager => state
+            .pending_grant
+            .as_ref()
+            .map(|request| request.request_id.clone()),
+        SshModalPage::Grant(card) => Some(card.request_id.clone()),
         SshModalPage::Add(_)
+        | SshModalPage::ConfirmDelete(_)
         | SshModalPage::ProjectBrowser
         | SshModalPage::OperationApproval(_)
         | SshModalPage::WorkerInstallFallback(_)
         | SshModalPage::Authentication(_)
         | SshModalPage::Diagnostic(_) => None,
     };
-    if let Some((request_id, lifetime, set_default)) = grant_denial {
-        return deny_grant_once(state, request_id, lifetime, set_default);
+    if let Some(request_id) = grant_cancellation {
+        return cancel_grant_once(state, request_id);
     }
     match &state.page {
         SshModalPage::Manager => SshModalOutcome::Close,
@@ -5637,6 +6307,9 @@ fn close_current_page(state: &mut SshManagerState) -> SshModalOutcome {
             unreachable!("project browser was handled before read-only match")
         }
         SshModalPage::Add(_) => unreachable!("add page returned before read-only match"),
+        SshModalPage::ConfirmDelete(_) => {
+            unreachable!("delete confirmation returned before read-only match")
+        }
         SshModalPage::Diagnostic(_) => unreachable!("diagnostic returned before read-only match"),
     }
 }
@@ -5702,6 +6375,56 @@ fn begin_grant_flow(
         SshDirectoryPurpose::LocalGrant { follow_up },
     )
 }
+fn open_target_edit(state: &mut SshManagerState) -> SshModalOutcome {
+    let Some((target, connected, read_only_message)) = state.selected_target().map(|target| {
+        (
+            target.is_manual().then(|| target.target.clone()),
+            target.connected,
+            target.read_only_message(),
+        )
+    }) else {
+        state.show_info("Select an SSH target to edit.");
+        return SshModalOutcome::Changed;
+    };
+    if let Some(target) = target {
+        state.page = SshModalPage::Add(SshManualTargetForm::editing(target));
+    } else if let Some(message) = read_only_message {
+        state.page = SshModalPage::Diagnostic(SshDiagnosticCard::details(message, connected, None));
+    }
+    SshModalOutcome::Changed
+}
+
+fn open_target_delete(state: &mut SshManagerState) -> SshModalOutcome {
+    let Some((target, target_id, connected, read_only_message)) = state.selected_target().map(|target| {
+        (
+            target.is_manual().then(|| target.target.clone()),
+            target.target_id.clone(),
+            target.connected,
+            target.read_only_message(),
+        )
+    }) else {
+        state.show_info("Select an SSH target to delete.");
+        return SshModalOutcome::Changed;
+    };
+    if let Some(target) = target {
+        let has_active_grants = state.targets.iter().any(|view| {
+            view.target_id == target_id
+                && matches!(
+                    &view.grant,
+                    SshGrantView::Granted { .. } | SshGrantView::Revoking { .. }
+                )
+        });
+        state.page = SshModalPage::ConfirmDelete(SshDeleteConfirmation::new(
+            target,
+            connected,
+            has_active_grants,
+        ));
+    } else if let Some(message) = read_only_message {
+        state.page = SshModalPage::Diagnostic(SshDiagnosticCard::details(message, connected, None));
+    }
+    SshModalOutcome::Changed
+}
+
 
 fn handle_manager_key(state: &mut SshManagerState, key: &KeyEvent) -> SshModalOutcome {
     match key.code {
@@ -5720,6 +6443,8 @@ fn handle_manager_key(state: &mut SshManagerState, key: &KeyEvent) -> SshModalOu
             state.page = SshModalPage::Add(Default::default());
             SshModalOutcome::Changed
         }
+        KeyCode::Char('e') if key.modifiers.is_empty() => open_target_edit(state),
+        KeyCode::Char('x') if key.modifiers.is_empty() => open_target_delete(state),
         KeyCode::Char('d') if key.modifiers.is_empty() => {
             if state.open_diagnostic() {
                 SshModalOutcome::Changed
@@ -5745,25 +6470,46 @@ fn handle_manager_key(state: &mut SshManagerState, key: &KeyEvent) -> SshModalOu
                 }
             }
         }
-        KeyCode::Enter => {
-            if state
-                .pending_grant
-                .as_ref()
-                .is_some_and(|request| request.target_id.is_none())
-            {
+        KeyCode::Enter if key.modifiers.is_empty() => {
+            if state.pending_grant.is_some() {
+                return begin_grant_flow(state, None);
+            }
+            if state.session_id.is_some() {
+                return state
+                    .selected_active_binding_id()
+                    .map(|binding_id| SshModalOutcome::UseBinding {
+                        binding_id: binding_id.to_owned(),
+                    })
+                    .unwrap_or_else(|| begin_grant_flow(state, Some(SshGrantFollowUp::UseBinding)));
+            }
+            match state.selected_target() {
+                Some(target) if target.connected => {
+                    state.show_info("Connected. Use /ssh in a chat to authorize SSH tools without a worker; o opens a remote project with a worker.");
+                    SshModalOutcome::Changed
+                }
+                Some(target) => SshModalOutcome::Connect {
+                    target_id: target.target_id.clone(),
+                },
+                None => {
+                    state.show_info("Select an SSH target to connect.");
+                    SshModalOutcome::Changed
+                }
+            }
+        }
+        KeyCode::Char('o') if key.modifiers.is_empty() => {
+            // A model's pending access request must remain an access flow, never become a project.
+            if state.pending_grant.is_some() {
                 return begin_grant_flow(state, None);
             }
             let Some(target_id) = state.selected_target().map(|target| target.target_id.clone())
             else {
-                state.show_error("Select an SSH target before choosing a remote folder.");
+                state.show_info("Select an SSH target before opening a remote project.");
                 return SshModalOutcome::Changed;
             };
             state.begin_project_browser(target_id, None)
         }
         KeyCode::Char('g')
-            if key.modifiers.is_empty()
-                && state.manager_advanced
-                && state.session_id.is_some() =>
+            if key.modifiers.is_empty() && state.session_id.is_some() =>
         {
             begin_grant_flow(state, None)
         }
@@ -6014,6 +6760,30 @@ fn handle_project_browser_key(state: &mut SshManagerState, key: &KeyEvent) -> Ss
     }
 }
 
+fn handle_delete_key(state: &mut SshManagerState, key: &KeyEvent) -> SshModalOutcome {
+    match key.code {
+        KeyCode::Esc if key.modifiers.is_empty() => {
+            state.return_to_manager();
+            SshModalOutcome::Changed
+        }
+        KeyCode::Enter if key.modifiers.is_empty() => {
+            let SshModalPage::ConfirmDelete(card) = &mut state.page else {
+                return SshModalOutcome::Unchanged;
+            };
+            if card.submitting {
+                return SshModalOutcome::Unchanged;
+            }
+            let expected = card.expected.clone();
+            let submission_id = card.start_submit();
+            SshModalOutcome::RemoveTarget {
+                expected,
+                submission_id,
+            }
+        }
+        _ => SshModalOutcome::Unchanged,
+    }
+}
+
 fn handle_add_key(form: &mut SshManualTargetForm, key: &KeyEvent) -> SshModalOutcome {
     if form.submitting {
         return SshModalOutcome::Unchanged;
@@ -6029,8 +6799,20 @@ fn handle_add_key(form: &mut SshManualTargetForm, key: &KeyEvent) -> SshModalOut
             SshModalOutcome::Changed
         }
         KeyCode::Enter => match form.start_submit() {
-            Ok((draft, submission_id)) => SshModalOutcome::AddTarget {
+            Ok(TargetFormSubmission::Add {
                 draft,
+                submission_id,
+            }) => SshModalOutcome::AddTarget {
+                draft,
+                submission_id,
+            },
+            Ok(TargetFormSubmission::Update {
+                expected,
+                replacement,
+                submission_id,
+            }) => SshModalOutcome::UpdateTarget {
+                expected,
+                replacement,
                 submission_id,
             },
             Err(error) => {
@@ -6068,7 +6850,10 @@ fn activate_grant_focus(card: &mut SshGrantCard) {
         }
         SshGrantFocus::Read | SshGrantFocus::Write | SshGrantFocus::Execute => {}
         SshGrantFocus::Lifetime => card.lifetime = card.lifetime.toggle(),
-        SshGrantFocus::Default => card.set_default = !card.set_default,
+        SshGrantFocus::Default if card.follow_up.is_none() => {
+            card.set_default = !card.set_default;
+        }
+        SshGrantFocus::Default => {}
         SshGrantFocus::RememberProject => {
             if let Some(project) = card.project.as_mut() {
                 project.remember = !project.remember;
@@ -6080,25 +6865,40 @@ fn activate_grant_focus(card: &mut SshGrantCard) {
     }
 }
 
+fn explicit_grant_denial(card: &SshGrantCard) -> SshModalOutcome {
+    SshModalOutcome::ApproveGrant {
+        request_id: card.request_id.clone(),
+        approved: false,
+        target_id: None,
+        root: None,
+        capabilities: None,
+        lifetime: if card.is_project_consent() && card.project_remember() {
+            SshGrantLifetime::ProjectRule
+        } else {
+            card.lifetime
+        },
+        set_default: if card.is_project_consent() {
+            false
+        } else {
+            card.set_default
+        },
+    }
+}
+
 fn handle_grant_key(card: &mut SshGrantCard, key: &KeyEvent) -> SshModalOutcome {
     match key.code {
-        KeyCode::Esc => SshModalOutcome::ApproveGrant {
+        KeyCode::Esc => SshModalOutcome::CancelGrant {
             request_id: card.request_id.clone(),
-            approved: false,
-            target_id: None,
-            root: None,
-            capabilities: None,
-            lifetime: if card.is_project_consent() && card.project_remember() {
-                SshGrantLifetime::ProjectRule
-            } else {
-                card.lifetime
-            },
-            set_default: if card.is_project_consent() {
-                false
-            } else {
-                card.set_default
-            },
         },
+        KeyCode::Char('n')
+            if key.modifiers.is_empty()
+                && (card.focus != SshGrantFocus::Root || card.verified_root) =>
+        {
+            explicit_grant_denial(card)
+        }
+        KeyCode::Char('d') if key.modifiers == KeyModifiers::CONTROL => {
+            explicit_grant_denial(card)
+        }
         KeyCode::Tab => {
             card.focus_next(false);
             SshModalOutcome::Changed
@@ -6149,7 +6949,9 @@ fn handle_grant_key(card: &mut SshGrantCard, key: &KeyEvent) -> SshModalOutcome 
             SshModalOutcome::Changed
         }
         KeyCode::Char('d')
-            if key.modifiers == KeyModifiers::ALT && !card.is_project_consent() =>
+            if key.modifiers == KeyModifiers::ALT
+                && !card.is_project_consent()
+                && card.follow_up.is_none() =>
         {
             card.focus = SshGrantFocus::Default;
             activate_grant_focus(card);
@@ -7040,16 +7842,74 @@ mod tests {
         KeyEvent::new(code, KeyModifiers::NONE)
     }
 
-    fn target_view(target_id: &str, grant: SshGrantView) -> SshTargetView {
-        SshTargetView {
-            target_id: target_id.into(),
-            label: format!("{target_id} label"),
-            source: "manual".into(),
-            effective_address: "user@example.test:22".into(),
-            connected: false,
-            connection_detail: "Disconnected.".into(),
-            grant,
+    #[test]
+    fn direct_ssh_name_waits_for_session_then_authorizes_once() {
+        let mut state = SshManagerState::new(None);
+        state.queue_target_reference("server-1 label".into());
+        state.set_targets(vec![target_view("server-1", SshGrantView::NotGranted)]);
+        assert!(matches!(state.continue_target_reference(), SshModalOutcome::Unchanged));
+        state.session_id = Some("session-1".into());
+        assert!(matches!(
+            state.continue_target_reference(),
+            SshModalOutcome::BrowseProjectDirectory { target_id, .. } if target_id == "server-1"
+        ));
+        assert!(matches!(state.continue_target_reference(), SshModalOutcome::Unchanged));
+    }
+
+    #[test]
+    fn direct_ssh_selection_reuses_only_an_unambiguous_binding() {
+        let mut state = SshManagerState::new(Some("session-1".into()));
+        state.set_targets(vec![target_view("server-1", granted("binding-1", "/a"))]);
+        state.queue_target_reference("server-1".into());
+        assert!(matches!(
+            state.continue_target_reference(),
+            SshModalOutcome::UseBinding { binding_id } if binding_id == "binding-1"
+        ));
+        state.set_targets(vec![
+            target_view("server-1", granted("binding-1", "/a")),
+            target_view("server-1", granted("binding-2", "/b")),
+        ]);
+        state.queue_target_reference("server-1".into());
+        assert!(matches!(state.continue_target_reference(), SshModalOutcome::Changed));
+        assert!(state.project_browser.is_none());
+        assert!(state.message.as_ref().unwrap().0.contains("multiple access bindings"));
+    }
+
+    #[test]
+    fn direct_ssh_selection_never_guesses_missing_or_duplicate_names() {
+        let mut state = SshManagerState::new(Some("session-1".into()));
+        let first = target_view("server-1", SshGrantView::NotGranted);
+        let mut second = target_view("server-2", SshGrantView::NotGranted);
+        second.target.label = first.target.label.clone();
+        state.set_targets(vec![target_view("unrelated", SshGrantView::NotGranted), first, second]);
+        for name in ["server-1 label", "server"] {
+            state.queue_target_reference(name.into());
+            assert!(matches!(state.continue_target_reference(), SshModalOutcome::Changed));
+            assert!(state.project_browser.is_none());
+            assert!(matches!(state.page, SshModalPage::Manager));
+            assert_eq!(
+                state.targets.iter().map(|view| view.target_id.as_str()).collect::<Vec<_>>(),
+                ["server-1", "server-2"],
+            );
         }
+        state.queue_target_reference("server-2".into());
+        assert!(matches!(
+            state.continue_target_reference(),
+            SshModalOutcome::BrowseProjectDirectory { target_id, .. } if target_id == "server-2"
+        ));
+    }
+
+    fn target_view(target_id: &str, grant: SshGrantView) -> SshTargetView {
+        let mut target = xai_grok_ssh::SshTarget::new(target_id);
+        target.id = target_id.into();
+        target.label = format!("{target_id} label");
+        SshTargetView::from_target(
+            target,
+            "user@example.test:22".into(),
+            false,
+            "Disconnected.".into(),
+            grant,
+        )
     }
 
     fn granted(binding_id: &str, root: &str) -> SshGrantView {
@@ -7119,31 +7979,20 @@ mod tests {
     }
 
     #[test]
-    fn primary_folder_browser_uses_real_directory_rows_and_ignores_stale_navigation() {
+    fn explicit_project_browser_uses_real_directory_rows_and_ignores_stale_navigation() {
         let mut state = SshManagerState::new(Some("source-session".into()));
         state.set_targets(vec![target_view("server-1", SshGrantView::NotGranted)]);
-        assert!(matches!(
-            handle_ssh_key(&mut state, &key(KeyCode::Char('g'))),
-            SshModalOutcome::Unchanged
-        ));
-        assert!(matches!(
-            handle_ssh_key(&mut state, &key(KeyCode::Char('u'))),
-            SshModalOutcome::Unchanged
-        ));
-        assert!(matches!(
-            handle_ssh_key(&mut state, &key(KeyCode::Char('o'))),
-            SshModalOutcome::Unchanged
-        ));
         let SshModalOutcome::BrowseProjectDirectory {
             request_id,
             target_id,
             path,
-        } = handle_ssh_key(&mut state, &key(KeyCode::Enter))
+        } = handle_ssh_key(&mut state, &key(KeyCode::Char('o')))
         else {
-            panic!("Enter must begin the folder browser");
+            panic!("Explicit project action must begin the project folder browser");
         };
         assert_eq!(target_id, "server-1");
         assert_eq!(path, None);
+        assert!(state.project_browser.as_ref().unwrap().purpose.is_project_open());
         assert!(!state.settle_project_directory(
             request_id,
             "other-server",
@@ -7395,7 +8244,10 @@ mod tests {
             "project-session".into(),
         ));
         assert!(matches!(
-            handle_ssh_key(&mut state, &key(KeyCode::Esc)),
+            handle_ssh_key(
+                &mut state,
+                &KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL),
+            ),
             SshModalOutcome::ApproveGrant {
                 request_id,
                 approved: false,
@@ -7409,6 +8261,46 @@ mod tests {
         );
         assert!(state.finish_project_preparation(open_request, None));
         assert_eq!(state.pending_project_open_tuple(), None);
+    }
+
+    #[test]
+    fn terminal_grant_cancellation_releases_project_preparation() {
+        let mut state = SshManagerState::new(Some("source-session".into()));
+        state.pending_project_open = Some(PendingProjectOpen {
+            request_id: 7,
+            session_id: "project-session".into(),
+            target_id: "server-1".into(),
+            original_root: "/srv/project".into(),
+        });
+        state.pending_grant = Some(SshIncomingGrant {
+            request_id: "grant-request".into(),
+            target_id: Some("server-1".into()),
+            root: Some("/srv/project".into()),
+            capabilities: SshCapabilitiesView::default(),
+            verified_identity: Some("builder@build.example.test:22".into()),
+            reason: "Open the selected project.".into(),
+            awaiting_tool: false,
+        });
+        state.pending_grant_session_id = Some("project-session".into());
+        let mut card = SshGrantCard::new(
+            "grant-request".into(),
+            "server-1".into(),
+            "Build server".into(),
+            Some("builder@build.example.test:22".into()),
+            "/srv/project",
+            None,
+            false,
+        );
+        card.project = Some(SshProjectConsent {
+            request_id: 7,
+            canonical_root: "/srv/project".into(),
+            remember: false,
+        });
+        state.page = SshModalPage::Grant(card);
+
+        assert!(state.settle_grant_cancellation("grant-request"));
+        assert_eq!(state.pending_project_open_tuple(), None);
+        assert!(matches!(&state.page, SshModalPage::Manager));
     }
 
     #[test]
@@ -7537,6 +8429,12 @@ mod tests {
             SshModalOutcome::Changed
         ));
         assert!(card.capabilities.write);
+        card.focus = SshGrantFocus::Lifetime;
+        card.focus_next(false);
+        assert_eq!(card.focus, SshGrantFocus::Read);
+        handle_grant_key(card, &KeyEvent::new(KeyCode::Char('d'), KeyModifiers::ALT));
+        assert_eq!(card.focus, SshGrantFocus::Read);
+        assert!(!card.set_default);
         assert_eq!(
             state.take_grant_follow_up("advanced-use-grant"),
             Some(SshGrantFollowUp::UseBinding)
@@ -7622,6 +8520,27 @@ mod tests {
             add_submission_id(handle_ssh_key(&mut replacement, &key(KeyCode::Enter)));
         assert_ne!(third_submission, replacement_submission);
         assert_ne!(state.instance_id(), replacement.instance_id());
+    }
+
+    #[test]
+    fn duplicate_candidate_labels_render_stable_identity_and_provenance() {
+        let mut manual = target_view("manual-target", SshGrantView::NotGranted);
+        manual.label = "Build".into();
+        let mut imported = target_view("imported-alias", SshGrantView::NotGranted);
+        imported.label = "Build".into();
+        imported.target.source = xai_grok_ssh::TargetSource::Imported {
+            path: std::path::PathBuf::from("/home/fixture/.ssh/config"),
+            line: 42,
+        };
+        let mut state = SshManagerState::new(Some("session-1".into()));
+        state.set_targets(vec![manual, imported]);
+        let area = Rect::new(0, 0, 100, 24);
+        let mut buffer = Buffer::empty(area);
+        render_ssh_modal(&mut buffer, area, &mut state, false, &Theme::current());
+        let visible = buffer_text(&buffer);
+        assert!(visible.contains("manual-target"));
+        assert!(visible.contains("imported-alias"));
+        assert!(visible.contains(".ssh/config:42"));
     }
 
     #[test]
@@ -7776,6 +8695,39 @@ mod tests {
             SshModalOutcome::Changed
         ));
         assert_eq!(card.focus, SshGrantFocus::Read);
+    }
+
+    #[test]
+    fn grant_root_editor_keeps_n_as_text_while_explicit_deny_remains_available() {
+        let mut card = SshGrantCard::new(
+            "request-1".into(),
+            "target-1".into(),
+            "Build host".into(),
+            None,
+            "/remote/root",
+            None,
+            false,
+        );
+        assert_eq!(card.focus, SshGrantFocus::Root);
+        assert!(matches!(
+            handle_grant_key(&mut card, &key(KeyCode::Char('n'))),
+            SshModalOutcome::Changed
+        ));
+        assert_eq!(card.root.text(), "/remote/rootn");
+        assert!(matches!(
+            handle_grant_key(
+                &mut card,
+                &KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL)
+            ),
+            SshModalOutcome::ApproveGrant {
+                approved: false,
+                ..
+            }
+        ));
+        assert!(matches!(
+            handle_grant_key(&mut card, &key(KeyCode::Esc)),
+            SshModalOutcome::CancelGrant { request_id } if request_id == "request-1"
+        ));
     }
 
     #[test]
@@ -7984,11 +8936,8 @@ mod tests {
         ));
         assert!(matches!(
             handle_ssh_key(&mut state, &key(KeyCode::Esc)),
-            SshModalOutcome::ApproveGrant {
-                request_id,
-                approved: false,
-                ..
-            } if request_id == "incoming-rootless"
+            SshModalOutcome::CancelGrant { request_id }
+                if request_id == "incoming-rootless"
         ));
         assert_eq!(
             state.grant_session_id_for("incoming-rootless").as_deref(),
@@ -8014,9 +8963,37 @@ mod tests {
             ),
             SshModalOutcome::Unchanged
         ));
-        assert!(!state.fail_grant_inspection(
+        assert!(!state.fail_pending_grant(
             "incoming-rootless",
             "late inspection failure".into(),
+        ));
+    }
+
+    #[test]
+    fn terminal_failure_cannot_reopen_a_diagnostic_wrapped_grant() {
+        let mut state = SshManagerState::new(Some("manager-session".into()));
+        state.set_targets(vec![target_view("server-1", SshGrantView::NotGranted)]);
+        let request = SshIncomingGrant {
+            request_id: "failed-request".into(),
+            target_id: Some("server-1".into()),
+            root: Some("/srv/checkout".into()),
+            capabilities: SshCapabilitiesView::default(),
+            verified_identity: Some("builder@build.example.test:22".into()),
+            reason: "Inspect a remote checkout.".into(),
+            awaiting_tool: false,
+        };
+        assert!(matches!(
+            state.show_incoming_grant("source-session".into(), request.clone()),
+            SshModalOutcome::Changed
+        ));
+        assert!(state.fail_pending_grant("failed-request", "connection failed".into()));
+        assert!(state.settle_grant_failure("failed-request", "connection failed".into()));
+        assert!(matches!(close_current_page(&mut state), SshModalOutcome::Changed));
+        assert!(matches!(&state.page, SshModalPage::Manager));
+        assert_eq!(state.grant_session_id_for("failed-request"), None);
+        assert!(matches!(
+            state.show_incoming_grant("source-session".into(), request),
+            SshModalOutcome::Unchanged
         ));
     }
 
@@ -8143,7 +9120,7 @@ mod tests {
     }
 
     #[test]
-    fn cancelled_local_picker_denies_a_late_request_once() {
+    fn cancelled_local_picker_cancels_a_late_request_once() {
         let mut state = SshManagerState::new(Some("session-1".into()));
         state.set_targets(vec![target_view("server-1", SshGrantView::NotGranted)]);
         handle_ssh_key(&mut state, &key(KeyCode::Char('m')));
@@ -8191,11 +9168,8 @@ mod tests {
                     awaiting_tool: false,
                 },
             ),
-            SshModalOutcome::ApproveGrant {
-                request_id,
-                approved: false,
-                ..
-            } if request_id == "late-local-request"
+            SshModalOutcome::CancelGrant { request_id }
+                if request_id == "late-local-request"
         ));
         assert!(matches!(
             state.show_incoming_grant(
@@ -8228,11 +9202,14 @@ mod tests {
             false,
         ));
         state.show_error("SSH access failed: the requested remote root does not exist");
-        assert!(matches!(&state.page, SshModalPage::Diagnostic(_)));
-        let area = Rect::new(0, 0, 60, 20);
-        let mut buffer = Buffer::empty(area);
-        render_ssh_modal(&mut buffer, area, &mut state, false, &Theme::current());
-        assert!(buffer_text(&buffer).contains("does not exist"));
+        let SshModalPage::Diagnostic(card) = &state.page else {
+            panic!("grant failure must open a diagnostic");
+        };
+        assert!(card.is_error);
+        assert!(matches!(
+            &card.return_grant,
+            Some(grant) if grant.request_id == "request-1"
+        ));
         assert!(matches!(
             handle_ssh_key(&mut state, &key(KeyCode::Esc)),
             SshModalOutcome::Changed
@@ -8244,8 +9221,7 @@ mod tests {
         ));
         assert!(matches!(
             handle_ssh_key(&mut state, &key(KeyCode::Esc)),
-            SshModalOutcome::ApproveGrant { approved: false, request_id, .. }
-                if request_id == "request-1"
+            SshModalOutcome::CancelGrant { request_id } if request_id == "request-1"
         ));
     }
 
@@ -8505,6 +9481,77 @@ mod tests {
     }
 
     #[test]
+    fn primary_session_access_chooses_a_grant_without_project_preparation() {
+        let mut state = SshManagerState::new(Some("local-session".into()));
+        state.set_targets(vec![target_view("server-1", SshGrantView::NotGranted)]);
+        let area = Rect::new(0, 0, 120, 40);
+        render_ssh_modal(&mut Buffer::empty(area), area, &mut state, false, &Theme::current());
+        let action = state.window.shortcut_hits.iter()
+            .find(|hit| hit.id == FOOTER_MANAGER_OPEN_FOLDER).unwrap().rect;
+        let SshModalOutcome::BrowseProjectDirectory { request_id, .. } = handle_ssh_mouse(
+            &mut state,
+            &MouseEvent {
+                kind: MouseEventKind::Down(crossterm::event::MouseButton::Left),
+                column: action.x,
+                row: action.y,
+                modifiers: KeyModifiers::NONE,
+            },
+        ) else { panic!("Session access must choose an authorization folder"); };
+        assert!(!state.project_browser.as_ref().unwrap().purpose.is_project_open());
+        assert!(state.settle_project_directory(
+            request_id, "server-1",
+            Ok(directory_listing("server-1", "/srv", Some("/"), &[])),
+        ));
+        assert!(matches!(
+            handle_ssh_key(&mut state, &key(KeyCode::Char('o'))),
+            SshModalOutcome::RequestGrant { target_id, root, .. }
+                if target_id == "server-1" && root == "/srv"
+        ));
+        assert!(state.pending_project_open.is_none());
+        assert_eq!(state.session_id.as_deref(), Some("local-session"));
+    }
+
+    #[test]
+    fn sessionless_enter_connects_without_opening_a_project_or_disconnecting() {
+        let mut state = SshManagerState::new(None);
+        state.set_targets(vec![target_view("server-1", SshGrantView::NotGranted)]);
+        assert!(matches!(
+            handle_ssh_key(&mut state, &key(KeyCode::Enter)),
+            SshModalOutcome::Connect { target_id } if target_id == "server-1"
+        ));
+        assert!(state.project_browser.is_none());
+        state.targets[0].connected = true;
+        assert!(matches!(
+            handle_ssh_key(&mut state, &key(KeyCode::Enter)),
+            SshModalOutcome::Changed
+        ));
+        assert!(state.project_browser.is_none());
+        let area = Rect::new(0, 0, 120, 40);
+        render_ssh_modal(&mut Buffer::empty(area), area, &mut state, false, &Theme::current());
+        let action = state.window.shortcut_hits.iter()
+            .find(|hit| hit.id == FOOTER_MANAGER_PROJECT).unwrap().rect;
+        let SshModalOutcome::BrowseProjectDirectory { request_id, .. } = handle_ssh_mouse(
+            &mut state,
+            &MouseEvent {
+                kind: MouseEventKind::Down(crossterm::event::MouseButton::Left),
+                column: action.x,
+                row: action.y,
+                modifiers: KeyModifiers::NONE,
+            },
+        ) else { panic!("Only explicit project action should open the project picker"); };
+        assert!(state.project_browser.as_ref().unwrap().purpose.is_project_open());
+        assert!(state.settle_project_directory(
+            request_id, "server-1",
+            Ok(directory_listing("server-1", "/srv", Some("/"), &[])),
+        ));
+        assert!(matches!(
+            handle_ssh_key(&mut state, &key(KeyCode::Char('o'))),
+            SshModalOutcome::ChooseProjectDirectory { target_id, root, .. }
+                if target_id == "server-1" && root == "/srv"
+        ));
+    }
+
+    #[test]
     fn sessionless_manager_keeps_authority_actions_inert_but_allows_refresh() {
         let mut state = SshManagerState::new(None);
         assert!(matches!(
@@ -8541,5 +9588,288 @@ mod tests {
         let mut disconnecting = SshManagerState::new(None);
         disconnecting.begin_connection_action("server-1", false);
         assert_eq!(disconnecting.pending_authentication_target_id(), None);
+    }
+
+    fn target_view_from_target(target: xai_grok_ssh::SshTarget) -> SshTargetView {
+        SshTargetView::from_target(
+            target,
+            "user@example.test:22".into(),
+            false,
+            "Disconnected.".into(),
+            SshGrantView::NotGranted,
+        )
+    }
+
+    #[test]
+    fn manual_target_edit_preserves_id_credential_extra_identities_and_worker_arguments() {
+        let mut target = xai_grok_ssh::SshTarget::new("before.example.test");
+        target.id = "manual-id".into();
+        target.label = "Before".into();
+        target.user = Some("builder".into());
+        target.port = Some(2202);
+        target.identity_files = vec![
+            std::path::PathBuf::from("~/.ssh/first"),
+            std::path::PathBuf::from("~/.ssh/second"),
+        ];
+        target.credential_ref = Some("keychain:build-host".into());
+        target.worker_command = vec![
+            "groky".into(),
+            "worker".into(),
+            "--socket".into(),
+            "a path/socket".into(),
+        ];
+        let mut state = SshManagerState::new(None);
+        state.set_targets(vec![target_view_from_target(target.clone())]);
+
+        assert!(matches!(
+            handle_ssh_key(&mut state, &key(KeyCode::Char('e'))),
+            SshModalOutcome::Changed
+        ));
+        let SshModalPage::Add(form) = &mut state.page else {
+            panic!("manual target must open the shared target form")
+        };
+        assert_eq!(form.worker_command.text(), r#""groky" "worker" "--socket" "a path/socket""#);
+        assert_eq!(
+            xai_grok_ssh::parse_worker_command(form.worker_command.text())
+                .expect("quoted edit field must retain worker argv"),
+            target.worker_command
+        );
+        form.label.set_text("After");
+        let SshModalOutcome::UpdateTarget {
+            expected,
+            replacement,
+            submission_id,
+        } = handle_ssh_key(&mut state, &key(KeyCode::Enter))
+        else {
+            panic!("editing a manual target must submit an expected snapshot and replacement")
+        };
+        assert_eq!(expected, target);
+        assert_eq!(replacement.id, "manual-id");
+        assert_eq!(replacement.label, "After");
+        assert_eq!(replacement.credential_ref.as_deref(), Some("keychain:build-host"));
+        assert_eq!(
+            replacement.identity_files,
+            vec![
+                std::path::PathBuf::from("~/.ssh/first"),
+                std::path::PathBuf::from("~/.ssh/second"),
+            ]
+        );
+        assert_eq!(replacement.worker_command, target.worker_command);
+        assert_ne!(submission_id, 0);
+        assert!(matches!(
+            handle_ssh_key(&mut state, &key(KeyCode::Enter)),
+            SshModalOutcome::Unchanged
+        ));
+        assert!(state.settle_target_update_for_submission(
+            submission_id,
+            Err("the target changed in another SSH configuration update".into())
+        ));
+        assert!(matches!(
+            &state.page,
+            SshModalPage::Add(form)
+                if form.label.text() == "After"
+                    && form.error.as_deref()
+                        == Some("the target changed in another SSH configuration update")
+        ));
+    }
+
+    #[test]
+    fn imported_target_is_read_only_with_source_path_and_line() {
+        let mut target = xai_grok_ssh::SshTarget::new("imported-alias");
+        target.id = "imported-id".into();
+        target.source = xai_grok_ssh::TargetSource::Imported {
+            path: std::path::PathBuf::from("/Users/test/.ssh/config"),
+            line: 37,
+        };
+        let mut state = SshManagerState::new(None);
+        state.set_targets(vec![target_view_from_target(target)]);
+        let area = Rect::new(0, 0, 120, 24);
+        let mut buffer = Buffer::empty(area);
+        render_ssh_modal(&mut buffer, area, &mut state, false, &Theme::current());
+        let source = buffer_text(&buffer);
+        assert!(source.contains("read-only"));
+        assert!(source.contains("/Users/test/.ssh/config:37"));
+
+
+        for action in ['e', 'x'] {
+            assert!(matches!(
+                handle_ssh_key(&mut state, &key(KeyCode::Char(action))),
+                SshModalOutcome::Changed
+            ));
+            let SshModalPage::Diagnostic(card) = &state.page else {
+                panic!("read-only source guidance must be scrollable");
+            };
+            assert!(!card.is_error);
+            assert!(card.message.contains("/Users/test/.ssh/config"));
+            assert!(card.message.contains("37"));
+            handle_ssh_key(&mut state, &key(KeyCode::Esc));
+            assert!(matches!(&state.page, SshModalPage::Manager));
+        }
+    }
+
+    #[test]
+    fn delete_requires_confirmation_and_stale_completion_cannot_settle_a_newer_form() {
+        let mut target = xai_grok_ssh::SshTarget::new("delete.example.test");
+        target.id = "delete-id".into();
+        target.label = "Delete me".into();
+        let mut state = SshManagerState::new(Some("session".into()));
+        let mut view = target_view_from_target(target.clone());
+        view.connected = true;
+        view.grant = granted("binding-1", "/srv/project");
+        state.set_targets(vec![view]);
+
+        assert!(matches!(
+            handle_ssh_key(&mut state, &key(KeyCode::Char('x'))),
+            SshModalOutcome::Changed
+        ));
+        let area = Rect::new(0, 0, 100, 24);
+        let mut buffer = Buffer::empty(area);
+        render_ssh_modal(&mut buffer, area, &mut state, false, &Theme::current());
+        let confirmation = buffer_text(&buffer);
+        assert!(confirmation.contains("Delete me"));
+        assert!(confirmation.contains("disconnected"));
+        assert!(confirmation.contains("revoked"));
+        assert!(matches!(
+            handle_ssh_key(&mut state, &key(KeyCode::Esc)),
+            SshModalOutcome::Changed
+        ));
+        assert!(matches!(&state.page, SshModalPage::Manager));
+
+        assert!(matches!(
+            handle_ssh_key(&mut state, &key(KeyCode::Char('x'))),
+            SshModalOutcome::Changed
+        ));
+        let SshModalOutcome::RemoveTarget {
+            expected,
+            submission_id: first_submission,
+        } = handle_ssh_key(&mut state, &key(KeyCode::Enter))
+        else {
+            panic!("confirmed deletion must submit the selected target snapshot")
+        };
+        assert_eq!(expected, target);
+        assert!(matches!(
+            close_current_page(&mut state),
+            SshModalOutcome::Changed
+        ));
+        assert!(matches!(
+            handle_ssh_key(&mut state, &key(KeyCode::Char('e'))),
+            SshModalOutcome::Changed
+        ));
+        let SshModalPage::Add(form) = &mut state.page else {
+            panic!("manual target must reopen for an edit")
+        };
+        form.label.set_text("Newer edit");
+        let SshModalOutcome::UpdateTarget {
+            submission_id: newer_submission,
+            ..
+        } = handle_ssh_key(&mut state, &key(KeyCode::Enter))
+        else {
+            panic!("newer edit must submit")
+        };
+        assert_ne!(first_submission, newer_submission);
+        assert!(!state.settle_target_remove_for_submission(first_submission, Ok(target.clone())));
+        assert!(state.target_update_is_submitting());
+    }
+
+    #[test]
+    fn manual_target_edit_and_delete_footer_controls_are_clickable() {
+        let mut target = xai_grok_ssh::SshTarget::new("controls.example.test");
+        target.id = "controls-id".into();
+        target.label = "Controls".into();
+        let mut state = SshManagerState::new(None);
+        state.set_targets(vec![target_view_from_target(target)]);
+        let area = Rect::new(0, 0, 100, 24);
+        let theme = Theme::current();
+        let click = |rect: Rect| MouseEvent {
+            kind: MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            column: rect.x,
+            row: rect.y,
+            modifiers: KeyModifiers::NONE,
+        };
+
+        let mut buffer = Buffer::empty(area);
+        render_ssh_modal(&mut buffer, area, &mut state, false, &theme);
+        let edit = state
+            .window
+            .shortcut_hits
+            .iter()
+            .find(|hit| hit.id == FOOTER_MANAGER_EDIT)
+            .expect("manual-target edit footer must render")
+            .rect;
+        assert!(matches!(
+            handle_ssh_mouse(&mut state, &click(edit)),
+            SshModalOutcome::Changed
+        ));
+        assert!(matches!(&state.page, SshModalPage::Add(_)));
+        assert!(matches!(
+            close_current_page(&mut state),
+            SshModalOutcome::Changed
+        ));
+
+        let mut buffer = Buffer::empty(area);
+        render_ssh_modal(&mut buffer, area, &mut state, false, &theme);
+        let delete = state
+            .window
+            .shortcut_hits
+            .iter()
+            .find(|hit| hit.id == FOOTER_MANAGER_DELETE)
+            .expect("manual-target delete footer must render")
+            .rect;
+        assert!(matches!(
+            handle_ssh_mouse(&mut state, &click(delete)),
+            SshModalOutcome::Changed
+        ));
+        assert!(matches!(&state.page, SshModalPage::ConfirmDelete(_)));
+
+        let mut buffer = Buffer::empty(area);
+        render_ssh_modal(&mut buffer, area, &mut state, false, &theme);
+        let cancel = state
+            .window
+            .shortcut_hits
+            .iter()
+            .find(|hit| hit.id == FOOTER_DELETE_CANCEL)
+            .expect("delete-cancel footer must render")
+            .rect;
+        assert!(matches!(
+            handle_ssh_mouse(&mut state, &click(cancel)),
+            SshModalOutcome::Changed
+        ));
+        assert!(matches!(&state.page, SshModalPage::Manager));
+    }
+
+    #[test]
+    fn refreshed_targets_drop_external_deletions_and_do_not_resurrect_removed_manual_targets() {
+        let mut imported = xai_grok_ssh::SshTarget::new("external-alias");
+        imported.id = "external-id".into();
+        imported.source = xai_grok_ssh::TargetSource::Imported {
+            path: std::path::PathBuf::from("/etc/ssh/ssh_config"),
+            line: 12,
+        };
+        let mut state = SshManagerState::new(None);
+        state.set_targets(vec![target_view_from_target(imported)]);
+        state.set_targets(Vec::new());
+        assert!(state.targets.is_empty());
+
+        let mut manual = xai_grok_ssh::SshTarget::new("removed.example.test");
+        manual.id = "removed-id".into();
+        state.set_targets(vec![target_view_from_target(manual.clone())]);
+        assert!(matches!(
+            handle_ssh_key(&mut state, &key(KeyCode::Char('x'))),
+            SshModalOutcome::Changed
+        ));
+        let SshModalOutcome::RemoveTarget { submission_id, .. } =
+            handle_ssh_key(&mut state, &key(KeyCode::Enter))
+        else {
+            panic!("manual target deletion must submit")
+        };
+        assert!(state.settle_target_remove_for_submission(submission_id, Ok(manual.clone())));
+        state.set_targets(vec![target_view_from_target(manual.clone())]);
+        assert!(
+            state.targets.is_empty(),
+            "a late list completion must not resurrect a locally removed target"
+        );
+        state.set_targets(Vec::new());
+        state.set_targets(vec![target_view_from_target(manual)]);
+        assert_eq!(state.targets[0].target_id, "removed-id");
     }
 }

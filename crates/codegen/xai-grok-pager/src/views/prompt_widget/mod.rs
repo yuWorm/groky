@@ -623,6 +623,60 @@ impl StashedPrompt {
     }
 }
 
+/// Per-composer lifecycle for the local `/ssh` target catalog.
+///
+/// The catalog is deliberately owned by the slash controller, but its load must be correlated
+/// with one visit to `/ssh` arguments so an old local-config read cannot alter a replacement
+/// prompt.
+#[derive(Debug, Default)]
+struct SshTargetCompletion {
+    entry_generation: u64,
+    active: bool,
+    load_pending: bool,
+    request_id: Option<u64>,
+    dismissed_text: Option<String>,
+}
+
+impl SshTargetCompletion {
+    fn enter(&mut self) {
+        self.entry_generation = self.entry_generation.wrapping_add(1);
+        if self.entry_generation == 0 {
+            self.entry_generation = 1;
+        }
+        self.active = true;
+        self.load_pending = true;
+        self.request_id = None;
+        self.dismissed_text = None;
+    }
+
+    fn leave(&mut self) {
+        self.active = false;
+        self.load_pending = false;
+        self.request_id = None;
+        self.dismissed_text = None;
+    }
+}
+
+/// Whether the cursor is in an argument-bearing `/ssh` command entry.
+///
+/// This deliberately reads the raw prompt text rather than the current slash snapshot: the
+/// lifecycle must invalidate stale requests even when a programmatic writer has not repainted that
+/// snapshot yet.
+fn ssh_target_args_phase(text: &str, cursor: usize) -> bool {
+    let Some(invocation) = crate::slash::parse_invocation(text) else {
+        return false;
+    };
+    if !matches!(invocation.token, "ssh" | "remote") {
+        return false;
+    }
+    let command_end = 1 + invocation.token.len();
+    cursor > command_end
+        && text
+            .get(command_end..)
+            .and_then(|tail| tail.chars().next())
+            .is_some_and(char::is_whitespace)
+}
+
 /// Reusable text prompt component.
 pub struct PromptWidget {
     pub textarea: TextArea,
@@ -638,6 +692,8 @@ pub struct PromptWidget {
     pub(crate) pending_viewer_request: Option<ViewerRequest>,
     /// Prompt history panel state: search mode (`/history`) or browse mode (Up on an empty prompt).
     pub history_search: HistorySearchState,
+    /// Correlates one `/ssh` or `/remote` argument visit with its local target-list request.
+    ssh_target_completion: SshTargetCompletion,
     /// Slash command controller: derives completion state from the text and cursor.
     /// Owned by the prompt; `AgentView` calls methods, never reaches in directly.
     pub(crate) slash_controller: crate::slash::SlashController,
@@ -722,6 +778,7 @@ impl PromptWidget {
             file_search_enabled: true,
             pending_viewer_request: None,
             history_search: HistorySearchState::new(),
+            ssh_target_completion: SshTargetCompletion::default(),
             slash_controller: crate::slash::SlashController::with_builtins(cwd.to_path_buf()),
             slash_state: crate::slash::SlashState::default(),
             slash_hovered: None,
@@ -1201,9 +1258,116 @@ impl PromptWidget {
         self.slash_controller.current_title()
     }
 
+    /// Claim the one local target-catalog request due for the current `/ssh` or `/remote`
+    /// argument visit. `request_id` is allocated by [`AppView`](crate::app::app_view::AppView)
+    /// across every live prompt, so a replacement prompt cannot accept an old result.
+    pub(crate) fn begin_ssh_target_load(&mut self, request_id: u64) -> Option<u64> {
+        self.sync_ssh_target_completion_phase();
+        let state = &mut self.ssh_target_completion;
+        if !state.active || !state.load_pending || state.request_id.is_some() {
+            return None;
+        }
+        state.load_pending = false;
+        state.request_id = Some(request_id);
+        Some(state.entry_generation)
+    }
+
+    /// Whether this prompt entered SSH-target arguments and has not yet emitted its one catalog
+    /// request for that entry generation.
+    pub(crate) fn ssh_target_load_pending(&mut self) -> bool {
+        self.sync_ssh_target_completion_phase();
+        self.ssh_target_completion.active
+            && self.ssh_target_completion.load_pending
+            && self.ssh_target_completion.request_id.is_none()
+    }
+    /// Apply a local target catalog only when it belongs to this still-active command entry.
+    ///
+    /// Refreshing after injection re-evaluates the query the user typed while the local service
+    /// was loading. It intentionally preserves an Esc dismissal of the unchanged draft.
+    pub(crate) fn apply_ssh_target_candidates(
+        &mut self,
+        request_id: u64,
+        entry_generation: u64,
+        candidates: Vec<crate::slash::command::ArgItem>,
+        models: &crate::acp::model_state::ModelState,
+    ) -> bool {
+        self.sync_ssh_target_completion_phase();
+        let state = &mut self.ssh_target_completion;
+        if !state.active
+            || state.entry_generation != entry_generation
+            || state.request_id != Some(request_id)
+        {
+            return false;
+        }
+        state.request_id = None;
+        self.slash_controller.set_ssh_candidates(candidates);
+        self.refresh_slash(models);
+        true
+    }
+
+    /// Consume an error result only when it belongs to the active target-catalog request.
+    ///
+    /// The caller turns `true` into the normal surface toast. This keeps stale failures as silent
+    /// as stale successes.
+    pub(crate) fn reject_ssh_target_load(
+        &mut self,
+        request_id: u64,
+        entry_generation: u64,
+    ) -> bool {
+        self.sync_ssh_target_completion_phase();
+        let state = &mut self.ssh_target_completion;
+        if !state.active
+            || state.entry_generation != entry_generation
+            || state.request_id != Some(request_id)
+        {
+            return false;
+        }
+        state.request_id = None;
+        true
+    }
+
+    fn sync_ssh_target_completion_phase(&mut self) {
+        let text = self.text();
+        let active = ssh_target_args_phase(text, self.cursor());
+        let clear_dismissal = active
+            && self
+                .ssh_target_completion
+                .dismissed_text
+                .as_deref()
+                .is_some_and(|dismissed| dismissed != text);
+
+        if active && !self.ssh_target_completion.active {
+            self.ssh_target_completion.enter();
+            self.slash_controller.set_ssh_candidates(Vec::new());
+        } else if !active && self.ssh_target_completion.active {
+            self.ssh_target_completion.leave();
+            self.slash_controller.set_ssh_candidates(Vec::new());
+        } else if clear_dismissal {
+            self.ssh_target_completion.dismissed_text = None;
+        }
+    }
+
+    fn dismiss_ssh_target_completion(&mut self) {
+        self.sync_ssh_target_completion_phase();
+        if self.ssh_target_completion.active {
+            self.ssh_target_completion.dismissed_text = Some(self.text().to_owned());
+        }
+    }
+
+    fn ssh_target_completion_dismissed(&self) -> bool {
+        self.ssh_target_completion.active
+            && self
+                .ssh_target_completion
+                .dismissed_text
+                .as_deref()
+                .is_some_and(|dismissed| dismissed == self.text())
+    }
+
     /// Refresh the slash snapshot from the current text and cursor. This is the only way to update the
     /// slash snapshot: `AgentView` never touches `slash_controller` or `slash_state` directly.
     pub fn refresh_slash(&mut self, models: &crate::acp::model_state::ModelState) {
+        self.sync_ssh_target_completion_phase();
+
         let was_in_args = {
             let snap = self.slash_state.snapshot();
             snap.open && !snap.cursor_in_command && !snap.matches.is_empty()
@@ -1230,6 +1394,9 @@ impl PromptWidget {
         } else if was_in_args && !now_in_args {
             // Left the args phase (e.g., user deleted text): cancel preview
             self.slash_cancel_preview();
+        }
+        if self.ssh_target_completion_dismissed() {
+            self.slash_state.close();
         }
     }
 
@@ -1322,6 +1489,7 @@ impl PromptWidget {
 
     /// Close the slash dropdown.
     pub fn slash_close(&mut self) {
+        self.dismiss_ssh_target_completion();
         self.slash_state.close();
     }
 
@@ -1693,6 +1861,9 @@ impl PromptWidget {
         self.undo_tip_fire = false;
         self.plan_nudge_fire = false;
         self.completion_accepted = false;
+        if key.code == KeyCode::Esc && key.modifiers.is_empty() {
+            self.dismiss_ssh_target_completion();
+        }
         // Both tips off (the default): skip the whole per-keystroke scan, no keyword match, no clear-detector bookkeeping
         if !self.contextual_hint_undo && !self.contextual_hint_plan_mode {
             return self.handle_key_inner(key);

@@ -183,6 +183,22 @@ impl AgentView {
                 draft,
                 submission_id,
             }),
+            SshModalOutcome::UpdateTarget {
+                expected,
+                replacement,
+                submission_id,
+            } => InputOutcome::Action(Action::UpdateSshTarget {
+                expected,
+                replacement,
+                submission_id,
+            }),
+            SshModalOutcome::RemoveTarget {
+                expected,
+                submission_id,
+            } => InputOutcome::Action(Action::RemoveSshTarget {
+                expected,
+                submission_id,
+            }),
             SshModalOutcome::Connect { target_id } => {
                 InputOutcome::Action(Action::ConnectSshTarget { target_id })
             }
@@ -225,6 +241,9 @@ impl AgentView {
                 lifetime,
                 set_default,
             }),
+            SshModalOutcome::CancelGrant { request_id } => {
+                InputOutcome::Action(Action::CancelSshGrant { request_id })
+            }
             SshModalOutcome::InspectGrantTarget {
                 request_id,
                 target_id,

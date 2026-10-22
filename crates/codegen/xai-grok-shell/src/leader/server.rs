@@ -1673,6 +1673,10 @@ pub async fn run_leader_server(
                                 .map(ClientId)
                                 .or_else(|| session_driver.get(&request.session_id).copied())
                                 .or(last_active_client),
+                            crate::ssh::SshEvent::GrantCancelled { client_id, .. }
+                            | crate::ssh::SshEvent::GrantFailed { client_id, .. } => {
+                                Some(ClientId(*client_id))
+                            }
                             _ => None,
                         };
                         if let Some(id) = target {

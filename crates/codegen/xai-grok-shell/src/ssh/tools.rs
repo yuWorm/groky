@@ -62,6 +62,9 @@ pub(super) struct SshTargetsInput {}
 
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
 pub(super) struct SshRequestAccessInput {
+    /// Prefer the exact target_id returned by ssh_targets. A unique exact
+    /// configured label, host, or imported alias is accepted; missing and
+    /// ambiguous values fail before user approval is requested.
     #[serde(default)]
     pub target: Option<String>,
     #[serde(default)]
@@ -414,7 +417,7 @@ pub(super) struct SshTargetsTool;
 metadata!(
     SshTargetsTool,
     xai_grok_tools::types::tool::ToolKind::Read,
-    "List only the SSH targets currently granted to this session, including each granted root, capability ceiling, default selection, and connection status. Configured but ungranted targets are never shown."
+    "Discover safe metadata for every configured SSH target and this session's existing access only. Each candidate has target_id, label, host, source, and current-session access. Discovery never connects or grants authority; use target_id for a later ssh_request_access call."
 );
 
 impl Tool for SshTargetsTool {
@@ -451,7 +454,12 @@ impl Tool for SshTargetsTool {
         _input: SshTargetsInput,
     ) -> Result<Self::Output, xai_tool_runtime::ToolError> {
         let resource = session_resource(&ctx).await?;
-        serde_json::to_value(resource.service.list_targets(&resource.session_id).await)
+        let discovery = resource
+            .service
+            .discover_targets(&resource.session_id)
+            .await
+            .map_err(service_error)?;
+        serde_json::to_value(discovery)
             .map(Into::into)
             .map_err(|error| xai_tool_runtime::ToolError::custom("ssh", error.to_string()))
     }
@@ -463,7 +471,7 @@ pub(super) struct SshRequestAccessTool;
 metadata!(
     SshRequestAccessTool,
     xai_grok_tools::types::tool::ToolKind::Other,
-    "Request human approval for a session-scoped SSH target and root. The call waits for that decision and, if approved, returns the exact narrowed binding target, root, and capabilities. It never grants access by itself, even when ordinary operations are configured for automatic approval. Omit target and root to let the local user choose without exposing configured targets."
+    "Request human approval for a session-scoped SSH target and root. Use an exact target_id returned by ssh_targets; an exact unique label, host, or imported alias is also resolved before any approval UI opens. Missing or ambiguous names return target_not_found or ambiguous_target without selecting another target. If approved, this returns the exact narrowed binding target, root, and capabilities, and never grants access by itself. Omit target and root to let the local user choose."
 );
 
 impl Tool for SshRequestAccessTool {

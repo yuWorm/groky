@@ -1278,11 +1278,23 @@ fn dispatch_inner(action: Action, app: &mut AppView) -> Vec<Effect> {
             super::vendor::dispatch_open_vendor_login(app, provider_id)
         }
         Action::OpenSshManager => super::ssh::dispatch_open_ssh_manager(app),
+        Action::SelectSshTarget { reference } => {
+            super::ssh::dispatch_select_ssh_target(app, reference)
+        }
         Action::RefreshSshTargets => super::ssh::dispatch_refresh_ssh_targets(app),
         Action::AddSshTarget {
             draft,
             submission_id,
         } => super::ssh::dispatch_add_ssh_target(app, draft, submission_id),
+        Action::UpdateSshTarget {
+            expected,
+            replacement,
+            submission_id,
+        } => super::ssh::dispatch_update_ssh_target(app, expected, replacement, submission_id),
+        Action::RemoveSshTarget {
+            expected,
+            submission_id,
+        } => super::ssh::dispatch_remove_ssh_target(app, expected, submission_id),
         Action::ConnectSshTarget { target_id } => {
             super::ssh::dispatch_connect_ssh_target(app, target_id)
         }
@@ -1335,6 +1347,9 @@ fn dispatch_inner(action: Action, app: &mut AppView) -> Vec<Effect> {
             lifetime,
             set_default,
         ),
+        Action::CancelSshGrant { request_id } => {
+            super::ssh::dispatch_cancel_ssh_grant(app, request_id)
+        }
         Action::UseSshBinding { binding_id } => super::ssh::dispatch_use_ssh_binding(app, binding_id),
         Action::RevokeSshBinding { binding_id } => {
             super::ssh::dispatch_revoke_ssh_binding(app, binding_id)

@@ -69,31 +69,56 @@ impl TargetStore {
         Ok(targets)
     }
 
-    /// Find a target by stable id, or by an imported/manual host alias.
-    pub fn get(&self, id_or_alias: &str) -> Result<Option<SshTarget>, ConfigError> {
-        let user_targets = self.load_user_targets()?;
-        if let Some(target) = user_targets
-            .iter()
-            .find(|target| target.id == id_or_alias)
-            .cloned()
-        {
+    /// Resolve a target reference without ever choosing a matching target by
+    /// position. Stable IDs take precedence, followed by imported OpenSSH
+    /// aliases, then an exact unique display label or host. This parsing-only
+    /// lookup never opens a connection.
+    pub fn resolve_reference(&self, reference: &str) -> Result<Option<SshTarget>, ConfigError> {
+        Ok(Self::resolve_configured_reference(reference, self.list()?.iter())?.cloned())
+    }
+
+    /// Resolve against a loaded configuration snapshot, including repeated grant rows.
+    /// Matching precedence is identical to [`Self::resolve_reference`].
+    pub fn resolve_configured_reference<'a>(
+        reference: &str,
+        targets: impl Iterator<Item = &'a SshTarget> + Clone,
+    ) -> Result<Option<&'a SshTarget>, ConfigError> {
+        if let Some(target) = unique_target_reference(
+            reference,
+            targets.clone().filter(|target| target.id == reference),
+        )? {
             return Ok(Some(target));
         }
-        let imported = parser::imported_aliases(
-            &self.user_ssh_config,
-            &self.system_ssh_config,
-            &self.ssh_home,
-        )?;
-        if let Some(target) = imported
-            .iter()
-            .find(|target| target.id == id_or_alias || target.host == id_or_alias)
-            .cloned()
-        {
-            return Ok(Some(imported_target(target)));
+        if let Some(target) = unique_target_reference(
+            reference,
+            targets.clone().filter(|target| {
+                matches!(&target.source, TargetSource::Imported { .. })
+                    && target.host == reference
+            }),
+        )? {
+            return Ok(Some(target));
         }
-        Ok(user_targets
-            .into_iter()
-            .find(|target| target.host == id_or_alias))
+        unique_target_reference(
+            reference,
+            targets
+                .filter(|target| target.label == reference || target.host == reference),
+        )
+    }
+
+    /// Return the stable target ID selected by [`Self::resolve_reference`].
+    /// Authority-bearing callers must persist and compare this ID, never the
+    /// caller-supplied label or host spelling.
+    pub fn canonical_id(&self, reference: &str) -> Result<String, ConfigError> {
+        self.resolve_reference(reference)?
+            .map(|target| target.id)
+            .ok_or_else(|| ConfigError::TargetNotFound(reference.to_owned()))
+    }
+
+    /// Compatibility lookup for callers that need the full configured target.
+    /// It has the same exact and ambiguity-safe semantics as
+    /// [`Self::resolve_reference`].
+    pub fn get(&self, reference: &str) -> Result<Option<SshTarget>, ConfigError> {
+        self.resolve_reference(reference)
     }
 
     /// Insert or replace a persisted user target. Imported aliases are a view
@@ -116,6 +141,75 @@ impl TargetStore {
             Ok(true)
         })?;
         Ok(target)
+    }
+
+    /// Replace an existing manual target only when it still equals the caller's
+    /// original snapshot. The check and write share the configuration lock so
+    /// stale editors cannot overwrite another editor's changes.
+    pub fn update(
+        &self,
+        expected: SshTarget,
+        mut replacement: SshTarget,
+    ) -> Result<SshTarget, ConfigError> {
+        if matches!(&expected.source, TargetSource::Imported { .. })
+            || matches!(&replacement.source, TargetSource::Imported { .. })
+        {
+            return Err(ConfigError::ImmutableImportedTarget(expected.id));
+        }
+        if replacement.id != expected.id {
+            return Err(ConfigError::InvalidTarget(
+                "target id cannot change during an update".to_owned(),
+            ));
+        }
+        validate_target(&replacement)?;
+        replacement.source = TargetSource::User;
+        let id = expected.id.clone();
+        let replacement_for_write = replacement.clone();
+        self.mutate_config(move |root| {
+            let Some(targets) = targets_table_mut(root)? else {
+                return Err(ConfigError::StaleTarget(id.clone()));
+            };
+            let Some(existing) = targets.get(&id) else {
+                return Err(ConfigError::StaleTarget(id.clone()));
+            };
+            let current = parse_stored_target(&id, existing, &self.config_path())?;
+            if current != expected {
+                return Err(ConfigError::StaleTarget(id.clone()));
+            }
+            let next = merge_target_value(Some(existing), &replacement_for_write)?;
+            if existing == &next {
+                return Ok(false);
+            }
+            targets.insert(id.clone(), next);
+            Ok(true)
+        })?;
+        Ok(replacement)
+    }
+
+    /// Remove an existing manual target only when it still equals the caller's
+    /// original snapshot. Imported aliases remain a read-only configuration view.
+    pub fn remove_expected(&self, expected: SshTarget) -> Result<SshTarget, ConfigError> {
+        if matches!(&expected.source, TargetSource::Imported { .. }) {
+            return Err(ConfigError::ImmutableImportedTarget(expected.id));
+        }
+        let id = expected.id.clone();
+        let mut removed = None;
+        self.mutate_config(|root| {
+            let Some(targets) = targets_table_mut(root)? else {
+                return Err(ConfigError::StaleTarget(id.clone()));
+            };
+            let Some(existing) = targets.get(&id) else {
+                return Err(ConfigError::StaleTarget(id.clone()));
+            };
+            let current = parse_stored_target(&id, existing, &self.config_path())?;
+            if current != expected {
+                return Err(ConfigError::StaleTarget(id.clone()));
+            }
+            removed = Some(current);
+            targets.remove(&id);
+            Ok(true)
+        })?;
+        Ok(removed.expect("the checked target was removed under the write lock"))
     }
 
     /// Remove one manually persisted target. Imported aliases are derived from
@@ -264,6 +358,28 @@ impl TargetStore {
             },
         )
     }
+}
+
+fn unique_target_reference<'a>(
+    reference: &str,
+    candidates: impl Iterator<Item = &'a SshTarget>,
+) -> Result<Option<&'a SshTarget>, ConfigError> {
+    let mut candidates = candidates;
+    let Some(first) = candidates.next() else {
+        return Ok(None);
+    };
+    let mut candidates = candidates.filter(|target| target.id != first.id);
+    let Some(second) = candidates.next() else {
+        return Ok(Some(first));
+    };
+    let mut candidate_ids = vec![first.id.clone(), second.id.clone()];
+    candidate_ids.extend(candidates.map(|target| target.id.clone()));
+    candidate_ids.sort();
+    candidate_ids.dedup();
+    Err(ConfigError::AmbiguousTarget {
+        reference: reference.to_owned(),
+        candidate_ids,
+    })
 }
 
 /// Parse a shell-like worker argv without invoking a shell. Quotes group an

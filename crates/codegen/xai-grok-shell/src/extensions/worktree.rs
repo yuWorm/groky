@@ -276,6 +276,16 @@ async fn resume_ssh_session_in_worktree(
                         approved,
                         binding,
                     }) if request_id == grant.id => return Ok((approved, binding)),
+                    Ok(crate::ssh::SshEvent::GrantCancelled { request_id, .. })
+                        if request_id == grant.id =>
+                    {
+                        anyhow::bail!("SSH approval was cancelled")
+                    }
+                    Ok(crate::ssh::SshEvent::GrantFailed {
+                        request_id, error, ..
+                    }) if request_id == grant.id => {
+                        anyhow::bail!("SSH approval failed: {error}")
+                    }
                     Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => {
                         anyhow::bail!("SSH grant approval stream closed")
