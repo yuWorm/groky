@@ -1004,21 +1004,21 @@ pub(crate) fn execute(
                     client_id,
                 )
                 .await;
-                match reply {
-                    Ok((client_id, _)) => TaskResult::SshOperationApprovalComplete {
-                        session_id,
+                let (client_id, expired, error) = match reply {
+                    Ok((
                         client_id,
-                        approval_id,
-                        error: None,
-                        owner,
-                    },
-                    Err((client_id, error)) => TaskResult::SshOperationApprovalComplete {
-                        session_id,
-                        client_id,
-                        approval_id,
-                        error: Some(error),
-                        owner,
-                    },
+                        xai_grok_shell::ssh::SshControlReply::OperationApprovalExpired,
+                    )) => (client_id, true, None),
+                    Ok((client_id, _)) => (client_id, false, None),
+                    Err((client_id, error)) => (client_id, false, Some(error)),
+                };
+                TaskResult::SshOperationApprovalComplete {
+                    session_id,
+                    client_id,
+                    approval_id,
+                    expired,
+                    error,
+                    owner,
                 }
             });
         }

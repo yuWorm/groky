@@ -750,6 +750,7 @@ impl StandaloneSshRunner {
             | SshEvent::BindingRevoked { .. }
             | SshEvent::Worker(_)
             | SshEvent::OperationApproval(_)
+            | SshEvent::OperationApprovalExpired { .. }
             | SshEvent::WorkerInstallRequested(_)
             | SshEvent::WorkerInstallProgress(_) => {}
             SshEvent::Authentication(_) => {}

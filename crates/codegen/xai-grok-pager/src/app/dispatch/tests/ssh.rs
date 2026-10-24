@@ -15,8 +15,8 @@ use crate::app::dispatch::ssh::{
 use crate::views::ssh_modal::{SshGrantLifetime, SshModalOutcome, handle_ssh_key};
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
 use xai_grok_shell::ssh::{
-    SshBinding, SshCapabilities, SshEvent, SshGrantRequest, SshHostIdentity,
-    SshWorkerInstallProgress, SshWorkerInstallRequest,
+    SshBinding, SshCapabilities, SshEvent, SshGrantRequest, SshHostIdentity, SshOperation,
+    SshOperationApproval, SshWorkerInstallProgress, SshWorkerInstallRequest,
 };
 
 const SESSION_ID: &str = "project-session";
@@ -69,6 +69,23 @@ fn binding(target_id: &str, root: &str) -> SshBinding {
         capabilities: SshCapabilities::all(),
         epoch: 1,
         revoked: false,
+    }
+}
+
+fn operation_approval(
+    approval_id: &str,
+    session_id: &str,
+    client_id: u64,
+) -> SshOperationApproval {
+    SshOperationApproval {
+        client_id,
+        approval_id: approval_id.into(),
+        operation_id: format!("operation-{approval_id}"),
+        binding_id: "binding-id".into(),
+        session_id: session_id.into(),
+        operation: SshOperation::Execute,
+        title: "Run fixture command".into(),
+        detail: serde_json::json!({"args": {"command": "printf fixture"}}),
     }
 }
 
@@ -1024,6 +1041,187 @@ fn broadcast_duplicate_of_a_direct_grant_reply_cannot_reopen_a_dismissed_manager
             .all(|effect| matches!(effect, Effect::SshAwaitEvent { .. })),
         "the duplicate only re-arms the global control receiver"
     );
+}
+
+#[test]
+fn operation_expiration_event_is_scoped_to_its_client_session_and_visible_card() {
+    let mut app = test_app_with_agent();
+    let source_id = AgentId(0);
+    let session_id = app.agents.get(&source_id).unwrap().session.session_id.as_ref().unwrap().to_string();
+    let client_id = app.ssh_client_id;
+    apply_ssh_control_event(
+        &mut app,
+        None,
+        None,
+        SshEvent::OperationApproval(operation_approval("expired", &session_id, client_id)),
+    );
+
+    apply_ssh_control_event(
+        &mut app,
+        None,
+        None,
+        SshEvent::OperationApprovalExpired {
+            client_id: client_id.wrapping_add(1),
+            session_id: session_id.clone(),
+            approval_id: "expired".into(),
+        },
+    );
+    apply_ssh_control_event(
+        &mut app,
+        None,
+        None,
+        SshEvent::OperationApprovalExpired {
+            client_id,
+            session_id: "different-session".into(),
+            approval_id: "expired".into(),
+        },
+    );
+    let submitted = dispatch(
+        Action::ApproveSshOperation {
+            approval_id: "expired".into(),
+            approved: true,
+            scope: xai_grok_shell::ssh::SshOperationApprovalScope::Once,
+        },
+        &mut app,
+    );
+    assert!(submitted.iter().any(|effect| matches!(
+        effect,
+        Effect::SshApproveOperation { approval_id, .. } if approval_id == "expired"
+    )));
+
+    let expired_effects = apply_ssh_control_event(
+        &mut app,
+        None,
+        None,
+        SshEvent::OperationApprovalExpired {
+            client_id,
+            session_id: session_id.clone(),
+            approval_id: "expired".into(),
+        },
+    );
+    assert!(expired_effects.iter().any(|effect| matches!(
+        effect,
+        Effect::SshListTargets {
+            session_id: Some(effect_session_id),
+            ..
+        } if effect_session_id == &session_id
+    )));
+    assert!(
+        dispatch(
+            Action::ApproveSshOperation {
+                approval_id: "expired".into(),
+                approved: false,
+                scope: xai_grok_shell::ssh::SshOperationApprovalScope::Once,
+            },
+            &mut app,
+        )
+        .is_empty(),
+        "the retired card must not send a second stale decision"
+    );
+    app.handle_input(&Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)));
+    assert!(
+        app.agents
+            .get(&source_id)
+            .and_then(|agent| agent.ssh_manager.as_ref())
+            .is_none(),
+        "the expiration returns to an escapable manager page"
+    );
+
+    apply_ssh_control_event(
+        &mut app,
+        None,
+        None,
+        SshEvent::OperationApprovalExpired {
+            client_id,
+            session_id: session_id.clone(),
+            approval_id: "expired".into(),
+        },
+    );
+    assert!(
+        app.agents
+            .get(&source_id)
+            .and_then(|agent| agent.ssh_manager.as_ref())
+            .is_none(),
+        "a late expiration must not reopen a dismissed modal"
+    );
+
+    apply_ssh_control_event(
+        &mut app,
+        None,
+        None,
+        SshEvent::OperationApproval(operation_approval("fresh", &session_id, client_id)),
+    );
+    let fresh = dispatch(
+        Action::ApproveSshOperation {
+            approval_id: "fresh".into(),
+            approved: true,
+            scope: xai_grok_shell::ssh::SshOperationApprovalScope::Once,
+        },
+        &mut app,
+    );
+    assert!(fresh.iter().any(|effect| matches!(
+        effect,
+        Effect::SshApproveOperation { approval_id, .. } if approval_id == "fresh"
+    )));
+}
+
+#[test]
+fn typed_operation_expiry_cannot_clobber_a_newer_approval() {
+    let mut app = test_app_with_agent();
+    let source_id = AgentId(0);
+    let session_id = app.agents.get(&source_id).unwrap().session.session_id.as_ref().unwrap().to_string();
+    let client_id = app.ssh_client_id;
+    apply_ssh_control_event(
+        &mut app,
+        None,
+        None,
+        SshEvent::OperationApproval(operation_approval("old", &session_id, client_id)),
+    );
+    let owner = ssh_manager_owner(&app).expect("the displayed approval owns its reply");
+    assert!(dispatch(
+        Action::ApproveSshOperation {
+            approval_id: "old".into(),
+            approved: true,
+            scope: xai_grok_shell::ssh::SshOperationApprovalScope::Once,
+        },
+        &mut app,
+    )
+    .iter()
+    .any(|effect| matches!(
+        effect,
+        Effect::SshApproveOperation { approval_id, .. } if approval_id == "old"
+    )));
+    apply_ssh_control_event(
+        &mut app,
+        None,
+        None,
+        SshEvent::OperationApproval(operation_approval("new", &session_id, client_id)),
+    );
+
+    dispatch(
+        Action::TaskComplete(TaskResult::SshOperationApprovalComplete {
+            session_id: Some(session_id),
+            client_id,
+            owner,
+            approval_id: "old".into(),
+            expired: true,
+            error: None,
+        }),
+        &mut app,
+    );
+    assert!(dispatch(
+        Action::ApproveSshOperation {
+            approval_id: "new".into(),
+            approved: true,
+            scope: xai_grok_shell::ssh::SshOperationApprovalScope::Once,
+        },
+        &mut app,
+    )
+    .iter()
+    .any(|effect| matches!(
+        effect,
+        Effect::SshApproveOperation { approval_id, .. } if approval_id == "new"
+    )));
 }
 
 fn worker_install_request(

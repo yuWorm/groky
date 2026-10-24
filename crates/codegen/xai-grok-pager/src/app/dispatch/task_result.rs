@@ -873,17 +873,25 @@ pub(super) fn dispatch_task_result(result: TaskResult, app: &mut AppView) -> Vec
             refresh.into_iter().collect()
         }
         TaskResult::SshOperationApprovalComplete {
-            session_id: _,
+            session_id,
             client_id,
             owner,
             approval_id,
+            expired,
             error,
         } => {
             app.ssh_client_id = client_id;
             let (dismiss_transient, refresh_session_id) =
-                if let Some(manager) = super::ssh::ssh_manager_for_owner_mut(app, owner) {
+                if let Some(manager) = super::ssh::ssh_manager_for_owner_mut(app, owner)
+                    && manager.session_id.as_deref() == session_id.as_deref()
+                {
                     (
-                        manager.settle_operation_approval(&approval_id, error),
+                        if expired {
+                            manager.expire_operation_approval(&approval_id);
+                            false
+                        } else {
+                            manager.settle_operation_approval(&approval_id, error)
+                        },
                         Some(manager.session_id.clone()),
                     )
                 } else {

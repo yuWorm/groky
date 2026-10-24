@@ -1662,6 +1662,9 @@ pub async fn run_leader_server(
                             crate::ssh::SshEvent::OperationApproval(approval) => {
                                 Some(ClientId(approval.client_id))
                             }
+                            crate::ssh::SshEvent::OperationApprovalExpired {
+                                client_id, ..
+                            } => Some(ClientId(*client_id)),
                             crate::ssh::SshEvent::WorkerInstallRequested(request) => {
                                 Some(ClientId(request.client_id))
                             }

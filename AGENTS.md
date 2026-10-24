@@ -25,3 +25,6 @@ Voice: `**Lead** rest.` Lead is the noun the user already knows (`/default`, `Re
 ### Unreleased
 
 Next groky version after `v0.1.27`.
+
+- **SSH operation approvals** retire expired or cancelled requests, recover from late replies without trapping the manager, and require fresh approval before retrying without replaying remote commands.
+- **SSH warnings** use warning colors distinct from errors; operation review instructions no longer appear in error red.

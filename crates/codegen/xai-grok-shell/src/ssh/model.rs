@@ -281,6 +281,12 @@ pub enum SshEvent {
     Authentication(SshAuthPrompt),
     Worker(SshSessionWorkerEvent),
     OperationApproval(SshOperationApproval),
+    /// An unanswered operation approval can no longer authorize the operation.
+    OperationApprovalExpired {
+        client_id: u64,
+        session_id: String,
+        approval_id: String,
+    },
     WorkerInstallRequested(SshWorkerInstallRequest),
     WorkerInstallProgress(SshWorkerInstallProgress),
     TargetStatus(SshTargetStatus),

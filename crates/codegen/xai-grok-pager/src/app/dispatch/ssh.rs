@@ -1493,6 +1493,10 @@ pub(super) fn apply_ssh_control_event(
         | xai_grok_shell::ssh::SshEvent::GrantFailed {
             client_id: event_client_id,
             ..
+        }
+        | xai_grok_shell::ssh::SshEvent::OperationApprovalExpired {
+            client_id: event_client_id,
+            ..
         } => *event_client_id == client_id,
         _ => true,
     };
@@ -1621,7 +1625,8 @@ pub(super) fn apply_ssh_control_event(
         xai_grok_shell::ssh::SshEvent::GrantRequested(request) => Some(request.session_id.clone()),
         xai_grok_shell::ssh::SshEvent::GrantCancelled { session_id, .. }
         | xai_grok_shell::ssh::SshEvent::GrantFailed { session_id, .. }
-        | xai_grok_shell::ssh::SshEvent::BindingRevoked { session_id, .. } => {
+        | xai_grok_shell::ssh::SshEvent::BindingRevoked { session_id, .. }
+        | xai_grok_shell::ssh::SshEvent::OperationApprovalExpired { session_id, .. } => {
             Some(session_id.clone())
         }
         xai_grok_shell::ssh::SshEvent::OperationApproval(approval) => {
@@ -1691,7 +1696,8 @@ pub(super) fn apply_ssh_control_event(
             | xai_grok_shell::ssh::SshEvent::BindingRevoked { .. }
             | xai_grok_shell::ssh::SshEvent::GrantResolved { .. }
             | xai_grok_shell::ssh::SshEvent::GrantCancelled { .. }
-            | xai_grok_shell::ssh::SshEvent::GrantFailed { .. } => {
+            | xai_grok_shell::ssh::SshEvent::GrantFailed { .. }
+            | xai_grok_shell::ssh::SshEvent::OperationApprovalExpired { .. } => {
                 existing_ssh_manager_for_session_mut(app, manager_session_id.as_deref())
             }
             xai_grok_shell::ssh::SshEvent::GrantRequested(_)
@@ -1833,6 +1839,17 @@ pub(super) fn apply_ssh_control_event(
                         ),
                         operation_approval_origin,
                     );
+                }
+            }
+            xai_grok_shell::ssh::SshEvent::OperationApprovalExpired {
+                client_id: event_client_id,
+                session_id: expired_session_id,
+                approval_id,
+            } => {
+                if event_client_id == client_id
+                    && manager.session_id.as_deref() == Some(expired_session_id.as_str())
+                {
+                    manager.expire_operation_approval(&approval_id);
                 }
             }
             xai_grok_shell::ssh::SshEvent::TargetStatus(status) => {

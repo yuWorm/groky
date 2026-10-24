@@ -285,6 +285,8 @@ pub enum SshControlReply {
     TargetStatus(SshTargetStatus),
     AuthenticationAccepted,
     OperationApprovalAccepted,
+    /// The submitted approval was already retired and authorized no command.
+    OperationApprovalExpired,
     OperationApprovalsReset,
     TargetUpdated(SshTarget),
     TargetRemoved(SshTarget),
@@ -408,6 +410,7 @@ mod tests {
                 },
             )),
             SshControlReply::OperationApprovalsReset,
+            SshControlReply::OperationApprovalExpired,
             SshControlReply::GrantCancelled {
                 request_id: "grant".into(),
             },

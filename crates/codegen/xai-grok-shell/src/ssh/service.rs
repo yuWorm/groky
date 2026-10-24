@@ -185,6 +185,7 @@ struct SessionSshInner {
     session_event_sinks: Mutex<HashMap<String, broadcast::Sender<SshSessionWorkerEvent>>>,
     grant_waiters: StdMutex<HashMap<String, PendingToolGrant>>,
     approval_waiters: Mutex<HashMap<String, PendingOperationApproval>>,
+    approval_generation: AtomicU64,
     operation_approval_policies: Mutex<Vec<OperationApprovalPolicy>>,
     worker_install_waiters: Mutex<HashMap<String, PendingWorkerInstall>>,
     project_registrations: RwLock<HashMap<String, ProjectRegistration>>,
@@ -280,6 +281,7 @@ struct PendingOperationApproval {
     binding: SshBinding,
     target_epoch: u64,
     operation: SshOperation,
+    generation: u64,
     response: oneshot::Sender<bool>,
 }
 
@@ -334,6 +336,140 @@ impl Drop for ToolGrantWaitGuard {
             });
         }
     }
+}
+
+struct OperationApprovalWaitGuard {
+    service: Weak<SessionSshInner>,
+    client_id: u64,
+    session_id: String,
+    approval_id: String,
+    generation: u64,
+    armed: bool,
+}
+
+impl OperationApprovalWaitGuard {
+    fn new(
+        service: Weak<SessionSshInner>,
+        client_id: u64,
+        session_id: String,
+        approval_id: String,
+        generation: u64,
+    ) -> Self {
+        Self {
+            service,
+            client_id,
+            session_id,
+            approval_id,
+            generation,
+            armed: true,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for OperationApprovalWaitGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let Some(service) = self.service.upgrade() else {
+            return;
+        };
+        let client_id = self.client_id;
+        let session_id = std::mem::take(&mut self.session_id);
+        let approval_id = std::mem::take(&mut self.approval_id);
+        let generation = self.generation;
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            runtime.spawn(async move {
+                expire_operation_approvals(&service, |current_approval_id, waiter| {
+                    current_approval_id == approval_id.as_str()
+                        && waiter.client_id == client_id
+                        && waiter.binding.session_id.as_str() == session_id.as_str()
+                        && waiter.generation == generation
+                })
+                .await;
+            });
+        }
+    }
+}
+
+struct OperationApprovalSubmissionGuard {
+    service: Arc<SessionSshInner>,
+    client_id: u64,
+    session_id: String,
+    approval_id: String,
+    armed: bool,
+}
+
+impl OperationApprovalSubmissionGuard {
+    fn new(
+        service: Arc<SessionSshInner>,
+        client_id: u64,
+        session_id: String,
+        approval_id: String,
+    ) -> Self {
+        Self {
+            service,
+            client_id,
+            session_id,
+            approval_id,
+            armed: true,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for OperationApprovalSubmissionGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            notify_operation_approval_expired(
+                &self.service,
+                self.client_id,
+                std::mem::take(&mut self.session_id),
+                std::mem::take(&mut self.approval_id),
+            );
+        }
+    }
+}
+
+async fn expire_operation_approvals(
+    service: &SessionSshInner,
+    mut should_expire: impl FnMut(&str, &PendingOperationApproval) -> bool,
+) {
+    let mut waiters = service.approval_waiters.lock().await;
+    // Broadcast delivery is synchronous and cannot re-enter this mutex.
+    waiters.retain(|approval_id, waiter| {
+        if should_expire(approval_id, waiter) {
+            notify_operation_approval_expired(
+                service,
+                waiter.client_id,
+                waiter.binding.session_id.clone(),
+                approval_id.clone(),
+            );
+            false
+        } else {
+            true
+        }
+    });
+}
+
+fn notify_operation_approval_expired(
+    service: &SessionSshInner,
+    client_id: u64,
+    session_id: String,
+    approval_id: String,
+) {
+    let _ = service.events.send(SshEvent::OperationApprovalExpired {
+        client_id,
+        session_id,
+        approval_id,
+    });
 }
 
 struct PendingWorkerInstall {
@@ -430,6 +566,7 @@ impl SessionSsh {
                 session_event_sinks: Mutex::new(HashMap::new()),
                 grant_waiters: StdMutex::new(HashMap::new()),
                 approval_waiters: Mutex::new(HashMap::new()),
+                approval_generation: AtomicU64::new(0),
                 operation_approval_policies: Mutex::new(Vec::new()),
                 worker_install_waiters: Mutex::new(HashMap::new()),
                 project_registrations: RwLock::new(HashMap::new()),
@@ -1183,8 +1320,13 @@ impl SessionSsh {
                 if decision.client_id != client_id {
                     return Err(SshServiceError::WrongClient);
                 }
-                self.submit_operation_approval(decision).await?;
-                Ok(SshControlReply::OperationApprovalAccepted)
+                match self.submit_operation_approval(decision).await {
+                    Ok(()) => Ok(SshControlReply::OperationApprovalAccepted),
+                    Err(SshServiceError::StaleOperationApproval) => {
+                        Ok(SshControlReply::OperationApprovalExpired)
+                    }
+                    Err(error) => Err(error),
+                }
             }
             SshControlCommand::ResetOperationApprovals {
                 session_id,
@@ -1422,11 +1564,10 @@ impl SessionSsh {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .retain(|_, waiter| waiter.session_id != session_id);
-        self.inner
-            .approval_waiters
-            .lock()
-            .await
-            .retain(|_, waiter| waiter.binding.session_id != session_id);
+        expire_operation_approvals(&self.inner, |_, waiter| {
+            waiter.binding.session_id.as_str() == session_id.as_str()
+        })
+        .await;
         self.inner
             .operation_approval_policies
             .lock()
@@ -1443,11 +1584,7 @@ impl SessionSsh {
     /// a disconnected local client. Durable SSH grants are intentionally not
     /// affected.
     pub async fn clear_client_interactions(&self, client_id: u64) {
-        self.inner
-            .approval_waiters
-            .lock()
-            .await
-            .retain(|_, waiter| waiter.client_id != client_id);
+        expire_operation_approvals(&self.inner, |_, waiter| waiter.client_id == client_id).await;
         self.inner
             .operation_approval_policies
             .lock()
@@ -1484,11 +1621,10 @@ impl SessionSsh {
 
     /// Removes all nonpersistent approval state for a terminal session close.
     pub async fn clear_session_interactions(&self, session_id: &str) {
-        self.inner
-            .approval_waiters
-            .lock()
-            .await
-            .retain(|_, waiter| waiter.binding.session_id != session_id);
+        expire_operation_approvals(&self.inner, |_, waiter| {
+            waiter.binding.session_id.as_str() == session_id
+        })
+        .await;
         self.inner
             .operation_approval_policies
             .lock()
@@ -2245,15 +2381,13 @@ impl SessionSsh {
             }
             affected
         };
-        self.inner
-            .approval_waiters
-            .lock()
-            .await
-            .retain(|_, waiter| {
-                !affected.iter().any(|(session_id, binding, _)| {
-                    waiter.binding.session_id == *session_id && waiter.binding.id == binding.id
-                })
-            });
+        expire_operation_approvals(&self.inner, |_, waiter| {
+            affected.iter().any(|(session_id, binding, _)| {
+                waiter.binding.session_id.as_str() == session_id.as_str()
+                    && waiter.binding.id == binding.id
+            })
+        })
+        .await;
         self.inner
             .operation_approval_policies
             .lock()
@@ -3125,42 +3259,84 @@ impl SessionSsh {
         &self,
         decision: SshOperationApprovalDecision,
     ) -> Result<(), SshServiceError> {
+        let SshOperationApprovalDecision {
+            client_id: submitted_client_id,
+            approval_id,
+            approved,
+            scope,
+        } = decision;
         // Keep the exact grant read lock through policy installation. A revoke
         // cannot turn a stale reply into a session-level approval rule.
         let sessions = self.inner.sessions.read().await;
-        let mut waiters = self.inner.approval_waiters.lock().await;
-        let current = waiters
-            .get(&decision.approval_id)
-            .ok_or(SshServiceError::StaleOperationApproval)?;
-        if current.client_id != decision.client_id
-            || current.target_epoch != self.target_config_epoch()
-            || current.response.is_closed()
-            || !sessions
-                .get(&current.binding.session_id)
-                .and_then(|state| state.grants.get(&current.binding.id))
-                .is_some_and(|record| {
-                    !record.persisted.binding.revoked
-                        && record.persisted.binding == current.binding
-                        && record.persisted.binding.capabilities.permits(current.operation)
-                })
-        {
-            return Err(SshServiceError::StaleOperationApproval);
-        }
+        let pending = {
+            let mut waiters = self.inner.approval_waiters.lock().await;
+            let current = waiters
+                .get(&approval_id)
+                .ok_or(SshServiceError::StaleOperationApproval)?;
+            if current.client_id != submitted_client_id {
+                return Err(SshServiceError::StaleOperationApproval);
+            }
+            let stale = current.target_epoch != self.target_config_epoch()
+                || current.response.is_closed()
+                || !sessions
+                    .get(&current.binding.session_id)
+                    .and_then(|state| state.grants.get(&current.binding.id))
+                    .is_some_and(|record| {
+                        !record.persisted.binding.revoked
+                            && record.persisted.binding == current.binding
+                            && record.persisted.binding.capabilities.permits(current.operation)
+                    });
+            if stale {
+                let PendingOperationApproval {
+                    client_id,
+                    binding,
+                    ..
+                } = waiters
+                    .remove(&approval_id)
+                    .expect("approval was present while holding the lock");
+                drop(waiters);
+                drop(sessions);
+                notify_operation_approval_expired(
+                    &self.inner,
+                    client_id,
+                    binding.session_id,
+                    approval_id,
+                );
+                return Err(SshServiceError::StaleOperationApproval);
+            }
+            waiters
+                .remove(&approval_id)
+                .expect("approval was present while holding the lock")
+        };
         let PendingOperationApproval {
             client_id,
             binding,
             target_epoch,
             operation,
             response,
-        } = waiters
-            .remove(&decision.approval_id)
-            .expect("approval was present while holding the lock");
-        if decision.approved
-            && decision.scope == SshOperationApprovalScope::Session
+            ..
+        } = pending;
+        let mut submission_guard = OperationApprovalSubmissionGuard::new(
+            self.inner.clone(),
+            client_id,
+            binding.session_id.clone(),
+            approval_id.clone(),
+        );
+        if approved
+            && scope == SshOperationApprovalScope::Session
             && matches!(operation, SshOperation::Write | SshOperation::Execute)
         {
             let mut policies = self.inner.operation_approval_policies.lock().await;
             if self.target_config_epoch() != target_epoch {
+                drop(policies);
+                drop(sessions);
+                submission_guard.disarm();
+                notify_operation_approval_expired(
+                    &self.inner,
+                    client_id,
+                    binding.session_id,
+                    approval_id,
+                );
                 return Err(SshServiceError::StaleOperationApproval);
             }
             policies.retain(|policy| {
@@ -3180,12 +3356,32 @@ impl SessionSsh {
                 operation,
             });
             if response.send(true).is_err() {
-                policies.pop();
+                let policy = policies
+                    .pop()
+                    .expect("new approval policy was present while holding the lock");
+                drop(policies);
+                drop(sessions);
+                submission_guard.disarm();
+                notify_operation_approval_expired(
+                    &self.inner,
+                    policy.client_id,
+                    policy.session_id,
+                    approval_id,
+                );
                 return Err(SshServiceError::StaleOperationApproval);
             }
-        } else if response.send(decision.approved).is_err() {
+        } else if response.send(approved).is_err() {
+            drop(sessions);
+            submission_guard.disarm();
+            notify_operation_approval_expired(
+                &self.inner,
+                client_id,
+                binding.session_id,
+                approval_id,
+            );
             return Err(SshServiceError::StaleOperationApproval);
         }
+        submission_guard.disarm();
         Ok(())
     }
 
@@ -4077,29 +4273,37 @@ impl SshClientCallbacks for WorkerCallbacks {
             return SshApprovalDecision::Approve;
         }
         let (response, receiver) = oneshot::channel();
+        let approval_id = request.approval_id.clone();
+        let generation = service.approval_generation.fetch_add(1, Ordering::Relaxed);
         {
             let mut waiters = service.approval_waiters.lock().await;
-            if waiters
-                .insert(
-                    request.approval_id.clone(),
-                    PendingOperationApproval {
-                        client_id,
-                        binding: self.binding.clone(),
-                        target_epoch: self.target_epoch,
-                        operation: request.operation,
-                        response,
-                    },
-                )
-                .is_some()
-            {
+            if waiters.contains_key(&approval_id) {
                 return SshApprovalDecision::Deny;
             }
+            waiters.insert(
+                approval_id.clone(),
+                PendingOperationApproval {
+                    client_id,
+                    binding: self.binding.clone(),
+                    target_epoch: self.target_epoch,
+                    operation: request.operation,
+                    generation,
+                    response,
+                },
+            );
         }
+        let mut guard = OperationApprovalWaitGuard::new(
+            self.service.clone(),
+            client_id,
+            self.binding.session_id.clone(),
+            approval_id.clone(),
+            generation,
+        );
         if service
             .events
             .send(SshEvent::OperationApproval(SshOperationApproval {
                 client_id,
-                approval_id: request.approval_id.clone(),
+                approval_id: approval_id.clone(),
                 operation_id: request.operation_id,
                 binding_id: self.binding.id.clone(),
                 session_id: self.binding.session_id.clone(),
@@ -4109,27 +4313,33 @@ impl SshClientCallbacks for WorkerCallbacks {
             }))
             .is_err()
         {
-            service
-                .approval_waiters
-                .lock()
-                .await
-                .remove(&request.approval_id);
+            let mut waiters = service.approval_waiters.lock().await;
+            if waiters
+                .get(&approval_id)
+                .is_some_and(|waiter| waiter.generation == generation)
+            {
+                waiters.remove(&approval_id);
+            }
+            guard.disarm();
             return SshApprovalDecision::Deny;
         }
-        let approved = tokio::time::timeout(INTERACTION_TIMEOUT, receiver)
-            .await
-            .ok()
-            .and_then(Result::ok)
-            .unwrap_or(false);
-        service
-            .approval_waiters
-            .lock()
-            .await
-            .remove(&request.approval_id);
-        if approved {
-            SshApprovalDecision::Approve
-        } else {
-            SshApprovalDecision::Deny
+        match tokio::time::timeout(INTERACTION_TIMEOUT, receiver).await {
+            Ok(Ok(true)) => {
+                guard.disarm();
+                SshApprovalDecision::Approve
+            }
+            Ok(Ok(false)) | Ok(Err(_)) => {
+                guard.disarm();
+                SshApprovalDecision::Deny
+            }
+            Err(_) => {
+                expire_operation_approvals(&service, |current_approval_id, waiter| {
+                    current_approval_id == approval_id.as_str() && waiter.generation == generation
+                })
+                .await;
+                guard.disarm();
+                SshApprovalDecision::Deny
+            }
         }
     }
 }
@@ -5708,6 +5918,276 @@ mod tests {
         assert!(service.snapshot_session("session").await.pending_requests.is_empty());
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn operation_approval_timeout_notifies_the_client_and_allows_a_fresh_request() {
+        let home = tempfile::tempdir().unwrap();
+        let service = SessionSsh::new(home.path().to_owned());
+        let granted = binding("binding", "session", "/remote/project");
+        service.restore_session("session", PersistedSshState {
+            grants: vec![PersistedSshGrant {
+                binding: granted.clone(),
+                parent_binding_id: None,
+                requires_revalidation: true,
+                scope: SshGrantScope::CurrentSession,
+                revoke_status: None,
+                worker_bound: false,
+                worker_commands: Vec::new(),
+            }],
+            default_binding_id: Some(granted.id.clone()),
+            pending_requests: Vec::new(),
+        }).await;
+        let mut events = service.subscribe_events();
+        let callbacks = WorkerCallbacks {
+            service: Arc::downgrade(&service.inner),
+            client_id: Some(7),
+            binding: granted,
+            target_epoch: service.target_config_epoch(),
+        };
+        let request = |id: &str| SshApprovalRequest {
+            approval_id: id.into(),
+            operation_id: id.into(),
+            binding_id: "binding".into(),
+            session_id: "session".into(),
+            operation: SshOperation::Execute,
+            title: "run remote command".into(),
+            detail: serde_json::json!({"command": "pwd"}),
+        };
+        let approval = callbacks.approve(request("expired"));
+        tokio::pin!(approval);
+        tokio::select! {
+            result = &mut approval => panic!("approval ended before review: {result:?}"),
+            event = events.recv() => assert!(matches!(event.unwrap(), SshEvent::OperationApproval(_))),
+        }
+        tokio::time::advance(INTERACTION_TIMEOUT).await;
+        assert_eq!(approval.await, SshApprovalDecision::Deny);
+        let terminal = events.try_recv().expect("expired approval must retire the client card");
+        let terminal = serde_json::to_value(terminal).unwrap();
+        assert_eq!(terminal["type"], "operation_approval_expired");
+        assert_eq!(terminal["approval_id"], "expired");
+        assert!(matches!(
+            service
+                .control(
+                    7,
+                    SshControlCommand::SubmitOperationApproval(SshOperationApprovalDecision {
+                        client_id: 7,
+                        approval_id: "expired".into(),
+                        approved: true,
+                        scope: SshOperationApprovalScope::Session,
+                    }),
+                )
+                .await,
+            Ok(SshControlReply::OperationApprovalExpired)
+        ));
+        let fresh = callbacks.approve(request("fresh"));
+        tokio::pin!(fresh);
+        tokio::select! {
+            result = &mut fresh => panic!("fresh request bypassed review: {result:?}"),
+            event = events.recv() => assert!(matches!(event.unwrap(), SshEvent::OperationApproval(_))),
+        }
+        service.submit_operation_approval(SshOperationApprovalDecision {
+            client_id: 7,
+            approval_id: "fresh".into(),
+            approved: true,
+            scope: SshOperationApprovalScope::Once,
+        }).await.unwrap();
+        assert_eq!(fresh.await, SshApprovalDecision::Approve);
+    }
+
+    #[tokio::test]
+    async fn dropped_operation_approval_future_retires_the_card_and_requires_a_fresh_request() {
+        let home = tempfile::tempdir().unwrap();
+        let service = SessionSsh::new(home.path().to_owned());
+        let granted = binding("binding", "session", "/remote/project");
+        service
+            .restore_session(
+                "session",
+                PersistedSshState {
+                    grants: vec![PersistedSshGrant {
+                        binding: granted.clone(),
+                        parent_binding_id: None,
+                        requires_revalidation: true,
+                        scope: SshGrantScope::CurrentSession,
+                        revoke_status: None,
+                        worker_bound: false,
+                        worker_commands: Vec::new(),
+                    }],
+                    default_binding_id: Some(granted.id.clone()),
+                    pending_requests: Vec::new(),
+                },
+            )
+            .await;
+        let mut events = service.subscribe_events();
+        let callbacks = WorkerCallbacks {
+            service: Arc::downgrade(&service.inner),
+            client_id: Some(7),
+            binding: granted.clone(),
+            target_epoch: service.target_config_epoch(),
+        };
+        let waiting = tokio::spawn(async move {
+            callbacks
+                .approve(SshApprovalRequest {
+                    approval_id: "dropped".into(),
+                    operation_id: "dropped".into(),
+                    binding_id: "binding".into(),
+                    session_id: "session".into(),
+                    operation: SshOperation::Execute,
+                    title: "run remote command".into(),
+                    detail: serde_json::json!({"command": "pwd"}),
+                })
+                .await
+        });
+        assert!(matches!(
+            events.recv().await.unwrap(),
+            SshEvent::OperationApproval(approval) if approval.approval_id == "dropped"
+        ));
+        waiting.abort();
+        assert!(waiting.await.unwrap_err().is_cancelled());
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_secs(1), events.recv())
+                .await
+                .unwrap()
+                .unwrap(),
+            SshEvent::OperationApprovalExpired {
+                client_id: 7,
+                ref session_id,
+                ref approval_id,
+            } if session_id == "session" && approval_id == "dropped"
+        ));
+        assert!(service.inner.approval_waiters.lock().await.is_empty());
+        assert!(matches!(
+            service
+                .submit_operation_approval(SshOperationApprovalDecision {
+                    client_id: 7,
+                    approval_id: "dropped".into(),
+                    approved: true,
+                    scope: SshOperationApprovalScope::Session,
+                })
+                .await,
+            Err(SshServiceError::StaleOperationApproval)
+        ));
+        assert!(
+            !operation_policy_allows(&service.inner, &granted, 7, SshOperation::Execute).await
+        );
+
+        let callbacks = WorkerCallbacks {
+            service: Arc::downgrade(&service.inner),
+            client_id: Some(7),
+            binding: granted.clone(),
+            target_epoch: service.target_config_epoch(),
+        };
+        let fresh = tokio::spawn(async move {
+            callbacks
+                .approve(SshApprovalRequest {
+                    approval_id: "fresh".into(),
+                    operation_id: "fresh".into(),
+                    binding_id: "binding".into(),
+                    session_id: "session".into(),
+                    operation: SshOperation::Execute,
+                    title: "run remote command".into(),
+                    detail: serde_json::json!({"command": "pwd"}),
+                })
+                .await
+        });
+        assert!(matches!(
+            events.recv().await.unwrap(),
+            SshEvent::OperationApproval(approval) if approval.approval_id == "fresh"
+        ));
+        service
+            .submit_operation_approval(SshOperationApprovalDecision {
+                client_id: 7,
+                approval_id: "fresh".into(),
+                approved: true,
+                scope: SshOperationApprovalScope::Once,
+            })
+            .await
+            .unwrap();
+        assert_eq!(fresh.await.unwrap(), SshApprovalDecision::Approve);
+    }
+
+    #[tokio::test]
+    async fn dropped_submission_after_claiming_an_approval_retires_the_card() {
+        let home = tempfile::tempdir().unwrap();
+        let service = SessionSsh::new(home.path().to_owned());
+        let granted = binding("binding", "session", "/remote/project");
+        service
+            .restore_session(
+                "session",
+                PersistedSshState {
+                    grants: vec![PersistedSshGrant {
+                        binding: granted.clone(),
+                        parent_binding_id: None,
+                        requires_revalidation: true,
+                        scope: SshGrantScope::CurrentSession,
+                        revoke_status: None,
+                        worker_bound: false,
+                        worker_commands: Vec::new(),
+                    }],
+                    default_binding_id: Some(granted.id.clone()),
+                    pending_requests: Vec::new(),
+                },
+            )
+            .await;
+        let mut events = service.subscribe_events();
+        let callbacks = WorkerCallbacks {
+            service: Arc::downgrade(&service.inner),
+            client_id: Some(7),
+            binding: granted.clone(),
+            target_epoch: service.target_config_epoch(),
+        };
+        let waiting = tokio::spawn(async move {
+            callbacks
+                .approve(SshApprovalRequest {
+                    approval_id: "submit-dropped".into(),
+                    operation_id: "submit-dropped".into(),
+                    binding_id: "binding".into(),
+                    session_id: "session".into(),
+                    operation: SshOperation::Execute,
+                    title: "run remote command".into(),
+                    detail: serde_json::json!({"command": "pwd"}),
+                })
+                .await
+        });
+        assert!(matches!(
+            events.recv().await.unwrap(),
+            SshEvent::OperationApproval(approval) if approval.approval_id == "submit-dropped"
+        ));
+
+        let policy_lock = service.inner.operation_approval_policies.lock().await;
+        let mut submission = Box::pin(service.submit_operation_approval(
+            SshOperationApprovalDecision {
+                client_id: 7,
+                approval_id: "submit-dropped".into(),
+                approved: true,
+                scope: SshOperationApprovalScope::Session,
+            },
+        ));
+        std::future::poll_fn(|context| {
+            match Future::poll(submission.as_mut(), context) {
+                std::task::Poll::Pending => std::task::Poll::Ready(()),
+                std::task::Poll::Ready(result) => {
+                    panic!("submission completed while its policy lock was held: {result:?}")
+                }
+            }
+        })
+        .await;
+        assert!(service.inner.approval_waiters.lock().await.is_empty());
+
+        drop(submission);
+        drop(policy_lock);
+        assert!(matches!(
+            events.recv().await.unwrap(),
+            SshEvent::OperationApprovalExpired {
+                client_id: 7,
+                ref session_id,
+                ref approval_id,
+            } if session_id == "session" && approval_id == "submit-dropped"
+        ));
+        assert_eq!(waiting.await.unwrap(), SshApprovalDecision::Deny);
+        assert!(
+            !operation_policy_allows(&service.inner, &granted, 7, SshOperation::Execute).await
+        );
+    }
+
     #[tokio::test]
     async fn session_operation_approval_is_binding_scoped_and_reset_or_revoke_clears_it() {
         let home = tempfile::tempdir().unwrap();
@@ -5731,7 +6211,7 @@ mod tests {
                 },
             )
             .await;
-        let (response, _receiver) = oneshot::channel();
+        let (response, receiver) = oneshot::channel();
         service.inner.approval_waiters.lock().await.insert(
             "foreign-client".into(),
             PendingOperationApproval {
@@ -5739,6 +6219,7 @@ mod tests {
                 binding: granted.clone(),
                 target_epoch: service.target_config_epoch(),
                 operation: SshOperation::Execute,
+                generation: 0,
                 response,
             },
         );
@@ -5757,11 +6238,15 @@ mod tests {
             !operation_policy_allows(&service.inner, &granted, 7, SshOperation::Execute).await
         );
         service
-            .inner
-            .approval_waiters
-            .lock()
+            .submit_operation_approval(SshOperationApprovalDecision {
+                client_id: 7,
+                approval_id: "foreign-client".into(),
+                approved: true,
+                scope: SshOperationApprovalScope::Once,
+            })
             .await
-            .remove("foreign-client");
+            .unwrap();
+        assert!(receiver.await.unwrap());
 
 
         async fn approve(
@@ -5778,6 +6263,7 @@ mod tests {
                     binding: binding.clone(),
                     target_epoch: service.target_config_epoch(),
                     operation: SshOperation::Execute,
+                    generation: 0,
                     response,
                 },
             );
@@ -5884,6 +6370,7 @@ mod tests {
         assert!(
             operation_policy_allows(&service.inner, &granted, 7, SshOperation::Execute).await
         );
+        let mut events = service.subscribe_events();
         let (response, _receiver) = oneshot::channel();
         service.inner.approval_waiters.lock().await.insert(
             "revoked-reply".into(),
@@ -5892,10 +6379,20 @@ mod tests {
                 binding: granted.clone(),
                 target_epoch: service.target_config_epoch(),
                 operation: SshOperation::Execute,
+                generation: 0,
                 response,
             },
         );
         service.revoke_binding("session", &granted.id).await.unwrap();
+        assert!(matches!(
+            events.recv().await.unwrap(),
+            SshEvent::OperationApprovalExpired {
+                client_id: 7,
+                ref session_id,
+                ref approval_id,
+            } if session_id == "session" && approval_id == "revoked-reply"
+        ));
+        assert!(service.inner.approval_waiters.lock().await.is_empty());
         assert!(matches!(
             service
                 .submit_operation_approval(SshOperationApprovalDecision {
@@ -6735,6 +7232,7 @@ mod tests {
                 binding: granted.clone(),
                 target_epoch: service.target_config_epoch(),
                 operation: SshOperation::Execute,
+                generation: 0,
                 response,
             },
         );
@@ -6768,7 +7266,7 @@ mod tests {
                     ),
                 )
                 .await,
-            Err(SshServiceError::StaleOperationApproval)
+            Ok(SshControlReply::OperationApprovalExpired)
         ));
 
         let deleted_grant = binding("deleted-binding", "deleted-session", "/repo");

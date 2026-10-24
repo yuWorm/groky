@@ -2381,6 +2381,34 @@ impl SshManagerState {
         true
     }
 
+    /// Retire a specific approval that the local SSH service has expired.
+    ///
+    /// Only the currently displayed matching card is removed, so a late expiration cannot
+    /// dismiss a newer request. No local decision is emitted for the retired operation.
+    pub fn expire_operation_approval(&mut self, approval_id: &str) -> bool {
+        if !matches!(
+            &self.page,
+            SshModalPage::OperationApproval(card) if card.approval_id == approval_id
+        ) {
+            return false;
+        }
+        if self
+            .submitted_operation_approval
+            .as_ref()
+            .is_some_and(|submitted| submitted.approval_id == approval_id)
+        {
+            self.submitted_operation_approval = None;
+        }
+        self.operation_approval_origin = None;
+        self.loading = true;
+        self.return_to_manager();
+        self.show_info(
+            "Retry operation for a new approval; prior approval expired. \
+             No remote command was authorized.",
+        );
+        true
+    }
+
     /// Settle one exact local-control submission.
     ///
     /// A successful allow from a transient approval returns to chat. Explicit-manager
@@ -4055,6 +4083,24 @@ fn render_manager(buf: &mut Buffer, area: Rect, state: &mut SshManagerState, the
             "Loading configured targets…",
             Style::default().fg(theme.text_secondary),
         );
+        if let Some((message, false)) = state.message.as_ref() {
+            let available = area.height.saturating_sub(1) as usize;
+            for (row, line) in modal_window::word_wrap(message, area.width as usize)
+                .into_iter()
+                .take(available)
+                .enumerate()
+            {
+                buf.set_stringn(
+                    area.x,
+                    area.y.saturating_add(1).saturating_add(row as u16),
+                    line,
+                    area.width as usize,
+                    Style::default().fg(theme.text_secondary),
+                );
+            }
+        } else {
+            render_message(buf, area, state.message.as_ref(), theme);
+        }
         return;
     }
     if state.targets.is_empty() {
@@ -4342,7 +4388,10 @@ fn render_diagnostic(buf: &mut Buffer, area: Rect, card: &mut SshDiagnosticCard,
             AuthenticationLineTone::Normal => Style::default().fg(theme.text_secondary),
             AuthenticationLineTone::Muted => Style::default().fg(theme.gray),
             AuthenticationLineTone::Success => Style::default().fg(theme.accent_success),
-            AuthenticationLineTone::Warning | AuthenticationLineTone::Error => Style::default()
+            AuthenticationLineTone::Warning => Style::default()
+                .fg(theme.warning)
+                .add_modifier(Modifier::BOLD),
+            AuthenticationLineTone::Error => Style::default()
                 .fg(theme.accent_error)
                 .add_modifier(Modifier::BOLD),
         };
@@ -4750,7 +4799,7 @@ fn render_grant(buf: &mut Buffer, area: Rect, card: &mut SshGrantCard, theme: &T
         let focused = line.focus == Some(card.focus);
         let style = if line.warning {
             Style::default()
-                .fg(theme.accent_error)
+                .fg(theme.warning)
                 .add_modifier(Modifier::BOLD)
         } else if focused {
             Style::default()
@@ -4899,7 +4948,7 @@ fn operation_approval_lines(
             "The remote operation payload did not match a known preview. Complete technical details:",
             width,
             Style::default()
-                .fg(theme.accent_error)
+                .fg(theme.warning)
                 .add_modifier(Modifier::BOLD),
         );
         push_operation_technical_value(&mut lines, "payload", &card.detail, width, theme);
@@ -4918,7 +4967,7 @@ fn operation_approval_lines(
             "Warning: remote commands run with this SSH user's privileges; cwd is not a sandbox.",
             width,
             Style::default()
-                .fg(theme.accent_error)
+                .fg(theme.warning)
                 .add_modifier(Modifier::BOLD),
         );
     }
@@ -4943,7 +4992,7 @@ fn operation_approval_lines(
             Style::default().fg(theme.text_secondary)
         } else {
             Style::default()
-                .fg(theme.accent_error)
+                .fg(theme.accent_user)
                 .add_modifier(Modifier::BOLD)
         },
     );
@@ -5638,7 +5687,10 @@ fn render_authentication(buf: &mut Buffer, area: Rect, card: &mut SshAuthCard, t
             AuthenticationLineTone::Normal => Style::default().fg(theme.text_secondary),
             AuthenticationLineTone::Muted => Style::default().fg(theme.gray),
             AuthenticationLineTone::Success => Style::default().fg(theme.accent_success),
-            AuthenticationLineTone::Warning | AuthenticationLineTone::Error => Style::default()
+            AuthenticationLineTone::Warning => Style::default()
+                .fg(theme.warning)
+                .add_modifier(Modifier::BOLD),
+            AuthenticationLineTone::Error => Style::default()
                 .fg(theme.accent_error)
                 .add_modifier(Modifier::BOLD),
         };
@@ -7536,6 +7588,93 @@ mod tests {
                     && !card.submitting
                     && card.error.as_deref() == Some("local control unavailable")
         ));
+    }
+
+    #[test]
+    fn expired_operation_retires_the_card_without_sending_a_stale_denial() {
+        let mut state = SshManagerState::new(Some("session-1".into()));
+        state.show_operation_approval(
+            approval("expired-approval"),
+            SshOperationApprovalOrigin::TransientEvent,
+        );
+        assert!(state.submit_operation_approval("expired-approval", true));
+
+        assert!(state.expire_operation_approval("expired-approval"));
+        assert!(matches!(&state.page, SshModalPage::Manager));
+        let area = Rect::new(0, 0, 64, 12);
+        let mut buffer = Buffer::empty(area);
+        render_ssh_modal(&mut buffer, area, &mut state, false, &Theme::current());
+        assert!(matches!(
+            handle_ssh_key(&mut state, &key(KeyCode::Char('y'))),
+            SshModalOutcome::Unchanged
+        ));
+        assert!(matches!(
+            handle_ssh_key(&mut state, &key(KeyCode::Char('n'))),
+            SshModalOutcome::Unchanged
+        ));
+        assert!(matches!(
+            handle_ssh_key(&mut state, &key(KeyCode::Esc)),
+            SshModalOutcome::Close
+        ));
+
+        state.show_operation_approval(
+            approval("fresh-approval"),
+            SshOperationApprovalOrigin::TransientEvent,
+        );
+        assert!(matches!(
+            handle_ssh_key(&mut state, &key(KeyCode::End)),
+            SshModalOutcome::Changed
+        ));
+        assert!(matches!(
+            handle_ssh_key(&mut state, &key(KeyCode::Char('y'))),
+            SshModalOutcome::ApproveOperation { approval_id, approved: true, .. }
+                if approval_id == "fresh-approval"
+        ));
+    }
+
+    #[test]
+    fn stale_operation_expiration_does_not_clobber_a_newer_card() {
+        let mut state = SshManagerState::new(Some("session-1".into()));
+        state.show_operation_approval(
+            approval("old-approval"),
+            SshOperationApprovalOrigin::TransientEvent,
+        );
+        assert!(state.submit_operation_approval("old-approval", true));
+        state.show_operation_approval(
+            approval("new-approval"),
+            SshOperationApprovalOrigin::TransientEvent,
+        );
+
+        assert!(!state.expire_operation_approval("old-approval"));
+        assert!(state.submit_operation_approval("new-approval", true));
+    }
+
+    #[test]
+    fn operation_approval_colours_warnings_errors_and_instructions_differently() {
+        let theme = Theme::current();
+        let area = Rect::new(0, 0, 160, 40);
+        let mut card = approval("colours");
+        card.error = Some("local SSH control is unavailable".into());
+        let mut buffer = Buffer::empty(area);
+        render_operation_approval(&mut buffer, area, &mut card, &theme);
+        let foreground_for_text = |text: &str| {
+            (0..area.height).find_map(|row| {
+                let start = row as usize * area.width as usize;
+                let end = start + area.width as usize;
+                let rendered: String = buffer.content[start..end]
+                    .iter()
+                    .map(|cell| cell.symbol())
+                    .collect();
+                rendered.find(text).map(|byte_index| {
+                    let column = rendered[..byte_index].chars().count();
+                    buffer.content[start + column].fg
+                })
+            })
+        };
+
+        assert_eq!(foreground_for_text("Warning:"), Some(theme.warning));
+        assert_eq!(foreground_for_text("Error:"), Some(theme.accent_error));
+        assert_eq!(foreground_for_text("After review:"), Some(theme.accent_user));
     }
 
     #[test]

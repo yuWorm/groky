@@ -2919,6 +2919,9 @@ pub enum TaskResult {
         client_id: u64,
         owner: SshManagerOwner,
         approval_id: String,
+        /// The service rejected this exact approval because its pending request retired.
+        expired: bool,
+        /// Transport and unexpected-control failures remain retryable on the displayed card.
         error: Option<String>,
     },
     /// A correlated local-control acknowledgement for one managed-worker fallback decision.
