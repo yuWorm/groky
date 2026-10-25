@@ -36,6 +36,9 @@ fn map_ssh_modal_outcome(outcome: SshModalOutcome) -> InputOutcome {
             expected,
             submission_id,
         }),
+        SshModalOutcome::SelectPromptTarget { target_id } => {
+            InputOutcome::Action(Action::ChooseSshPromptTarget { target_id })
+        }
         SshModalOutcome::Connect { target_id } => {
             InputOutcome::Action(Action::ConnectSshTarget { target_id })
         }
@@ -673,15 +676,24 @@ pub(super) fn existing_ssh_manager_for_session_mut<'a>(
 }
 
 pub(super) fn dispatch_open_ssh_manager(app: &mut AppView) -> Vec<Effect> {
+    open_ssh_surface(app, false)
+}
+
+pub(super) fn dispatch_open_ssh_target_picker(app: &mut AppView) -> Vec<Effect> {
+    open_ssh_surface(app, true)
+}
+
+fn open_ssh_surface(app: &mut AppView, for_prompt: bool) -> Vec<Effect> {
     let session_id = active_session_id(app);
-    if let Some(agent) = get_active_agent_mut(app) {
-        agent.ssh_manager = Some(crate::views::ssh_modal::SshManagerState::new(
-            session_id.clone(),
-        ));
+    let manager = if for_prompt {
+        crate::views::ssh_modal::SshManagerState::for_prompt(session_id.clone())
     } else {
-        app.welcome_ssh_manager = Some(crate::views::ssh_modal::SshManagerState::new(
-            session_id.clone(),
-        ));
+        crate::views::ssh_modal::SshManagerState::new(session_id.clone())
+    };
+    if let Some(agent) = get_active_agent_mut(app) {
+        agent.ssh_manager = Some(manager);
+    } else {
+        app.welcome_ssh_manager = Some(manager);
     }
     let owner = ssh_manager_owner(app).expect("the SSH manager was just installed");
     let mut effects = Vec::with_capacity(2);
@@ -703,13 +715,62 @@ pub(super) fn dispatch_open_ssh_manager(app: &mut AppView) -> Vec<Effect> {
 }
 
 pub(super) fn dispatch_select_ssh_target(app: &mut AppView, reference: String) -> Vec<Effect> {
-    let effects = dispatch_open_ssh_manager(app);
+    let effects = dispatch_open_ssh_target_picker(app);
     if let Some(owner) = ssh_manager_owner(app)
         && let Some(manager) = ssh_manager_for_owner_mut(app, owner)
     {
         manager.queue_target_reference(reference);
     }
     effects
+}
+
+pub(super) fn dispatch_choose_ssh_prompt_target(
+    app: &mut AppView,
+    target_id: String,
+) -> Vec<Effect> {
+    if let Some(owner) = ssh_manager_owner(app) {
+        choose_ssh_prompt_target_for_owner(app, owner, &target_id);
+    }
+    vec![]
+}
+
+/// Selecting a target changes only the exact originating draft. It never grants access,
+/// queues a prompt, switches sessions, or resurrects a closed picker.
+pub(super) fn choose_ssh_prompt_target_for_owner(
+    app: &mut AppView,
+    owner: SshManagerOwner,
+    target_id: &str,
+) {
+    let Some(manager) = ssh_manager_for_owner_mut(app, owner) else {
+        return;
+    };
+    if !manager.is_prompt_picker() {
+        return;
+    }
+    let Some(target) = manager.targets.iter().find(|target| {
+        target.target_id == target_id && target.connected
+    }) else {
+        return;
+    };
+    let label = target.label.clone();
+    let address = target.effective_address.clone();
+    let session_id = manager.session_id.clone();
+    match owner.agent_id {
+        Some(agent_id) => {
+            let Some(agent) = app.agents.get_mut(&agent_id) else { return };
+            if agent.session.session_id.as_ref().map(|id| id.0.as_ref())
+                != session_id.as_deref()
+            {
+                return;
+            }
+            agent.prompt.set_ssh_target_context(target_id, &label, &address);
+        }
+        None => {
+            let Some(dashboard) = app.dashboard.as_mut() else { return };
+            dashboard.dispatch.set_ssh_target_context(target_id, &label, &address);
+        }
+    }
+    close_ssh_manager_for_owner(app, owner);
 }
 
 /// CLI and interactive entry share the same correlated project preparation and consent.
@@ -1497,17 +1558,28 @@ pub(super) fn apply_ssh_control_event(
         | xai_grok_shell::ssh::SshEvent::OperationApprovalExpired {
             client_id: event_client_id,
             ..
+        }
+        | xai_grok_shell::ssh::SshEvent::SudoAuthenticationResolved {
+            client_id: event_client_id,
+            ..
         } => *event_client_id == client_id,
+        xai_grok_shell::ssh::SshEvent::SudoAuthentication { prompt, .. } => {
+            prompt.client_id == client_id
+        }
         _ => true,
     };
     if !event_targets_this_client {
         return vec![Effect::SshAwaitEvent { client_id, session_id }];
     }
-    let owner = owner.or_else(|| match &event {
-        xai_grok_shell::ssh::SshEvent::Authentication(prompt) =>
-            ssh_manager_owner_for_authentication(app, &prompt.target_id),
-        _ => None,
-    });
+    let owner = match &event {
+        xai_grok_shell::ssh::SshEvent::SudoAuthentication { session_id, .. }
+        | xai_grok_shell::ssh::SshEvent::SudoAuthenticationResolved { session_id, .. } => {
+            ssh_manager_owner_for_session(app, Some(session_id))
+        }
+        xai_grok_shell::ssh::SshEvent::Authentication(prompt) => owner
+            .or_else(|| ssh_manager_owner_for_authentication(app, &prompt.target_id)),
+        _ => owner,
+    };
     match &event {
         xai_grok_shell::ssh::SshEvent::WorkerInstallRequested(request) => {
             let mut effects = vec![Effect::SshAwaitEvent {
@@ -1626,7 +1698,9 @@ pub(super) fn apply_ssh_control_event(
         xai_grok_shell::ssh::SshEvent::GrantCancelled { session_id, .. }
         | xai_grok_shell::ssh::SshEvent::GrantFailed { session_id, .. }
         | xai_grok_shell::ssh::SshEvent::BindingRevoked { session_id, .. }
-        | xai_grok_shell::ssh::SshEvent::OperationApprovalExpired { session_id, .. } => {
+        | xai_grok_shell::ssh::SshEvent::OperationApprovalExpired { session_id, .. }
+        | xai_grok_shell::ssh::SshEvent::SudoAuthentication { session_id, .. }
+        | xai_grok_shell::ssh::SshEvent::SudoAuthenticationResolved { session_id, .. } => {
             Some(session_id.clone())
         }
         xai_grok_shell::ssh::SshEvent::OperationApproval(approval) => {
@@ -1689,6 +1763,7 @@ pub(super) fn apply_ssh_control_event(
     let mut project_resolution = None;
     let mut grant_follow_up = None;
     let mut grant_continuation = SshModalOutcome::Unchanged;
+    let mut selected_prompt_target = None;
     let manager = match owner {
         Some(owner) => ssh_manager_for_owner_mut(app, owner),
         None => match &event {
@@ -1697,7 +1772,9 @@ pub(super) fn apply_ssh_control_event(
             | xai_grok_shell::ssh::SshEvent::GrantResolved { .. }
             | xai_grok_shell::ssh::SshEvent::GrantCancelled { .. }
             | xai_grok_shell::ssh::SshEvent::GrantFailed { .. }
-            | xai_grok_shell::ssh::SshEvent::OperationApprovalExpired { .. } => {
+            | xai_grok_shell::ssh::SshEvent::OperationApprovalExpired { .. }
+            | xai_grok_shell::ssh::SshEvent::SudoAuthentication { .. }
+            | xai_grok_shell::ssh::SshEvent::SudoAuthenticationResolved { .. } => {
                 existing_ssh_manager_for_session_mut(app, manager_session_id.as_deref())
             }
             xai_grok_shell::ssh::SshEvent::GrantRequested(_)
@@ -1814,11 +1891,48 @@ pub(super) fn apply_ssh_control_event(
                 }
             }
             xai_grok_shell::ssh::SshEvent::Authentication(prompt) => {
-                if prompt.client_id == client_id {
+                if prompt.client_id == client_id
+                    && !matches!(
+                        &prompt.kind,
+                        xai_grok_shell::ssh::SshAuthPromptKind::SudoPassword
+                    )
+                {
                     match crate::app::ssh_control::authentication_card(prompt) {
                         Ok(card) => manager.show_authentication(card),
                         Err(error) => manager.show_error(error),
                     }
+                }
+            }
+            xai_grok_shell::ssh::SshEvent::SudoAuthentication {
+                session_id: sudo_session_id,
+                operation_id,
+                prompt,
+            } => {
+                if prompt.client_id == client_id
+                    && manager.session_id.as_deref() == Some(sudo_session_id.as_str())
+                    && let Ok(card) = crate::app::ssh_control::authentication_card(prompt)
+                {
+                    manager.show_sudo_authentication(
+                        client_id,
+                        &sudo_session_id,
+                        &operation_id,
+                        card,
+                    );
+                }
+            }
+            xai_grok_shell::ssh::SshEvent::SudoAuthenticationResolved {
+                client_id: event_client_id,
+                session_id: sudo_session_id,
+                challenge_id,
+                error,
+            } => {
+                if event_client_id == client_id {
+                    manager.resolve_sudo_authentication(
+                        event_client_id,
+                        &sudo_session_id,
+                        &challenge_id,
+                        error,
+                    );
                 }
             }
             xai_grok_shell::ssh::SshEvent::OperationApproval(approval) => {
@@ -1836,7 +1950,9 @@ pub(super) fn apply_ssh_control_event(
                             approval.title,
                             approval.detail,
                             approval.operation,
-                        ),
+                        )
+                        .with_allow_session(approval.allow_session)
+                        .with_operation_id(approval.operation_id),
                         operation_approval_origin,
                     );
                 }
@@ -1854,6 +1970,12 @@ pub(super) fn apply_ssh_control_event(
             }
             xai_grok_shell::ssh::SshEvent::TargetStatus(status) => {
                 manager.apply_target_status(&status.target_id, status.connection, status.detail);
+                if owner.is_some()
+                    && status.connection == xai_grok_shell::ssh::SshConnectionState::Connected
+                {
+                    selected_prompt_target =
+                        manager.take_connected_prompt_target(&status.target_id);
+                }
             }
             xai_grok_shell::ssh::SshEvent::WorkerInstallRequested(_)
             | xai_grok_shell::ssh::SshEvent::WorkerInstallProgress(_) => {
@@ -1866,6 +1988,10 @@ pub(super) fn apply_ssh_control_event(
                 }];
             }
         }
+    }
+    if let (Some(owner), Some(target_id)) = (owner, selected_prompt_target) {
+        choose_ssh_prompt_target_for_owner(app, owner, &target_id);
+        return vec![Effect::SshAwaitEvent { client_id, session_id }];
     }
     if close_tool_manager
         && let Some(owner) = resolution_owner

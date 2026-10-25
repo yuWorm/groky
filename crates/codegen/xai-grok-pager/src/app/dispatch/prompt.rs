@@ -669,6 +669,14 @@ pub(super) fn dispatch_send_prompt_submission(
         }
         return prelude;
     };
+    let text = if !literal && submission.is_none() {
+        app.agents.get(&id)
+            .filter(|agent| agent.prompt.text() == text)
+            .and_then(|agent| agent.prompt.ssh_target_picker_command())
+            .unwrap_or(text)
+    } else {
+        text
+    };
     // A slash command is refused below only if it would queue, so `/new`, `/resume`, and `exit` still run
     let runs_locally = !literal
         && (text.trim().starts_with('/')
@@ -983,6 +991,20 @@ pub(super) fn dispatch_send_prompt_submission(
             }
             other => other,
         };
+
+        // `/ssh` only opens a local picker. Keep its existing chips and images in the composer
+        // instead of taking the normal local-command snapshot, then remove just the invocation so
+        // the selected context and later requirements form one ordinary prompt.
+        if let CommandResult::Action(
+            action @ (Action::OpenSshTargetPicker | Action::SelectSshTarget { .. }),
+        ) = exec_result
+        {
+            if consume_input {
+                agent.prompt.remove_ssh_target_picker_command();
+            }
+            effects.extend(dispatch(action, app));
+            return effects;
+        }
 
         // One snapshot re-binds orphan placeholders and then owns the chips and images; the composer's
         // image state is not read again below.

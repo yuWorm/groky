@@ -2865,6 +2865,9 @@ impl DashboardState {
     /// to the slash dispatcher (there's no session to "open"), so `attach` only affects the
     /// plain-dispatch path.
     fn dispatch_send_action(&mut self, attach: bool) -> InputOutcome {
+        if let Some(text) = self.dispatch.ssh_target_picker_command() {
+            return InputOutcome::Action(Action::DashboardDispatchSlash { text });
+        }
         let text = self.dispatch.text().to_string();
         let trimmed = text.trim();
         if trimmed.is_empty() {

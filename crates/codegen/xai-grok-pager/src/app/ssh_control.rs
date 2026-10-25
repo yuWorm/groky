@@ -259,6 +259,9 @@ pub(crate) fn authentication_card(
         (SshAuthPromptKind::Password, SshAuthPromptDetail::Secret {
             username, message, allow_remember,
         }) => SshAuthKind::Password { username, message, allow_remember },
+        (SshAuthPromptKind::SudoPassword, SshAuthPromptDetail::Secret {
+            username, message, allow_remember: false,
+        }) => SshAuthKind::SudoPassword { username, message },
         (SshAuthPromptKind::PrivateKeyPassphrase, SshAuthPromptDetail::Secret {
             username, message, allow_remember,
         }) => SshAuthKind::PrivateKeyPassphrase { username, message, allow_remember },

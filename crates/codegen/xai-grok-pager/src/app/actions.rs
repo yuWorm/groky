@@ -675,7 +675,11 @@ pub enum Action {
     },
     /// Open the local SSH target and authorization manager. Works before provider login.
     OpenSshManager,
-    /// Select a configured SSH target by exact name or ID, then authorize/use it in this session.
+    /// Choose a server to include in an editable chat draft, without granting access or sending.
+    OpenSshTargetPicker,
+    /// Add a connected target selected by the current picker to its owning composer.
+    ChooseSshPromptTarget { target_id: String },
+    /// Resolve a configured target by exact name or ID for the current chat draft.
     SelectSshTarget { reference: String },
     /// Reload configured targets and current-session SSH grant/connection status.
     RefreshSshTargets,

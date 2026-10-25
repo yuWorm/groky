@@ -530,6 +530,7 @@ impl StandaloneSshRunner {
             // outcomes are unreachable from the session-less shortcuts, but refusing them here
             // also prevents a future modal change from turning this surface into a grant engine.
             SshModalOutcome::RequestGrant { .. }
+            | SshModalOutcome::SelectPromptTarget { .. }
             | SshModalOutcome::ApproveGrant { .. }
             | SshModalOutcome::CancelGrant { .. }
             | SshModalOutcome::InspectGrantTarget { .. }
@@ -724,6 +725,10 @@ impl StandaloneSshRunner {
         match event {
             SshEvent::Authentication(prompt)
                 if prompt.client_id == self.client_id
+                    && !matches!(
+                        &prompt.kind,
+                        xai_grok_shell::ssh::SshAuthPromptKind::SudoPassword
+                    )
                     && self.state.pending_authentication_target_id() == Some(prompt.target_id.as_str()) =>
             {
                 if self.last_authentication_submission.as_ref().is_some_and(|submitted| {
@@ -752,7 +757,9 @@ impl StandaloneSshRunner {
             | SshEvent::OperationApproval(_)
             | SshEvent::OperationApprovalExpired { .. }
             | SshEvent::WorkerInstallRequested(_)
-            | SshEvent::WorkerInstallProgress(_) => {}
+            | SshEvent::WorkerInstallProgress(_)
+            | SshEvent::SudoAuthentication { .. }
+            | SshEvent::SudoAuthenticationResolved { .. } => {}
             SshEvent::Authentication(_) => {}
         }
         LoopAction::Continue

@@ -44,6 +44,8 @@ pub const KIND_PASTE: ElementKind = ElementKind(1);
 pub const KIND_FILE_REF: ElementKind = ElementKind(2);
 /// Element kind tag for pasted image chips (`[Image #N]`).
 pub const KIND_IMAGE: ElementKind = ElementKind(3);
+/// Element kind tag for the selected SSH server context.
+pub const KIND_SSH_TARGET: ElementKind = ElementKind(4);
 
 /// Byte size at which a single-line paste is chipped (display only, not an offload threshold).
 const PASTE_CHIP_DISPLAY_BYTES: usize = 10_000;
@@ -75,7 +77,7 @@ fn text_without_image_chips(
 /// What kind of element interaction occurred when pressing Enter on a chip.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ElementInteraction {
-    /// Paste or file-ref element was inlined (expanded).
+    /// Paste, file-ref, or SSH-target element was inlined (expanded).
     Inlined,
     /// Image chip was activated (caller should open preview).
     ImagePreview,
@@ -1018,9 +1020,10 @@ impl PromptWidget {
         }
     }
 
-    /// Whether a completion range overlaps an atomic prompt element (paste chip, file ref, image chip).
-    /// Completion ranges are computed over the plain request text, but `TextArea::replace_range` expands any element overlap to the WHOLE element.
-    /// Accepting such a range would swallow the entire chip (paste data loss). Treated as a stale no-op.
+    /// Whether a completion range overlaps an atomic prompt element (paste, file ref, image, SSH
+    /// target). Completion ranges are computed over the plain request text, but
+    /// `TextArea::replace_range` expands any element overlap to the whole element. Accepting such
+    /// a range would swallow the entire chip, so it is treated as a stale no-op.
     fn completion_range_clips_element(&self, range: &std::ops::Range<usize>) -> bool {
         self.textarea
             .elements()
@@ -1235,6 +1238,116 @@ impl PromptWidget {
         if self.text() != text {
             self.set_text(text);
         }
+    }
+
+    /// Insert or replace the selected SSH server context without submitting the draft.
+    ///
+    /// The atomic chip keeps the composer readable while its buffer text is structured, durable
+    /// context sent with the user's ordinary prompt. Re-selecting a server replaces every live
+    /// target chip so a draft cannot send contradictory selections. An expanded chip is plain text
+    /// by user choice and is deliberately left alone.
+    pub fn set_ssh_target_context(&mut self, target_id: &str, label: &str, address: &str) {
+        let payload = ssh_target_context_payload(target_id, label, address);
+        let display = ssh_target_chip_display(label, address);
+        let existing_ranges: Vec<_> = self
+            .textarea
+            .elements()
+            .iter()
+            .filter(|element| element.kind == KIND_SSH_TARGET)
+            .map(|element| element.range.clone())
+            .collect();
+
+        self.post_insert_image_preview = None;
+        self.hovered_image_element_id = None;
+        self.suggestions.invalidate_draft();
+        self.textarea.begin_undo_group();
+        let chip_end = if let Some(first_range) = existing_ranges.first() {
+            for range in existing_ranges.iter().skip(1).rev() {
+                self.textarea.replace_range(range.clone(), "");
+            }
+            let start = first_range.start;
+            self.textarea.replace_range_with_element(
+                first_range.clone(),
+                &payload,
+                KIND_SSH_TARGET,
+                Some(display),
+            );
+            start + payload.len()
+        } else {
+            let start = self.textarea.cursor();
+            self.textarea
+                .insert_element(&payload, KIND_SSH_TARGET, Some(display));
+            start + payload.len()
+        };
+
+        let following_whitespace = self
+            .textarea
+            .text()
+            .get(chip_end..)
+            .and_then(|tail| tail.chars().next())
+            .filter(|character| character.is_whitespace());
+        if following_whitespace.is_none() {
+            self.set_cursor(chip_end);
+            self.textarea.insert_str(" ");
+        }
+        self.set_cursor(self.text().len());
+        self.textarea.end_undo_group();
+
+        self.ssh_target_completion.leave();
+        self.slash_controller.set_ssh_candidates(Vec::new());
+        self.slash_state.close();
+        self.update_file_search_context();
+    }
+
+    /// Recognize a local SSH picker command outside atomic attachments. A preceding target
+    /// or image chip is draft context, not a reason to send `/ssh` to the model.
+    pub(crate) fn ssh_target_picker_command(&self) -> Option<String> {
+        let mut end = 0;
+        let leading = self.textarea.elements().iter().find_map(|element| {
+            let gap = &self.text()[end..element.range.start];
+            end = element.range.end;
+            (!gap.trim().is_empty()).then_some(gap)
+        }).unwrap_or_else(|| &self.text()[end..]);
+        crate::slash::parse_invocation(leading.trim())
+            .filter(|invocation| matches!(invocation.token, "ssh" | "remote"))?;
+        let (text, _) = strip_all_elements(self.text(), self.cursor(), &self.textarea);
+        Some(text)
+    }
+
+    /// Remove the `/ssh` or `/remote` invocation while retaining all atomic attachments.
+    ///
+    /// This is the local picker handoff: command text must not linger and execute again when the
+    /// user later sends their requirements, but attachments already in the composer remain owned
+    /// by the draft.
+    pub(crate) fn remove_ssh_target_picker_command(&mut self) {
+        if self.ssh_target_picker_command().is_none() {
+            return;
+        }
+        let mut ranges = Vec::with_capacity(self.textarea.elements().len() + 1);
+        let mut end = 0;
+        for element in self.textarea.elements() {
+            if end < element.range.start {
+                ranges.push(end..element.range.start);
+            }
+            end = element.range.end;
+        }
+        if end < self.text().len() {
+            ranges.push(end..self.text().len());
+        }
+
+        self.post_insert_image_preview = None;
+        self.hovered_image_element_id = None;
+        self.suggestions.invalidate_draft();
+        self.textarea.begin_undo_group();
+        for range in ranges.into_iter().rev() {
+            self.textarea.replace_range(range, "");
+        }
+        self.textarea.end_undo_group();
+        self.set_cursor(0);
+        self.ssh_target_completion.leave();
+        self.slash_controller.set_ssh_candidates(Vec::new());
+        self.slash_state.close();
+        self.update_file_search_context();
     }
 
     /// Append plain text at the end without replacing existing chip elements.
@@ -2938,9 +3051,10 @@ impl PromptWidget {
         self.rechip_orphan_image_placeholders();
     }
 
-    /// Re-register all chip elements (paste blocks, @-file refs, image chips) after a `set_text` restore.
-    /// Uses the byte ranges stored at capture time; no buffer re-scanning. A range an element of the
-    /// same kind already covers is skipped, so a re-chipped image never gets a second element.
+    /// Re-register all chip elements (paste blocks, @-file refs, image chips, SSH target context)
+    /// after a `set_text` restore. Uses the byte ranges stored at capture time; no buffer re-scanning.
+    /// A range an element of the same kind already covers is skipped, so a re-chipped image never
+    /// gets a second element.
     pub fn restore_chip_elements(&mut self, elems: &[crate::app::agent::ChipElement]) {
         let covered: Vec<(ElementKind, std::ops::Range<usize>)> = self
             .textarea
@@ -3100,17 +3214,18 @@ impl PromptWidget {
         true
     }
 
-    /// Try to interact with an element at the cursor. Enter on a paste/file-ref element inlines
-    /// (expands) it. Enter on an image chip signals the caller to open the preview (it does NOT inline
-    /// the placeholder text). Returns `Some(interaction)` if handled, `None` otherwise.
+    /// Try to interact with an element at the cursor. Enter on a paste, file-ref, or SSH-target
+    /// element inlines (expands) it. Enter on an image chip signals the caller to open the preview
+    /// (it does NOT inline the placeholder text). Returns `Some(interaction)` if handled, `None`
+    /// otherwise.
     pub fn try_element_interaction(&mut self, key: &KeyEvent) -> Option<ElementInteraction> {
         let elem = self.textarea.element_at_cursor()?;
         if !key!(Enter).matches(key) {
             return None;
         }
+        let id = elem.id;
         match elem.kind {
-            k if k == KIND_PASTE || k == KIND_FILE_REF => {
-                let id = elem.id;
+            k if k == KIND_PASTE || k == KIND_FILE_REF || k == KIND_SSH_TARGET => {
                 self.expand_element(id);
                 Some(ElementInteraction::Inlined)
             }
@@ -3941,7 +4056,8 @@ fn map_clean_range_to_raw(
     start..end
 }
 
-/// Rewrite slash snapshot ranges from clean-text coordinates to raw buffer coordinates (paste/image chips are omitted from clean text).
+/// Rewrite slash snapshot ranges from clean-text coordinates to raw buffer coordinates (chip bodies
+/// are omitted from clean text).
 fn remap_slash_snapshot_to_raw(
     snap: &mut crate::slash::SlashSnapshot,
     text: &str,
@@ -3964,6 +4080,76 @@ fn remap_slash_snapshot_to_raw(
     if let Some(ref mut ghost) = snap.inline_ghost {
         ghost.token_range = map_clean_range_to_raw(text, ghost.token_range.clone(), textarea);
     }
+}
+
+/// Serialized wire context for a selected SSH target.
+///
+/// This contains only the configured target identity and human-readable address, never
+/// authentication material or connection metadata.
+#[derive(serde::Serialize)]
+struct SshTargetContextPayload<'a> {
+    #[serde(rename = "type")]
+    kind: &'static str,
+    target_id: &'a str,
+    label: &'a str,
+    address: &'a str,
+}
+
+fn ssh_target_context_payload(target_id: &str, label: &str, address: &str) -> String {
+    let payload = serde_json::to_string(&SshTargetContextPayload {
+        kind: "ssh_target",
+        target_id,
+        label,
+        address,
+    })
+    .expect("serializing SSH target context strings cannot fail");
+    escape_json_inline_separators(payload)
+}
+
+/// Escape values that JSON permits literally but a terminal text buffer must not contain.
+fn escape_json_inline_separators(payload: String) -> String {
+    if !payload
+        .chars()
+        .any(|character| character.is_control() || matches!(character, '\u{2028}' | '\u{2029}'))
+    {
+        return payload;
+    }
+
+    use std::fmt::Write;
+
+    let mut escaped = String::with_capacity(payload.len());
+    for character in payload.chars() {
+        if character.is_control() || matches!(character, '\u{2028}' | '\u{2029}') {
+            write!(escaped, "\\u{:04x}", character as u32)
+                .expect("writing a JSON escape into a String cannot fail");
+        } else {
+            escaped.push(character);
+        }
+    }
+    escaped
+}
+
+/// Format untrusted target metadata for a terminal-rendered chip.
+///
+/// The buffer keeps JSON-escaped values; the display also eliminates every C0/C1 control so a
+/// configured label or address cannot inject terminal controls into a rendered `Span`.
+fn ssh_target_chip_display(label: &str, address: &str) -> Line<'static> {
+    fn push_terminal_safe(output: &mut String, value: &str) {
+        for character in value.chars() {
+            if character.is_control() || matches!(character, '\u{2028}' | '\u{2029}') {
+                output.push(' ');
+            } else {
+                output.push(character);
+            }
+        }
+    }
+
+    let mut text = String::with_capacity("SSH:  · ".len() + label.len() + address.len());
+    text.push_str("SSH: ");
+    push_terminal_safe(&mut text, label);
+    text.push_str(" · ");
+    push_terminal_safe(&mut text, address);
+    chip_line(text)
 }
 
 /// Build a `[<label>]` chip line with the shared chip styling (dim brackets, paste foreground/background).

@@ -29,6 +29,83 @@ fn send_prompt_clears_active_ephemeral_tip() {
 }
 
 #[test]
+fn ssh_picker_command_keeps_attachments_and_never_queues_model_work() {
+    let mut app = test_app_with_agent();
+    let id = AgentId(0);
+    {
+        let agent = app.agents.get_mut(&id).expect("fixture agent");
+        agent.prompt.set_text("/ssh ");
+        agent
+            .prompt
+            .insert_image(crate::prompt_images::PastedImage {
+                element_id: xai_ratatui_textarea::ElementId::from_raw(0),
+                display_number: 0,
+                mime_type: "image/png".into(),
+                dimensions: Some((100, 80)),
+                byte_len: 16,
+                encoded_bytes: Some(vec![0; 16].into()),
+                source_path: None,
+                staged_temp_path: None,
+                session_image_path: None,
+                preview: crate::prompt_images::PromptImagePreview::default(),
+            })
+            .expect("image chip");
+    }
+    let command = agent_ref(&app, id).prompt.text().to_owned();
+
+    let effects = dispatch_send_prompt(&mut app, command);
+
+    assert!(
+        effects
+            .iter()
+            .any(|effect| matches!(effect, Effect::SshListTargets { .. })),
+        "/ssh must open the local picker"
+    );
+    assert!(
+        !effects
+            .iter()
+            .any(|effect| matches!(effect, Effect::SendPrompt { .. })),
+        "opening the picker must not start model work"
+    );
+    let agent = agent_ref(&app, id);
+    assert!(agent.session.pending_prompts.is_empty());
+    assert_eq!(agent.prompt.images.len(), 1, "image ownership remains in draft");
+    assert_eq!(
+        agent
+            .prompt
+            .textarea
+            .elements()
+            .iter()
+            .filter(|element| element.kind == crate::views::prompt_widget::KIND_IMAGE)
+            .count(),
+        1,
+        "image chip remains visible after picker handoff"
+    );
+    assert!(
+        !agent.prompt.text().trim_start().starts_with("/ssh"),
+        "the command must not execute again after a target is selected"
+    );
+}
+
+#[test]
+fn ssh_picker_command_after_selected_target_keeps_context_until_reselection() {
+    let mut app = test_app_with_agent();
+    let id = AgentId(0);
+    let prompt = &mut app.agents.get_mut(&id).unwrap().prompt;
+    prompt.set_ssh_target_context("previous-host", "Previous host", "user@previous-host:22");
+    prompt.append_text("/remote next-host");
+    let text = prompt.text().to_owned();
+    let effects = dispatch_send_prompt(&mut app, text);
+    assert!(effects.iter().any(|effect| matches!(effect, Effect::SshListTargets { .. })));
+    let agent = agent_ref(&app, id);
+    assert!(!agent.session.state.is_turn_running());
+    assert!(agent.session.pending_prompts.is_empty());
+    assert!(agent.prompt.text().contains("previous-host"));
+    assert!(!agent.prompt.text().contains("/remote"));
+    assert!(!agent.prompt.text().contains("next-host"));
+}
+
+#[test]
 fn doctor_fix_list_and_plan_dispatch_as_background_effects() {
     let mut app = test_app_with_agent();
     let id = AgentId(0);

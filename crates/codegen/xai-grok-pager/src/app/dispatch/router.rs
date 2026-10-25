@@ -1278,6 +1278,10 @@ fn dispatch_inner(action: Action, app: &mut AppView) -> Vec<Effect> {
             super::vendor::dispatch_open_vendor_login(app, provider_id)
         }
         Action::OpenSshManager => super::ssh::dispatch_open_ssh_manager(app),
+        Action::OpenSshTargetPicker => super::ssh::dispatch_open_ssh_target_picker(app),
+        Action::ChooseSshPromptTarget { target_id } => {
+            super::ssh::dispatch_choose_ssh_prompt_target(app, target_id)
+        }
         Action::SelectSshTarget { reference } => {
             super::ssh::dispatch_select_ssh_target(app, reference)
         }

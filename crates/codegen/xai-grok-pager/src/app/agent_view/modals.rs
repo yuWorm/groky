@@ -199,6 +199,9 @@ impl AgentView {
                 expected,
                 submission_id,
             }),
+            SshModalOutcome::SelectPromptTarget { target_id } => {
+                InputOutcome::Action(Action::ChooseSshPromptTarget { target_id })
+            }
             SshModalOutcome::Connect { target_id } => {
                 InputOutcome::Action(Action::ConnectSshTarget { target_id })
             }

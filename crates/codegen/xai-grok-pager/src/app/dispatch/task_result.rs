@@ -644,6 +644,16 @@ pub(super) fn dispatch_task_result(result: TaskResult, app: &mut AppView) -> Vec
                     None => {
                         manager.set_targets(targets);
                         match manager.continue_target_reference() {
+                            crate::views::ssh_modal::SshModalOutcome::SelectPromptTarget { target_id } => {
+                                super::ssh::choose_ssh_prompt_target_for_owner(app, owner, &target_id);
+                                return vec![];
+                            }
+                            crate::views::ssh_modal::SshModalOutcome::Connect { target_id } => {
+                                manager.begin_connection_action(&target_id, true);
+                                return vec![Effect::SshConnect {
+                                    session_id, target_id, client_id, owner,
+                                }];
+                            }
                             crate::views::ssh_modal::SshModalOutcome::BrowseProjectDirectory {
                                 request_id, target_id, path,
                             } => return vec![Effect::SshBrowseProjectDirectory {

@@ -30,6 +30,232 @@
     }
 
     #[test]
+    fn ssh_target_context_sends_target_and_later_requirements() {
+        let mut pw = PromptWidget::new();
+
+        pw.set_ssh_target_context(
+            "target-build-cache",
+            "Build Cache",
+            "builder@cache.example.test:2222",
+        );
+        pw.append_text("inspect the failed deployment logs");
+
+        let target = pw
+            .textarea
+            .elements()
+            .iter()
+            .find(|element| element.kind == KIND_SSH_TARGET)
+            .expect("SSH target chip");
+        let payload = pw
+            .textarea
+            .element_text(target.id)
+            .expect("target payload");
+        assert!(payload.contains(r#""target_id":"target-build-cache""#));
+        assert!(payload.contains(r#""label":"Build Cache""#));
+        let display: String = target
+            .display
+            .as_ref()
+            .expect("target chip display")
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect();
+        assert!(display.contains("Build Cache"));
+        assert!(display.contains("builder@cache.example.test:2222"));
+        assert!(payload.contains(r#""address":"builder@cache.example.test:2222""#));
+
+        let submitted = pw.try_send().expect("target context plus requirements sends");
+        assert!(submitted.contains(r#""target_id":"target-build-cache""#));
+        assert!(
+            submitted.contains("inspect the failed deployment logs"),
+            "user requirements must stay in the ordinary submitted prompt"
+        );
+    }
+
+    #[test]
+    fn ssh_target_selection_returns_typing_to_the_end_of_existing_requirements() {
+        let mut pw = PromptWidget::new();
+        pw.set_text("Inspect disk usage. ");
+        pw.set_ssh_target_context("target-east", "Build East", "user@build:22");
+        for character in "Do not delete files.".chars() {
+            pw.handle_key(&KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE));
+        }
+        let submitted = pw.try_send().unwrap();
+        assert!(submitted.contains("target-east"));
+        assert!(submitted.ends_with("Inspect disk usage. Do not delete files."));
+    }
+
+    #[test]
+    fn ssh_target_context_replaces_only_its_chip_and_preserves_attachments() {
+        let mut pw = PromptWidget::new();
+        pw.textarea.insert_str("review ");
+        pw.insert_image(test_image()).expect("image chip");
+        pw.handle_paste("one\ntwo\nthree\nfour");
+
+        pw.set_ssh_target_context("target-east", "Build Cache", "cache-east.example.test");
+        pw.append_text("then compare the compiler output");
+        pw.set_ssh_target_context("target-west", "Build Cache", "cache-west.example.test");
+
+        let ssh_chips: Vec<_> = pw
+            .textarea
+            .elements()
+            .iter()
+            .filter(|element| element.kind == KIND_SSH_TARGET)
+            .collect();
+        assert_eq!(ssh_chips.len(), 1, "a draft has one live SSH selection");
+        let selected: serde_json::Value = serde_json::from_str(
+            pw.textarea.element_text(ssh_chips[0].id).unwrap(),
+        ).unwrap();
+        assert_eq!(selected["target_id"], "target-west");
+        assert!(!pw.text().contains("target-east"));
+        assert_eq!(pw.images.len(), 1, "image payload remains attached");
+        assert_eq!(
+            pw.textarea
+                .elements()
+                .iter()
+                .filter(|element| element.kind == KIND_IMAGE)
+                .count(),
+            1
+        );
+        assert_eq!(
+            pw.textarea
+                .elements()
+                .iter()
+                .filter(|element| element.kind == KIND_PASTE)
+                .count(),
+            1,
+            "unrelated paste chip remains atomic"
+        );
+        assert!(pw.text().contains("then compare the compiler output"));
+
+        assert!(pw.textarea.undo(), "target replacement is undoable");
+        assert!(pw.text().contains("target-east"));
+        assert_eq!(
+            pw.textarea
+                .elements()
+                .iter()
+                .filter(|element| element.kind == KIND_SSH_TARGET)
+                .count(),
+            1,
+            "undo restores the earlier target as a chip"
+        );
+    }
+
+    #[test]
+    fn ssh_picker_handoff_keeps_existing_target_until_a_new_selection_replaces_it() {
+        let mut pw = PromptWidget::new();
+        pw.set_text("/ssh ");
+        pw.set_ssh_target_context("target-east", "Build Cache", "cache-east.example.test");
+
+        pw.remove_ssh_target_picker_command();
+        assert!(
+            pw.text().contains(r#""target_id":"target-east""#),
+            "canceling the picker leaves the prior draft context intact"
+        );
+        assert_eq!(
+            pw.textarea
+                .elements()
+                .iter()
+                .filter(|element| element.kind == KIND_SSH_TARGET)
+                .count(),
+            1
+        );
+
+        pw.set_ssh_target_context("target-west", "Build Cache", "cache-west.example.test");
+        assert!(pw.text().contains(r#""target_id":"target-west""#));
+        assert!(!pw.text().contains("target-east"));
+    }
+
+    #[test]
+    fn ssh_target_context_expands_or_deletes_with_existing_chip_interactions() {
+        let mut pw = PromptWidget::new();
+        pw.set_ssh_target_context("target-east", "Build Cache", "cache-east.example.test");
+        let target = pw
+            .textarea
+            .elements()
+            .iter()
+            .find(|element| element.kind == KIND_SSH_TARGET)
+            .expect("SSH target chip");
+        pw.set_cursor(target.range.start);
+
+        assert_eq!(
+            pw.try_element_interaction(&key!(Enter).to_key_event()),
+            Some(ElementInteraction::Inlined)
+        );
+        assert!(
+            pw.textarea
+                .elements()
+                .iter()
+                .all(|element| element.kind != KIND_SSH_TARGET)
+        );
+        assert!(
+            pw.text().contains(r#""target_id":"target-east""#),
+            "expanding keeps durable context visible and editable"
+        );
+
+        let mut delete = PromptWidget::new();
+        delete.set_ssh_target_context("target-east", "Build Cache", "cache-east.example.test");
+        assert_eq!(
+            delete.handle_key(&key!(Backspace).to_key_event()),
+            PromptEvent::Edited,
+            "first backspace removes the editable spacer"
+        );
+        assert_eq!(
+            delete.handle_key(&key!(Backspace).to_key_event()),
+            PromptEvent::Edited,
+            "second backspace removes the atomic context chip"
+        );
+        assert!(
+            delete
+                .textarea
+                .elements()
+                .iter()
+                .all(|element| element.kind != KIND_SSH_TARGET)
+        );
+        assert!(!delete.text().contains(r#""target_id":"target-east""#));
+    }
+
+    #[test]
+    fn ssh_target_context_escapes_metadata_and_terminal_display() {
+        let mut pw = PromptWidget::new();
+        pw.set_ssh_target_context(
+            "target\u{1b}",
+            "Build\nCache\u{2028}",
+            "builder@\u{1b}[31mcache.example.test\u{2029}",
+        );
+
+        let target = pw
+            .textarea
+            .elements()
+            .iter()
+            .find(|element| element.kind == KIND_SSH_TARGET)
+            .expect("SSH target chip");
+        let payload = pw.textarea.element_text(target.id).expect("target payload");
+        assert!(
+            !payload
+                .chars()
+                .any(|character| character.is_control()
+                    || matches!(character, '\u{2028}' | '\u{2029}')),
+            "wire payload must JSON-escape terminal control characters"
+        );
+        let display: String = target
+            .display
+            .as_ref()
+            .expect("target chip display")
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect();
+        assert!(
+            !display
+                .chars()
+                .any(|character| character.is_control()
+                    || matches!(character, '\u{2028}' | '\u{2029}')),
+            "terminal display must not render control characters"
+        );
+    }
+
+    #[test]
     fn shift_enter_inserts_newline() {
         let mut pw = PromptWidget::new();
         pw.textarea.insert_str("line1");

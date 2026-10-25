@@ -1659,6 +1659,12 @@ pub async fn run_leader_server(
                     } else {
                         let target = match &event {
                             crate::ssh::SshEvent::Authentication(prompt) => Some(ClientId(prompt.client_id)),
+                            crate::ssh::SshEvent::SudoAuthentication { prompt, .. } => {
+                                Some(ClientId(prompt.client_id))
+                            }
+                            crate::ssh::SshEvent::SudoAuthenticationResolved { client_id, .. } => {
+                                Some(ClientId(*client_id))
+                            }
                             crate::ssh::SshEvent::OperationApproval(approval) => {
                                 Some(ClientId(approval.client_id))
                             }

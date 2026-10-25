@@ -193,13 +193,16 @@ groky checks compatibility but never overwrites or automatically updates it.
 Git, ripgrep and the project's tools must still be available remotely. The worker
 does not need an xAI login; model requests and provider credentials remain local.
 
-Open `/ssh` in a local chat to **choose the SSH server for that session**. Candidate
-rows show a stable target ID and configuration source. Select a server and press
-`Enter`, choose a remote folder, then approve the required permissions. The approved
-binding automatically becomes this session's SSH default; `Enter` on an already
-granted row selects that exact binding without requesting another grant.
-This uses native SSH/SFTP, does not install or start a worker, and keeps the current
-chat and local workspace. `g` separately requests access without changing the default.
+Open `/ssh` in a local chat to **choose an SSH server for the current draft**.
+Select a server with `Enter` or a click. A connected server returns directly to the
+composer; a disconnected server uses the connection/authentication flow first.
+The selected server appears as a removable SSH chip. Add your requirements and
+send when ready: selection alone never sends a message or starts an agent turn.
+The normal message includes the exact target ID and address alongside your text.
+Existing text, images and paste chips stay in the draft; selecting another server
+replaces the target chip. Selection does not grant access, change the session's
+default binding, start a worker, or switch projects. The agent requests any missing
+permissions when it needs to operate; `g` remains available for explicit access grants.
 
 Typing `/ssh ` (or `/remote `) opens server suggestions automatically, without
 pressing Enter. Type to filter by name, host, address or ID; rows show the address,
@@ -212,9 +215,8 @@ To submit a server reference directly rather than accept a suggestion, enter
 `/ssh <server name or target ID>`, dismiss suggestions with `Esc`, then press Enter.
 For example, `/ssh build-server` or `/ssh QA storage`; names containing spaces
 need no quotes. Stable IDs take precedence over exact
-OpenSSH aliases, then unique labels/hosts. A single existing grant is selected
-directly; otherwise the same folder/consent flow applies. Duplicate names show
-matching candidates, and multiple grants require choosing the intended folder.
+OpenSSH aliases, then unique labels/hosts. Duplicate names show matching candidates;
+multiple grants for one server appear as one server choice in the draft picker.
 Unknown names leave the server chooser open without connecting to a guessed target.
 
 To **open a remote project**, select `o open project (worker)` in the manager.
@@ -243,7 +245,7 @@ without a folder also use this picker, retaining their original permission ceili
 explicitly rejects it. Lookup, connection and inspection failures return their real
 errors to the waiting tool instead of reporting user denial. Directory errors open
 full diagnostics and retain the last valid folder for retry.
-`r` revokes only the selected grant. Each active grant has its own row.
+In advanced management, each active grant has its own row; `r` revokes only the selected grant.
 Target rows and footer actions are clickable; the wheel scrolls lists. Permission
 options support clicks and `Tab`/`Space`; `PgUp`/`PgDn` inspect wrapped details.
 
@@ -261,7 +263,22 @@ separate auto-approval rules. These rules do not survive session closure, grant 
 or client disconnect, and are not inherited by other sessions or grants. Select the grant
 under Advanced and press `p` (“ask each time”) to reset its operation approvals.
 Auto-approval never expands access permissions or bypasses host verification; remote commands
-still run with the SSH user's privileges, and the working directory is not a sandbox.
+run with the SSH user's privileges by default, and the working directory is not a sandbox.
+
+For a root command, `ssh_run` accepts `sudo: true`. The review identifies the SSH login
+and root execution identity and shows the exact command and working directory. Root commands
+always require one-time approval; ordinary session approval never covers them. If remote sudo
+requests a password, enter the SSH account's sudo password in the masked local prompt. It is
+sent only over that SSH connection, never included in model/tool arguments or history, and
+never remembered. `NOPASSWD` still requires review but does not request a password; managed
+sudo ignores cached credentials. Cancellation, expiry, or revocation before execution stops
+the command; failures are not automatically replayed. After execution starts, a lost connection
+cannot prove that the remote command stopped.
+
+This path requires the server's sudo policy to permit the root shell wrapper; restricted
+command-only sudoers or a TTY requirement may reject it. SFTP reads/writes/edits do not
+silently elevate. These controls are not a shell sandbox: ordinary commands retain all
+privileges already granted to the SSH account, including server-configured passwordless sudo.
 
 Passwords, encrypted private keys, ssh-agent and keyboard-interactive authentication are supported.
 Host trust and access grants are separate confirmations. Passwords are masked and

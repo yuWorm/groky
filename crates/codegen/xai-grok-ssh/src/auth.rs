@@ -20,13 +20,19 @@ impl Secret {
         Self::from_owned(value.as_ref().to_vec())
     }
 
-    /// Adopt bytes returned by a credential backend without leaving an
-    /// additional, non-zeroized allocation behind.
-    pub(crate) fn from_owned(value: Vec<u8>) -> Self {
+    /// Adopt owned bytes without making an additional plaintext copy.
+    ///
+    /// Callers are responsible for ensuring the source allocation is no longer
+    /// retained outside this zeroizing container.
+    pub fn from_owned(value: Vec<u8>) -> Self {
         Self {
             bytes: Zeroizing::new(value),
             remember: false,
         }
+    }
+
+    pub(crate) fn into_bytes(self) -> Zeroizing<Vec<u8>> {
+        self.bytes
     }
 
     /// Supplies a secret that the user explicitly chose to save in the
@@ -85,6 +91,17 @@ pub struct SecretPrompt {
     pub kind: SecretKind,
     pub message: String,
     pub allow_remember: bool,
+}
+
+/// A sudo password request tied to one SSH connection generation.
+///
+/// Unlike SSH authentication, sudo passwords are never persisted or reused.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SudoPasswordPrompt {
+    pub challenge_id: Uuid,
+    pub connection_generation: u64,
+    pub target_id: String,
+    pub username: String,
 }
 
 /// A single keyboard-interactive question. `echo` is a rendering instruction,
@@ -166,6 +183,20 @@ pub trait Interaction: Send + Sync {
         &self,
         prompt: KeyboardInteractivePrompt,
     ) -> Result<Vec<Secret>, InteractionError>;
+}
+
+/// UI/control-plane bridge for a single root command.
+///
+/// Implementations must make each authorization decision independently from
+/// ordinary SSH execute policy and must not retain sudo passwords.
+#[async_trait]
+pub trait SudoInteraction: Send + Sync {
+    async fn request_password(
+        &self,
+        prompt: SudoPasswordPrompt,
+    ) -> Result<Secret, InteractionError>;
+
+    async fn authorize_execution(&self) -> Result<(), InteractionError>;
 }
 
 /// A redacted, structured resolver failure suitable for UI and CLI display.
@@ -381,6 +412,20 @@ pub enum SshError {
     CredentialStoreUnavailable,
     #[error("SSH transport failed")]
     Transport,
+    #[error("sudo cannot run noninteractively on the remote host")]
+    SudoUnavailable,
+    #[error("sudo authentication failed")]
+    SudoAuthenticationFailed,
+    #[error("sudo authorization did not complete")]
+    SudoAuthorizationDenied,
+    #[error("sudo authorization handshake timed out")]
+    SudoHandshakeTimeout,
+    #[error("sudo authorization protocol failed")]
+    SudoProtocol,
+    #[error("sudo command input is invalid")]
+    InvalidSudoInput,
+    #[error("sudo password input is invalid")]
+    InvalidSudoPassword,
 }
 
 #[cfg(test)]

@@ -1,6 +1,7 @@
 use crate::auth::{
     ConfigurationDiagnostic, ConfigurationDiagnosticKind, Interaction, InteractionError,
     KeyboardInteractivePrompt, KeyboardInteractiveQuestion, SecretKind, SecretPrompt, SshError,
+    SudoInteraction,
 };
 use crate::config::{
     AlgorithmRequirements, AuthMethod, ProxyRoute, ResolvedSshConfig, SshTarget, TargetStore,
@@ -79,7 +80,7 @@ struct SftpAtomicReplaceSession {
 
 /// Owns a raw channel until it is either transferred to its long-lived user or
 /// closed. `russh::Channel` itself does not request close when dropped.
-struct ClosingChannel {
+pub(crate) struct ClosingChannel {
     channel: Option<Channel<client::Msg>>,
     use_guard: Option<EntryUse>,
     runtime: tokio::runtime::Handle,
@@ -96,7 +97,7 @@ impl ClosingChannel {
         }
     }
 
-    async fn close(&self) -> Result<(), SshError> {
+    pub(crate) async fn close(&self) -> Result<(), SshError> {
         if !self.close_sent.load(Ordering::Acquire) {
             close_channel(self).await?;
             self.close_sent.store(true, Ordering::Release);
@@ -233,11 +234,11 @@ impl SftpConnection {
 
 /// A generation-bound raw SSH exec channel.
 pub struct SshCommand {
-    channel: ClosingChannel,
-    entry: Arc<ConnectionEntry>,
-    generation: u64,
-    pending: VecDeque<SshCommandEvent>,
-    finished: bool,
+    pub(crate) channel: ClosingChannel,
+    pub(crate) entry: Arc<ConnectionEntry>,
+    pub(crate) generation: u64,
+    pub(crate) pending: VecDeque<SshCommandEvent>,
+    pub(crate) finished: bool,
 }
 
 impl std::fmt::Debug for SshCommand {
@@ -407,6 +408,7 @@ impl ConnectionManager {
         Ok(ConnectionLease {
             entry: Arc::clone(&entry),
             identity,
+            target_id: target_id.to_owned(),
             generation,
             _use_guard: use_guard,
         })
@@ -541,6 +543,7 @@ impl ConnectionManager {
 pub struct ConnectionLease {
     entry: Arc<ConnectionEntry>,
     identity: Arc<SshHostIdentity>,
+    target_id: String,
     generation: u64,
     _use_guard: EntryUse,
 }
@@ -672,6 +675,29 @@ impl ConnectionLease {
             finished,
         })
     }
+
+    /// Start one explicitly authorized root command without allocating a PTY.
+    ///
+    /// The command does not start until the supplied interaction grants the
+    /// root-specific authorization gate. Sudo passwords are consumed only when
+    /// the remote sudo process emits its unique prompt marker.
+    pub async fn exec_sudo_command(
+        &self,
+        command: &str,
+        cwd: &str,
+        interaction: Arc<dyn SudoInteraction>,
+    ) -> Result<SshCommand, SshError> {
+        crate::sudo::exec_sudo_command(
+            Arc::clone(&self.entry),
+            self.generation,
+            &self.target_id,
+            &self.identity.username,
+            command,
+            cwd,
+            interaction,
+        )
+        .await
+    }
 }
 
 async fn open_sftp_channel(
@@ -694,7 +720,7 @@ async fn open_sftp_channel(
     Ok(channel)
 }
 
-async fn open_session_channel(
+pub(crate) async fn open_session_channel(
     entry: &Arc<ConnectionEntry>,
     generation: u64,
     send_environment: bool,
@@ -830,7 +856,7 @@ async fn apply_send_environment(
     Ok(())
 }
 
-fn generation_is_current(entry: &ConnectionEntry, generation: u64) -> bool {
+pub(crate) fn generation_is_current(entry: &ConnectionEntry, generation: u64) -> bool {
     entry.generation.load(Ordering::Acquire) == generation
         && entry.phase() == ConnectionPhase::Connected
 }
@@ -868,7 +894,7 @@ fn command_event(
     }
 }
 
-fn queue_initial_command_event(
+pub(crate) fn queue_initial_command_event(
     pending: &mut VecDeque<SshCommandEvent>,
     pending_bytes: &mut usize,
     event: SshCommandEvent,
@@ -908,7 +934,7 @@ async fn await_subsystem_acceptance(channel: &mut Channel<client::Msg>) -> Resul
     .map_err(|_| SshError::ChannelRequestTimeout)?
 }
 
-async fn await_command_acceptance(
+pub(crate) async fn await_command_acceptance(
     channel: &mut Channel<client::Msg>,
 ) -> Result<(VecDeque<SshCommandEvent>, bool), SshError> {
     timeout(CHANNEL_REQUEST_TIMEOUT, async {
@@ -941,7 +967,10 @@ async fn send_subsystem_request(channel: &Channel<client::Msg>) -> Result<(), Ss
     .map_err(|_| SshError::Transport)
 }
 
-async fn send_exec_request(channel: &Channel<client::Msg>, command: &str) -> Result<(), SshError> {
+pub(crate) async fn send_exec_request(
+    channel: &Channel<client::Msg>,
+    command: &str,
+) -> Result<(), SshError> {
     timeout(CHANNEL_REQUEST_TIMEOUT, channel.exec(true, command))
         .await
         .map_err(|_| SshError::ChannelRequestTimeout)?
@@ -1319,7 +1348,7 @@ fn host_key_policy_key(policy: crate::config::HostKeyPolicy) -> u8 {
     }
 }
 
-struct ConnectionEntry {
+pub(crate) struct ConnectionEntry {
     generation: AtomicU64,
     active_uses: AtomicUsize,
     cleanup_scheduled: AtomicBool,

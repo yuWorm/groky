@@ -1,4 +1,4 @@
-//! `/ssh [target]`: choose a session SSH target or open its manager.
+//! `/ssh [target]`: choose a server for the editable chat draft.
 
 use std::collections::HashSet;
 
@@ -63,7 +63,7 @@ impl SlashCommand for SshCommand {
     slash_meta! {
         name: "ssh",
         aliases: ["remote"],
-        description: "Choose an SSH server by name or manage session access",
+        description: "Choose an SSH server for this chat draft",
         usage: "/ssh [server name or target ID]",
         takes_args: true,
     }
@@ -74,7 +74,7 @@ impl SlashCommand for SshCommand {
 
     fn run(&self, _ctx: &mut CommandExecCtx, args: &str) -> CommandResult {
         if args.trim().is_empty() {
-            CommandResult::Action(Action::OpenSshManager)
+            CommandResult::Action(Action::OpenSshTargetPicker)
         } else {
             CommandResult::Action(Action::SelectSshTarget {
                 reference: args.trim().to_owned(),
@@ -88,8 +88,6 @@ mod tests {
     use std::path::PathBuf;
 
     use super::*;
-    use crate::acp::model_state::ModelState;
-    use crate::app::bundle::BundleState;
     use crate::views::ssh_modal::{SshGrantView, SshTargetView};
 
     fn target_view(target_id: &str, label: &str, host: &str, address: &str) -> SshTargetView {
@@ -103,34 +101,6 @@ mod tests {
             String::new(),
             SshGrantView::NotGranted,
         )
-    }
-
-    fn app_ctx<'a>(models: &'a ModelState, candidates: &'a [ArgItem]) -> AppCtx<'a> {
-        AppCtx {
-            models,
-            cwd: std::path::Path::new("."),
-            has_session_announcements: false,
-            billing_surface_visible: true,
-            usage_command_visible: true,
-            workflows_available: true,
-            saved_workflows: &[],
-            ssh_candidates: candidates,
-            workflow_runs: &[],
-            screen_mode: crate::app::ScreenMode::Fullscreen,
-            current_title: None,
-        }
-    }
-
-    fn exec_ctx<'a>(models: &'a ModelState, bundle: &'a BundleState) -> CommandExecCtx<'a> {
-        CommandExecCtx {
-            models,
-            session_id: None,
-            bundle_state: bundle,
-            screen_mode: crate::app::ScreenMode::Fullscreen,
-            billing_surface_visible: true,
-            usage_command_visible: true,
-            pager_state: crate::settings::PagerLocalSnapshot::default(),
-        }
     }
 
     #[test]
@@ -182,42 +152,5 @@ mod tests {
         ] {
             assert!(east.description.contains(field), "missing row detail {field:?}");
         }
-    }
-
-    #[test]
-    fn suggest_args_returns_the_injected_catalog_without_filtering_it() {
-        let candidates = target_candidates(vec![target_view(
-            "target-east",
-            "Build Cache",
-            "cache-east",
-            "builder@cache-east.example.test:2222",
-        )]);
-        let models = ModelState::default();
-
-        let suggestions = SshCommand
-            .suggest_args(&app_ctx(&models, &candidates), "build")
-            .expect("SSH completion catalog");
-
-        assert_eq!(suggestions.len(), 1);
-        assert_eq!(suggestions[0].insert_text, "target-east");
-    }
-
-    #[test]
-    fn no_arg_opens_manager_and_direct_reference_remains_supported() {
-        let models = ModelState::default();
-        let bundle = BundleState::default();
-        let mut ctx = exec_ctx(&models, &bundle);
-        let command = SshCommand;
-
-        assert!(command.takes_args());
-        assert!(!command.args_required());
-        assert!(matches!(
-            command.run(&mut ctx, "  "),
-            CommandResult::Action(Action::OpenSshManager)
-        ));
-        assert!(matches!(
-            command.run(&mut ctx, " target-east "),
-            CommandResult::Action(Action::SelectSshTarget { reference }) if reference == "target-east"
-        ));
     }
 }

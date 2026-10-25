@@ -170,6 +170,14 @@ pub(super) struct SshCommandArgs {
         deserialize_with = "xai_grok_tools::types::schema::deserialize_lenient_u64"
     )]
     pub block_until_ms: Option<u64>,
+    /// Run this one explicitly approved command as root. Root execution is
+    /// never available to SFTP tools or a session-wide approval.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub sudo: bool,
+}
+
+fn is_false(value: &bool) -> bool {
+    !value
 }
 
 remote_input!(SshReadInput, SshTextReadArgs);
@@ -408,7 +416,7 @@ forwarding_tool!(
     SshOperation::Execute,
     "GrokBuild:run_terminal_cmd",
     false,
-    "Run a command through native SSH exec without a worker. Requires execution authorization and per-command user approval. Streams stdout/stderr and records the exit status. Background tasks are tracked by this local service; after connection loss the remote outcome is unknown, not automatically retried. The cwd is not a sandbox."
+    "Run a command through native SSH exec without a worker. Requires execution authorization and per-command user approval. Set sudo:true only to request one explicitly approved root command; do not embed sudo or passwords in command text. Root approval is one-time, can affect the entire remote host, and a failed root mutation must not be automatically retried. Streams stdout/stderr and records the exit status. Background tasks are tracked by this local service; after connection loss the remote outcome is unknown, not automatically retried. The cwd is not a sandbox."
 );
 
 #[derive(Debug, Default)]

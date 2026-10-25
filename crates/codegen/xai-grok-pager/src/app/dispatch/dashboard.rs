@@ -1325,6 +1325,15 @@ pub(super) fn dispatch_dashboard_dispatch_slash(app: &mut AppView, text: String)
             }
             vec![]
         }
+        CommandResult::Action(
+            action @ (Action::OpenSshTargetPicker | Action::SelectSshTarget { .. }),
+        ) => {
+            if let Some(d) = app.dashboard.as_mut() {
+                d.dispatch.remove_ssh_target_picker_command();
+                d.error_toast = None;
+            }
+            dispatch(action, app)
+        }
         CommandResult::Action(action) => {
             if let Some(d) = app.dashboard.as_mut() {
                 d.dispatch.set_text("");

@@ -457,6 +457,11 @@ pub enum SshAuthKind {
         message: String,
         allow_remember: bool,
     },
+    /// A per-command sudo challenge for the remote SSH account; its password is never stored.
+    SudoPassword {
+        username: String,
+        message: String,
+    },
     PrivateKeyPassphrase {
         username: String,
         message: String,
@@ -467,17 +472,18 @@ pub enum SshAuthKind {
         instruction: String,
         prompts: Vec<String>,
     },
-}
 
+}
 impl SshAuthKind {
     fn title(&self) -> &'static str {
         match self {
             Self::HostKey { .. } => "SSH host key confirmation",
             Self::Password { .. } => "SSH password",
+            Self::SudoPassword { .. } => "Root SSH authentication",
             Self::PrivateKeyPassphrase { .. } => "SSH private-key passphrase",
             Self::KeyboardInteractive { .. } => "SSH authentication challenge",
-        }
     }
+}
 }
 
 const MAX_SECRET_BYTES: usize = 4096;
@@ -660,7 +666,9 @@ impl SshAuthCard {
         let answer_count = match &kind {
             SshAuthKind::HostKey { .. } => 0,
             SshAuthKind::KeyboardInteractive { prompts, .. } => prompts.len().max(1),
-            SshAuthKind::Password { .. } | SshAuthKind::PrivateKeyPassphrase { .. } => 1,
+            SshAuthKind::Password { .. }
+            | SshAuthKind::SudoPassword { .. }
+            | SshAuthKind::PrivateKeyPassphrase { .. } => 1,
         };
         Self {
             challenge_id,
@@ -710,7 +718,9 @@ impl SshAuthCard {
     fn take_auth_response(&mut self) -> (Option<SshSecret>, Vec<SshSecret>) {
         let is_single_secret = matches!(
             &self.kind,
-            SshAuthKind::Password { .. } | SshAuthKind::PrivateKeyPassphrase { .. }
+            SshAuthKind::Password { .. }
+                | SshAuthKind::SudoPassword { .. }
+                | SshAuthKind::PrivateKeyPassphrase { .. }
         );
         let mut answers = self.secret_answers();
         if is_single_secret {
@@ -1034,6 +1044,8 @@ pub struct SshOperationApprovalCard {
     /// Typed payload retained until it has been rendered; no JSON serialization at the boundary.
     pub detail: Value,
     pub operation: SshOperation,
+    allow_session: bool,
+    operation_id: Option<String>,
     scroll_offset: usize,
     max_scroll_offset: usize,
     page_size: usize,
@@ -1042,8 +1054,8 @@ pub struct SshOperationApprovalCard {
     submitting: bool,
     copy_status: Option<&'static str>,
     error: Option<String>,
-}
 
+}
 impl SshOperationApprovalCard {
     pub fn new(
         approval_id: String,
@@ -1062,6 +1074,8 @@ impl SshOperationApprovalCard {
             title,
             detail,
             operation,
+            allow_session: true,
+            operation_id: None,
             scroll_offset: 0,
             max_scroll_offset: 0,
             page_size: 1,
@@ -1071,6 +1085,31 @@ impl SshOperationApprovalCard {
             copy_status: None,
             error: None,
         }
+    }
+
+    /// Restrict this request to a one-time decision without changing existing card fixtures.
+    pub fn with_allow_session(mut self, allow_session: bool) -> Self {
+        self.allow_session = allow_session;
+        self
+    }
+
+    /// Attach the shell operation correlation used by scoped sudo authentication events.
+    pub fn with_operation_id(mut self, operation_id: impl Into<String>) -> Self {
+        self.operation_id = Some(operation_id.into());
+        self
+    }
+
+    /// Whether this card may create a session-and-binding operation policy.
+    pub fn allows_session(&self) -> bool {
+        self.allow_session && !self.is_sudo()
+    }
+
+    fn is_sudo(&self) -> bool {
+        self.detail
+            .get("args")
+            .and_then(|args| args.get("sudo"))
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
     }
 }
 
@@ -1306,6 +1345,16 @@ struct SubmittedOperationApproval {
     origin: SshOperationApprovalOrigin,
 }
 
+/// A root command may ask for its password after its operation approval acknowledgement.
+///
+/// The tuple remains local so an event from a retired operation cannot replace another modal.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PendingSudoAuthentication {
+    operation_id: String,
+    client_id: Option<u64>,
+    challenge_id: Option<String>,
+}
+
 struct SshDeleteConfirmation {
     expected: xai_grok_ssh::SshTarget,
     label: String,
@@ -1370,6 +1419,12 @@ fn next_nonzero_id(counter: &AtomicU64) -> u64 {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SshManagerMode {
+    Manage,
+    PromptPicker,
+}
+
 /// Manager state usable from Welcome and from a running session.
 pub struct SshManagerState {
     pub window: ModalWindowState,
@@ -1383,6 +1438,9 @@ pub struct SshManagerState {
     manager_visible_rows: usize,
     manager_row_hits: Vec<ManagerRowHit>,
     manager_advanced: bool,
+    mode: SshManagerMode,
+    /// Exact disconnected server awaiting the matching owned successful connection result.
+    pending_prompt_target_id: Option<String>,
     pending_target_selection_id: Option<String>,
     pending_target_reference: Option<String>,
     /// Removed targets stay retired locally so an older target-list completion cannot resurrect
@@ -1427,6 +1485,8 @@ pub struct SshManagerState {
     operation_approval_origin: Option<SshOperationApprovalOrigin>,
     /// Exact operation decision awaiting its local-control acknowledgement.
     submitted_operation_approval: Option<SubmittedOperationApproval>,
+    /// Root authentication is accepted only for the exact approved operation in this manager.
+    pending_sudo_authentication: Option<PendingSudoAuthentication>,
 }
 
 impl SshManagerState {
@@ -1443,6 +1503,8 @@ impl SshManagerState {
             manager_visible_rows: 0,
             manager_row_hits: Vec::new(),
             manager_advanced: false,
+            mode: SshManagerMode::Manage,
+            pending_prompt_target_id: None,
             pending_target_selection_id: None,
             pending_target_reference: None,
             retired_target_ids: Vec::new(),
@@ -1464,7 +1526,23 @@ impl SshManagerState {
             session_id,
             operation_approval_origin: None,
             submitted_operation_approval: None,
+            pending_sudo_authentication: None,
         }
+    }
+
+    /// Create a picker for choosing an SSH server to attach to the current chat draft.
+    ///
+    /// This mode never creates model authority from an ordinary target selection.
+    pub fn for_prompt(session_id: Option<String>) -> Self {
+        let mut state = Self::new(session_id);
+        state.mode = SshManagerMode::PromptPicker;
+        state
+    }
+
+    /// Whether this overlay chooses a server for the current chat draft rather than managing
+    /// access for a model session.
+    pub fn is_prompt_picker(&self) -> bool {
+        self.mode == SshManagerMode::PromptPicker
     }
 
     /// Globally unique identity for matching asynchronous local-control completions to this
@@ -1657,6 +1735,9 @@ impl SshManagerState {
                 true
             }
             Ok(target) => {
+                if self.pending_prompt_target_id.as_deref() == Some(target.id.as_str()) {
+                    self.clear_pending_prompt_target();
+                }
                 if !self.retired_target_ids.iter().any(|id| id == &target.id) {
                     self.retired_target_ids.push(target.id.clone());
                 }
@@ -1907,13 +1988,61 @@ impl SshManagerState {
         true
     }
 
+    /// Consume the exact prompt selection only after its target is known connected.
+    ///
+    /// The app additionally correlates the successful connection result to this modal instance
+    /// before calling this method, so an unowned global status cannot select a draft target.
+    pub fn take_connected_prompt_target(&mut self, target_id: &str) -> Option<String> {
+        if self.pending_prompt_target_id.as_deref() != Some(target_id)
+            || !self.is_prompt_picker()
+            || !matches!(&self.page, SshModalPage::Manager)
+            || self.pending_grant.is_some()
+            || !self
+                .targets
+                .iter()
+                .any(|target| target.target_id == target_id && target.connected)
+        {
+            return None;
+        }
+        self.pending_prompt_target_id.take()
+    }
+
+    fn clear_pending_prompt_target(&mut self) {
+        self.pending_prompt_target_id = None;
+    }
+
+    fn select_prompt_target(&mut self) -> SshModalOutcome {
+        let Some((target_id, connected)) = self
+            .selected_target()
+            .map(|target| (target.target_id.clone(), target.connected))
+        else {
+            self.show_info("Select an SSH server for the current draft.");
+            return SshModalOutcome::Changed;
+        };
+        self.clear_pending_prompt_target();
+        if connected {
+            SshModalOutcome::SelectPromptTarget { target_id }
+        } else {
+            self.pending_prompt_target_id = Some(target_id.clone());
+            SshModalOutcome::Connect { target_id }
+        }
+    }
+
     pub fn queue_target_reference(&mut self, reference: String) {
         self.pending_target_reference = Some(reference);
     }
 
-    /// Consume direct selection only after this manager has its session and target snapshot.
+    /// Consume a direct configured reference after its target snapshot arrives.
+    ///
+    /// Prompt pickers accept this without a session because selection only updates the current
+    /// draft; management mode retains its existing session requirement.
     pub fn continue_target_reference(&mut self) -> SshModalOutcome {
-        if self.loading || self.session_id.is_none() {
+        if self.loading || (!self.is_prompt_picker() && self.session_id.is_none()) {
+            return SshModalOutcome::Unchanged;
+        }
+        if self.is_prompt_picker()
+            && (!matches!(&self.page, SshModalPage::Manager) || self.pending_grant.is_some())
+        {
             return SshModalOutcome::Unchanged;
         }
         let Some(reference) = self.pending_target_reference.take() else {
@@ -1939,7 +2068,9 @@ impl SshManagerState {
             }
         };
         self.select_target_id(&target_id);
-        if self.targets.iter().filter(|view| view.target_id == target_id).count() > 1 {
+        if !self.is_prompt_picker()
+            && self.targets.iter().filter(|view| view.target_id == target_id).count() > 1
+        {
             self.show_info("This server has multiple access bindings. Select the intended folder and press Enter.");
             return SshModalOutcome::Changed;
         }
@@ -2284,6 +2415,19 @@ impl SshManagerState {
                 }
             }
         }
+        if self.is_prompt_picker() && !self.manager_advanced {
+            let mut visible = 0;
+            while visible < targets.len() {
+                let duplicate = targets[..visible]
+                    .iter()
+                    .any(|shown| shown.target_id == targets[visible].target_id);
+                if duplicate {
+                    targets.remove(visible);
+                } else {
+                    visible += 1;
+                }
+            }
+        }
 
         self.targets = targets;
         let pending_target_selection_id = self.pending_target_selection_id.clone();
@@ -2318,13 +2462,22 @@ impl SshManagerState {
                 .saturating_sub(self.manager_visible_rows.max(1)),
         );
         self.loading = false;
+        if self.is_prompt_picker()
+            && self
+                .pending_prompt_target_id
+                .as_ref()
+                .is_some_and(|target_id| !self.targets.iter().any(|target| &target.target_id == target_id))
+        {
+            self.clear_pending_prompt_target();
+        }
         if matches!(
             &self.page,
             SshModalPage::Authentication(card)
-                if self
-                    .targets
-                    .iter()
-                    .any(|target| target.target_id == card.target_id && target.connected)
+                if !matches!(&card.kind, SshAuthKind::SudoPassword { .. })
+                    && self
+                        .targets
+                        .iter()
+                        .any(|target| target.target_id == card.target_id && target.connected)
         ) {
             self.return_after_authentication();
         }
@@ -2353,6 +2506,7 @@ impl SshManagerState {
         self.page = SshModalPage::OperationApproval(card);
         self.operation_approval_origin = Some(origin);
         self.submitted_operation_approval = None;
+        self.pending_sudo_authentication = None;
     }
 
     /// Preserve a transient origin across a burst of approvals without treating the overlay as
@@ -2371,6 +2525,14 @@ impl SshManagerState {
         }
         card.submitting = true;
         card.error = None;
+        self.pending_sudo_authentication = (approved && card.is_sudo())
+            .then(|| card.operation_id.as_ref())
+            .flatten()
+            .map(|operation_id| PendingSudoAuthentication {
+                operation_id: operation_id.clone(),
+                client_id: None,
+                challenge_id: None,
+            });
         self.submitted_operation_approval = Some(SubmittedOperationApproval {
             approval_id: approval_id.to_owned(),
             approved,
@@ -2378,6 +2540,94 @@ impl SshManagerState {
                 .operation_approval_origin
                 .unwrap_or(SshOperationApprovalOrigin::ExplicitManager),
         });
+        true
+    }
+
+    /// Display a root-password challenge only for the exact root operation that was approved in
+    /// this session. A stale challenge is ignored rather than replacing unrelated user input.
+    pub fn show_sudo_authentication(
+        &mut self,
+        client_id: u64,
+        session_id: &str,
+        operation_id: &str,
+        card: SshAuthCard,
+    ) -> bool {
+        if self.session_id.as_deref() != Some(session_id) {
+            return false;
+        }
+        let matches_submitted_root = matches!(
+            &self.page,
+            SshModalPage::OperationApproval(approval)
+                if approval.submitting
+                    && approval.is_sudo()
+                    && approval.operation_id.as_deref() == Some(operation_id)
+        );
+        let Some(pending) = self.pending_sudo_authentication.as_mut() else {
+            return false;
+        };
+        if pending.operation_id != operation_id {
+            return false;
+        }
+        if let SshModalPage::Authentication(current) = &self.page {
+            return pending.client_id == Some(client_id)
+                && pending.challenge_id.as_deref() == Some(card.challenge_id.as_str())
+                && current.challenge_id == card.challenge_id
+                && current.connection_generation == card.connection_generation
+                && current.target_id == card.target_id
+                && matches!(&current.kind, SshAuthKind::SudoPassword { .. });
+        }
+        if !matches_submitted_root && !matches!(&self.page, SshModalPage::Manager) {
+            return false;
+        }
+        pending.client_id = Some(client_id);
+        pending.challenge_id = Some(card.challenge_id.clone());
+        self.resume_project_browser_after_authentication = false;
+        self.page = SshModalPage::Authentication(card);
+        true
+    }
+
+    /// Retire only the sudo challenge that belongs to this manager's exact client and session.
+    ///
+    /// Dropping the matching [`SshAuthCard`] drops its zeroizing local input buffer. A stale
+    /// completion for a previous challenge is deliberately ignored.
+    pub fn resolve_sudo_authentication(
+        &mut self,
+        client_id: u64,
+        session_id: &str,
+        challenge_id: &str,
+        error: Option<String>,
+    ) -> bool {
+        if self.session_id.as_deref() != Some(session_id) {
+            return false;
+        }
+        let Some(pending) = self.pending_sudo_authentication.as_ref() else {
+            return false;
+        };
+        if pending.client_id != Some(client_id)
+            || pending.challenge_id.as_deref() != Some(challenge_id)
+        {
+            return false;
+        }
+        self.pending_sudo_authentication = None;
+        let visible = matches!(
+            &self.page,
+            SshModalPage::Authentication(card)
+                if card.challenge_id == challenge_id
+                    && matches!(&card.kind, SshAuthKind::SudoPassword { .. })
+        );
+        if visible {
+            if let SshModalPage::Authentication(card) = &mut self.page {
+                card.clear_answers();
+            }
+            self.return_after_authentication();
+            if error.is_some() {
+                self.show_info(
+                    "Root authentication was cancelled or timed out; the command was not run.",
+                );
+            } else {
+                self.show_info("Root authentication submitted; waiting for command result.");
+            }
+        }
         true
     }
 
@@ -2399,6 +2649,7 @@ impl SshManagerState {
         {
             self.submitted_operation_approval = None;
         }
+        self.pending_sudo_authentication = None;
         self.operation_approval_origin = None;
         self.loading = true;
         self.return_to_manager();
@@ -2429,15 +2680,36 @@ impl SshManagerState {
             &self.page,
             SshModalPage::OperationApproval(card) if card.approval_id == approval_id
         );
+        let awaiting_sudo_authentication = self.pending_sudo_authentication.is_some();
         if let Some(error) = error {
+            self.pending_sudo_authentication = None;
             if let SshModalPage::OperationApproval(card) = &mut self.page
                 && card.approval_id == approval_id
             {
                 card.submitting = false;
                 card.error = Some(error);
+            } else if awaiting_sudo_authentication
+                && matches!(
+                    &self.page,
+                    SshModalPage::Authentication(card)
+                        if matches!(&card.kind, SshAuthKind::SudoPassword { .. })
+                )
+            {
+                if let SshModalPage::Authentication(card) = &mut self.page {
+                    card.clear_answers();
+                }
+                self.return_after_authentication();
+                self.show_error(error);
             } else {
                 self.show_error(error);
             }
+            return false;
+        }
+        if awaiting_sudo_authentication {
+            if displayed {
+                self.return_to_manager();
+            }
+            self.show_info("Root command approved; waiting for remote sudo authentication.");
             return false;
         }
         if submitted.approved
@@ -2700,6 +2972,9 @@ impl SshManagerState {
     }
 
     pub fn begin_connection_action(&mut self, target_id: &str, connect: bool) {
+        if !connect && self.pending_prompt_target_id.as_deref() == Some(target_id) {
+            self.clear_pending_prompt_target();
+        }
         self.show_info(if connect {
             "Connecting through the local SSH service…"
         } else {
@@ -2735,8 +3010,21 @@ impl SshManagerState {
             target.connected = connected;
             target.connection_detail = detail.clone();
         }
+        if self.pending_prompt_target_id.as_deref() == Some(target_id)
+            && matches!(
+                connection,
+                SshConnectionState::Disconnected | SshConnectionState::Failed
+            )
+        {
+            self.clear_pending_prompt_target();
+        }
         if connected
-            && matches!(&self.page, SshModalPage::Authentication(card) if card.target_id == target_id)
+            && matches!(
+                &self.page,
+                SshModalPage::Authentication(card)
+                    if !matches!(&card.kind, SshAuthKind::SudoPassword { .. })
+                        && card.target_id == target_id
+            )
         {
             self.return_after_authentication();
         }
@@ -3084,6 +3372,7 @@ impl SshManagerState {
     }
 
     pub fn show_error(&mut self, error: impl Into<String>) {
+        self.clear_pending_prompt_target();
         self.pending_connection = None;
         self.pending_connection_is_connecting = false;
         let error = error.into();
@@ -3181,6 +3470,9 @@ pub enum SshModalOutcome {
     RemoveTarget {
         expected: xai_grok_ssh::SshTarget,
         submission_id: u64,
+    },
+    SelectPromptTarget {
+        target_id: String,
     },
     Connect {
         target_id: String,
@@ -3300,6 +3592,64 @@ const FOOTER_HOST_REPLACE: usize = 513;
 const FOOTER_HOST_REJECT: usize = 514;
 const FOOTER_DIAGNOSTIC_CLOSE: usize = 601;
 
+
+const PROMPT_MANAGER_SHORTCUTS: &[Shortcut<'static>] = &[
+    Shortcut {
+        label: "j/k move",
+        clickable: false,
+        id: 0,
+    },
+    Shortcut {
+        label: "Enter select server",
+        clickable: true,
+        id: FOOTER_MANAGER_OPEN_FOLDER,
+    },
+    Shortcut {
+        label: "c connect/disconnect",
+        clickable: true,
+        id: FOOTER_MANAGER_CONNECTION,
+    },
+    Shortcut {
+        label: "o open project (worker)",
+        clickable: true,
+        id: FOOTER_MANAGER_PROJECT,
+    },
+    Shortcut {
+        label: "g grant",
+        clickable: true,
+        id: FOOTER_MANAGER_GRANT,
+    },
+    Shortcut {
+        label: "a add",
+        clickable: true,
+        id: FOOTER_MANAGER_ADD,
+    },
+    Shortcut {
+        label: "e edit",
+        clickable: true,
+        id: FOOTER_MANAGER_EDIT,
+    },
+    Shortcut {
+        label: "x delete",
+        clickable: true,
+        id: FOOTER_MANAGER_DELETE,
+    },
+    Shortcut {
+        label: "d details",
+        clickable: true,
+        id: FOOTER_MANAGER_DIAGNOSTIC,
+    },
+    Shortcut {
+        label: "m advanced",
+        clickable: true,
+        id: FOOTER_MANAGER_ADVANCED,
+    },
+    Shortcut {
+        label: "Esc close",
+        clickable: true,
+        id: FOOTER_MANAGER_CLOSE,
+    },
+];
 const PRIMARY_MANAGER_SHORTCUTS: &[Shortcut<'static>] = &primary_manager_shortcuts(true, false);
 const PRIMARY_MANAGER_WITH_BINDING_SHORTCUTS: &[Shortcut<'static>] =
     &primary_manager_shortcuts(true, true);
@@ -3675,6 +4025,34 @@ const OPERATION_APPROVAL_SHORTCUTS: &[Shortcut<'static>] = &[
     },
 ];
 
+const ROOT_OPERATION_APPROVAL_SHORTCUTS: &[Shortcut<'static>] = &[
+    Shortcut {
+        label: "↑/↓ PgUp/PgDn inspect",
+        clickable: false,
+        id: 0,
+    },
+    Shortcut {
+        label: "d raw details",
+        clickable: false,
+        id: 0,
+    },
+    Shortcut {
+        label: "c copy command",
+        clickable: true,
+        id: FOOTER_OPERATION_COPY,
+    },
+    Shortcut {
+        label: "y allow once",
+        clickable: true,
+        id: FOOTER_OPERATION_ALLOW,
+    },
+    Shortcut {
+        label: "n/Esc deny",
+        clickable: true,
+        id: FOOTER_OPERATION_DENY,
+    },
+];
+
 const WORKER_INSTALL_FALLBACK_SHORTCUTS: &[Shortcut<'static>] = &[
     Shortcut {
         label: "↑/↓ inspect",
@@ -3949,6 +4327,11 @@ pub fn render_ssh_modal(
         | SshModalPage::Diagnostic(_) => {}
     }
     let (title, shortcuts): (&str, &[Shortcut<'_>]) = match &state.page {
+        SshModalPage::Manager
+            if state.is_prompt_picker() && !state.manager_advanced && state.pending_grant.is_none() => (
+            "Choose SSH server for current draft",
+            PROMPT_MANAGER_SHORTCUTS,
+        ),
         SshModalPage::Manager => (
             "SSH targets",
             if state.session_id.is_none() && state.manager_advanced {
@@ -4002,9 +4385,18 @@ pub fn render_ssh_modal(
             .is_some_and(|browser| browser.purpose.is_project_open())
             .then_some(("Choose project folder (requires worker)", PROJECT_BROWSER_SHORTCUTS))
             .unwrap_or(("Choose SSH access folder (no worker)", GRANT_BROWSER_SHORTCUTS)),
-        SshModalPage::OperationApproval(_) => {
-            ("SSH operation approval", OPERATION_APPROVAL_SHORTCUTS)
-        }
+        SshModalPage::OperationApproval(card) => (
+            if card.is_sudo() {
+                "Root SSH operation approval"
+            } else {
+                "SSH operation approval"
+            },
+            if card.allows_session() {
+                OPERATION_APPROVAL_SHORTCUTS
+            } else {
+                ROOT_OPERATION_APPROVAL_SHORTCUTS
+            },
+        ),
         SshModalPage::WorkerInstallFallback(card) => (
             "Remote worker fallback",
             if card.submitting || card.is_decided() {
@@ -4893,7 +5285,20 @@ fn operation_approval_lines(
         width,
         Style::default().fg(theme.text_secondary),
     );
-    if let Some(identity) = card.target_identity.as_deref() {
+    if card.is_sudo() {
+        let login_identity = card
+            .target_identity
+            .as_deref()
+            .map(safe_operation_text)
+            .or_else(|| operation_identity(&card.detail))
+            .unwrap_or_else(|| "the verified SSH login identity".into());
+        push_operation_wrapped(
+            &mut lines,
+            &format!("SSH login identity: {login_identity} → root"),
+            width,
+            Style::default().fg(theme.text_secondary),
+        );
+    } else if let Some(identity) = card.target_identity.as_deref() {
         push_operation_wrapped(
             &mut lines,
             &format!("Verified SSH identity: {}", safe_operation_text(identity)),
@@ -4962,9 +5367,14 @@ fn operation_approval_lines(
     }
 
     if card.operation == SshOperation::Execute {
+        let warning = if card.is_sudo() {
+            "Warning: this command runs as root. Root access is not confined to this SSH cwd or grant root."
+        } else {
+            "Warning: remote commands run with this SSH user's privileges; cwd is not a sandbox."
+        };
         push_operation_wrapped(
             &mut lines,
-            "Warning: remote commands run with this SSH user's privileges; cwd is not a sandbox.",
+            warning,
             width,
             Style::default()
                 .fg(theme.warning)
@@ -4984,8 +5394,10 @@ fn operation_approval_lines(
         &mut lines,
         if card.submitting {
             "Submitting remote operation decision…"
-        } else {
+        } else if card.allows_session() {
             "After review: y allow once · a allow this operation kind for this SSH session and binding · n/Esc deny"
+        } else {
+            "After review: y allow once · n/Esc deny"
         },
         width,
         if card.submitting {
@@ -5607,6 +6019,46 @@ fn authentication_lines(card: &SshAuthCard, width: usize) -> Vec<(String, Authen
                 );
             }
         }
+        SshAuthKind::SudoPassword {
+            username,
+            message: _,
+        } => {
+            append_wrapped_authentication_line(
+                &mut lines,
+                &format!("Target: {}", card.target_id),
+                AuthenticationLineTone::Normal,
+                width,
+            );
+            append_wrapped_authentication_line(
+                &mut lines,
+                &format!("SSH login identity: {username} → root"),
+                AuthenticationLineTone::Warning,
+                width,
+            );
+            append_wrapped_authentication_line(
+                &mut lines,
+                "Enter the remote SSH account's sudo password here. It is sent only over this SSH connection for this one root command and is not saved.",
+                AuthenticationLineTone::Warning,
+                width,
+            );
+            append_wrapped_authentication_line(
+                &mut lines,
+                "",
+                AuthenticationLineTone::Normal,
+                width,
+            );
+            let bullets = card
+                .answers
+                .first()
+                .map(|answer| "•".repeat(answer.text().chars().count()))
+                .unwrap_or_default();
+            append_wrapped_authentication_line(
+                &mut lines,
+                &format!("› {bullets}"),
+                AuthenticationLineTone::Normal,
+                width,
+            );
+        }
         SshAuthKind::KeyboardInteractive {
             name,
             instruction,
@@ -5762,7 +6214,21 @@ pub fn handle_ssh_key(state: &mut SshManagerState, key: &KeyEvent) -> SshModalOu
             unreachable!("manager, deletion, and browser pages are handled before borrowing modal page")
         }
     };
-    if matches!(&outcome, SshModalOutcome::AnswerAuthentication { .. }) {
+    if let SshModalOutcome::AnswerAuthentication {
+        host_key_decision,
+        secret,
+        answers,
+        ..
+    } = &outcome
+    {
+        let cancelled = secret.is_none()
+            && answers.is_empty()
+            && host_key_decision
+                .as_ref()
+                .map_or(true, |decision| decision == &xai_grok_shell::ssh::SshHostKeyDecision::Reject);
+        if cancelled {
+            state.clear_pending_prompt_target();
+        }
         state.return_after_authentication();
     }
     outcome
@@ -5813,7 +6279,9 @@ fn footer_key_for(page: &SshModalPage, id: usize) -> Option<KeyEvent> {
         (SshModalPage::OperationApproval(_), FOOTER_OPERATION_ALLOW) => {
             Some(key(KeyCode::Char('y')))
         }
-        (SshModalPage::OperationApproval(_), FOOTER_OPERATION_ALLOW_SESSION) => {
+        (SshModalPage::OperationApproval(card), FOOTER_OPERATION_ALLOW_SESSION)
+            if card.allows_session() =>
+        {
             Some(key(KeyCode::Char('a')))
         }
         (SshModalPage::OperationApproval(_), FOOTER_OPERATION_DENY) => {
@@ -5992,6 +6460,9 @@ pub fn handle_ssh_mouse(state: &mut SshManagerState, mouse: &MouseEvent) -> SshM
                 return SshModalOutcome::Unchanged;
             };
             state.selected = index;
+            if state.is_prompt_picker() && !state.manager_advanced {
+                return handle_manager_key(state, &KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+            }
             return SshModalOutcome::Changed;
         }
         if matches!(&state.page, SshModalPage::ProjectBrowser) {
@@ -6215,6 +6686,7 @@ fn cancel_grant_once(state: &mut SshManagerState, request_id: String) -> SshModa
 }
 
 fn close_current_page(state: &mut SshManagerState) -> SshModalOutcome {
+    state.clear_pending_prompt_target();
     if matches!(&state.page, SshModalPage::ProjectBrowser) {
         let purpose = state
             .project_browser
@@ -6507,7 +6979,13 @@ fn handle_manager_key(state: &mut SshManagerState, key: &KeyEvent) -> SshModalOu
         }
         KeyCode::Char('m') if key.modifiers.is_empty() => {
             state.manager_advanced = !state.manager_advanced;
-            SshModalOutcome::Changed
+            if state.is_prompt_picker() {
+                state.clear_pending_prompt_target();
+                state.pending_target_reference = None;
+                SshModalOutcome::Refresh
+            } else {
+                SshModalOutcome::Changed
+            }
         }
         KeyCode::Char('c') if key.modifiers.is_empty() => {
             let selected = state
@@ -6525,6 +7003,9 @@ fn handle_manager_key(state: &mut SshManagerState, key: &KeyEvent) -> SshModalOu
         KeyCode::Enter if key.modifiers.is_empty() => {
             if state.pending_grant.is_some() {
                 return begin_grant_flow(state, None);
+            }
+            if state.is_prompt_picker() && !state.manager_advanced {
+                return state.select_prompt_target();
             }
             if state.session_id.is_some() {
                 return state
@@ -7119,7 +7600,7 @@ fn handle_operation_approval_key(
         KeyCode::Char('y') if key.modifiers.is_empty() => {
             approve_operation(card, SshOperationApprovalScope::Once)
         }
-        KeyCode::Char('a') if key.modifiers.is_empty() => {
+        KeyCode::Char('a') if key.modifiers.is_empty() && card.allows_session() => {
             approve_operation(card, SshOperationApprovalScope::Session)
         }
         KeyCode::Char('n') if key.modifiers.is_empty() => SshModalOutcome::ApproveOperation {
@@ -7347,7 +7828,7 @@ fn handle_authentication_key(card: &mut SshAuthCard, key: &KeyEvent) -> SshModal
                 connection_generation: card.connection_generation,
                 target_id: card.target_id.clone(),
                 host_key_decision: None,
-                remember: card.remember,
+                remember: card.can_remember() && card.remember,
                 secret,
                 answers,
             }
@@ -7385,6 +7866,24 @@ mod tests {
             }),
             SshOperation::Execute,
         )
+    }
+
+    fn root_approval(id: &str) -> SshOperationApprovalCard {
+        SshOperationApprovalCard::new(
+            id.into(),
+            "binding-1".into(),
+            "target-1".into(),
+            Some("build@host:22 (SHA256:test)".into()),
+            "Run root operation".into(),
+            serde_json::json!({
+                "root": "/srv/project",
+                "cwd": "/srv/project/scripts",
+                "args": {"command": "id -u", "sudo": true},
+            }),
+            SshOperation::Execute,
+        )
+        .with_allow_session(false)
+        .with_operation_id(format!("operation-{id}"))
     }
 
     fn worker_install_request(request_id: &str) -> xai_grok_shell::ssh::SshWorkerInstallRequest {
@@ -7872,6 +8371,188 @@ mod tests {
     }
 
     #[test]
+    fn root_operation_only_allows_once_from_keyboard_or_footer() {
+        let area = Rect::new(0, 0, 96, 24);
+        let mut keyboard = SshManagerState::new(Some("session-1".into()));
+        keyboard.show_operation_approval(
+            root_approval("root-keyboard"),
+            SshOperationApprovalOrigin::ExplicitManager,
+        );
+        let mut buffer = Buffer::empty(area);
+        render_ssh_modal(&mut buffer, area, &mut keyboard, false, &Theme::current());
+        assert!(matches!(
+            handle_ssh_key(&mut keyboard, &key(KeyCode::End)),
+            SshModalOutcome::Changed
+        ));
+        assert!(matches!(
+            handle_ssh_key(&mut keyboard, &key(KeyCode::Char('a'))),
+            SshModalOutcome::Unchanged
+        ));
+        assert!(matches!(
+            handle_ssh_key(&mut keyboard, &key(KeyCode::Char('y'))),
+            SshModalOutcome::ApproveOperation {
+                approved: true,
+                scope: SshOperationApprovalScope::Once,
+                ..
+            }
+        ));
+
+        let mut mouse = SshManagerState::new(Some("session-1".into()));
+        mouse.show_operation_approval(
+            root_approval("root-mouse"),
+            SshOperationApprovalOrigin::ExplicitManager,
+        );
+        let mut buffer = Buffer::empty(area);
+        render_ssh_modal(&mut buffer, area, &mut mouse, false, &Theme::current());
+        assert!(matches!(
+            handle_ssh_key(&mut mouse, &key(KeyCode::End)),
+            SshModalOutcome::Changed
+        ));
+        let mut buffer = Buffer::empty(area);
+        render_ssh_modal(&mut buffer, area, &mut mouse, false, &Theme::current());
+        assert!(!mouse
+            .window
+            .shortcut_hits
+            .iter()
+            .any(|hit| hit.id == FOOTER_OPERATION_ALLOW_SESSION));
+        let allow_once = mouse
+            .window
+            .shortcut_hits
+            .iter()
+            .find(|hit| hit.id == FOOTER_OPERATION_ALLOW)
+            .expect("root footer keeps one-time approval")
+            .rect;
+        assert!(matches!(
+            handle_ssh_mouse(
+                &mut mouse,
+                &MouseEvent {
+                    kind: MouseEventKind::Down(crossterm::event::MouseButton::Left),
+                    column: allow_once.x,
+                    row: allow_once.y,
+                    modifiers: KeyModifiers::NONE,
+                },
+            ),
+            SshModalOutcome::ApproveOperation {
+                approved: true,
+                scope: SshOperationApprovalScope::Once,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn root_password_keeps_input_hidden_and_never_remembered() {
+        let mut card = SshAuthCard::new(
+            "sudo-challenge".into(),
+            7,
+            "target-1".into(),
+            SshAuthKind::SudoPassword {
+                username: "build".into(),
+                message: "Root password required".into(),
+            },
+        );
+        assert!(!card.can_remember());
+        assert!(matches!(
+            handle_authentication_key(
+                &mut card,
+                &KeyEvent::new(KeyCode::Char('r'), KeyModifiers::ALT)
+            ),
+            SshModalOutcome::Unchanged
+        ));
+        assert!(!card.remember);
+        assert!(matches!(
+            handle_authentication_key(&mut card, &key(KeyCode::Char('x'))),
+            SshModalOutcome::Changed
+        ));
+        let rendered = authentication_lines(&card, 100)
+            .into_iter()
+            .map(|(line, _)| line)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(!rendered.contains('x'));
+        assert!(matches!(
+            handle_authentication_key(&mut card, &key(KeyCode::Enter)),
+            SshModalOutcome::AnswerAuthentication {
+                remember: false,
+                secret: Some(_),
+                answers,
+                ..
+            } if answers.is_empty()
+        ));
+    }
+
+    #[test]
+    fn sudo_prompt_and_resolution_require_the_original_scope() {
+        let mut state = SshManagerState::new(Some("session-1".into()));
+        state.show_operation_approval(
+            root_approval("root-operation"),
+            SshOperationApprovalOrigin::TransientEvent,
+        );
+        assert!(state.submit_operation_approval("root-operation", true));
+        let sudo_card = || {
+            SshAuthCard::new(
+                "sudo-challenge".into(),
+                9,
+                "target-1".into(),
+                SshAuthKind::SudoPassword {
+                    username: "build".into(),
+                    message: "Root password required".into(),
+                },
+            )
+        };
+
+        assert!(!state.show_sudo_authentication(
+            7,
+            "other-session",
+            "operation-root-operation",
+            sudo_card(),
+        ));
+        assert!(!state.show_sudo_authentication(7, "session-1", "other-operation", sudo_card()));
+        assert!(state.show_sudo_authentication(
+            7,
+            "session-1",
+            "operation-root-operation",
+            sudo_card(),
+        ));
+        state.apply_target_status("target-1", SshConnectionState::Connected, None);
+        assert!(matches!(
+            &state.page,
+            SshModalPage::Authentication(card) if card.challenge_id == "sudo-challenge"
+        ));
+        assert!(!state.resolve_sudo_authentication(
+            8,
+            "session-1",
+            "sudo-challenge",
+            Some("ignored".into()),
+        ));
+        assert!(!state.resolve_sudo_authentication(
+            7,
+            "other-session",
+            "sudo-challenge",
+            Some("ignored".into()),
+        ));
+        assert!(matches!(
+            &state.page,
+            SshModalPage::Authentication(card) if card.challenge_id == "sudo-challenge"
+        ));
+
+        state.show_operation_approval(
+            approval("new-operation"),
+            SshOperationApprovalOrigin::TransientEvent,
+        );
+        assert!(!state.resolve_sudo_authentication(
+            7,
+            "session-1",
+            "sudo-challenge",
+            Some("late".into()),
+        ));
+        assert!(matches!(
+            &state.page,
+            SshModalPage::OperationApproval(card) if card.approval_id == "new-operation"
+        ));
+    }
+
+    #[test]
     fn advanced_reset_is_limited_to_the_selected_active_binding() {
         let mut state = SshManagerState::new(Some("session-1".into()));
         state.set_targets(vec![target_view("server-1", granted("binding-1", "/srv/project"))]);
@@ -8036,6 +8717,152 @@ mod tests {
             state.continue_target_reference(),
             SshModalOutcome::BrowseProjectDirectory { target_id, .. } if target_id == "server-2"
         ));
+    }
+
+    #[test]
+    fn prompt_picker_connected_selection_never_uses_a_grant_or_starts_project_work() {
+        let mut state = SshManagerState::for_prompt(Some("session-1".into()));
+        let mut target = target_view("server-1", granted("binding-1", "/srv/project"));
+        target.connected = true;
+        state.set_targets(vec![target]);
+
+        assert!(state.is_prompt_picker());
+        assert!(matches!(
+            handle_ssh_key(&mut state, &key(KeyCode::Enter)),
+            SshModalOutcome::SelectPromptTarget { target_id } if target_id == "server-1"
+        ));
+        assert!(state.pending_grant.is_none());
+        assert!(state.project_browser.is_none());
+        assert_eq!(state.take_connected_prompt_target("server-1"), None);
+    }
+
+    #[test]
+    fn prompt_picker_connect_completion_only_consumes_its_current_pending_target() {
+        let mut state = SshManagerState::for_prompt(None);
+        state.set_targets(vec![
+            target_view("server-1", SshGrantView::NotGranted),
+            target_view("server-2", SshGrantView::NotGranted),
+        ]);
+
+        assert!(matches!(
+            handle_ssh_key(&mut state, &key(KeyCode::Enter)),
+            SshModalOutcome::Connect { target_id } if target_id == "server-1"
+        ));
+        handle_ssh_key(&mut state, &key(KeyCode::Down));
+        assert!(matches!(
+            handle_ssh_key(&mut state, &key(KeyCode::Enter)),
+            SshModalOutcome::Connect { target_id } if target_id == "server-2"
+        ));
+
+        state.apply_target_status("server-1", SshConnectionState::Failed, None);
+        state.apply_target_status("server-2", SshConnectionState::Connected, None);
+        assert_eq!(
+            state.take_connected_prompt_target("server-2"),
+            Some("server-2".into())
+        );
+    }
+
+    #[test]
+    fn prompt_picker_cancelled_or_failed_connection_cannot_select_later() {
+        let mut state = SshManagerState::for_prompt(None);
+        state.set_targets(vec![target_view("server-1", SshGrantView::NotGranted)]);
+
+        assert!(matches!(
+            handle_ssh_key(&mut state, &key(KeyCode::Enter)),
+            SshModalOutcome::Connect { target_id } if target_id == "server-1"
+        ));
+        assert!(matches!(
+            handle_ssh_key(&mut state, &key(KeyCode::Esc)),
+            SshModalOutcome::Close
+        ));
+        state.apply_target_status("server-1", SshConnectionState::Connected, None);
+        assert_eq!(state.take_connected_prompt_target("server-1"), None);
+
+        state.apply_target_status("server-1", SshConnectionState::Disconnected, None);
+        assert!(matches!(
+            handle_ssh_key(&mut state, &key(KeyCode::Enter)),
+            SshModalOutcome::Connect { target_id } if target_id == "server-1"
+        ));
+        state.apply_target_status("server-1", SshConnectionState::Failed, None);
+        state.apply_target_status("server-1", SshConnectionState::Connected, None);
+        assert_eq!(state.take_connected_prompt_target("server-1"), None);
+    }
+
+    #[test]
+    fn prompt_picker_authentication_rejection_clears_pending_selection() {
+        let mut state = SshManagerState::for_prompt(None);
+        state.set_targets(vec![target_view("target-1", SshGrantView::NotGranted)]);
+        assert!(matches!(
+            handle_ssh_key(&mut state, &key(KeyCode::Enter)),
+            SshModalOutcome::Connect { target_id } if target_id == "target-1"
+        ));
+
+        state.show_authentication(host_key_card("unknown", Vec::new(), false));
+        assert!(matches!(
+            handle_ssh_key(&mut state, &key(KeyCode::Char('n'))),
+            SshModalOutcome::AnswerAuthentication { .. }
+        ));
+        state.apply_target_status("target-1", SshConnectionState::Connected, None);
+        assert_eq!(state.take_connected_prompt_target("target-1"), None);
+    }
+
+    #[test]
+    fn prompt_picker_resolves_sessionless_references_and_deduplicates_grant_rows() {
+        let mut state = SshManagerState::for_prompt(None);
+        let mut second_target = target_view("server-2", SshGrantView::NotGranted);
+        second_target.label = "server-1 label".into();
+        second_target.target.label = "server-1 label".into();
+        state.set_targets(vec![
+            target_view("server-1", granted("binding-1", "/a")),
+            target_view("server-1", granted("binding-2", "/b")),
+            second_target,
+        ]);
+        assert_eq!(
+            state
+                .targets
+                .iter()
+                .map(|target| target.target_id.as_str())
+                .collect::<Vec<_>>(),
+            ["server-1", "server-2"]
+        );
+
+        state.queue_target_reference("server-1".into());
+        assert!(matches!(
+            state.continue_target_reference(),
+            SshModalOutcome::Connect { target_id } if target_id == "server-1"
+        ));
+
+        state.queue_target_reference("server-1 label".into());
+        assert!(matches!(
+            state.continue_target_reference(),
+            SshModalOutcome::Changed
+        ));
+        assert_eq!(state.targets.len(), 2);
+        assert!(state
+            .message
+            .as_ref()
+            .is_some_and(|(message, _)| message.contains("Multiple matching servers")));
+    }
+
+    #[test]
+    fn prompt_picker_advanced_mode_retains_each_existing_grant() {
+        let mut state = SshManagerState::for_prompt(Some("session-1".into()));
+        let targets = vec![
+            target_view("server-1", granted("binding-1", "/a")),
+            target_view("server-1", granted("binding-2", "/b")),
+        ];
+        state.set_targets(targets.clone());
+        assert_eq!(state.targets.len(), 1);
+        assert!(matches!(handle_ssh_key(&mut state, &key(KeyCode::Char('m'))),
+            SshModalOutcome::Refresh));
+        state.set_targets(targets.clone());
+        state.selected = 1;
+        assert!(matches!(handle_ssh_key(&mut state, &key(KeyCode::Enter)),
+            SshModalOutcome::UseBinding { binding_id } if binding_id == "binding-2"));
+        assert!(matches!(handle_ssh_key(&mut state, &key(KeyCode::Char('m'))),
+            SshModalOutcome::Refresh));
+        state.set_targets(targets);
+        assert_eq!(state.targets.len(), 1);
     }
 
     fn target_view(target_id: &str, grant: SshGrantView) -> SshTargetView {

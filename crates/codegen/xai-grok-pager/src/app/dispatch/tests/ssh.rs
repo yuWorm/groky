@@ -15,8 +15,9 @@ use crate::app::dispatch::ssh::{
 use crate::views::ssh_modal::{SshGrantLifetime, SshModalOutcome, handle_ssh_key};
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
 use xai_grok_shell::ssh::{
-    SshBinding, SshCapabilities, SshEvent, SshGrantRequest, SshHostIdentity, SshOperation,
-    SshOperationApproval, SshWorkerInstallProgress, SshWorkerInstallRequest,
+    SshAuthPrompt, SshAuthPromptDetail, SshAuthPromptKind, SshBinding, SshCapabilities, SshEvent,
+    SshGrantRequest, SshHostIdentity, SshOperation, SshOperationApproval,
+    SshWorkerInstallProgress, SshWorkerInstallRequest,
 };
 
 const SESSION_ID: &str = "project-session";
@@ -86,9 +87,24 @@ fn operation_approval(
         operation: SshOperation::Execute,
         title: "Run fixture command".into(),
         detail: serde_json::json!({"args": {"command": "printf fixture"}}),
+        allow_session: true,
     }
 }
 
+
+fn root_operation_approval(
+    approval_id: &str,
+    session_id: &str,
+    client_id: u64,
+) -> SshOperationApproval {
+    let mut approval = operation_approval(approval_id, session_id, client_id);
+    approval.allow_session = false;
+    approval.detail = serde_json::json!({
+        "cwd": "/srv/fixture/project",
+        "args": {"command": "id -u", "sudo": true},
+    });
+    approval
+}
 fn begin_grant(app: &mut AppView, request_id: &str, target_id: &str, root: &str) {
     let effects = dispatch_begin_ssh_project_open(app, pending_project());
     let (flow_id, owner) = effects.iter().find_map(|effect| match effect {
@@ -1224,6 +1240,126 @@ fn typed_operation_expiry_cannot_clobber_a_newer_approval() {
     )));
 }
 
+#[test]
+fn sudo_authentication_events_stay_on_their_original_client_session_and_operation() {
+    let mut app = test_app_with_agent();
+    let source_id = AgentId(0);
+    let session_id = app.agents.get(&source_id).unwrap().session.session_id.as_ref().unwrap().to_string();
+    let client_id = app.ssh_client_id;
+    apply_ssh_control_event(
+        &mut app,
+        None,
+        None,
+        SshEvent::OperationApproval(root_operation_approval(
+            "root-operation",
+            &session_id,
+            client_id,
+        )),
+    );
+    assert!(dispatch(
+        Action::ApproveSshOperation {
+            approval_id: "root-operation".into(),
+            approved: true,
+            scope: xai_grok_shell::ssh::SshOperationApprovalScope::Once,
+        },
+        &mut app,
+    )
+    .iter()
+    .any(|effect| matches!(
+        effect,
+        Effect::SshApproveOperation { approval_id, .. } if approval_id == "root-operation"
+    )));
+    let sudo_prompt = |event_client_id, event_session_id: String| SshEvent::SudoAuthentication {
+        session_id: event_session_id,
+        operation_id: "operation-root-operation".into(),
+        prompt: SshAuthPrompt {
+            client_id: event_client_id,
+            connection_generation: 4,
+            challenge_id: "sudo-challenge".into(),
+            target_id: TARGET_ID.into(),
+            kind: SshAuthPromptKind::SudoPassword,
+            detail: SshAuthPromptDetail::Secret {
+                username: "fixture-user".into(),
+                message: "Root password required".into(),
+                allow_remember: false,
+            },
+        },
+    };
+
+    apply_ssh_control_event(
+        &mut app,
+        None,
+        None,
+        sudo_prompt(client_id.wrapping_add(1), session_id.clone()),
+    );
+    apply_ssh_control_event(
+        &mut app,
+        None,
+        None,
+        sudo_prompt(client_id, "different-session".into()),
+    );
+    {
+        let manager = app
+            .agents
+            .get_mut(&source_id)
+            .and_then(|agent| agent.ssh_manager.as_mut())
+            .expect("root approval remains in its source manager");
+        assert!(matches!(
+            handle_ssh_key(manager, &KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE)),
+            SshModalOutcome::Unchanged
+        ));
+    }
+
+    apply_ssh_control_event(
+        &mut app,
+        None,
+        None,
+        sudo_prompt(client_id, session_id.clone()),
+    );
+    {
+        let manager = app
+            .agents
+            .get_mut(&source_id)
+            .and_then(|agent| agent.ssh_manager.as_mut())
+            .expect("scoped sudo prompt uses its source manager");
+        assert!(matches!(
+            handle_ssh_key(manager, &KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
+            SshModalOutcome::AnswerAuthentication { challenge_id, .. } if challenge_id == "sudo-challenge"
+        ));
+    }
+
+    apply_ssh_control_event(
+        &mut app,
+        None,
+        None,
+        SshEvent::OperationApproval(operation_approval("new-operation", &session_id, client_id)),
+    );
+    apply_ssh_control_event(
+        &mut app,
+        None,
+        None,
+        SshEvent::SudoAuthenticationResolved {
+            client_id,
+            session_id: session_id.clone(),
+            challenge_id: "sudo-challenge".into(),
+            error: Some("timed out".into()),
+        },
+    );
+    assert!(dispatch(
+        Action::ApproveSshOperation {
+            approval_id: "new-operation".into(),
+            approved: true,
+            scope: xai_grok_shell::ssh::SshOperationApprovalScope::Once,
+        },
+        &mut app,
+    )
+    .iter()
+    .any(|effect| matches!(
+        effect,
+        Effect::SshApproveOperation { approval_id, .. } if approval_id == "new-operation"
+    )));
+}
+
 fn worker_install_request(
     request_id: &str,
     session_id: &str,
@@ -1785,33 +1921,6 @@ fn cancelled_project_start_cannot_replace_a_new_folder_flow_on_completion() {
     assert!(effects.iter().any(|effect| matches!(effect, Effect::UnregisterActiveSession { session_id } if session_id.0.as_ref() == SESSION_ID)));
 }
 
-#[test]
-fn direct_ssh_selection_cannot_resume_in_a_replacement_manager() {
-    let mut app = test_app_with_agent();
-    app.active_view = ActiveView::Agent(AgentId(0));
-    let initial = dispatch(Action::SelectSshTarget { reference: "Fixture".into() }, &mut app);
-    let (session_id, owner) = ssh_target_list_request(&initial);
-    let mut target = xai_grok_ssh::SshTarget::new(TARGET_ID);
-    target.id = TARGET_ID.into();
-    target.label = "Fixture".into();
-    let targets = vec![crate::views::ssh_modal::SshTargetView::from_target(
-        target, "user@host:22".into(), false, String::new(),
-        crate::views::ssh_modal::SshGrantView::NotGranted,
-    )];
-    let client_id = app.ssh_client_id;
-    let effects = dispatch(Action::TaskComplete(TaskResult::SshTargetsLoaded {
-        session_id: session_id.clone(), client_id, owner, targets: targets.clone(), error: None,
-    }), &mut app);
-    assert!(matches!(effects.as_slice(), [Effect::SshBrowseProjectDirectory {
-        target_id, owner: actual_owner, ..
-    }] if target_id == TARGET_ID && actual_owner == &owner));
-    dispatch(Action::OpenSshManager, &mut app);
-    let late = dispatch(Action::TaskComplete(TaskResult::SshTargetsLoaded {
-        session_id, client_id, owner, targets, error: None,
-    }), &mut app);
-    assert!(late.is_empty());
-    assert_ne!(ssh_manager_owner(&app), Some(owner));
-}
 
 #[test]
 fn enter_defaults_the_selected_existing_binding_without_requesting_access() {
@@ -2141,5 +2250,170 @@ fn ssh_tool_grant_authentication_stays_with_its_hidden_originating_session() {
         handle_ssh_key(manager, &KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
         SshModalOutcome::AnswerAuthentication { challenge_id, connection_generation: 3, .. }
             if challenge_id == "grant-password"
+    ));
+}
+
+fn prompt_picker_target(connected: bool) -> crate::views::ssh_modal::SshTargetView {
+    let mut target = xai_grok_ssh::SshTarget::new("build.example.test");
+    target.id = "draft-server".into();
+    target.label = "Build server".into();
+    crate::views::ssh_modal::SshTargetView::from_target(
+        target,
+        "builder@build.example.test:22".into(),
+        connected,
+        String::new(),
+        crate::views::ssh_modal::SshGrantView::NotGranted,
+    )
+}
+
+fn load_prompt_picker_target(
+    app: &mut AppView,
+    connected: bool,
+) -> (crate::app::actions::SshManagerOwner, Vec<Effect>) {
+    let effects = dispatch(Action::SelectSshTarget { reference: "draft-server".into() }, app);
+    let (session_id, owner) = ssh_target_list_request(&effects);
+    let effects = dispatch(Action::TaskComplete(TaskResult::SshTargetsLoaded {
+        session_id,
+        client_id: app.ssh_client_id,
+        owner,
+        targets: vec![prompt_picker_target(connected)],
+        error: None,
+    }), app);
+    (owner, effects)
+}
+
+#[test]
+fn ssh_picker_connected_target_waits_for_requirements_and_explicit_send() {
+    let mut app = test_app_with_agent();
+    let id = AgentId(0);
+    app.active_view = ActiveView::Agent(id);
+    app.agents.get_mut(&id).unwrap().prompt.set_text("Inspect disk usage. ");
+    let (_, effects) = load_prompt_picker_target(&mut app, true);
+    assert!(effects.is_empty(), "selection must not send or grant access");
+    let agent = app.agents.get_mut(&id).unwrap();
+    assert!(agent.ssh_manager.is_none());
+    assert!(agent.session.pending_prompts.is_empty());
+    assert!(!agent.session.state.is_turn_running());
+    assert!(agent.prompt.text().contains("Inspect disk usage."));
+    assert!(agent.prompt.text().contains("draft-server"));
+    agent.prompt.append_text("Do not delete anything.");
+    let text = agent.prompt.text().to_owned();
+    let effects = dispatch(Action::SendPrompt(text), &mut app);
+    assert!(matches!(effects.as_slice(), [Effect::SendPrompt { text, .. }]
+        if text.contains("draft-server") && text.contains("Inspect disk usage.")
+            && text.contains("Do not delete anything.")));
+}
+
+#[test]
+fn ssh_picker_connects_before_adding_target_to_its_original_draft() {
+    let mut app = test_app_with_agent();
+    let id = AgentId(0);
+    app.active_view = ActiveView::Agent(id);
+    app.agents.get_mut(&id).unwrap().prompt.set_text("Keep this request");
+    let (owner, effects) = load_prompt_picker_target(&mut app, false);
+    assert!(matches!(effects.as_slice(), [Effect::SshConnect { target_id, .. }]
+        if target_id == "draft-server"));
+    assert_eq!(app.agents.get(&id).unwrap().prompt.text(), "Keep this request");
+    let status = || SshEvent::TargetStatus(xai_grok_shell::ssh::SshTargetStatus {
+        target_id: "draft-server".into(),
+        connection: xai_grok_shell::ssh::SshConnectionState::Connected,
+        detail: None,
+    });
+    apply_ssh_control_event(&mut app, Some("test-session".into()), None, status());
+    assert_eq!(app.agents.get(&id).unwrap().prompt.text(), "Keep this request",
+        "a broadcast status is not the owned connect result");
+    app.active_view = ActiveView::Welcome;
+    let effects = apply_ssh_control_event(
+        &mut app, Some("test-session".into()), Some(owner), status(),
+    );
+    assert!(matches!(effects.as_slice(), [Effect::SshAwaitEvent { .. }]));
+    assert_eq!(app.active_view, ActiveView::Welcome);
+    let agent = app.agents.get(&id).unwrap();
+    assert!(agent.prompt.text().contains("Keep this request"));
+    assert!(agent.prompt.text().contains("draft-server"));
+    assert!(agent.ssh_manager.is_none());
+    assert!(agent.session.pending_prompts.is_empty());
+    assert!(!agent.session.state.is_turn_running());
+}
+
+#[test]
+fn ssh_picker_late_connection_cannot_modify_a_replacement_draft() {
+    let mut app = test_app_with_agent();
+    let id = AgentId(0);
+    app.active_view = ActiveView::Agent(id);
+    let (old_owner, _) = load_prompt_picker_target(&mut app, false);
+    close_ssh_manager_for_owner(&mut app, old_owner);
+    app.agents.get_mut(&id).unwrap().prompt.set_text("New task");
+    dispatch(Action::OpenSshTargetPicker, &mut app);
+    let new_owner = ssh_manager_owner(&app).unwrap();
+    assert_ne!(old_owner, new_owner);
+    apply_ssh_control_event(
+        &mut app,
+        Some("test-session".into()),
+        Some(old_owner),
+        SshEvent::TargetStatus(xai_grok_shell::ssh::SshTargetStatus {
+            target_id: "draft-server".into(),
+            connection: xai_grok_shell::ssh::SshConnectionState::Connected,
+            detail: None,
+        }),
+    );
+    assert_eq!(app.agents.get(&id).unwrap().prompt.text(), "New task");
+    assert_eq!(ssh_manager_owner(&app), Some(new_owner));
+    assert!(!app.agents.get(&id).unwrap().session.state.is_turn_running());
+}
+
+#[test]
+fn ssh_picker_transport_error_retires_selection_before_late_success() {
+    let mut app = test_app_with_agent();
+    let id = AgentId(0);
+    app.active_view = ActiveView::Agent(id);
+    app.agents.get_mut(&id).unwrap().prompt.set_text("Retain my request");
+    let (owner, _) = load_prompt_picker_target(&mut app, false);
+    dispatch(Action::TaskComplete(TaskResult::SshActionComplete {
+        session_id: Some("test-session".into()),
+        client_id: app.ssh_client_id,
+        owner: Some(owner),
+        target_id: Some("draft-server".into()),
+        message: None,
+        error: Some("Connection timed out".into()),
+    }), &mut app);
+    apply_ssh_control_event(
+        &mut app,
+        Some("test-session".into()),
+        Some(owner),
+        SshEvent::TargetStatus(xai_grok_shell::ssh::SshTargetStatus {
+            target_id: "draft-server".into(),
+            connection: xai_grok_shell::ssh::SshConnectionState::Connected,
+            detail: None,
+        }),
+    );
+    assert_eq!(app.agents.get(&id).unwrap().prompt.text(), "Retain my request");
+    assert_eq!(ssh_manager_owner(&app), Some(owner));
+}
+
+#[test]
+fn ssh_picker_connect_result_does_not_dismiss_an_operation_approval() {
+    let mut app = test_app_with_agent();
+    let id = AgentId(0);
+    app.active_view = ActiveView::Agent(id);
+    let (owner, _) = load_prompt_picker_target(&mut app, false);
+    let approval = operation_approval("while-connecting", "test-session", app.ssh_client_id);
+    apply_ssh_control_event(
+        &mut app, Some("test-session".into()), None, SshEvent::OperationApproval(approval),
+    );
+    apply_ssh_control_event(
+        &mut app, Some("test-session".into()), Some(owner),
+        SshEvent::TargetStatus(xai_grok_shell::ssh::SshTargetStatus {
+            target_id: "draft-server".into(),
+            connection: xai_grok_shell::ssh::SshConnectionState::Connected,
+            detail: None,
+        }),
+    );
+    let agent = app.agents.get_mut(&id).unwrap();
+    assert!(!agent.prompt.text().contains("draft-server"));
+    assert!(matches!(
+        handle_ssh_key(agent.ssh_manager.as_mut().unwrap(), &KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
+        SshModalOutcome::ApproveOperation { approval_id, approved: false, .. }
+            if approval_id == "while-connecting"
     ));
 }

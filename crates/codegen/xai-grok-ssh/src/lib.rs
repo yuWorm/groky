@@ -10,11 +10,13 @@ pub mod config;
 mod connection;
 mod credentials;
 mod known_hosts;
+mod sudo;
 
 pub use auth::{
     ConfigurationDiagnostic, ConfigurationDiagnosticKind, HostKeyDecision, HostKeyPrompt,
     HostKeyStatus, Interaction, InteractionError, KeyboardInteractivePrompt,
-    KeyboardInteractiveQuestion, Secret, SecretKind, SecretPrompt, SshError,
+    KeyboardInteractiveQuestion, Secret, SecretKind, SecretPrompt, SshError, SudoInteraction,
+    SudoPasswordPrompt,
 };
 pub use config::{
     AgentConfig, AlgorithmRequirements, AuthMethod, ConfigError, ConfigValueSource,

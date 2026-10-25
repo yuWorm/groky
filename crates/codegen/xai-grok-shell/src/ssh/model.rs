@@ -279,6 +279,21 @@ pub enum SshEvent {
         status: RevokeStatus,
     },
     Authentication(SshAuthPrompt),
+    /// A root-operation password prompt scoped to its originating SSH session
+    /// and native operation. It must never enter session/model replay.
+    SudoAuthentication {
+        session_id: String,
+        operation_id: String,
+        prompt: SshAuthPrompt,
+    },
+    /// Completes exactly one root-password challenge without exposing its
+    /// secret or remote authentication transcript.
+    SudoAuthenticationResolved {
+        client_id: u64,
+        session_id: String,
+        challenge_id: String,
+        error: Option<String>,
+    },
     Worker(SshSessionWorkerEvent),
     OperationApproval(SshOperationApproval),
     /// An unanswered operation approval can no longer authorize the operation.
@@ -304,6 +319,14 @@ pub struct SshOperationApproval {
     pub operation: SshOperation,
     pub title: String,
     pub detail: serde_json::Value,
+    /// Whether this approval may establish a session policy. Root operations
+    /// are always one-time and serialize this as false.
+    #[serde(default = "default_allow_session")]
+    pub allow_session: bool,
+}
+
+fn default_allow_session() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -407,6 +430,8 @@ pub enum SshAuthPromptKind {
     Password,
     PrivateKeyPassphrase,
     KeyboardInteractive,
+    /// Password for an explicitly approved, one-time root command.
+    SudoPassword,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

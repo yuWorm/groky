@@ -13,7 +13,7 @@ use uuid::Uuid;
 use xai_grok_ssh::{
     ConfigError, ConnectionLease, ConnectionManager, ConnectionPhase, HostKeyDecision,
     HostKeyPrompt, Interaction, InteractionError, KeyboardInteractivePrompt, Secret, SecretKind,
-    SecretPrompt, SshError, TargetSource, TargetStore,
+    SecretPrompt, SshError, SudoInteraction, SudoPasswordPrompt, TargetSource, TargetStore,
 };
 use xai_grok_tools::types::output::{ToolOutput, ToolRunResult};
 use xai_grok_workspace_client::ssh::{SshClientCallbacks, SshClientError, SshWorkspaceClient};
@@ -91,6 +91,8 @@ pub enum SshServiceError {
     StaleAuthentication,
     #[error("SSH operation approval is stale or belongs to another client")]
     StaleOperationApproval,
+    #[error("root SSH commands require a one-time approval")]
+    SessionApprovalNotAllowed,
     #[error("SSH worker installation consent is stale or belongs to another client or grant")]
     StaleWorkerInstall,
     #[error("SSH access request was denied by the local user")]
@@ -182,12 +184,14 @@ struct SessionSshInner {
     worker_locks: Mutex<HashMap<String, Arc<Mutex<()>>>>,
     manual_holds: Mutex<HashMap<String, ConnectionLease>>,
     auth_waiters: Mutex<HashMap<String, PendingAuthentication>>,
+    sudo_auth_waiters: Mutex<HashMap<String, PendingSudoAuthentication>>,
+    sudo_gates: Mutex<HashMap<String, PendingSudoGate>>,
+    worker_install_waiters: Mutex<HashMap<String, PendingWorkerInstall>>,
     session_event_sinks: Mutex<HashMap<String, broadcast::Sender<SshSessionWorkerEvent>>>,
     grant_waiters: StdMutex<HashMap<String, PendingToolGrant>>,
     approval_waiters: Mutex<HashMap<String, PendingOperationApproval>>,
     approval_generation: AtomicU64,
     operation_approval_policies: Mutex<Vec<OperationApprovalPolicy>>,
-    worker_install_waiters: Mutex<HashMap<String, PendingWorkerInstall>>,
     project_registrations: RwLock<HashMap<String, ProjectRegistration>>,
     project_rules_path: PathBuf,
     project_rules: Mutex<ProjectRuleStore>,
@@ -257,6 +261,28 @@ struct PendingAuthentication {
     response: oneshot::Sender<SshAuthResponse>,
 }
 
+struct PendingSudoAuthentication {
+    client_id: u64,
+    binding: SshBinding,
+    target_epoch: u64,
+    connection_generation: u64,
+    operation_id: String,
+    gate_id: String,
+    active: Arc<AtomicBool>,
+    resolved: Arc<AtomicBool>,
+    response: oneshot::Sender<SshAuthResponse>,
+}
+
+struct PendingSudoGate {
+    client_id: u64,
+    binding: SshBinding,
+    target_epoch: u64,
+    operation_id: String,
+    active: Arc<AtomicBool>,
+    resolved: Arc<AtomicBool>,
+    challenge_id: Arc<StdMutex<Option<String>>>,
+}
+
 struct PendingToolGrant {
     session_id: String,
     client_id: u64,
@@ -281,6 +307,8 @@ struct PendingOperationApproval {
     binding: SshBinding,
     target_epoch: u64,
     operation: SshOperation,
+    /// False for root commands, which can only receive one-time consent.
+    allow_session: bool,
     generation: u64,
     response: oneshot::Sender<bool>,
 }
@@ -563,6 +591,8 @@ impl SessionSsh {
                 worker_locks: Mutex::new(HashMap::new()),
                 manual_holds: Mutex::new(HashMap::new()),
                 auth_waiters: Mutex::new(HashMap::new()),
+                sudo_auth_waiters: Mutex::new(HashMap::new()),
+                sudo_gates: Mutex::new(HashMap::new()),
                 session_event_sinks: Mutex::new(HashMap::new()),
                 grant_waiters: StdMutex::new(HashMap::new()),
                 approval_waiters: Mutex::new(HashMap::new()),
@@ -1568,6 +1598,12 @@ impl SessionSsh {
             waiter.binding.session_id.as_str() == session_id.as_str()
         })
         .await;
+        retire_sudo_gates(
+            &self.inner,
+            |gate| gate.binding.session_id.as_str() == session_id.as_str(),
+            "Root password entry was cancelled",
+        )
+        .await;
         self.inner
             .operation_approval_policies
             .lock()
@@ -1585,6 +1621,12 @@ impl SessionSsh {
     /// affected.
     pub async fn clear_client_interactions(&self, client_id: u64) {
         expire_operation_approvals(&self.inner, |_, waiter| waiter.client_id == client_id).await;
+        retire_sudo_gates(
+            &self.inner,
+            |gate| gate.client_id == client_id,
+            "Root password entry was cancelled",
+        )
+        .await;
         self.inner
             .operation_approval_policies
             .lock()
@@ -1624,6 +1666,12 @@ impl SessionSsh {
         expire_operation_approvals(&self.inner, |_, waiter| {
             waiter.binding.session_id.as_str() == session_id
         })
+        .await;
+        retire_sudo_gates(
+            &self.inner,
+            |gate| gate.binding.session_id == session_id,
+            "Root password entry was cancelled",
+        )
         .await;
         self.inner
             .operation_approval_policies
@@ -2388,6 +2436,16 @@ impl SessionSsh {
             })
         })
         .await;
+        retire_sudo_gates(
+            &self.inner,
+            |gate| {
+                affected.iter().any(|(session_id, binding, _)| {
+                    gate.binding.session_id == *session_id && gate.binding.id == binding.id
+                })
+            },
+            "Root password entry was cancelled",
+        )
+        .await;
         self.inner
             .operation_approval_policies
             .lock()
@@ -2672,6 +2730,17 @@ impl SessionSsh {
         if request.invocation.operation != expected {
             return Err(SshServiceError::CapabilityDenied);
         }
+        // Explicit native dispatches can bypass the model tool's typed input.
+        // Validate the complete run input before connection/approval so malformed
+        // root requests cannot leave a pending approval card behind.
+        let command_args = (expected == SshOperation::Execute)
+            .then(|| {
+                serde_json::from_value::<super::tools::SshCommandArgs>(request.args.clone())
+                    .map_err(|error| SshServiceError::Native(format!("invalid ssh_run input: {error}")))
+            })
+            .transpose()?;
+        let is_sudo = command_args.as_ref().is_some_and(|args| args.sudo);
+        let target_epoch = self.target_config_epoch();
         let binding = self.binding_for_invocation(&request.invocation).await?;
         let lease = self
             .acquire(&binding.target_id, client_id, client_id.is_some())
@@ -2704,7 +2773,8 @@ impl SessionSsh {
             service: Arc::downgrade(&self.inner),
             client_id,
             binding: binding.clone(),
-            target_epoch: self.target_config_epoch(),
+            target_epoch,
+            allow_session: !is_sudo,
         });
         let mut completion_guard = operation.guard(callbacks.clone());
         let mut effects_started = false;
@@ -2713,10 +2783,12 @@ impl SessionSsh {
                 let approved = callbacks.approve(SshApprovalRequest {
                     approval_id: Uuid::now_v7().to_string(), operation_id: operation.id.clone(),
                     binding_id: binding.id.clone(), session_id: binding.session_id.clone(),
-                    operation: expected, title: format!("SSH {}", request.tool_name),
+                    operation: expected,
+                    title: if is_sudo { "SSH root command".into() } else { format!("SSH {}", request.tool_name) },
                     detail: serde_json::json!({
                         "target_id": binding.target_id, "identity": binding.identity,
-                        "root": binding.root, "cwd": cwd, "tool": request.tool_name, "args": request.args,
+                        "root": binding.root, "cwd": cwd, "tool": request.tool_name,
+                        "args": request.args, "sudo": is_sudo,
                     }),
                 }).await;
                 if approved != SshApprovalDecision::Approve {
@@ -2728,13 +2800,44 @@ impl SessionSsh {
                 return Err(SshServiceError::RevokedBinding(binding.id.clone()));
             }
             if expected == SshOperation::Execute {
-                let args: xai_grok_tools::implementations::grok_build::bash::BashToolInput =
-                    serde_json::from_value(request.args).map_err(|error| SshServiceError::Native(error.to_string()))?;
-                let command = format!("cd -- {} && exec sh -c {}",
-                    super::native_tasks::shell_quote(&cwd).map_err(SshServiceError::Native)?,
-                    super::native_tasks::shell_quote(&args.command).map_err(SshServiceError::Native)?);
+                let command_args = command_args
+                    .as_ref()
+                    .expect("execute input was validated before dispatch");
+                let args = xai_grok_tools::implementations::grok_build::bash::BashToolInput {
+                    command: command_args.command.clone(),
+                    description: command_args.description.clone(),
+                    timeout: command_args.timeout,
+                    is_background: command_args.is_background,
+                    block_until_ms: command_args.block_until_ms,
+                };
+                let channel = if is_sudo {
+                    let client_id = client_id.ok_or(SshServiceError::InteractiveClientRequired)?;
+                    let interaction: Arc<dyn SudoInteraction> = Arc::new(
+                        SudoInteractionBridge::register(
+                            Arc::downgrade(&self.inner),
+                            client_id,
+                            binding.clone(),
+                            target_epoch,
+                            operation.id.clone(),
+                        )
+                        .await?,
+                    );
+                    // Once the root-capable channel starts, cancellation or a
+                    // lost GO acknowledgement cannot prove no remote effects.
+                    effects_started = true;
+                    lease
+                        .exec_sudo_command(&args.command, &cwd, interaction)
+                        .await?
+                } else {
+                    let command = format!(
+                        "cd -- {} && exec sh -c {}",
+                        super::native_tasks::shell_quote(&cwd).map_err(SshServiceError::Native)?,
+                        super::native_tasks::shell_quote(&args.command)
+                            .map_err(SshServiceError::Native)?
+                    );
+                    lease.exec_command(&command).await?
+                };
                 effects_started = true;
-                let channel = lease.exec_command(&command).await?;
                 return Ok(operation.clone().run(channel, args, callbacks.clone()).await);
             }
             effects_started = expected != SshOperation::Read;
@@ -3060,6 +3163,12 @@ impl SessionSsh {
             .lock()
             .await
             .retain(|_, waiter| waiter.target_id != target_id);
+        retire_sudo_gates(
+            &self.inner,
+            |gate| gate.binding.target_id == target_id,
+            "Root password entry was cancelled",
+        )
+        .await;
         self.inner
             .workers
             .lock()
@@ -3234,6 +3343,68 @@ impl SessionSsh {
         &self,
         response: SshAuthResponse,
     ) -> Result<(), SshServiceError> {
+        let sudo_waiter = {
+            // Hold the exact grant read lock while claiming a root-password
+            // response, so revoke cannot authorize a stale GO handshake.
+            let sessions = self.inner.sessions.read().await;
+            let mut waiters = self.inner.sudo_auth_waiters.lock().await;
+            match waiters.get(&response.challenge_id) {
+                Some(current) => {
+                    if current.client_id != response.client_id
+                        || current.connection_generation != response.connection_generation
+                    {
+                        return Err(SshServiceError::StaleAuthentication);
+                    }
+                    let stale = current.target_epoch != self.target_config_epoch()
+                        || current.operation_id != current.gate_id
+                        || !current.active.load(Ordering::Acquire)
+                        || !sessions
+                            .get(&current.binding.session_id)
+                            .and_then(|state| state.grants.get(&current.binding.id))
+                            .is_some_and(|record| {
+                                !record.persisted.binding.revoked
+                                    && record.persisted.binding == current.binding
+                                    && record
+                                        .persisted
+                                        .binding
+                                        .capabilities
+                                        .permits(SshOperation::Execute)
+                            });
+                    let waiter = waiters
+                        .remove(&response.challenge_id)
+                        .expect("sudo authentication waiter was present while holding the lock");
+                    Some((stale, waiter))
+                }
+                None => None,
+            }
+        };
+        if let Some((stale, waiter)) = sudo_waiter {
+            if stale {
+                waiter.active.store(false, Ordering::Release);
+                emit_sudo_auth_resolution(
+                    &self.inner,
+                    waiter.client_id,
+                    waiter.binding.session_id,
+                    response.challenge_id.clone(),
+                    &waiter.resolved,
+                    Some("Root password entry is no longer valid".into()),
+                );
+                return Err(SshServiceError::StaleAuthentication);
+            }
+            let challenge_id = response.challenge_id.clone();
+            return waiter.response.send(response).map_err(|_| {
+                emit_sudo_auth_resolution(
+                    &self.inner,
+                    waiter.client_id,
+                    waiter.binding.session_id,
+                    challenge_id,
+                    &waiter.resolved,
+                    Some("Root password entry was cancelled".into()),
+                );
+                SshServiceError::StaleAuthentication
+            });
+        }
+
         let waiter = {
             let mut waiters = self.inner.auth_waiters.lock().await;
             let current = waiters
@@ -3276,6 +3447,11 @@ impl SessionSsh {
             if current.client_id != submitted_client_id {
                 return Err(SshServiceError::StaleOperationApproval);
             }
+            if scope == SshOperationApprovalScope::Session && !current.allow_session {
+                // Do not retire the card: the client may resubmit the same
+                // one-time root decision with `Once`.
+                return Err(SshServiceError::SessionApprovalNotAllowed);
+            }
             let stale = current.target_epoch != self.target_config_epoch()
                 || current.response.is_closed()
                 || !sessions
@@ -3313,6 +3489,7 @@ impl SessionSsh {
             binding,
             target_epoch,
             operation,
+            allow_session,
             response,
             ..
         } = pending;
@@ -3323,6 +3500,7 @@ impl SessionSsh {
             approval_id.clone(),
         );
         if approved
+            && allow_session
             && scope == SshOperationApprovalScope::Session
             && matches!(operation, SshOperation::Write | SshOperation::Execute)
         {
@@ -3767,6 +3945,7 @@ impl SessionSsh {
             client_id,
             binding: binding.clone(),
             target_epoch,
+            allow_session: true,
         });
         let client = SshWorkspaceClient::connect(stream, binding, callbacks).await?;
         let binding = client.binding().await;
@@ -4225,6 +4404,7 @@ struct WorkerCallbacks {
     client_id: Option<u64>,
     binding: SshBinding,
     target_epoch: u64,
+    allow_session: bool,
 }
 
 #[async_trait]
@@ -4267,7 +4447,8 @@ impl SshClientCallbacks for WorkerCallbacks {
         {
             return SshApprovalDecision::Deny;
         }
-        if matches!(request.operation, SshOperation::Write | SshOperation::Execute)
+        if self.allow_session
+            && matches!(request.operation, SshOperation::Write | SshOperation::Execute)
             && operation_policy_allows(&service, &self.binding, client_id, request.operation).await
         {
             return SshApprovalDecision::Approve;
@@ -4287,6 +4468,7 @@ impl SshClientCallbacks for WorkerCallbacks {
                     binding: self.binding.clone(),
                     target_epoch: self.target_epoch,
                     operation: request.operation,
+                    allow_session: self.allow_session,
                     generation,
                     response,
                 },
@@ -4310,6 +4492,7 @@ impl SshClientCallbacks for WorkerCallbacks {
                 operation: request.operation,
                 title: request.title,
                 detail: request.detail,
+                allow_session: self.allow_session,
             }))
             .is_err()
         {
@@ -4447,6 +4630,366 @@ async fn await_auth_response(
         .and_then(Result::ok)
         .ok_or(InteractionError::Unavailable);
     service.auth_waiters.lock().await.remove(&challenge_id);
+    result
+}
+
+fn emit_sudo_auth_resolution(
+    service: &SessionSshInner,
+    client_id: u64,
+    session_id: String,
+    challenge_id: String,
+    resolved: &AtomicBool,
+    error: Option<String>,
+) {
+    if resolved.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    let _ = service.events.send(SshEvent::SudoAuthenticationResolved {
+        client_id,
+        session_id,
+        challenge_id,
+        error,
+    });
+}
+
+async fn retire_sudo_gates(
+    service: &SessionSshInner,
+    mut should_retire: impl FnMut(&PendingSudoGate) -> bool,
+    error: &str,
+) {
+    let retired = {
+        let mut gates = service.sudo_gates.lock().await;
+        let ids = gates
+            .iter()
+            .filter_map(|(id, gate)| should_retire(gate).then(|| id.clone()))
+            .collect::<Vec<_>>();
+        ids.into_iter()
+            .filter_map(|id| {
+                gates.remove(&id).map(|gate| {
+                    gate.active.store(false, Ordering::Release);
+                    (id, gate)
+                })
+            })
+            .collect::<Vec<_>>()
+    };
+    if retired.is_empty() {
+        return;
+    }
+    let retired_ids = retired
+        .iter()
+        .map(|(id, _)| id.clone())
+        .collect::<HashSet<_>>();
+    let waiters = {
+        let mut waiters = service.sudo_auth_waiters.lock().await;
+        let challenge_ids = waiters
+            .iter()
+            .filter_map(|(challenge_id, waiter)| {
+                retired_ids
+                    .contains(&waiter.gate_id)
+                    .then(|| challenge_id.clone())
+            })
+            .collect::<Vec<_>>();
+        challenge_ids
+            .into_iter()
+            .filter_map(|challenge_id| {
+                waiters.remove(&challenge_id).map(|waiter| (challenge_id, waiter))
+            })
+            .collect::<Vec<_>>()
+    };
+    for (challenge_id, waiter) in waiters {
+        emit_sudo_auth_resolution(
+            service,
+            waiter.client_id,
+            waiter.binding.session_id,
+            challenge_id,
+            &waiter.resolved,
+            Some(error.into()),
+        );
+    }
+    for (_, gate) in retired {
+        let challenge_id = gate
+            .challenge_id
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        if let Some(challenge_id) = challenge_id {
+            emit_sudo_auth_resolution(
+                service,
+                gate.client_id,
+                gate.binding.session_id,
+                challenge_id,
+                &gate.resolved,
+                Some(error.into()),
+            );
+        }
+    }
+}
+
+struct SudoInteractionBridge {
+    service: Weak<SessionSshInner>,
+    client_id: u64,
+    binding: SshBinding,
+    target_epoch: u64,
+    operation_id: String,
+    active: Arc<AtomicBool>,
+    resolved: Arc<AtomicBool>,
+    challenge_id: Arc<StdMutex<Option<String>>>,
+}
+
+impl SudoInteractionBridge {
+    async fn register(
+        service: Weak<SessionSshInner>,
+        client_id: u64,
+        binding: SshBinding,
+        target_epoch: u64,
+        operation_id: String,
+    ) -> Result<Self, SshServiceError> {
+        let Some(inner) = service.upgrade() else {
+            return Err(SshServiceError::InteractiveClientRequired);
+        };
+        if inner.target_config_epoch.load(Ordering::Acquire) != target_epoch
+            || !binding_is_live_for_operation(&inner, &binding, SshOperation::Execute).await
+        {
+            return Err(SshServiceError::StaleInvocation);
+        }
+        let active = Arc::new(AtomicBool::new(true));
+        let resolved = Arc::new(AtomicBool::new(false));
+        let challenge_id = Arc::new(StdMutex::new(None));
+        let mut gates = inner.sudo_gates.lock().await;
+        if gates.contains_key(&operation_id) {
+            return Err(SshServiceError::Native(
+                "root SSH operation identifier is already active".into(),
+            ));
+        }
+        gates.insert(
+            operation_id.clone(),
+            PendingSudoGate {
+                client_id,
+                binding: binding.clone(),
+                target_epoch,
+                operation_id: operation_id.clone(),
+                active: active.clone(),
+                resolved: resolved.clone(),
+                challenge_id: challenge_id.clone(),
+            },
+        );
+        drop(gates);
+        Ok(Self {
+            service,
+            client_id,
+            binding,
+            target_epoch,
+            operation_id,
+            active,
+            resolved,
+            challenge_id,
+        })
+    }
+
+    async fn authorize(&self) -> Result<(), InteractionError> {
+        if !self.active.load(Ordering::Acquire) {
+            return Err(InteractionError::Unavailable);
+        }
+        let Some(service) = self.service.upgrade() else {
+            self.active.store(false, Ordering::Release);
+            return Err(InteractionError::Unavailable);
+        };
+        if service.target_config_epoch.load(Ordering::Acquire) != self.target_epoch
+            || !binding_is_live_for_operation(&service, &self.binding, SshOperation::Execute).await
+        {
+            self.active.store(false, Ordering::Release);
+            return Err(InteractionError::Rejected);
+        }
+        Ok(())
+    }
+
+    fn resolve(&self, challenge_id: String, error: Option<String>) {
+        if let Some(service) = self.service.upgrade() {
+            emit_sudo_auth_resolution(
+                &service,
+                self.client_id,
+                self.binding.session_id.clone(),
+                challenge_id,
+                &self.resolved,
+                error,
+            );
+        }
+    }
+}
+
+impl Drop for SudoInteractionBridge {
+    fn drop(&mut self) {
+        self.active.store(false, Ordering::Release);
+        let Some(service) = self.service.upgrade() else {
+            return;
+        };
+        let operation_id = std::mem::take(&mut self.operation_id);
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            runtime.spawn(async move {
+                retire_sudo_gates(
+                    &service,
+                    |gate| gate.operation_id == operation_id,
+                    "Root password entry was cancelled",
+                )
+                .await;
+            });
+        }
+    }
+}
+
+#[async_trait]
+impl SudoInteraction for SudoInteractionBridge {
+    async fn request_password(
+        &self,
+        prompt: SudoPasswordPrompt,
+    ) -> Result<Secret, InteractionError> {
+        if prompt.target_id != self.binding.target_id {
+            self.resolve(
+                prompt.challenge_id.to_string(),
+                Some("Root password entry is no longer valid".into()),
+            );
+            return Err(InteractionError::Rejected);
+        }
+        if let Err(error) = self.authorize().await {
+            self.resolve(
+                prompt.challenge_id.to_string(),
+                Some("Root command authorization was cancelled".into()),
+            );
+            return Err(error);
+        }
+        let challenge_id = prompt.challenge_id.to_string();
+        let mut response = match await_sudo_auth_response(self, prompt).await {
+            Ok(response) => response,
+            Err(error) => {
+                self.resolve(
+                    challenge_id,
+                    Some("Root password entry was cancelled or expired".into()),
+                );
+                return Err(error);
+            }
+        };
+        if response.accepted == Some(false) {
+            self.resolve(
+                challenge_id,
+                Some("Root password entry was declined".into()),
+            );
+            return Err(InteractionError::Rejected);
+        }
+        let mut secret = match response.secret.take() {
+            Some(secret) => secret,
+            None => {
+                self.resolve(
+                    challenge_id,
+                    Some("Root password entry was declined".into()),
+                );
+                return Err(InteractionError::Rejected);
+            }
+        };
+        if secret
+            .iter()
+            .any(|byte| matches!(byte, b'\0' | b'\r' | b'\n'))
+        {
+            secret.zeroize();
+            self.resolve(
+                challenge_id,
+                Some("Root password may not contain NUL, CR, or LF".into()),
+            );
+            return Err(InteractionError::Rejected);
+        }
+        // `remember` is deliberately ignored: root credentials never enter a
+        // session cache, persisted state, event, trace, or model history.
+        self.resolve(challenge_id, None);
+        Ok(Secret::from_owned(secret))
+    }
+
+    async fn authorize_execution(&self) -> Result<(), InteractionError> {
+        self.authorize().await
+    }
+}
+
+async fn await_sudo_auth_response(
+    bridge: &SudoInteractionBridge,
+    prompt: SudoPasswordPrompt,
+) -> Result<SshAuthResponse, InteractionError> {
+    let Some(service) = bridge.service.upgrade() else {
+        return Err(InteractionError::Unavailable);
+    };
+    if bridge.authorize().await.is_err() {
+        return Err(InteractionError::Rejected);
+    }
+    let challenge_id = prompt.challenge_id.to_string();
+    *bridge
+        .challenge_id
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(challenge_id.clone());
+    let (response, receiver) = oneshot::channel();
+    {
+        let gates = service.sudo_gates.lock().await;
+        let Some(gate) = gates.get(&bridge.operation_id) else {
+            return Err(InteractionError::Unavailable);
+        };
+        if gate.client_id != bridge.client_id
+            || gate.binding != bridge.binding
+            || gate.target_epoch != bridge.target_epoch
+            || !Arc::ptr_eq(&gate.active, &bridge.active)
+            || !Arc::ptr_eq(&gate.resolved, &bridge.resolved)
+            || !Arc::ptr_eq(&gate.challenge_id, &bridge.challenge_id)
+        {
+            return Err(InteractionError::Unavailable);
+        }
+        let mut waiters = service.sudo_auth_waiters.lock().await;
+        if waiters.contains_key(&challenge_id) {
+            return Err(InteractionError::Unavailable);
+        }
+        waiters.insert(
+            challenge_id.clone(),
+            PendingSudoAuthentication {
+                client_id: bridge.client_id,
+                binding: bridge.binding.clone(),
+                target_epoch: bridge.target_epoch,
+                connection_generation: prompt.connection_generation,
+                operation_id: bridge.operation_id.clone(),
+                gate_id: bridge.operation_id.clone(),
+                active: bridge.active.clone(),
+                resolved: bridge.resolved.clone(),
+                response,
+            },
+        );
+    }
+    let prompt = SshAuthPrompt {
+        client_id: bridge.client_id,
+        connection_generation: prompt.connection_generation,
+        challenge_id: challenge_id.clone(),
+        target_id: prompt.target_id,
+        kind: SshAuthPromptKind::SudoPassword,
+        detail: SshAuthPromptDetail::Secret {
+            username: prompt.username,
+            message: "Enter the SSH account's sudo password locally for this one root command.".into(),
+            allow_remember: false,
+        },
+    };
+    if service
+        .events
+        .send(SshEvent::SudoAuthentication {
+            session_id: bridge.binding.session_id.clone(),
+            operation_id: bridge.operation_id.clone(),
+            prompt,
+        })
+        .is_err()
+    {
+        service.sudo_auth_waiters.lock().await.remove(&challenge_id);
+        return Err(InteractionError::Unavailable);
+    }
+    let result = tokio::time::timeout(INTERACTION_TIMEOUT, receiver)
+        .await
+        .ok()
+        .and_then(Result::ok)
+        .ok_or(InteractionError::Unavailable);
+    service
+        .sudo_auth_waiters
+        .lock()
+        .await
+        .remove(&challenge_id);
     result
 }
 
@@ -4983,6 +5526,7 @@ mod tests {
             client_id: None,
             binding: binding("binding", "session", "/remote/project"),
             target_epoch: service.target_config_epoch(),
+            allow_session: true,
         };
         assert_eq!(
             callbacks
@@ -5033,6 +5577,353 @@ mod tests {
             epoch: 1,
             revoked: false,
         }
+    }
+
+    async fn service_with_execute_grant() -> (tempfile::TempDir, SessionSsh, SshBinding) {
+        let home = tempfile::tempdir().unwrap();
+        let service = SessionSsh::new(home.path().to_owned());
+        let granted = binding("binding", "session", "/remote/project");
+        service
+            .restore_session(
+                "session",
+                PersistedSshState {
+                    grants: vec![PersistedSshGrant {
+                        binding: granted.clone(),
+                        parent_binding_id: None,
+                        requires_revalidation: false,
+                        scope: SshGrantScope::CurrentSession,
+                        revoke_status: None,
+                        worker_bound: false,
+                        worker_commands: Vec::new(),
+                    }],
+                    default_binding_id: Some(granted.id.clone()),
+                    pending_requests: Vec::new(),
+                },
+            )
+            .await;
+        (home, service, granted)
+    }
+
+    #[tokio::test]
+    async fn malformed_direct_sudo_input_fails_before_approval_or_connection() {
+        let home = tempfile::tempdir().unwrap();
+        let service = SessionSsh::new(home.path().to_owned());
+        let error = service
+            .dispatch(
+                SshDispatchRequest {
+                    invocation: ResolvedSshInvocation {
+                        binding_id: "missing-binding".into(),
+                        target_id: "missing-target".into(),
+                        session_id: "session".into(),
+                        epoch: 1,
+                        cwd: "/remote/project".into(),
+                        operation: SshOperation::Execute,
+                        call_id: "call".into(),
+                    },
+                    tool_name: "GrokBuild:run_terminal_cmd".into(),
+                    args: serde_json::json!({
+                        "command": "id",
+                        "description": "Inspect remote identity.",
+                        "sudo": "not-a-boolean",
+                    }),
+                    mutation_id: Some("call".into()),
+                },
+                Some(7),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            SshServiceError::Native(message) if message.contains("invalid ssh_run input")
+        ));
+        assert!(service.inner.approval_waiters.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn root_operation_ignores_execute_session_policy_and_requires_once_approval() {
+        let (_home, service, granted) = service_with_execute_grant().await;
+        service
+            .inner
+            .operation_approval_policies
+            .lock()
+            .await
+            .push(OperationApprovalPolicy {
+                client_id: 7,
+                session_id: granted.session_id.clone(),
+                binding_id: granted.id.clone(),
+                epoch: granted.epoch,
+                identity: granted.identity.clone(),
+                operation: SshOperation::Execute,
+            });
+        let callbacks = WorkerCallbacks {
+            service: Arc::downgrade(&service.inner),
+            client_id: Some(7),
+            binding: granted,
+            target_epoch: service.target_config_epoch(),
+            allow_session: false,
+        };
+        let mut events = service.subscribe_events();
+        let waiting = tokio::spawn(async move {
+            callbacks
+                .approve(SshApprovalRequest {
+                    approval_id: "root-once".into(),
+                    operation_id: "operation".into(),
+                    binding_id: "binding".into(),
+                    session_id: "session".into(),
+                    operation: SshOperation::Execute,
+                    title: "SSH root command".into(),
+                    detail: serde_json::json!({"args": {"sudo": true, "command": "id"}}),
+                })
+                .await
+        });
+        assert!(matches!(
+            events.recv().await.unwrap(),
+            SshEvent::OperationApproval(approval)
+                if approval.approval_id == "root-once" && !approval.allow_session
+        ));
+        service
+            .submit_operation_approval(SshOperationApprovalDecision {
+                client_id: 7,
+                approval_id: "root-once".into(),
+                approved: true,
+                scope: SshOperationApprovalScope::Once,
+            })
+            .await
+            .unwrap();
+        assert_eq!(waiting.await.unwrap(), SshApprovalDecision::Approve);
+    }
+
+    #[tokio::test]
+    async fn root_session_scope_is_rejected_without_retiring_once_approval() {
+        let (_home, service, granted) = service_with_execute_grant().await;
+        let (response, receiver) = oneshot::channel();
+        service.inner.approval_waiters.lock().await.insert(
+            "root-once".into(),
+            PendingOperationApproval {
+                client_id: 7,
+                binding: granted,
+                target_epoch: service.target_config_epoch(),
+                operation: SshOperation::Execute,
+                allow_session: false,
+                generation: 1,
+                response,
+            },
+        );
+        assert!(matches!(
+            service
+                .submit_operation_approval(SshOperationApprovalDecision {
+                    client_id: 7,
+                    approval_id: "root-once".into(),
+                    approved: true,
+                    scope: SshOperationApprovalScope::Session,
+                })
+                .await,
+            Err(SshServiceError::SessionApprovalNotAllowed)
+        ));
+        assert!(service
+            .inner
+            .approval_waiters
+            .lock()
+            .await
+            .contains_key("root-once"));
+        service
+            .submit_operation_approval(SshOperationApprovalDecision {
+                client_id: 7,
+                approval_id: "root-once".into(),
+                approved: true,
+                scope: SshOperationApprovalScope::Once,
+            })
+            .await
+            .unwrap();
+        assert!(receiver.await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn sudo_password_reply_is_client_scoped_and_never_enters_events() {
+        let (_home, service, granted) = service_with_execute_grant().await;
+        let bridge = Arc::new(
+            SudoInteractionBridge::register(
+                Arc::downgrade(&service.inner),
+                7,
+                granted,
+                service.target_config_epoch(),
+                "root-operation".into(),
+            )
+            .await
+            .unwrap(),
+        );
+        let challenge_id = Uuid::now_v7();
+        let mut events = service.subscribe_events();
+        let waiting = {
+            let bridge = bridge.clone();
+            tokio::spawn(async move {
+                bridge
+                    .request_password(SudoPasswordPrompt {
+                        challenge_id,
+                        connection_generation: 42,
+                        target_id: "target".into(),
+                        username: "user".into(),
+                    })
+                    .await
+            })
+        };
+        let prompt = events.recv().await.unwrap();
+        assert!(matches!(
+            &prompt,
+            SshEvent::SudoAuthentication { prompt, .. }
+                if prompt.challenge_id == challenge_id.to_string()
+                    && prompt.kind == SshAuthPromptKind::SudoPassword
+        ));
+        let password = b"only-local-root-password".to_vec();
+        assert!(matches!(
+            service
+                .submit_auth_response(SshAuthResponse {
+                    client_id: 8,
+                    connection_generation: 42,
+                    challenge_id: challenge_id.to_string(),
+                    accepted: None,
+                    host_key_decision: None,
+                    remember: false,
+                    secret: None,
+                    answers: Vec::new(),
+                })
+                .await,
+            Err(SshServiceError::StaleAuthentication)
+        ));
+        assert!(service
+            .inner
+            .sudo_auth_waiters
+            .lock()
+            .await
+            .contains_key(&challenge_id.to_string()));
+        service
+            .submit_auth_response(SshAuthResponse {
+                client_id: 7,
+                connection_generation: 42,
+                challenge_id: challenge_id.to_string(),
+                accepted: None,
+                host_key_decision: None,
+                remember: true,
+                secret: Some(password.clone()),
+                answers: Vec::new(),
+            })
+            .await
+            .unwrap();
+        drop(waiting.await.unwrap().unwrap());
+        let resolved = events.recv().await.unwrap();
+        let serialized = serde_json::to_string(&prompt).unwrap()
+            + serde_json::to_string(&resolved).unwrap().as_str();
+        assert!(!serialized.contains(std::str::from_utf8(&password).unwrap()));
+        assert!(matches!(
+            resolved,
+            SshEvent::SudoAuthenticationResolved {
+                client_id: 7,
+                error: None,
+                ..
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn revoking_a_binding_cancels_pending_sudo_authentication() {
+        let (_home, service, granted) = service_with_execute_grant().await;
+        let bridge = Arc::new(
+            SudoInteractionBridge::register(
+                Arc::downgrade(&service.inner),
+                7,
+                granted.clone(),
+                service.target_config_epoch(),
+                "root-operation".into(),
+            )
+            .await
+            .unwrap(),
+        );
+        let mut events = service.subscribe_events();
+        let waiting = {
+            let bridge = bridge.clone();
+            tokio::spawn(async move {
+                bridge
+                    .request_password(SudoPasswordPrompt {
+                        challenge_id: Uuid::now_v7(),
+                        connection_generation: 42,
+                        target_id: "target".into(),
+                        username: "user".into(),
+                    })
+                    .await
+            })
+        };
+        assert!(matches!(
+            events.recv().await.unwrap(),
+            SshEvent::SudoAuthentication { .. }
+        ));
+        service.revoke_binding("session", &granted.id).await.unwrap();
+        assert!(waiting.await.unwrap().is_err());
+        let resolved = events.recv().await.unwrap();
+        assert!(matches!(
+            resolved,
+            SshEvent::SudoAuthenticationResolved {
+                client_id: 7,
+                error: Some(_),
+                ..
+            }
+        ));
+        assert!(service.inner.sudo_auth_waiters.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn cancelled_sudo_password_reply_never_reaches_the_transport_secret() {
+        let (_home, service, granted) = service_with_execute_grant().await;
+        let bridge = Arc::new(
+            SudoInteractionBridge::register(
+                Arc::downgrade(&service.inner),
+                7,
+                granted,
+                service.target_config_epoch(),
+                "root-operation".into(),
+            )
+            .await
+            .unwrap(),
+        );
+        let challenge_id = Uuid::now_v7();
+        let mut events = service.subscribe_events();
+        let waiting = {
+            let bridge = bridge.clone();
+            tokio::spawn(async move {
+                bridge
+                    .request_password(SudoPasswordPrompt {
+                        challenge_id,
+                        connection_generation: 42,
+                        target_id: "target".into(),
+                        username: "user".into(),
+                    })
+                    .await
+            })
+        };
+        assert!(matches!(
+            events.recv().await.unwrap(),
+            SshEvent::SudoAuthentication { .. }
+        ));
+        service
+            .submit_auth_response(SshAuthResponse {
+                client_id: 7,
+                connection_generation: 42,
+                challenge_id: challenge_id.to_string(),
+                accepted: Some(false),
+                host_key_decision: None,
+                remember: true,
+                secret: Some(b"never-adopted".to_vec()),
+                answers: Vec::new(),
+            })
+            .await
+            .unwrap();
+        assert!(waiting.await.unwrap().is_err());
+        assert!(matches!(
+            events.recv().await.unwrap(),
+            SshEvent::SudoAuthenticationResolved {
+                error: Some(_),
+                ..
+            }
+        ));
     }
 
     fn write_manual_target(home: &std::path::Path, id: &str, label: &str, host: &str) {
@@ -5942,6 +6833,7 @@ mod tests {
             client_id: Some(7),
             binding: granted,
             target_epoch: service.target_config_epoch(),
+            allow_session: true,
         };
         let request = |id: &str| SshApprovalRequest {
             approval_id: id.into(),
@@ -6022,6 +6914,7 @@ mod tests {
             client_id: Some(7),
             binding: granted.clone(),
             target_epoch: service.target_config_epoch(),
+            allow_session: true,
         };
         let waiting = tokio::spawn(async move {
             callbacks
@@ -6074,6 +6967,7 @@ mod tests {
             client_id: Some(7),
             binding: granted.clone(),
             target_epoch: service.target_config_epoch(),
+            allow_session: true,
         };
         let fresh = tokio::spawn(async move {
             callbacks
@@ -6133,6 +7027,7 @@ mod tests {
             client_id: Some(7),
             binding: granted.clone(),
             target_epoch: service.target_config_epoch(),
+            allow_session: true,
         };
         let waiting = tokio::spawn(async move {
             callbacks
@@ -6219,6 +7114,7 @@ mod tests {
                 binding: granted.clone(),
                 target_epoch: service.target_config_epoch(),
                 operation: SshOperation::Execute,
+                allow_session: true,
                 generation: 0,
                 response,
             },
@@ -6263,6 +7159,7 @@ mod tests {
                     binding: binding.clone(),
                     target_epoch: service.target_config_epoch(),
                     operation: SshOperation::Execute,
+                    allow_session: true,
                     generation: 0,
                     response,
                 },
@@ -6379,6 +7276,7 @@ mod tests {
                 binding: granted.clone(),
                 target_epoch: service.target_config_epoch(),
                 operation: SshOperation::Execute,
+                allow_session: true,
                 generation: 0,
                 response,
             },
@@ -7232,6 +8130,7 @@ mod tests {
                 binding: granted.clone(),
                 target_epoch: service.target_config_epoch(),
                 operation: SshOperation::Execute,
+                allow_session: true,
                 generation: 0,
                 response,
             },
