@@ -1,3 +1,15 @@
+# 0.1.28 — 2026-10-25
+
+## Features
+
+- **`/ssh`** selects a server into an editable chat draft, connects only when needed, and sends the target with your requirements only when you submit; existing text and attachments are preserved.
+- **SSH root commands** support explicit `sudo` execution with one-time approval, masked local password entry over SSH, no saved sudo credentials, and cancellation-safe authorization without automatic replay.
+
+## Bug Fixes
+
+- **SSH operation approvals** retire expired or cancelled requests, recover from late replies without trapping the manager, and require fresh approval before retrying without replaying remote commands.
+- **SSH warnings** use warning colors distinct from errors; operation review instructions no longer appear in error red.
+
 # 0.1.27 — 2026-10-22
 
 ## Features

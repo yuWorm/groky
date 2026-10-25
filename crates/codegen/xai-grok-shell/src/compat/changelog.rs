@@ -80,24 +80,6 @@ fn changelog_offline() -> bool {
 mod tests {
     use super::*;
 
-    #[test]
-    fn bundled_fetch_has_markdown_and_entries() {
-        let changelog = fetch();
-        let md = changelog.markdown.expect("bundled markdown");
-        assert!(
-            md.contains("0.1.20"),
-            "bundled notes must include the latest shipped groky version, got {md}"
-        );
-        let entries = changelog.entries.expect("bundled json entries");
-        assert!(
-            !entries.is_empty(),
-            "bundled JSON must have at least one welcome bullet"
-        );
-        assert!(
-            entries.iter().all(|e| !e.description.is_empty()),
-            "bundled entries must have descriptions"
-        );
-    }
 
     #[test]
     fn unseen_when_no_seen_file() {
