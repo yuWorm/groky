@@ -101,16 +101,34 @@ pub fn kind_from_wire(kind: &str) -> QueueEntryKind {
     }
 }
 
+/// Text projected for queue presentation without changing the authoritative row text.
+fn display_text_for_kind(text: &str, kind: QueueEntryKind) -> std::borrow::Cow<'_, str> {
+    if kind == QueueEntryKind::Prompt {
+        super::ssh_context::display_text(text)
+    } else {
+        std::borrow::Cow::Borrowed(text)
+    }
+}
+
+/// First non-empty line projected for the queue row.
+///
+/// SSH target envelopes are durable prompt text, but ordinary prompt rows display their
+/// readable context label. Commands, especially literal bash commands, retain their text.
+fn display_first_line(text: &str, kind: QueueEntryKind) -> String {
+    let display_text = display_text_for_kind(text, kind);
+
+    display_text
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .unwrap_or("")
+        .to_string()
+}
+
 impl QueuedPromptEntry {
     /// Create a new entry from a `QueuedPrompt` and its current position.
     pub(crate) fn new(prompt: &QueuedPrompt, position: usize, mutation: QueueMutation) -> Self {
-        let first_line = prompt
-            .text
-            .lines()
-            .map(|l| l.trim())
-            .find(|l| !l.is_empty())
-            .unwrap_or("")
-            .to_string();
+        let first_line = display_first_line(&prompt.text, prompt.kind);
 
         let line_count = prompt.text.lines().count();
         let capabilities = ServerRowCapabilities::for_local(mutation);
@@ -140,15 +158,9 @@ impl QueuedPromptEntry {
         position: usize,
         mutation: QueueMutation,
     ) -> Self {
-        let first_line = wire
-            .text
-            .lines()
-            .map(|l| l.trim())
-            .find(|l| !l.is_empty())
-            .unwrap_or("")
-            .to_string();
-        let line_count = wire.text.lines().count();
         let kind = kind_from_wire(&wire.kind);
+        let first_line = display_first_line(&wire.text, kind);
+        let line_count = wire.text.lines().count();
         let capabilities = ServerRowCapabilities::for_pane(&wire.kind, mutation);
         let styled = Self::build_styled(&first_line, line_count, kind, None, capabilities);
         Self {
@@ -675,9 +687,9 @@ impl QueuePane {
         self.list_state.selected_id()
     }
 
-    /// Get the full text of the currently selected entry, if any.
+    /// Get the full authoritative text of the currently selected entry, if any.
     ///
-    /// Used to determine if the entry is multiline (for preview overlay).
+    /// Copy, edit, search, and send continue to use this original payload.
     pub fn selected_text(&self) -> Option<&str> {
         let id = self.list_state.selected_id()?;
         self.entries
@@ -1011,13 +1023,15 @@ impl QueuePane {
         // Multiline preview overlay: show when focused and selected entry has 2+ lines.
         if focused
             && let Some(overlay) = overlay_area
-            && let Some(text) = self.selected_text()
-            && text.lines().count() > 1
+            && let Some(id) = self.selected_id()
+            && let Some(entry) = self.entries.iter().find(|entry| entry.id == id)
+            && entry.text.lines().count() > 1
         {
+            let text = display_text_for_kind(&entry.text, entry.kind);
             let theme = Theme::current();
             // Use accent_user for text (matches prompt color in queue list).
             let style = PreviewStyle::new(theme.bg_dark, theme.accent_user, theme.gray_dim);
-            render_preview_overlay(buf, overlay, text, style, PreviewConfig::default());
+            render_preview_overlay(buf, overlay, &text, style, PreviewConfig::default());
         }
     }
 }
@@ -1532,6 +1546,113 @@ mod tests {
         let r1 = pane.row_ref(7).unwrap();
         assert_eq!(r1.origin, QueueRowOrigin::Local);
         assert_eq!(r1.server_id, None);
+    }
+
+    #[test]
+    fn ssh_context_rows_display_labels_without_rewriting_authoritative_text() {
+        let local_payload = r#"{"type":"ssh_target","target_id":"local-build","label":"Local build","address":"builder@local-build.example.test:22"}"#;
+        let server_payload = r#"{"type":"ssh_target","target_id":"shared-build","label":"Shared build","address":"builder@shared-build.example.test:22"}"#;
+        let local_text = format!("{local_payload}\nInspect the local build logs.");
+        let server_text = format!("{server_payload}\nInspect the shared build logs.");
+        let mut local = std::collections::VecDeque::new();
+        local.push_back(local_prompt(7, &local_text));
+        let server = vec![wire("server-ssh", &server_text, 0)];
+        let mut pane = QueuePane::new();
+
+        pane.sync_from_merged(&local, &server, None, None, &Default::default());
+
+        for (origin, raw, display) in [
+            (
+                QueueRowOrigin::Server,
+                &server_text,
+                "[SSH: Shared build · builder@shared-build.example.test:22]",
+            ),
+            (
+                QueueRowOrigin::Local,
+                &local_text,
+                "[SSH: Local build · builder@local-build.example.test:22]",
+            ),
+        ] {
+            let entry = pane
+                .entries
+                .iter()
+                .find(|entry| entry.origin == origin)
+                .unwrap_or_else(|| panic!("missing {origin:?} SSH queue row"));
+            let visible = span_texts(entry).concat();
+
+            assert!(visible.contains(display), "{visible}");
+            assert!(!visible.contains(r#""type":"ssh_target""#), "{visible}");
+            assert!(visible.contains("(+1 line)"), "{visible}");
+            assert_eq!(entry.text, *raw);
+            assert_eq!(entry.copy_text(), *raw);
+            assert_eq!(entry.search_text(), *raw);
+        }
+    }
+
+    #[test]
+    fn ssh_context_preview_projects_selected_local_and_server_rows() {
+        let local_payload = r#"{"type":"ssh_target","target_id":"local-preview","label":"Local preview","address":"builder@local-preview.example.test:22"}"#;
+        let server_payload = r#"{"type":"ssh_target","target_id":"server-preview","label":"Server preview","address":"builder@server-preview.example.test:22"}"#;
+        let local_text = format!("{local_payload}\nInspect the local preview.");
+        let server_text = format!("{server_payload}\nInspect the server preview.");
+        let mut local = std::collections::VecDeque::new();
+        local.push_back(local_prompt(7, &local_text));
+        let server = vec![wire("server-preview", &server_text, 0)];
+        let mut pane = QueuePane::new();
+        pane.sync_from_merged(&local, &server, None, None, &Default::default());
+
+        let queue_area = Rect::new(0, 0, 120, 1);
+        let preview_area = Rect::new(0, 1, 120, 6);
+        let layout_cfg = LayoutConfig::default();
+        for (origin, raw, display) in [
+            (
+                QueueRowOrigin::Server,
+                &server_text,
+                "[SSH: Server preview · builder@server-preview.example.test:22]",
+            ),
+            (
+                QueueRowOrigin::Local,
+                &local_text,
+                "[SSH: Local preview · builder@local-preview.example.test:22]",
+            ),
+        ] {
+            let id = pane
+                .entries
+                .iter()
+                .find(|entry| entry.origin == origin)
+                .map(|entry| entry.id)
+                .unwrap_or_else(|| panic!("missing {origin:?} SSH queue row"));
+            pane.list_state.select_by_id(id);
+            let mut buf = Buffer::empty(Rect::new(0, 0, 120, 7));
+
+            pane.render(
+                queue_area,
+                &mut buf,
+                true,
+                &layout_cfg,
+                Some(preview_area),
+                true,
+            );
+
+            let visible = buffer_text(&buf, preview_area);
+            assert!(visible.contains(display), "{visible}");
+            assert!(!visible.contains(r#""type":"ssh_target""#), "{visible}");
+            assert_eq!(pane.selected_text(), Some(raw.as_str()));
+        }
+    }
+
+    #[test]
+    fn ssh_context_does_not_project_bash_queue_text() {
+        let raw = r#"{"type":"ssh_target","target_id":"build-shell","label":"Build shell","address":"builder@build-shell.example.test:22"}"#;
+        let entry = QueuedPromptEntry::new(
+            &QueuedPrompt::plain(7, raw, QueueEntryKind::BashCommand),
+            1,
+            QueueMutation::PerRowKind,
+        );
+        let visible = span_texts(&entry).concat();
+
+        assert!(visible.contains(r#""type":"ssh_target""#), "{visible}");
+        assert!(visible.contains(raw), "{visible}");
     }
 
     /// `select_after_delete` picks the neighbor from the *merged* rows, so a trailing local row's neighbor can be a server row across the boundary.

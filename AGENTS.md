@@ -25,3 +25,5 @@ Voice: `**Lead** rest.` Lead is the noun the user already knows (`/default`, `Re
 ### Unreleased
 
 Next groky version after `v0.1.28`.
+
+- **SSH target labels** stay readable in sent messages, queued prompts and previews, and restored chat history instead of displaying raw JSON, while preserving the original target context sent to the agent.

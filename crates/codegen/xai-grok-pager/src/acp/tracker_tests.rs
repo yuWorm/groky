@@ -514,6 +514,57 @@ fn session_replay_creates_user_entries() {
     assert!(tracker.handle_update(user_message("second question"), &meta(), &mut sb));
     assert_eq!(sb.len(), 3);
 }
+
+/// Persisted SSH target envelopes carry their own display identity; replay has no textarea chip
+/// metadata to recover it from.
+#[test]
+fn replayed_ssh_context_projects_durable_wire_prompt_without_local_chip_metadata() {
+    use crate::scrollback::block::BlockContent;
+    use crate::scrollback::types::{BlockContext, DisplayMode};
+
+    let wire = crate::views::ssh_context::payload(
+        "imported:build-east",
+        "Build East",
+        "builder@build-east.example.test:2222",
+    );
+    let raw = format!("{wire} inspect the failed deployment logs");
+    let replay = NotificationMeta {
+        is_replay: true,
+        ..Default::default()
+    };
+    let mut sb = ScrollbackState::new();
+    let mut tracker = AcpUpdateTracker::new();
+
+    assert!(tracker.handle_update(user_message(&raw), &replay, &mut sb));
+    let RenderBlock::UserPrompt(block) = &sb.get(0).expect("replayed prompt").block else {
+        panic!("expected replayed user prompt");
+    };
+    assert_eq!(block.text, raw);
+    assert_eq!(block.copy_text(), raw);
+
+    let output = block.output(&BlockContext {
+        mode: DisplayMode::Expanded,
+        is_running: false,
+        width: 120,
+        raw: false,
+        max_lines: None,
+        appearance: Default::default(),
+        is_selected: false,
+        cwd: None,
+    });
+    let rendered: String = output
+        .lines
+        .iter()
+        .flat_map(|line| line.content.spans.iter())
+        .map(|span| span.content.as_ref())
+        .collect();
+    assert!(rendered.contains("[SSH: Build East · builder@build-east.example.test:2222]"));
+    assert!(rendered.contains("inspect the failed deployment logs"));
+    assert!(
+        !rendered.contains("\"target_id\""),
+        "replay must not surface transport JSON: {rendered:?}"
+    );
+}
 /// Skill replay: XML metadata becomes a clean skill block, body is absorbed.
 #[test]
 fn skill_replay_creates_clean_block() {

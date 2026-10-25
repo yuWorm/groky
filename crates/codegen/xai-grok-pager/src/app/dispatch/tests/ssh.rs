@@ -2287,6 +2287,7 @@ fn ssh_picker_connected_target_waits_for_requirements_and_explicit_send() {
     let mut app = test_app_with_agent();
     let id = AgentId(0);
     app.active_view = ActiveView::Agent(id);
+
     app.agents.get_mut(&id).unwrap().prompt.set_text("Inspect disk usage. ");
     let (_, effects) = load_prompt_picker_target(&mut app, true);
     assert!(effects.is_empty(), "selection must not send or grant access");
@@ -2298,10 +2299,50 @@ fn ssh_picker_connected_target_waits_for_requirements_and_explicit_send() {
     assert!(agent.prompt.text().contains("draft-server"));
     agent.prompt.append_text("Do not delete anything.");
     let text = agent.prompt.text().to_owned();
-    let effects = dispatch(Action::SendPrompt(text), &mut app);
-    assert!(matches!(effects.as_slice(), [Effect::SendPrompt { text, .. }]
-        if text.contains("draft-server") && text.contains("Inspect disk usage.")
-            && text.contains("Do not delete anything.")));
+    let effects = dispatch(Action::SendPrompt(text.clone()), &mut app);
+    let sent = match effects.as_slice() {
+        [Effect::SendPrompt { text, .. }] => text,
+        other => panic!("expected one prompt send effect, got {other:?}"),
+    };
+    assert_eq!(sent, &text, "display projection must not alter the model's request");
+
+    let block = app.agents.get(&id).unwrap().scrollback.iter_entries()
+        .find_map(|(_, entry)| match &entry.block {
+            RenderBlock::UserPrompt(block) => Some(block),
+            _ => None,
+        })
+        .expect("sending paints a user message");
+    with_theme_test_env(|| {
+        let output = crate::scrollback::block::BlockContent::output(
+            block,
+            &crate::scrollback::types::BlockContext {
+                mode: crate::scrollback::types::DisplayMode::Expanded,
+                is_running: false,
+                width: 160,
+                raw: false,
+                max_lines: None,
+                appearance: crate::appearance::AppearanceConfig::default(),
+                is_selected: false,
+                cwd: None,
+            },
+        );
+        let painted = output
+            .lines
+            .iter()
+            .flat_map(|line| line.content.spans.iter())
+            .map(|span| span.content.as_ref())
+            .collect::<String>();
+
+        assert!(painted.contains("Inspect disk usage."), "{painted}");
+        assert!(
+            painted.contains("[SSH: Build server · builder@build.example.test:22]"),
+            "{painted}"
+        );
+        assert!(painted.contains("Do not delete anything."), "{painted}");
+        assert!(!painted.contains(r#""type":"ssh_target""#), "{painted}");
+    });
+    assert_eq!(block.text, *sent);
+    assert_eq!(block.copy_text(), *sent);
 }
 
 #[test]

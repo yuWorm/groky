@@ -80,6 +80,92 @@ fn token_styled_line(
     Line::from(spans)
 }
 
+/// Append one readable SSH chip using the same foreground/background palette as composer chips.
+fn append_ssh_chip_spans(
+    spans: &mut Vec<Span<'static>>,
+    display: &str,
+    bracket_style: Style,
+    chip_style: Style,
+) {
+    if let Some(label) = display
+        .strip_prefix('[')
+        .and_then(|without_open| without_open.strip_suffix(']'))
+    {
+        spans.push(Span::styled("[", bracket_style));
+        spans.push(Span::styled(label.to_string(), chip_style));
+        spans.push(Span::styled("]", bracket_style));
+    } else {
+        spans.push(Span::styled(display.to_string(), chip_style));
+    }
+}
+
+/// Rebuild one source line with durable SSH envelopes projected as chips.
+///
+/// Token ranges remain in the original prompt's byte coordinate space. Each ordinary source
+/// segment is styled against its source offset, so a shorter chip never shifts later skill tokens.
+fn ssh_context_styled_line(
+    line_text: &str,
+    line_start: usize,
+    token_ranges: &[Range<usize>],
+    chips: &[crate::views::ssh_context::SshTargetChip],
+    token_style: Style,
+    body_style: Style,
+    chip_bracket_style: Style,
+    chip_style: Style,
+) -> Line<'static> {
+    let line_end = line_start + line_text.len();
+    let mut spans = Vec::new();
+    let mut source_pos = line_start;
+
+    for chip in chips {
+        if chip.range.end <= line_start {
+            continue;
+        }
+        if chip.range.start >= line_end {
+            break;
+        }
+        if chip.range.start < line_start || chip.range.end > line_end {
+            continue;
+        }
+        if source_pos < chip.range.start {
+            let start = source_pos - line_start;
+            let end = chip.range.start - line_start;
+            spans.extend(
+                token_styled_line(
+                    &line_text[start..end],
+                    source_pos,
+                    token_ranges,
+                    token_style,
+                    body_style,
+                )
+                .spans,
+            );
+        }
+        append_ssh_chip_spans(
+            &mut spans,
+            &chip.display,
+            chip_bracket_style,
+            chip_style,
+        );
+        source_pos = chip.range.end;
+    }
+
+    if source_pos < line_end {
+        let start = source_pos - line_start;
+        spans.extend(
+            token_styled_line(
+                &line_text[start..],
+                source_pos,
+                token_ranges,
+                token_style,
+                body_style,
+            )
+            .spans,
+        );
+    }
+    Line::from(spans)
+}
+
 #[derive(Debug, Clone)]
 pub struct UserPromptBlock {
     pub text: String,
@@ -276,9 +362,18 @@ impl UserPromptBlock {
 
         let base_content_width = (width as usize).saturating_sub(prefix_width).max(1);
 
+        let ssh_chips: Vec<_> = if self.is_bash {
+            Vec::new()
+        } else {
+            crate::views::ssh_context::chips(&self.text).collect()
+        };
+        let chip_bracket_style = Style::default().fg(theme.paste_dim).bg(theme.paste_bg);
+        let chip_style = Style::default().fg(theme.paste_fg).bg(theme.paste_bg);
+
         let mut all_lines: Vec<BlockLine> = Vec::new();
         let logical_lines: Vec<&str> = self.text.lines().collect();
         let total_logical = logical_lines.len();
+        let mut first_ssh_chip = 0usize;
 
         for (logical_idx, line_text) in logical_lines.iter().enumerate() {
             if line_text.is_empty() {
@@ -319,19 +414,43 @@ impl UserPromptBlock {
                 continue;
             }
 
-            // Wrap this line's content.
-            let content_line = if self.skill_token_ranges.is_empty() {
+            // `lines()` strips terminators, so recover this line's byte offset from the subslice
+            // pointer into `self.text`.
+            debug_assert!(
+                self.text
+                    .as_bytes()
+                    .as_ptr_range()
+                    .contains(&line_text.as_ptr()),
+                "line_text must be a subslice of self.text"
+            );
+            let line_start = line_text.as_ptr() as usize - self.text.as_ptr() as usize;
+            let line_end = line_start + line_text.len();
+            while first_ssh_chip < ssh_chips.len()
+                && ssh_chips[first_ssh_chip].range.end <= line_start
+            {
+                first_ssh_chip += 1;
+            }
+            let chips_for_line = &ssh_chips[first_ssh_chip..];
+            let has_ssh_chip = chips_for_line.first().is_some_and(|chip| {
+                chip.range.start >= line_start && chip.range.end <= line_end
+            });
+
+            // Wrap this line's content after projecting durable SSH envelopes. Ordinary source
+            // spans retain their original byte coordinates for skill-token styling.
+            let content_line = if has_ssh_chip {
+                ssh_context_styled_line(
+                    line_text,
+                    line_start,
+                    &self.skill_token_ranges,
+                    chips_for_line,
+                    skill_style,
+                    text_style,
+                    chip_bracket_style,
+                    chip_style,
+                )
+            } else if self.skill_token_ranges.is_empty() {
                 Line::from(Span::styled(line_text.to_string(), text_style))
             } else {
-                // `lines()` strips terminators, so recover this line's byte offset from the subslice pointer into `self.text`
-                debug_assert!(
-                    self.text
-                        .as_bytes()
-                        .as_ptr_range()
-                        .contains(&line_text.as_ptr()),
-                    "line_text must be a subslice of self.text"
-                );
-                let line_start = line_text.as_ptr() as usize - self.text.as_ptr() as usize;
                 token_styled_line(
                     line_text,
                     line_start,
@@ -491,7 +610,10 @@ impl BlockContent for UserPromptBlock {
         // which is harmless.
         const MIN_CONTENT_WIDTH: usize = 60;
         let mut visual_lines = 0usize;
-        for line in self.text.lines() {
+        let display_text =
+            (!self.is_bash).then(|| crate::views::ssh_context::display_text(&self.text));
+        let text = display_text.as_deref().unwrap_or(self.text.as_str());
+        for line in text.lines() {
             let w = line.width();
             visual_lines += if w == 0 {
                 1
@@ -628,6 +750,139 @@ mod tests {
 
         assert_eq!(lines.len(), 1);
         assert!(line_text(&line_at(&lines, 0).content).starts_with("$ "));
+    }
+
+    #[test]
+    fn ssh_contexts_render_as_styled_chips_without_changing_raw_prompt_text() {
+        let _guard = crate::theme::cache::pin_theme();
+        let first = crate::views::ssh_context::payload(
+            "imported:build-east",
+            "東京 build",
+            "builder@build-east.example.test:2222",
+        );
+        let second = crate::views::ssh_context::payload(
+            "target-west",
+            "β staging",
+            "ops@staging.example.test:2222",
+        );
+        let text = format!("Review {first} /verify then {second} and /archive keep the backups.");
+        let verify_start = text.find("/verify").expect("first skill token");
+        let archive_start = text.find("/archive").expect("second skill token");
+        let block = UserPromptBlock::with_skill_tokens(
+            text.clone(),
+            vec![
+                verify_start..verify_start + "/verify".len(),
+                archive_start..archive_start + "/archive".len(),
+            ],
+        );
+
+        let lines = block.wrap_prompt_lines(256, None, false, false);
+        let rendered = line_text(&line_at(&lines, 0).content);
+        assert_eq!(block.text, text);
+        assert_eq!(block.copy_text(), text);
+        assert!(rendered.contains("[SSH: 東京 build · builder@build-east.example.test:2222]"));
+        assert!(rendered.contains("[SSH: β staging · ops@staging.example.test:2222]"));
+        assert!(rendered.contains("Review ") && rendered.contains("and /archive keep the backups."));
+        assert!(
+            !rendered.contains("\"target_id\""),
+            "durable wire fields must not leak into the rendered prompt: {rendered:?}"
+        );
+
+        let theme = Theme::current();
+        let spans = &line_at(&lines, 0).content.spans;
+        assert!(spans.iter().any(|span| {
+            span.content.as_ref() == "SSH: 東京 build · builder@build-east.example.test:2222"
+                && span.style.fg == Some(theme.paste_fg)
+                && span.style.bg == Some(theme.paste_bg)
+        }));
+        let skill_text: String = spans
+            .iter()
+            .filter(|span| span.style.fg == Some(theme.accent_skill))
+            .map(|span| span.content.as_ref())
+            .collect();
+        assert_eq!(
+            skill_text, "/verify/archive",
+            "skill ranges after a shortened SSH display replacement stay in raw-text coordinates"
+        );
+    }
+
+    #[test]
+    fn ssh_context_is_projected_for_interjections_too() {
+        let _guard = crate::theme::cache::pin_theme();
+        let wire = crate::views::ssh_context::payload(
+            "imported:build-east",
+            "Build East",
+            "builder@build-east.example.test:2222",
+        );
+        let block = UserPromptBlock::interjection(format!("{wire} inspect the failed deployment"));
+
+        let rendered = line_text(&line_at(
+            &block.wrap_prompt_lines(160, None, false, false),
+            0,
+        )
+        .content);
+        assert!(rendered.contains("[SSH: Build East · builder@build-east.example.test:2222]"));
+        assert!(rendered.contains("inspect the failed deployment"));
+        assert!(!rendered.contains("\"target_id\""));
+    }
+
+    #[test]
+    fn malformed_non_ssh_and_bash_context_text_stay_literal() {
+        let _guard = crate::theme::cache::pin_theme();
+        let malformed = r#"{"type":"ssh_target","target_id":"id","label":"host"}"#;
+        let non_ssh =
+            r#"{"type":"other_context","target_id":"id","label":"host","address":"host:22"}"#;
+        let text = format!("before {malformed} after {non_ssh}");
+        let literal = UserPromptBlock::new(text.clone());
+        let literal_lines = literal.wrap_prompt_lines(256, None, false, false);
+        assert_eq!(line_text(&line_at(&literal_lines, 0).content), text);
+
+        let wire = crate::views::ssh_context::payload(
+            "imported:build-east",
+            "Build East",
+            "builder@build-east.example.test:2222",
+        );
+        let bash = UserPromptBlock::bash(wire.clone());
+        let bash_lines = bash.wrap_prompt_lines(160, None, false, false);
+        assert_eq!(line_text(&line_at(&bash_lines, 0).content), wire);
+    }
+
+    #[test]
+    fn ssh_context_chip_wraps_before_expanded_and_collapsed_rendering() {
+        let _guard = crate::theme::cache::pin_theme();
+        let wire = crate::views::ssh_context::payload(
+            "imported:build-east",
+            "Build East",
+            "builder@build-east.example.test:2222",
+        );
+        let block = UserPromptBlock::new(format!(
+            "{wire} inspect logs without deleting anything and retain the request until every verification step is complete"
+        ));
+
+        let expanded = block.wrap_prompt_lines(36, None, false, false);
+        assert!(expanded.len() > COLLAPSED_MAX_LINES, "fixture must require truncation");
+        let expanded_text: String = expanded
+            .iter()
+            .map(|line| line_text(&line.content))
+            .collect();
+        assert!(expanded_text.contains("[SSH:"));
+        assert!(expanded_text.contains("Build"));
+        assert!(expanded_text.contains("builder@build-east.example.test:2222"));
+        assert!(expanded_text.contains("inspect"));
+        assert!(expanded_text.contains("without"));
+        assert!(expanded_text.contains("deleting"));
+        assert!(!expanded_text.contains("\"target_id\""));
+
+        let collapsed = block.wrap_prompt_lines(36, Some(COLLAPSED_MAX_LINES), false, false);
+        let collapsed_text: String = collapsed
+            .iter()
+            .map(|line| line_text(&line.content))
+            .collect();
+        assert_eq!(collapsed.len(), COLLAPSED_MAX_LINES);
+        assert!(collapsed_text.contains("[SSH:"));
+        assert!(collapsed_text.contains("inspect"));
+        assert!(!collapsed_text.contains("\"target_id\""));
+        assert!(line_text(&line_at(&collapsed, 2).content).ends_with(" \u{2026}"));
     }
 
     /// Terminal theme (fullscreen): prompts render bandless — bold primary

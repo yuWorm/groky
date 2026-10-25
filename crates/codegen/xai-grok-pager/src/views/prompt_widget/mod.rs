@@ -1247,8 +1247,8 @@ impl PromptWidget {
     /// target chip so a draft cannot send contradictory selections. An expanded chip is plain text
     /// by user choice and is deliberately left alone.
     pub fn set_ssh_target_context(&mut self, target_id: &str, label: &str, address: &str) {
-        let payload = ssh_target_context_payload(target_id, label, address);
-        let display = ssh_target_chip_display(label, address);
+        let payload = crate::views::ssh_context::payload(target_id, label, address);
+        let display = chip_line(crate::views::ssh_context::label(label, address));
         let existing_ranges: Vec<_> = self
             .textarea
             .elements()
@@ -4082,75 +4082,6 @@ fn remap_slash_snapshot_to_raw(
     }
 }
 
-/// Serialized wire context for a selected SSH target.
-///
-/// This contains only the configured target identity and human-readable address, never
-/// authentication material or connection metadata.
-#[derive(serde::Serialize)]
-struct SshTargetContextPayload<'a> {
-    #[serde(rename = "type")]
-    kind: &'static str,
-    target_id: &'a str,
-    label: &'a str,
-    address: &'a str,
-}
-
-fn ssh_target_context_payload(target_id: &str, label: &str, address: &str) -> String {
-    let payload = serde_json::to_string(&SshTargetContextPayload {
-        kind: "ssh_target",
-        target_id,
-        label,
-        address,
-    })
-    .expect("serializing SSH target context strings cannot fail");
-    escape_json_inline_separators(payload)
-}
-
-/// Escape values that JSON permits literally but a terminal text buffer must not contain.
-fn escape_json_inline_separators(payload: String) -> String {
-    if !payload
-        .chars()
-        .any(|character| character.is_control() || matches!(character, '\u{2028}' | '\u{2029}'))
-    {
-        return payload;
-    }
-
-    use std::fmt::Write;
-
-    let mut escaped = String::with_capacity(payload.len());
-    for character in payload.chars() {
-        if character.is_control() || matches!(character, '\u{2028}' | '\u{2029}') {
-            write!(escaped, "\\u{:04x}", character as u32)
-                .expect("writing a JSON escape into a String cannot fail");
-        } else {
-            escaped.push(character);
-        }
-    }
-    escaped
-}
-
-/// Format untrusted target metadata for a terminal-rendered chip.
-///
-/// The buffer keeps JSON-escaped values; the display also eliminates every C0/C1 control so a
-/// configured label or address cannot inject terminal controls into a rendered `Span`.
-fn ssh_target_chip_display(label: &str, address: &str) -> Line<'static> {
-    fn push_terminal_safe(output: &mut String, value: &str) {
-        for character in value.chars() {
-            if character.is_control() || matches!(character, '\u{2028}' | '\u{2029}') {
-                output.push(' ');
-            } else {
-                output.push(character);
-            }
-        }
-    }
-
-    let mut text = String::with_capacity("SSH:  · ".len() + label.len() + address.len());
-    text.push_str("SSH: ");
-    push_terminal_safe(&mut text, label);
-    text.push_str(" · ");
-    push_terminal_safe(&mut text, address);
-    chip_line(text)
-}
 
 /// Build a `[<label>]` chip line with the shared chip styling (dim brackets, paste foreground/background).
 fn chip_line(label: String) -> Line<'static> {
