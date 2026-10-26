@@ -134,7 +134,7 @@ impl AgentView {
     }
     pub(super) fn handle_ssh_manager_key(&mut self, key: &KeyEvent) -> InputOutcome {
         let outcome = {
-            let Some(state) = &mut self.ssh_manager else {
+            let Some(state) = self.ssh_manager.as_mut().filter(|state| state.is_visible()) else {
                 return InputOutcome::Unchanged;
             };
             crate::views::ssh_modal::handle_ssh_key(state, key)
@@ -144,7 +144,7 @@ impl AgentView {
 
     pub(super) fn handle_ssh_manager_paste(&mut self, text: &str) -> InputOutcome {
         let outcome = {
-            let Some(state) = &mut self.ssh_manager else {
+            let Some(state) = self.ssh_manager.as_mut().filter(|state| state.is_visible()) else {
                 return InputOutcome::Unchanged;
             };
             crate::views::ssh_modal::handle_ssh_paste(state, text)
@@ -154,7 +154,7 @@ impl AgentView {
 
     pub(super) fn handle_ssh_manager_mouse(&mut self, mouse: &MouseEvent) -> InputOutcome {
         let outcome = {
-            let Some(state) = &mut self.ssh_manager else {
+            let Some(state) = self.ssh_manager.as_mut().filter(|state| state.is_visible()) else {
                 return InputOutcome::Unchanged;
             };
             crate::views::ssh_modal::handle_ssh_mouse(state, mouse)
@@ -170,7 +170,9 @@ impl AgentView {
 
         match outcome {
             SshModalOutcome::Close => {
-                self.ssh_manager = None;
+                if !self.ssh_manager.as_mut().is_some_and(|state| state.hide_if_waiting_for_sudo()) {
+                    self.ssh_manager = None;
+                }
                 InputOutcome::Changed
             }
             SshModalOutcome::Changed => InputOutcome::Changed,

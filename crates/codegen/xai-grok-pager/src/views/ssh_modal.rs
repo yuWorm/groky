@@ -648,6 +648,9 @@ pub struct SshAuthCard {
     pub kind: SshAuthKind,
     answers: Vec<SecretEditor>,
     active_answer: usize,
+    /// Reveal the active input after an edit/focus move, without defeating manual scrolling.
+    reveal_answer: bool,
+    viewport_size: Option<(u16, u16)>,
     /// Top wrapped line visible in an authentication card with more content than its viewport.
     scroll_offset: usize,
     /// Render-derived upper bound for [`Self::scroll_offset`].
@@ -678,6 +681,8 @@ impl SshAuthCard {
             kind,
             answers: (0..answer_count).map(|_| SecretEditor::default()).collect(),
             active_answer: 0,
+            reveal_answer: true,
+            viewport_size: None,
             scroll_offset: 0,
             max_scroll_offset: 0,
             error: None,
@@ -698,6 +703,7 @@ impl SshAuthCard {
     }
 
     fn answer_mut(&mut self) -> Option<&mut SecretEditor> {
+        self.reveal_answer = true;
         self.answers.get_mut(self.active_answer)
     }
 
@@ -706,6 +712,7 @@ impl SshAuthCard {
             answer.clear();
         }
         self.active_answer = 0;
+        self.reveal_answer = true;
     }
 
     fn secret_answers(&mut self) -> Vec<SshSecret> {
@@ -1172,11 +1179,15 @@ impl SshWorkerInstallFallbackCard {
     }
 }
 
-/// Whether an operation approval interrupted chat or was opened from the SSH manager.
+/// Outcome of settling one exact remote-operation approval.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SshOperationApprovalOrigin {
-    ExplicitManager,
-    TransientEvent,
+pub enum SshOperationApprovalSettlement {
+    /// The matching card remains available with its result or diagnostic.
+    KeepVisible,
+    /// The matching successful approval can return to its originating chat.
+    Dismiss,
+    /// Keep only the scoped sudo correlation while no modal is displayed.
+    AwaitingSudoAuthentication,
 }
 
 /// Full, wrapped SSH diagnostic retained separately from the one-line manager status.
@@ -1342,7 +1353,6 @@ struct PendingProjectOpen {
 struct SubmittedOperationApproval {
     approval_id: String,
     approved: bool,
-    origin: SshOperationApprovalOrigin,
 }
 
 /// A root command may ask for its password after its operation approval acknowledgement.
@@ -1434,6 +1444,9 @@ pub struct SshManagerState {
     pub loading: bool,
     pub message: Option<(String, bool)>,
     instance_id: u64,
+    /// A dismissed root approval retains only exact sudo correlation until the service either
+    /// asks for its password or the manager is intentionally replaced.
+    visible: bool,
     manager_scroll_offset: usize,
     manager_visible_rows: usize,
     manager_row_hits: Vec<ManagerRowHit>,
@@ -1457,9 +1470,6 @@ pub struct SshManagerState {
     pending_connection_is_connecting: bool,
     /// Immutable request retained while a directory selection or identity inspection is pending.
     pending_grant: Option<SshIncomingGrant>,
-    /// Request created for a live model tool, used only to close its automatically-opened manager
-    /// after the matching grant settles.
-    transient_tool_grant_id: Option<String>,
     /// Request IDs whose inspection has been dispatched. This suppresses duplicated grant events
     /// until the matching verified event arrives.
     inspecting_grant_ids: Vec<String>,
@@ -1481,8 +1491,6 @@ pub struct SshManagerState {
     /// Session whose grants are shown. `None` is Welcome: connect/config actions remain usable,
     /// but granting and selecting a default requires creating or opening a session first.
     pub session_id: Option<String>,
-    /// The opening context of the currently visible or most recently submitted operation card.
-    operation_approval_origin: Option<SshOperationApprovalOrigin>,
     /// Exact operation decision awaiting its local-control acknowledgement.
     submitted_operation_approval: Option<SubmittedOperationApproval>,
     /// Root authentication is accepted only for the exact approved operation in this manager.
@@ -1499,6 +1507,7 @@ impl SshManagerState {
             loading: true,
             message: None,
             instance_id: next_nonzero_id(&NEXT_MANAGER_INSTANCE_ID),
+            visible: true,
             manager_scroll_offset: 0,
             manager_visible_rows: 0,
             manager_row_hits: Vec::new(),
@@ -1514,7 +1523,6 @@ impl SshManagerState {
             pending_connection: None,
             pending_connection_is_connecting: false,
             pending_grant: None,
-            transient_tool_grant_id: None,
             inspecting_grant_ids: Vec::new(),
             cancelled_grant_ids: Vec::new(),
             submitted_grant: None,
@@ -1524,7 +1532,6 @@ impl SshManagerState {
             settled_grant_follow_up: None,
             local_grant_options: None,
             session_id,
-            operation_approval_origin: None,
             submitted_operation_approval: None,
             pending_sudo_authentication: None,
         }
@@ -1551,27 +1558,42 @@ impl SshManagerState {
         self.instance_id
     }
 
-    /// Mark the exact currently displayed/pending model-tool grant as transient.
+    /// Whether the manager currently owns the visible modal and input surface.
     ///
-    /// The app calls this only when it opened a manager for the first global live-tool request.
-    /// A stale event cannot mark an unrelated manager because the pending request and active
-    /// grant surface must still agree.
-    pub fn mark_transient_tool_grant(&mut self, request_id: &str) {
-        if self.current_grant_surface_matches(request_id) {
-            self.transient_tool_grant_id = Some(request_id.to_owned());
+    /// A root approval may retain its exact sudo tuple while hidden so a later password
+    /// challenge can safely reopen this same instance.
+    pub fn is_visible(&self) -> bool {
+        self.visible
+    }
+
+    /// Reopen local management without discarding an approved root operation's correlation.
+    pub fn reopen(&mut self, for_prompt: bool) {
+        self.visible = true;
+        self.mode = if for_prompt { SshManagerMode::PromptPicker } else { SshManagerMode::Manage };
+        self.manager_advanced = false;
+        self.page = SshModalPage::Manager;
+        self.pending_target_reference = None;
+    }
+
+    /// True means the caller must retain this manager for an outstanding sudo challenge.
+    pub fn hide_if_waiting_for_sudo(&mut self) -> bool {
+        if self.pending_sudo_authentication.is_none() {
+            return false;
         }
+        if matches!(&self.page, SshModalPage::Authentication(card)
+            if matches!(&card.kind, SshAuthKind::SudoPassword { .. }))
+        {
+            return true;
+        }
+        self.visible = false;
+        self.page = SshModalPage::Manager;
+        self.resume_project_browser_after_authentication = false;
+        true
     }
 
-    /// Whether settling `request_id` may close this auto-created manager.
-    ///
-    /// Do not close while an approval, authentication, or another request has replaced the
-    /// original card. The caller checks this before `settle_grant` consumes the request.
-    pub fn is_transient_tool_grant(&self, request_id: &str) -> bool {
-        self.transient_tool_grant_id.as_deref() == Some(request_id)
-            && self.current_grant_surface_matches(request_id)
-    }
 
-    fn current_grant_surface_matches(&self, request_id: &str) -> bool {
+    /// Whether this exact grant still owns the visible consent surface.
+    pub fn current_grant_surface_matches(&self, request_id: &str) -> bool {
         self.pending_grant.as_ref().is_some_and(|request| request.request_id == request_id)
             && match &self.page {
                 SshModalPage::Manager => true,
@@ -2484,6 +2506,7 @@ impl SshManagerState {
     }
 
     pub fn show_grant(&mut self, card: SshGrantCard) {
+        self.visible = true;
         self.page = SshModalPage::Grant(card);
     }
 
@@ -2494,25 +2517,16 @@ impl SshManagerState {
                     .project_browser
                     .as_ref()
                     .is_some_and(|browser| browser.target_id == card.target_id);
+        self.visible = true;
         self.page = SshModalPage::Authentication(card);
     }
 
-    /// Display a remote operation approval card and retain whether it interrupted chat.
-    pub fn show_operation_approval(
-        &mut self,
-        card: SshOperationApprovalCard,
-        origin: SshOperationApprovalOrigin,
-    ) {
+    /// Display a remote operation approval card.
+    pub fn show_operation_approval(&mut self, card: SshOperationApprovalCard) {
+        self.visible = true;
         self.page = SshModalPage::OperationApproval(card);
-        self.operation_approval_origin = Some(origin);
         self.submitted_operation_approval = None;
         self.pending_sudo_authentication = None;
-    }
-
-    /// Preserve a transient origin across a burst of approvals without treating the overlay as
-    /// explicitly opened merely because the previous card is still present.
-    pub fn operation_approval_origin(&self) -> Option<SshOperationApprovalOrigin> {
-        self.operation_approval_origin
     }
 
     /// Mark the exact visible card as submitted. Stale input cannot decide another operation.
@@ -2536,9 +2550,6 @@ impl SshManagerState {
         self.submitted_operation_approval = Some(SubmittedOperationApproval {
             approval_id: approval_id.to_owned(),
             approved,
-            origin: self
-                .operation_approval_origin
-                .unwrap_or(SshOperationApprovalOrigin::ExplicitManager),
         });
         true
     }
@@ -2583,6 +2594,7 @@ impl SshManagerState {
         pending.challenge_id = Some(card.challenge_id.clone());
         self.resume_project_browser_after_authentication = false;
         self.page = SshModalPage::Authentication(card);
+        self.visible = true;
         true
     }
 
@@ -2625,7 +2637,7 @@ impl SshManagerState {
                     "Root authentication was cancelled or timed out; the command was not run.",
                 );
             } else {
-                self.show_info("Root authentication submitted; waiting for command result.");
+                self.visible = false;
             }
         }
         true
@@ -2650,7 +2662,6 @@ impl SshManagerState {
             self.submitted_operation_approval = None;
         }
         self.pending_sudo_authentication = None;
-        self.operation_approval_origin = None;
         self.loading = true;
         self.return_to_manager();
         self.show_info(
@@ -2660,17 +2671,18 @@ impl SshManagerState {
         true
     }
 
-    /// Settle one exact local-control submission.
-    ///
-    /// A successful allow from a transient approval returns to chat. Explicit-manager
-    /// approvals and all denials remain visible in the manager; a failure remains on the card.
-    /// A late completion for an older card cannot hide a newer approval.
-    pub fn settle_operation_approval(&mut self, approval_id: &str, error: Option<String>) -> bool {
+    /// Settle one exact local-control submission without allowing a stale acknowledgement to
+    /// dismiss a replacement card.
+    pub fn settle_operation_approval(
+        &mut self,
+        approval_id: &str,
+        error: Option<String>,
+    ) -> SshOperationApprovalSettlement {
         let Some(submitted) = self.submitted_operation_approval.as_ref() else {
-            return false;
+            return SshOperationApprovalSettlement::KeepVisible;
         };
         if submitted.approval_id != approval_id {
-            return false;
+            return SshOperationApprovalSettlement::KeepVisible;
         }
         let submitted = self
             .submitted_operation_approval
@@ -2703,30 +2715,26 @@ impl SshManagerState {
             } else {
                 self.show_error(error);
             }
-            return false;
+            return SshOperationApprovalSettlement::KeepVisible;
         }
         if awaiting_sudo_authentication {
             if displayed {
+                // The root command can either request a password later or reach its READY gate
+                // immediately. Hide the manager but retain this exact pending tuple for either.
                 self.return_to_manager();
+                self.visible = false;
+                return SshOperationApprovalSettlement::AwaitingSudoAuthentication;
             }
-            self.show_info("Root command approved; waiting for remote sudo authentication.");
-            return false;
+            return SshOperationApprovalSettlement::KeepVisible;
         }
-        if submitted.approved
-            && submitted.origin == SshOperationApprovalOrigin::TransientEvent
-            && displayed
-        {
-            return true;
+        if submitted.approved && displayed {
+            return SshOperationApprovalSettlement::Dismiss;
         }
         if displayed {
             self.return_to_manager();
+            self.show_info("Remote operation denied.");
         }
-        self.show_info(if submitted.approved {
-            "Remote operation approval sent."
-        } else {
-            "Remote operation denied."
-        });
-        false
+        SshOperationApprovalSettlement::KeepVisible
     }
 
     /// Display the exact local-download/upload fallback for one managed worker installation.
@@ -2749,6 +2757,7 @@ impl SshManagerState {
         ) {
             return;
         }
+        self.visible = true;
         self.page = SshModalPage::WorkerInstallFallback(SshWorkerInstallFallbackCard::new(request));
     }
 
@@ -2830,17 +2839,10 @@ impl SshManagerState {
         request: SshIncomingGrant,
     ) -> SshModalOutcome {
         let request_id = request.request_id.clone();
-        if self.transient_tool_grant_id.as_deref() != Some(request_id.as_str())
-            && self
-                .pending_grant
-                .as_ref()
-                .is_some_and(|pending| pending.request_id != request_id)
-        {
-            self.transient_tool_grant_id = None;
-        }
         if self.cancelled_grant_ids.iter().any(|id| id == &request_id) {
             return SshModalOutcome::Unchanged;
         }
+        self.visible = true;
         let cancelled_local_request = self
             .cancelled_local_grant_options
             .iter()
@@ -3114,9 +3116,6 @@ impl SshManagerState {
         if let Some(request_id) = request_id.as_deref() {
             self.inspecting_grant_ids.retain(|id| id != request_id);
         }
-        if self.transient_tool_grant_id.as_deref() == request_id.as_deref() {
-            self.transient_tool_grant_id = None;
-        }
         self.pending_grant = None;
         self.submitted_grant = None;
         self.pending_grant_session_id = None;
@@ -3178,9 +3177,6 @@ impl SshManagerState {
             return false;
         }
         self.inspecting_grant_ids.retain(|id| id != request_id);
-        if self.transient_tool_grant_id.as_deref() == Some(request_id) {
-            self.transient_tool_grant_id = None;
-        }
         self.pending_grant = None;
         self.submitted_grant = None;
         self.pending_grant_session_id = None;
@@ -4303,7 +4299,7 @@ fn window_config<'a>(
     }
 }
 
-/// Render the current local-only SSH overlay. `None` means the modal is too small to render.
+/// Render the SSH overlay and return the visible, focused text input's terminal cursor.
 pub fn render_ssh_modal(
     buf: &mut Buffer,
     area: Rect,
@@ -4311,6 +4307,9 @@ pub fn render_ssh_modal(
     compact: bool,
     theme: &Theme,
 ) -> Option<(u16, u16)> {
+    if !state.is_visible() {
+        return None;
+    }
     state.manager_row_hits.clear();
     if let Some(browser) = state.project_browser.as_mut() {
         browser.row_hits.clear();
@@ -4440,12 +4439,12 @@ pub fn render_ssh_modal(
         render_manager(buf, content, state, theme);
     } else {
         match &mut state.page {
-            SshModalPage::Add(form) => render_add(buf, content, form, theme),
+            SshModalPage::Add(form) => return render_add(buf, content, form, theme),
             SshModalPage::ConfirmDelete(card) => render_delete_confirmation(buf, content, card, theme),
-            SshModalPage::Grant(card) => render_grant(buf, content, card, theme),
+            SshModalPage::Grant(card) => return render_grant(buf, content, card, theme),
             SshModalPage::ProjectBrowser => {
                 if let Some(browser) = state.project_browser.as_mut() {
-                    render_project_browser(buf, content, browser, theme);
+                    return render_project_browser(buf, content, browser, theme);
                 }
             }
             SshModalPage::OperationApproval(card) => {
@@ -4454,7 +4453,7 @@ pub fn render_ssh_modal(
             SshModalPage::WorkerInstallFallback(card) => {
                 render_worker_install_fallback(buf, content, card, theme)
             }
-            SshModalPage::Authentication(card) => render_authentication(buf, content, card, theme),
+            SshModalPage::Authentication(card) => return render_authentication(buf, content, card, theme),
             SshModalPage::Diagnostic(card) => render_diagnostic(buf, content, card, theme),
             SshModalPage::Manager => unreachable!("manager rendered before mutable page match"),
         }
@@ -4582,12 +4581,15 @@ fn render_project_browser(
     area: Rect,
     browser: &mut SshProjectBrowser,
     theme: &Theme,
-) {
+) -> Option<(u16, u16)> {
     if area.height == 0 || area.width == 0 {
         browser.visible_rows = 0;
-        return;
+        return None;
     }
     let mut y = area.y;
+    let mut cursor = None;
+    let has_status = browser.error.is_some() || browser.notice.is_some()
+        || browser.loading || browser.preparing;
     buf.set_stringn(
         area.x,
         y,
@@ -4596,13 +4598,13 @@ fn render_project_browser(
         Style::default().fg(theme.text_secondary),
     );
     y = y.saturating_add(1);
-    if y < area.bottom() {
-        render_line_editor(
+    if y < area.bottom().saturating_sub(u16::from(has_status)) {
+        cursor = render_line_editor(
             buf,
             Rect::new(area.x, y, area.width, 1),
             "Path: ",
             &browser.path,
-            browser.editing_path,
+            browser.editing_path && !browser.preparing,
             theme,
         );
         y = y.saturating_add(1);
@@ -4711,6 +4713,7 @@ fn render_project_browser(
             style,
         );
     }
+    cursor
 }
 
 fn render_diagnostic(buf: &mut Buffer, area: Rect, card: &mut SshDiagnosticCard, theme: &Theme) {
@@ -4817,9 +4820,9 @@ fn render_line_editor(
     editor: &LineEditor,
     active: bool,
     theme: &Theme,
-) {
-    if area.width == 0 {
-        return;
+) -> Option<(u16, u16)> {
+    if area.width == 0 || area.height == 0 {
+        return None;
     }
     let label_width = (label.len() as u16).min(area.width);
     let label_style = if active {
@@ -4833,7 +4836,7 @@ fn render_line_editor(
     let input_x = area.x.saturating_add(label_width);
     let input_width = area.width.saturating_sub(label_width) as usize;
     if input_width == 0 {
-        return;
+        return None;
     }
     let viewport = editor.viewport(input_width);
     let visible = editor
@@ -4847,37 +4850,40 @@ fn render_line_editor(
         input_width,
         Style::default().fg(theme.text_secondary),
     );
-    if active {
-        let cursor_x = input_x.saturating_add(
+    active.then(|| (
+        input_x.saturating_add(
             (viewport.cursor_display_column as u16).min(input_width.saturating_sub(1) as u16),
-        );
-        if let Some(cell) = buf.cell_mut((cursor_x, area.y)) {
-            cell.set_style(theme.block_cursor_over(theme.bg_base));
-        }
-    }
+        ),
+        area.y,
+    ))
 }
 
-fn render_add(buf: &mut Buffer, area: Rect, form: &mut SshManualTargetForm, theme: &Theme) {
+fn render_add(buf: &mut Buffer, area: Rect, form: &mut SshManualTargetForm, theme: &Theme) -> Option<(u16, u16)> {
     let mut y = area.y;
+    let mut cursor = None;
     let status = form.error.as_deref().or_else(|| {
         form.submitting
             .then_some("Saving target through the local SSH service…")
     });
     let fields_bottom = area.bottom().saturating_sub(u16::from(status.is_some()));
     let mut worker_command_visible = false;
-    for field in ManualTargetField::ALL {
+    let visible_fields = fields_bottom.saturating_sub(area.y) as usize;
+    let active_index = ManualTargetField::ALL.iter().position(|field| *field == form.active).unwrap_or(0);
+    let first_field = active_index.saturating_sub(visible_fields.saturating_sub(1));
+    for field in ManualTargetField::ALL.into_iter().skip(first_field) {
         if y >= fields_bottom {
             break;
         }
         let row = Rect::new(area.x, y, area.width, 1);
-        render_line_editor(
+        let field_cursor = render_line_editor(
             buf,
             row,
             field.input_label(),
             form.editor(field),
-            form.active == field,
+            form.active == field && !form.submitting,
             theme,
         );
+        cursor = cursor.or(field_cursor);
         form.field_hits.push((field, row));
         worker_command_visible |= field == ManualTargetField::WorkerCommand;
         y = y.saturating_add(1);
@@ -4917,6 +4923,7 @@ fn render_add(buf: &mut Buffer, area: Rect, form: &mut SshManualTargetForm, them
             },
         );
     }
+    cursor
 }
 
 fn render_delete_confirmation(
@@ -4988,11 +4995,11 @@ fn push_grant_wrapped(
     }
 }
 
-fn render_grant(buf: &mut Buffer, area: Rect, card: &mut SshGrantCard, theme: &Theme) {
+fn render_grant(buf: &mut Buffer, area: Rect, card: &mut SshGrantCard, theme: &Theme) -> Option<(u16, u16)> {
     if area.height == 0 || area.width == 0 {
         card.max_scroll_offset = 0;
         card.reviewed_to_end = false;
-        return;
+        return None;
     }
     let width = area.width as usize;
     let mut lines = Vec::new();
@@ -5180,6 +5187,7 @@ fn render_grant(buf: &mut Buffer, area: Rect, card: &mut SshGrantCard, theme: &T
     card.max_scroll_offset = lines.len().saturating_sub(body_height);
     card.scroll_offset = card.scroll_offset.min(card.max_scroll_offset);
     card.reviewed_to_end = body_height > 0 && card.scroll_offset >= card.max_scroll_offset;
+    let mut cursor = None;
     for (index, line) in lines
         .iter()
         .skip(card.scroll_offset)
@@ -5201,7 +5209,7 @@ fn render_grant(buf: &mut Buffer, area: Rect, card: &mut SshGrantCard, theme: &T
             Style::default().fg(theme.text_secondary)
         };
         if line.root_editor {
-            render_line_editor(buf, rect, &line.text, &card.root, focused, theme);
+            cursor = render_line_editor(buf, rect, &line.text, &card.root, focused, theme);
         } else {
             buf.set_stringn(area.x, y, &line.text, area.width as usize, style);
         }
@@ -5220,6 +5228,7 @@ fn render_grant(buf: &mut Buffer, area: Rect, card: &mut SshGrantCard, theme: &T
                 .add_modifier(Modifier::BOLD),
         );
     }
+    cursor
 }
 
 struct OperationApprovalRenderLine {
@@ -5862,8 +5871,34 @@ fn changed_host_key(status: &str, previous_keys: &[String]) -> bool {
     status.eq_ignore_ascii_case("changed") || !previous_keys.is_empty()
 }
 
-fn authentication_lines(card: &SshAuthCard, width: usize) -> Vec<(String, AuthenticationLineTone)> {
+/// Append only the visible portion of a masked answer; secret bytes never enter display strings.
+fn push_authentication_input(
+    lines: &mut Vec<(String, AuthenticationLineTone)>,
+    card: &SshAuthCard,
+    index: usize,
+    width: usize,
+) -> Option<(usize, usize)> {
+    let answer = card.answers.get(index)?;
+    let active = index == card.active_answer;
+    let columns = width.saturating_sub(2);
+    let before = answer.text()[..answer.cursor_byte].chars().count();
+    let after = answer.text()[answer.cursor_byte..].chars().count();
+    let start = if active { before.saturating_sub(columns.saturating_sub(1)) } else { 0 };
+    let visible = (before + after).saturating_sub(start).min(columns);
+    let mut line = String::with_capacity(4 + visible * '•'.len_utf8());
+    line.push_str(if active { "› " } else { "  " });
+    line.extend(std::iter::repeat_n('•', visible));
+    let row = lines.len();
+    lines.push((line, AuthenticationLineTone::Normal));
+    (active && columns > 0).then_some((row, 2 + before - start))
+}
+
+fn authentication_lines(
+    card: &SshAuthCard,
+    width: usize,
+) -> (Vec<(String, AuthenticationLineTone)>, Option<(usize, usize)>) {
     let mut lines = Vec::new();
+    let mut cursor = None;
     match &card.kind {
         SshAuthKind::HostKey {
             hostname,
@@ -5996,17 +6031,7 @@ fn authentication_lines(card: &SshAuthCard, width: usize) -> Vec<(String, Authen
                 AuthenticationLineTone::Normal,
                 width,
             );
-            let bullets = card
-                .answers
-                .first()
-                .map(|answer| "•".repeat(answer.text().chars().count()))
-                .unwrap_or_default();
-            append_wrapped_authentication_line(
-                &mut lines,
-                &format!("› {bullets}"),
-                AuthenticationLineTone::Normal,
-                width,
-            );
+            cursor = push_authentication_input(&mut lines, card, 0, width);
             if card.can_remember() {
                 append_wrapped_authentication_line(
                     &mut lines,
@@ -6047,17 +6072,7 @@ fn authentication_lines(card: &SshAuthCard, width: usize) -> Vec<(String, Authen
                 AuthenticationLineTone::Normal,
                 width,
             );
-            let bullets = card
-                .answers
-                .first()
-                .map(|answer| "•".repeat(answer.text().chars().count()))
-                .unwrap_or_default();
-            append_wrapped_authentication_line(
-                &mut lines,
-                &format!("› {bullets}"),
-                AuthenticationLineTone::Normal,
-                width,
-            );
+            cursor = push_authentication_input(&mut lines, card, 0, width);
         }
         SshAuthKind::KeyboardInteractive {
             name,
@@ -6083,24 +6098,9 @@ fn authentication_lines(card: &SshAuthCard, width: usize) -> Vec<(String, Authen
                     AuthenticationLineTone::Normal,
                     width,
                 );
-                let bullets = card
-                    .answers
-                    .get(index)
-                    .map(|answer| "•".repeat(answer.text().chars().count()))
-                    .unwrap_or_default();
-                append_wrapped_authentication_line(
-                    &mut lines,
-                    &format!(
-                        "{} {bullets}",
-                        if index == card.active_answer {
-                            "›"
-                        } else {
-                            " "
-                        }
-                    ),
-                    AuthenticationLineTone::Normal,
-                    width,
-                );
+                if let Some(position) = push_authentication_input(&mut lines, card, index, width) {
+                    cursor = Some(position);
+                }
             }
         }
     }
@@ -6113,14 +6113,19 @@ fn authentication_lines(card: &SshAuthCard, width: usize) -> Vec<(String, Authen
             width,
         );
     }
-    lines
+    (lines, cursor)
 }
 
-fn render_authentication(buf: &mut Buffer, area: Rect, card: &mut SshAuthCard, theme: &Theme) {
-    if area.height == 0 {
-        return;
+fn render_authentication(
+    buf: &mut Buffer,
+    area: Rect,
+    card: &mut SshAuthCard,
+    theme: &Theme,
+) -> Option<(u16, u16)> {
+    if area.height == 0 || area.width == 0 {
+        return None;
     }
-    let lines = authentication_lines(card, area.width as usize);
+    let (lines, cursor) = authentication_lines(card, area.width as usize);
     let height = area.height as usize;
     let body_height = if lines.len() > height && height > 1 {
         height - 1
@@ -6128,6 +6133,18 @@ fn render_authentication(buf: &mut Buffer, area: Rect, card: &mut SshAuthCard, t
         height
     };
     card.max_scroll_offset = lines.len().saturating_sub(body_height);
+    let resized = card.viewport_size != Some((area.width, area.height));
+    card.viewport_size = Some((area.width, area.height));
+    if (card.reveal_answer || resized) && let Some((row, _)) = cursor {
+        if row < card.scroll_offset {
+            card.scroll_offset = row;
+        } else if row >= card.scroll_offset + body_height {
+            card.scroll_offset = row + 1 - body_height;
+        }
+    }
+    if cursor.is_some() {
+        card.reveal_answer = false;
+    }
     card.scroll_offset = card.scroll_offset.min(card.max_scroll_offset);
     for (index, (line, tone)) in lines
         .iter()
@@ -6168,6 +6185,11 @@ fn render_authentication(buf: &mut Buffer, area: Rect, card: &mut SshAuthCard, t
             Style::default().fg(theme.gray),
         );
     }
+    cursor.and_then(|(row, column)| {
+        let visible_row = row.checked_sub(card.scroll_offset)?;
+        (visible_row < body_height && column < area.width as usize)
+            .then_some((area.x + column as u16, area.y + visible_row as u16))
+    })
 }
 
 fn render_message(buf: &mut Buffer, area: Rect, message: Option<&(String, bool)>, theme: &Theme) {
@@ -7811,6 +7833,7 @@ fn handle_authentication_key(card: &mut SshAuthCard, key: &KeyEvent) -> SshModal
             } else {
                 (card.active_answer + 1) % len
             };
+            card.reveal_answer = true;
             SshModalOutcome::Changed
         }
         KeyCode::Char('r') if key.modifiers == KeyModifiers::ALT && card.can_remember() => {
@@ -7904,6 +7927,7 @@ mod tests {
     #[test]
     fn worker_fallback_wraps_details_and_routes_keyboard_mouse_and_close_decisions() {
         let mut state = SshManagerState::new(Some("source-session".into()));
+        state.visible = false;
         state.show_worker_install_fallback(worker_install_request("fallback-1"));
         let area = Rect::new(0, 0, 60, 12);
         let theme = Theme::current();
@@ -8022,36 +8046,29 @@ mod tests {
     }
 
     #[test]
-    fn transient_allowed_operation_returns_to_chat_only_after_matching_acknowledgement() {
-        let mut state = SshManagerState::new(Some("session-1".into()));
-        state.show_operation_approval(
-            approval("approval-1"),
-            SshOperationApprovalOrigin::TransientEvent,
-        );
-        assert!(state.submit_operation_approval("approval-1", true));
+    fn successful_operation_approval_dismisses_every_origin() {
+        for approval_id in ["explicit", "transient"] {
+            let mut state = SshManagerState::new(Some("session-1".into()));
+            state.show_operation_approval(approval(approval_id));
+            assert!(state.submit_operation_approval(approval_id, true));
 
-        assert!(state.settle_operation_approval("approval-1", None));
+            assert_eq!(
+                state.settle_operation_approval(approval_id, None),
+                SshOperationApprovalSettlement::Dismiss,
+            );
+        }
     }
 
     #[test]
-    fn explicit_or_denied_operation_keeps_a_visible_result() {
+    fn denied_operation_keeps_a_visible_result() {
         let mut state = SshManagerState::new(Some("session-1".into()));
-        state.show_operation_approval(
-            approval("approval-1"),
-            SshOperationApprovalOrigin::ExplicitManager,
-        );
-        assert!(state.submit_operation_approval("approval-1", true));
+        state.show_operation_approval(approval("approval-1"));
+        assert!(state.submit_operation_approval("approval-1", false));
 
-        assert!(!state.settle_operation_approval("approval-1", None));
-        assert!(matches!(&state.page, SshModalPage::Manager));
-        assert!(state.message.is_some());
-
-        state.show_operation_approval(
-            approval("approval-2"),
-            SshOperationApprovalOrigin::TransientEvent,
+        assert_eq!(
+            state.settle_operation_approval("approval-1", None),
+            SshOperationApprovalSettlement::KeepVisible,
         );
-        assert!(state.submit_operation_approval("approval-2", false));
-        assert!(!state.settle_operation_approval("approval-2", None));
         assert!(matches!(&state.page, SshModalPage::Manager));
         assert!(state.message.is_some());
     }
@@ -8059,26 +8076,23 @@ mod tests {
     #[test]
     fn stale_completion_cannot_hide_a_newer_operation_or_its_submission_error() {
         let mut state = SshManagerState::new(Some("session-1".into()));
-        state.show_operation_approval(
-            approval("approval-1"),
-            SshOperationApprovalOrigin::TransientEvent,
-        );
+        state.show_operation_approval(approval("approval-1"));
         assert!(state.submit_operation_approval("approval-1", true));
 
-        state.show_operation_approval(
-            approval("approval-2"),
-            SshOperationApprovalOrigin::TransientEvent,
+        state.show_operation_approval(approval("approval-2"));
+        assert_eq!(
+            state.settle_operation_approval("approval-1", None),
+            SshOperationApprovalSettlement::KeepVisible,
         );
-        assert!(!state.settle_operation_approval("approval-1", None));
         assert!(matches!(
             &state.page,
             SshModalPage::OperationApproval(card) if card.approval_id == "approval-2"
         ));
 
         assert!(state.submit_operation_approval("approval-2", true));
-        assert!(
-            !state
-                .settle_operation_approval("approval-2", Some("local control unavailable".into()))
+        assert_eq!(
+            state.settle_operation_approval("approval-2", Some("local control unavailable".into())),
+            SshOperationApprovalSettlement::KeepVisible,
         );
         assert!(matches!(
             &state.page,
@@ -8092,10 +8106,7 @@ mod tests {
     #[test]
     fn expired_operation_retires_the_card_without_sending_a_stale_denial() {
         let mut state = SshManagerState::new(Some("session-1".into()));
-        state.show_operation_approval(
-            approval("expired-approval"),
-            SshOperationApprovalOrigin::TransientEvent,
-        );
+        state.show_operation_approval(approval("expired-approval"));
         assert!(state.submit_operation_approval("expired-approval", true));
 
         assert!(state.expire_operation_approval("expired-approval"));
@@ -8116,10 +8127,7 @@ mod tests {
             SshModalOutcome::Close
         ));
 
-        state.show_operation_approval(
-            approval("fresh-approval"),
-            SshOperationApprovalOrigin::TransientEvent,
-        );
+        state.show_operation_approval(approval("fresh-approval"));
         assert!(matches!(
             handle_ssh_key(&mut state, &key(KeyCode::End)),
             SshModalOutcome::Changed
@@ -8134,15 +8142,9 @@ mod tests {
     #[test]
     fn stale_operation_expiration_does_not_clobber_a_newer_card() {
         let mut state = SshManagerState::new(Some("session-1".into()));
-        state.show_operation_approval(
-            approval("old-approval"),
-            SshOperationApprovalOrigin::TransientEvent,
-        );
+        state.show_operation_approval(approval("old-approval"));
         assert!(state.submit_operation_approval("old-approval", true));
-        state.show_operation_approval(
-            approval("new-approval"),
-            SshOperationApprovalOrigin::TransientEvent,
-        );
+        state.show_operation_approval(approval("new-approval"));
 
         assert!(!state.expire_operation_approval("old-approval"));
         assert!(state.submit_operation_approval("new-approval", true));
@@ -8203,7 +8205,7 @@ mod tests {
             SshOperation::Execute,
         );
         let mut state = SshManagerState::new(Some("session-1".into()));
-        state.show_operation_approval(card, SshOperationApprovalOrigin::ExplicitManager);
+        state.show_operation_approval(card);
         let area = Rect::new(0, 0, 72, 14);
         let mut frames = String::new();
         for _ in 0..128 {
@@ -8272,7 +8274,7 @@ mod tests {
             SshOperation::Execute,
         );
         let mut state = SshManagerState::new(Some("session-1".into()));
-        state.show_operation_approval(card, SshOperationApprovalOrigin::ExplicitManager);
+        state.show_operation_approval(card);
         let area = Rect::new(0, 0, 64, 13);
         let mut buffer = Buffer::empty(area);
         render_ssh_modal(&mut buffer, area, &mut state, false, &Theme::current());
@@ -8331,7 +8333,7 @@ mod tests {
             }
         ));
 
-        state.show_operation_approval(approval("review-2"), SshOperationApprovalOrigin::ExplicitManager);
+        state.show_operation_approval(approval("review-2"));
         assert!(matches!(
             &state.page,
             SshModalPage::OperationApproval(card)
@@ -8374,10 +8376,7 @@ mod tests {
     fn root_operation_only_allows_once_from_keyboard_or_footer() {
         let area = Rect::new(0, 0, 96, 24);
         let mut keyboard = SshManagerState::new(Some("session-1".into()));
-        keyboard.show_operation_approval(
-            root_approval("root-keyboard"),
-            SshOperationApprovalOrigin::ExplicitManager,
-        );
+        keyboard.show_operation_approval(root_approval("root-keyboard"));
         let mut buffer = Buffer::empty(area);
         render_ssh_modal(&mut buffer, area, &mut keyboard, false, &Theme::current());
         assert!(matches!(
@@ -8398,10 +8397,7 @@ mod tests {
         ));
 
         let mut mouse = SshManagerState::new(Some("session-1".into()));
-        mouse.show_operation_approval(
-            root_approval("root-mouse"),
-            SshOperationApprovalOrigin::ExplicitManager,
-        );
+        mouse.show_operation_approval(root_approval("root-mouse"));
         let mut buffer = Buffer::empty(area);
         render_ssh_modal(&mut buffer, area, &mut mouse, false, &Theme::current());
         assert!(matches!(
@@ -8465,6 +8461,7 @@ mod tests {
             SshModalOutcome::Changed
         ));
         let rendered = authentication_lines(&card, 100)
+            .0
             .into_iter()
             .map(|(line, _)| line)
             .collect::<Vec<_>>()
@@ -8484,10 +8481,7 @@ mod tests {
     #[test]
     fn sudo_prompt_and_resolution_require_the_original_scope() {
         let mut state = SshManagerState::new(Some("session-1".into()));
-        state.show_operation_approval(
-            root_approval("root-operation"),
-            SshOperationApprovalOrigin::TransientEvent,
-        );
+        state.show_operation_approval(root_approval("root-operation"));
         assert!(state.submit_operation_approval("root-operation", true));
         let sudo_card = || {
             SshAuthCard::new(
@@ -8536,10 +8530,7 @@ mod tests {
             SshModalPage::Authentication(card) if card.challenge_id == "sudo-challenge"
         ));
 
-        state.show_operation_approval(
-            approval("new-operation"),
-            SshOperationApprovalOrigin::TransientEvent,
-        );
+        state.show_operation_approval(approval("new-operation"));
         assert!(!state.resolve_sudo_authentication(
             7,
             "session-1",
@@ -8550,6 +8541,48 @@ mod tests {
             &state.page,
             SshModalPage::OperationApproval(card) if card.approval_id == "new-operation"
         ));
+    }
+
+    #[test]
+    fn root_approval_hides_until_its_exact_password_challenge_then_returns_to_chat() {
+        let mut state = SshManagerState::new(Some("session-1".into()));
+        state.show_operation_approval(root_approval("root-operation"));
+        assert!(state.submit_operation_approval("root-operation", true));
+
+        assert_eq!(
+            state.settle_operation_approval("root-operation", None),
+            SshOperationApprovalSettlement::AwaitingSudoAuthentication,
+        );
+        assert!(!state.is_visible(), "NOPASSWD must leave no server-list modal");
+
+        let sudo_card = || {
+            SshAuthCard::new(
+                "sudo-challenge".into(),
+                9,
+                "target-1".into(),
+                SshAuthKind::SudoPassword {
+                    username: "build".into(),
+                    message: "Root password required".into(),
+                },
+            )
+        };
+        assert!(!state.show_sudo_authentication(
+            7,
+            "session-1",
+            "different-operation",
+            sudo_card(),
+        ));
+        assert!(!state.is_visible());
+
+        assert!(state.show_sudo_authentication(
+            7,
+            "session-1",
+            "operation-root-operation",
+            sudo_card(),
+        ));
+        assert!(state.is_visible());
+        assert!(state.resolve_sudo_authentication(7, "session-1", "sudo-challenge", None));
+        assert!(!state.is_visible());
     }
 
     #[test]
@@ -8601,62 +8634,6 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn transient_tool_grant_marker_survives_inspection_but_not_replacement_or_settlement() {
-        let request = |identity: Option<&str>| SshIncomingGrant {
-            request_id: "tool-grant".into(),
-            target_id: Some("server-1".into()),
-            root: Some("/srv/project".into()),
-            capabilities: SshCapabilitiesView::default(),
-            verified_identity: identity.map(str::to_owned),
-            reason: "Read a verified checkout.".into(),
-            awaiting_tool: true,
-        };
-        let mut state = SshManagerState::new(Some("session-1".into()));
-        state.set_targets(vec![target_view("server-1", SshGrantView::NotGranted)]);
-        assert!(matches!(
-            state.show_incoming_grant("session-1".into(), request(None)),
-            SshModalOutcome::InspectGrantTarget { .. }
-        ));
-        state.mark_transient_tool_grant("tool-grant");
-        assert!(state.is_transient_tool_grant("tool-grant"));
-        assert_eq!(
-            state.pending_authentication_target_id(),
-            Some("server-1")
-        );
-        assert!(matches!(
-            state.show_incoming_grant(
-                "session-1".into(),
-                request(Some("builder@build.example.test:22"))
-            ),
-            SshModalOutcome::Changed
-        ));
-        assert!(state.is_transient_tool_grant("tool-grant"));
-        let area = Rect::new(0, 0, 80, 24);
-        let mut buffer = Buffer::empty(area);
-        render_ssh_modal(&mut buffer, area, &mut state, false, &Theme::current());
-        assert!(buffer_text(&buffer).contains("model is waiting for your decision"));
-        state.show_operation_approval(approval("replacement"), SshOperationApprovalOrigin::TransientEvent);
-        assert!(!state.is_transient_tool_grant("tool-grant"));
-
-        let mut settled = SshManagerState::new(Some("session-1".into()));
-        settled.set_targets(vec![target_view("server-1", SshGrantView::NotGranted)]);
-        assert!(matches!(
-            settled.show_incoming_grant("session-1".into(), request(None)),
-            SshModalOutcome::InspectGrantTarget { .. }
-        ));
-        settled.mark_transient_tool_grant("tool-grant");
-        assert!(matches!(
-            settled.show_incoming_grant(
-                "session-1".into(),
-                request(Some("builder@build.example.test:22"))
-            ),
-            SshModalOutcome::Changed
-        ));
-        assert!(settled.is_transient_tool_grant("tool-grant"));
-        settled.settle_grant(true);
-        assert!(!settled.is_transient_tool_grant("tool-grant"));
-    }
 
     fn key(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)
@@ -10837,5 +10814,96 @@ mod tests {
         state.set_targets(Vec::new());
         state.set_targets(vec![target_view_from_target(manual)]);
         assert_eq!(state.targets[0].target_id, "removed-id");
+    }
+
+    #[test]
+    fn ssh_target_fields_expose_moving_cursors_and_keep_compact_focus_visible() {
+        let theme = Theme::default();
+        let area = Rect::new(0, 0, 70, 10);
+        let mut form = SshManualTargetForm::default();
+        for field in ManualTargetField::ALL {
+            form.active = field;
+            form.editor_mut().set_text("");
+            let before = render_add(&mut Buffer::empty(area), area, &mut form, &theme).unwrap();
+            form.editor_mut().insert_paste("界a");
+            let after = render_add(&mut Buffer::empty(area), area, &mut form, &theme).unwrap();
+            assert_eq!(after, (before.0 + 3, before.1));
+            form.editor_mut().handle_key(&key(KeyCode::Left));
+            let moved = render_add(&mut Buffer::empty(area), area, &mut form, &theme).unwrap();
+            assert_eq!(moved, (before.0 + 2, before.1));
+        }
+        form.active = ManualTargetField::WorkerCommand;
+        let compact = Rect::new(0, 0, 30, 2);
+        let cursor = render_add(&mut Buffer::empty(compact), compact, &mut form, &theme).unwrap();
+        assert_eq!(cursor.1, 1, "Tab's active field remains visible in a short form");
+        assert!(cursor.0 < compact.width);
+        form.submitting = true;
+        assert!(render_add(&mut Buffer::empty(compact), compact, &mut form, &theme).is_none());
+    }
+
+    #[test]
+    fn ssh_password_cursor_tracks_masked_unicode_and_horizontal_scrolling() {
+        let theme = Theme::default();
+        let area = Rect::new(0, 0, 30, 8);
+        let mut card = SshAuthCard::new("password".into(), 1, "fixture".into(),
+            SshAuthKind::Password { username:"operator".into(), message:"Enter password".into(), allow_remember:false });
+        let empty = render_authentication(&mut Buffer::empty(area), area, &mut card, &theme).unwrap();
+        card.answer_mut().unwrap().insert_paste("密🙂ab");
+        let mut buffer = Buffer::empty(area);
+        let after = render_authentication(&mut buffer, area, &mut card, &theme).unwrap();
+        assert_eq!(after, (empty.0 + 4, empty.1));
+        assert!(!buffer_text(&buffer).contains("密🙂ab"));
+        handle_authentication_key(&mut card, &key(KeyCode::Home));
+        assert_eq!(render_authentication(&mut Buffer::empty(area), area, &mut card, &theme), Some(empty));
+        card.answer_mut().unwrap().insert_paste(&"密".repeat(80));
+        let scrolled = render_authentication(&mut Buffer::empty(area), area, &mut card, &theme).unwrap();
+        assert_eq!(scrolled.0, area.right() - 1);
+        handle_authentication_key(&mut card, &key(KeyCode::Home));
+        assert_eq!(render_authentication(&mut Buffer::empty(area), area, &mut card, &theme), Some(empty));
+    }
+
+    #[test]
+    fn ssh_keyboard_interactive_cursor_follows_answer_focus_and_manual_scroll() {
+        let theme = Theme::default();
+        let area = Rect::new(0, 0, 32, 4);
+        let mut card = SshAuthCard::new("challenge".into(), 1, "fixture".into(),
+            SshAuthKind::KeyboardInteractive {
+                name:"Authentication".into(), instruction:"Read this instruction.\n".repeat(12),
+                prompts:vec!["First challenge".into(), "Second challenge".into()],
+            });
+        assert!(render_authentication(&mut Buffer::empty(area), area, &mut card, &theme).is_some());
+        handle_authentication_key(&mut card, &key(KeyCode::Tab));
+        let mut buffer = Buffer::empty(area);
+        let second = render_authentication(&mut buffer, area, &mut card, &theme).unwrap();
+        assert!(buffer_text(&buffer).contains("Second challenge"));
+        card.answer_mut().unwrap().insert_paste("1234");
+        let typed = render_authentication(&mut Buffer::empty(area), area, &mut card, &theme).unwrap();
+        assert_eq!(typed.0, second.0 + 4);
+        assert_eq!(card.answers.first().unwrap().text(), "");
+        assert_eq!(card.answers.get(1).unwrap().text(), "1234");
+        handle_authentication_key(&mut card, &key(KeyCode::PageUp));
+        assert!(render_authentication(&mut Buffer::empty(area), area, &mut card, &theme).is_none());
+        handle_authentication_key(&mut card, &key(KeyCode::Left));
+        assert!(render_authentication(&mut Buffer::empty(area), area, &mut card, &theme).is_some());
+    }
+
+    #[test]
+    fn ssh_root_and_directory_inputs_return_cursors_only_while_editing() {
+        let theme = Theme::default();
+        let area = Rect::new(0, 0, 80, 24);
+        let mut grant = SshGrantCard::new("grant".into(), "fixture".into(), "Fixture".into(),
+            None, "/tmp", None, false);
+        assert!(render_grant(&mut Buffer::empty(area), area, &mut grant, &theme).is_some());
+        grant.focus = SshGrantFocus::Read;
+        assert!(render_grant(&mut Buffer::empty(area), area, &mut grant, &theme).is_none());
+        let mut browser = SshProjectBrowser::new("fixture".into(), Some("/tmp".into()), 1, SshDirectoryPurpose::ProjectOpen);
+        assert!(render_project_browser(&mut Buffer::empty(area), area, &mut browser, &theme).is_none());
+        browser.editing_path = true;
+        let cursor = render_project_browser(&mut Buffer::empty(area), area, &mut browser, &theme).unwrap();
+        assert_eq!(cursor.1, area.y + 1);
+        browser.preparing = true;
+        assert!(render_project_browser(&mut Buffer::empty(area), area, &mut browser, &theme).is_none());
+        let mut manager = SshManagerState::new(None);
+        assert!(render_ssh_modal(&mut Buffer::empty(area), area, &mut manager, false, &theme).is_none());
     }
 }

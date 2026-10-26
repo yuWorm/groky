@@ -891,33 +891,47 @@ pub(super) fn dispatch_task_result(result: TaskResult, app: &mut AppView) -> Vec
             error,
         } => {
             app.ssh_client_id = client_id;
-            let (dismiss_transient, refresh_session_id) =
+            let (settlement, refresh_session_id) =
                 if let Some(manager) = super::ssh::ssh_manager_for_owner_mut(app, owner)
                     && manager.session_id.as_deref() == session_id.as_deref()
                 {
-                    (
-                        if expired {
-                            manager.expire_operation_approval(&approval_id);
-                            false
-                        } else {
-                            manager.settle_operation_approval(&approval_id, error)
-                        },
-                        Some(manager.session_id.clone()),
+                    let settlement = if expired {
+                        manager.expire_operation_approval(&approval_id);
+                        crate::views::ssh_modal::SshOperationApprovalSettlement::KeepVisible
+                    } else {
+                        manager.settle_operation_approval(&approval_id, error)
+                    };
+                    let refresh_session_id = matches!(
+                        settlement,
+                        crate::views::ssh_modal::SshOperationApprovalSettlement::KeepVisible
                     )
+                    .then(|| manager.session_id.clone());
+                    (settlement, refresh_session_id)
                 } else {
-                    (false, None)
+                    (
+                        crate::views::ssh_modal::SshOperationApprovalSettlement::KeepVisible,
+                        None,
+                    )
                 };
-            if dismiss_transient {
-                super::ssh::close_ssh_manager_for_owner(app, owner);
-                vec![]
-            } else if let Some(session_id) = refresh_session_id {
-                vec![Effect::SshListTargets {
-                    session_id,
-                    client_id,
-                    owner,
-                }]
-            } else {
-                vec![]
+            match settlement {
+                crate::views::ssh_modal::SshOperationApprovalSettlement::Dismiss => {
+                    super::ssh::close_ssh_manager_for_owner(app, owner);
+                    vec![]
+                }
+                crate::views::ssh_modal::SshOperationApprovalSettlement::AwaitingSudoAuthentication => {
+                    vec![]
+                }
+                crate::views::ssh_modal::SshOperationApprovalSettlement::KeepVisible => {
+                    refresh_session_id
+                        .map(|session_id| {
+                            vec![Effect::SshListTargets {
+                                session_id,
+                                client_id,
+                                owner,
+                            }]
+                        })
+                        .unwrap_or_default()
+                }
             }
         }
         TaskResult::SshWorkerInstallApprovalComplete {

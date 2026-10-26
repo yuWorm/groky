@@ -27,3 +27,5 @@ Voice: `**Lead** rest.` Lead is the noun the user already knows (`/default`, `Re
 Next groky version after `v0.1.28`.
 
 - **SSH target labels** stay readable in sent messages, queued prompts and previews, and restored chat history instead of displaying raw JSON, while preserving the original target context sent to the agent.
+- **SSH approvals** return to chat after successful access or command consent instead of showing the server list, while preserving project-opening follow-ups and any required per-command sudo password challenge.
+- **SSH input cursors** remain visible in focused target, directory, grant and masked authentication fields, with Unicode-aware movement, scrolling and correct cursor ownership when dialogs close.

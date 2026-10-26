@@ -864,13 +864,15 @@ async fn run_terminal(start: SshTuiStart) -> Result<Option<SshProjectOpen>> {
                 );
                 if let Some(runner) = runner.as_mut() {
                     let compact = area.height < 16;
-                    let _ = render_ssh_modal(
+                    if let Some(cursor) = render_ssh_modal(
                         frame.buffer_mut(),
                         area,
                         &mut runner.state,
                         compact,
                         &theme,
-                    );
+                    ) {
+                        frame.set_cursor_position(cursor);
+                    }
                 }
             });
             if let Err(error) = draw_result {

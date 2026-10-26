@@ -463,31 +463,50 @@ fn has_recorded_resumed_worker_install(
     })
 }
 
-/// Close precisely the manager instance that produced a transient approval.
+/// Dismiss precisely the manager instance that produced a transient approval.
 ///
 /// Unlike session lookup, this cannot close a manager reopened while the decision was in flight.
+/// A retained root authorization keeps only its exact sudo correlation when the visible surface
+/// is dismissed, so a later password prompt cannot be lost.
 pub(super) fn close_ssh_manager_for_owner(app: &mut AppView, owner: SshManagerOwner) {
     match owner.agent_id {
-        Some(agent_id)
-            if app.agents.get(&agent_id).is_some_and(|agent| {
-                agent
-                    .ssh_manager
-                    .as_ref()
-                    .is_some_and(|manager| manager.instance_id() == owner.instance_id)
-            }) =>
-        {
-            if let Some(agent) = app.agents.get_mut(&agent_id) {
-                agent.ssh_manager = None;
+        Some(agent_id) => {
+            let Some(agent) = app.agents.get_mut(&agent_id) else {
+                return;
+            };
+            if !agent
+                .ssh_manager
+                .as_ref()
+                .is_some_and(|manager| manager.instance_id() == owner.instance_id)
+            {
+                return;
             }
+            if agent
+                .ssh_manager
+                .as_mut()
+                .is_some_and(|manager| manager.hide_if_waiting_for_sudo())
+            {
+                return;
+            }
+            agent.ssh_manager = None;
         }
-        None if app
-            .welcome_ssh_manager
-            .as_ref()
-            .is_some_and(|manager| manager.instance_id() == owner.instance_id) =>
-        {
+        None => {
+            if !app
+                .welcome_ssh_manager
+                .as_ref()
+                .is_some_and(|manager| manager.instance_id() == owner.instance_id)
+            {
+                return;
+            }
+            if app
+                .welcome_ssh_manager
+                .as_mut()
+                .is_some_and(|manager| manager.hide_if_waiting_for_sudo())
+            {
+                return;
+            }
             app.welcome_ssh_manager = None;
         }
-        Some(_) | None => {}
     }
 }
 
@@ -683,17 +702,33 @@ pub(super) fn dispatch_open_ssh_target_picker(app: &mut AppView) -> Vec<Effect> 
     open_ssh_surface(app, true)
 }
 
+fn new_ssh_surface_state(
+    for_prompt: bool,
+    session_id: Option<String>,
+) -> crate::views::ssh_modal::SshManagerState {
+    if for_prompt {
+        crate::views::ssh_modal::SshManagerState::for_prompt(session_id)
+    } else {
+        crate::views::ssh_modal::SshManagerState::new(session_id)
+    }
+}
+
 fn open_ssh_surface(app: &mut AppView, for_prompt: bool) -> Vec<Effect> {
     let session_id = active_session_id(app);
-    let manager = if for_prompt {
-        crate::views::ssh_modal::SshManagerState::for_prompt(session_id.clone())
-    } else {
-        crate::views::ssh_modal::SshManagerState::new(session_id.clone())
-    };
     if let Some(agent) = get_active_agent_mut(app) {
-        agent.ssh_manager = Some(manager);
+        if let Some(manager) = agent.ssh_manager.as_mut().filter(|manager| !manager.is_visible()) {
+            manager.reopen(for_prompt);
+        } else {
+            agent.ssh_manager = Some(new_ssh_surface_state(for_prompt, session_id.clone()));
+        }
+    } else if let Some(manager) = app
+        .welcome_ssh_manager
+        .as_mut()
+        .filter(|manager| !manager.is_visible())
+    {
+        manager.reopen(for_prompt);
     } else {
-        app.welcome_ssh_manager = Some(manager);
+        app.welcome_ssh_manager = Some(new_ssh_surface_state(for_prompt, session_id.clone()));
     }
     let owner = ssh_manager_owner(app).expect("the SSH manager was just installed");
     let mut effects = Vec::with_capacity(2);
@@ -1738,27 +1773,10 @@ pub(super) fn apply_ssh_control_event(
         }
         _ => event_session_id.clone(),
     };
-    let transient_tool_request = matches!(
-        &event, xai_grok_shell::ssh::SshEvent::GrantRequested(request) if request.awaiting_tool
-    ) && owner.is_none()
-        && existing_ssh_manager_for_session(app, manager_session_id.as_deref()).is_none();
-    let operation_approval_origin = match (&owner, &event) {
-        (Some(owner), xai_grok_shell::ssh::SshEvent::OperationApproval(_)) => {
-            ssh_manager_for_owner_mut(app, *owner)
-                .and_then(|manager| manager.operation_approval_origin())
-                .unwrap_or(crate::views::ssh_modal::SshOperationApprovalOrigin::ExplicitManager)
-        }
-        (None, xai_grok_shell::ssh::SshEvent::OperationApproval(_)) => {
-            existing_ssh_manager_for_session(app, manager_session_id.as_deref())
-                .and_then(|manager| manager.operation_approval_origin())
-                .unwrap_or(crate::views::ssh_modal::SshOperationApprovalOrigin::TransientEvent)
-        }
-        _ => crate::views::ssh_modal::SshOperationApprovalOrigin::ExplicitManager,
-    };
     let resolution_owner = owner
         .or_else(|| ssh_manager_owner_for_session(app, manager_session_id.as_deref()));
     let mut grant_resolution = None;
-    let mut close_tool_manager = false;
+    let mut dismiss_approved_grant_manager = false;
     let mut terminal_grant_failed = false;
     let mut project_resolution = None;
     let mut grant_follow_up = None;
@@ -1796,13 +1814,9 @@ pub(super) fn apply_ssh_control_event(
                             &request.id, request.target_id.as_deref(), request.root.as_deref(),
                         );
                     }
-                    let transient_request_id = transient_tool_request.then(|| request.id.clone());
                     grant_continuation = manager.show_incoming_grant(
                         request.session_id.clone(), incoming_grant(request),
                     );
-                    if let Some(request_id) = transient_request_id {
-                        manager.mark_transient_tool_grant(&request_id);
-                    }
                 }
             }
             xai_grok_shell::ssh::SshEvent::GrantResolved {
@@ -1832,7 +1846,10 @@ pub(super) fn apply_ssh_control_event(
                     if pending_project.is_some() {
                         project_resolution = manager.pending_project_request_id();
                     }
-                    close_tool_manager = manager.is_transient_tool_grant(&request_id);
+                    dismiss_approved_grant_manager = approved
+                        && binding.is_some()
+                        && pending_project.is_none()
+                        && manager.current_grant_surface_matches(&request_id);
                     manager.settle_grant(approved);
                     if !approved
                         && let Some(request_id) = project_resolution
@@ -1855,10 +1872,7 @@ pub(super) fn apply_ssh_control_event(
                     && manager.grant_session_id_for(&request_id).as_deref()
                         == Some(grant_session_id.as_str())
                 {
-                    let close = manager.is_transient_tool_grant(&request_id);
-                    if manager.settle_grant_cancellation(&request_id) {
-                        close_tool_manager = close;
-                    }
+                    manager.settle_grant_cancellation(&request_id);
                 }
             }
             xai_grok_shell::ssh::SshEvent::GrantFailed {
@@ -1870,12 +1884,9 @@ pub(super) fn apply_ssh_control_event(
                 if grant_client_id == client_id
                     && manager.grant_session_id_for(&request_id).as_deref()
                         == Some(grant_session_id.as_str())
+                    && manager.settle_grant_failure(&request_id, error)
                 {
-                    let close = manager.is_transient_tool_grant(&request_id);
-                    if manager.settle_grant_failure(&request_id, error) {
-                        close_tool_manager = close;
-                        terminal_grant_failed = true;
-                    }
+                    terminal_grant_failed = true;
                 }
             }
             xai_grok_shell::ssh::SshEvent::BindingRevoked {
@@ -1953,7 +1964,6 @@ pub(super) fn apply_ssh_control_event(
                         )
                         .with_allow_session(approval.allow_session)
                         .with_operation_id(approval.operation_id),
-                        operation_approval_origin,
                     );
                 }
             }
@@ -1993,12 +2003,6 @@ pub(super) fn apply_ssh_control_event(
         choose_ssh_prompt_target_for_owner(app, owner, &target_id);
         return vec![Effect::SshAwaitEvent { client_id, session_id }];
     }
-    if close_tool_manager
-        && let Some(owner) = resolution_owner
-    {
-        close_ssh_manager_for_owner(app, owner);
-        return vec![Effect::SshAwaitEvent { client_id, session_id }];
-    }
     if terminal_grant_failed {
         return vec![Effect::SshAwaitEvent { client_id, session_id }];
     }
@@ -2014,10 +2018,20 @@ pub(super) fn apply_ssh_control_event(
         if matches!(grant_follow_up, Some(crate::views::ssh_modal::SshGrantFollowUp::UseBinding))
             && let Some(owner) = resolution_owner
         {
-            return vec![Effect::SshUseBinding {
+            let effects = vec![Effect::SshUseBinding {
                 session_id: binding.session_id, binding_id: binding.id, client_id, owner,
             }];
+            if dismiss_approved_grant_manager {
+                close_ssh_manager_for_owner(app, owner);
+            }
+            return effects;
         }
+    }
+    if dismiss_approved_grant_manager
+        && let Some(owner) = resolution_owner
+    {
+        close_ssh_manager_for_owner(app, owner);
+        return vec![Effect::SshAwaitEvent { client_id, session_id }];
     }
     let refresh = owner
         .or_else(|| ssh_manager_owner_for_session(app, manager_session_id.as_deref()))
@@ -2070,7 +2084,11 @@ pub(crate) fn handle_welcome_ssh_input(
     event: &crossterm::event::Event,
 ) -> InputOutcome {
     let outcome = {
-        let Some(state) = app.welcome_ssh_manager.as_mut() else {
+        let Some(state) = app
+            .welcome_ssh_manager
+            .as_mut()
+            .filter(|state| state.is_visible())
+        else {
             return InputOutcome::Unchanged;
         };
         match event {
@@ -2087,7 +2105,13 @@ pub(crate) fn handle_welcome_ssh_input(
         }
     };
     if matches!(outcome, SshModalOutcome::Close) {
-        app.welcome_ssh_manager = None;
+        if !app
+            .welcome_ssh_manager
+            .as_mut()
+            .is_some_and(|manager| manager.hide_if_waiting_for_sudo())
+        {
+            app.welcome_ssh_manager = None;
+        }
         InputOutcome::Changed
     } else {
         map_ssh_modal_outcome(outcome)

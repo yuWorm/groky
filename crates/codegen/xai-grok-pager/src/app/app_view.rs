@@ -2403,7 +2403,7 @@ impl AppView {
         // while Escape is delivered to the covered card instead.
         if matches!(self.active_view, ActiveView::Welcome)
             && self.welcome_doc_viewer.is_none()
-            && self.welcome_ssh_manager.is_some()
+            && self.welcome_ssh_manager.as_ref().is_some_and(|manager| manager.is_visible())
         {
             return crate::app::dispatch::ssh::handle_welcome_ssh_input(self, ev);
         }
@@ -4659,16 +4659,18 @@ impl AppView {
                                     compact,
                                 );
                             }
-                            if let Some(modal_state) = self.welcome_ssh_manager.as_mut() {
-                                let theme = crate::theme::Theme::current();
-                                crate::views::ssh_modal::render_ssh_modal(
-                                    f.buffer_mut(),
-                                    view_area,
-                                    modal_state,
-                                    compact,
-                                    &theme,
-                                );
-                            }
+                            let ssh_modal_cursor = self.welcome_ssh_manager.as_mut()
+                                .filter(|state| state.is_visible())
+                                .map(|modal_state| {
+                                    let theme = crate::theme::Theme::current();
+                                    crate::views::ssh_modal::render_ssh_modal(
+                                        f.buffer_mut(),
+                                        view_area,
+                                        modal_state,
+                                        compact,
+                                        &theme,
+                                    )
+                                });
                             if let Some(dialog) = self.new_worktree_dialog.as_ref() {
                                 crate::views::new_worktree_dialog::render_new_worktree_dialog(
                                     view_area,
@@ -4725,8 +4727,13 @@ impl AppView {
                             let has_cloud_modal = false;
                             let has_remote_modal = false;
                             let cursor =
-                                if has_cloud_modal || has_remote_modal || self.tutorial.is_some() {
+                                if has_cloud_modal || has_remote_modal || self.tutorial.is_some()
+                                    || self.new_worktree_dialog.is_some()
+                                    || self.welcome_doc_viewer.is_some()
+                                {
                                     None
+                                } else if let Some(cursor) = ssh_modal_cursor {
+                                    cursor
                                 } else {
                                     result.cursor_pos
                                 };
@@ -5160,10 +5167,10 @@ impl AppView {
     /// True when any modal that should swallow scroll input is open.
     fn is_scroll_blocking_modal_open(&self) -> bool {
         let cloud_modal_open = false;
-        matches!(self.active_view, ActiveView::Agent(id) if self.agents.get(&id).is_some_and(|a| a.extensions_modal.is_some() || a.active_modal.is_some() || a.ssh_manager.is_some()))
+        matches!(self.active_view, ActiveView::Agent(id) if self.agents.get(&id).is_some_and(|a| a.extensions_modal.is_some() || a.active_modal.is_some() || a.ssh_manager.as_ref().is_some_and(|manager| manager.is_visible())))
             || self.import_claude_modal.is_some()
             || self.welcome_vendor_login.is_some()
-            || self.welcome_ssh_manager.is_some()
+            || self.welcome_ssh_manager.as_ref().is_some_and(|manager| manager.is_visible())
             || self.new_worktree_dialog.is_some()
             || self.welcome_doc_viewer.is_some()
             || self.tutorial.is_some()

@@ -3892,7 +3892,7 @@ impl AgentView {
             self.pane_areas = layout.pane_areas();
             return (prompt_cursor_pos, prompt_post_flush);
         }
-        if let Some(modal_state) = &mut self.ssh_manager {
+        if let Some(modal_state) = self.ssh_manager.as_mut().filter(|state| state.is_visible()) {
             let overlay_area = Rect {
                 x: area.x,
                 y: area.y,
@@ -3901,7 +3901,7 @@ impl AgentView {
             };
             let compact = self.scrollback.appearance().prompt.compact;
             let theme = Theme::current();
-            crate::views::ssh_modal::render_ssh_modal(
+            let cursor = crate::views::ssh_modal::render_ssh_modal(
                 buf,
                 overlay_area,
                 modal_state,
@@ -3909,7 +3909,7 @@ impl AgentView {
                 &theme,
             );
             self.pane_areas = layout.pane_areas();
-            return (None, crate::terminal::overlay::clear().map(Into::into));
+            return (cursor, crate::terminal::overlay::clear().map(Into::into));
         }
         if let Some(ref mut modal_state) = self.vendor_login {
             let overlay_area = Rect {
@@ -5099,5 +5099,89 @@ mod status_line_draw_tests {
             agent.last_status_line_size, painted,
             "a frame with no row must not export a width the script would read as the 80-column fallback"
         );
+    }
+}
+
+#[cfg(test)]
+mod ssh_cursor_host_tests {
+    use super::super::test_fixtures::make_agent;
+    use super::*;
+    use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
+    use crate::views::ssh_modal::{
+        SshAuthCard, SshAuthKind, SshManagerState, SshOperationApprovalCard,
+        handle_ssh_key,
+    };
+
+    fn draw_cursor(agent: &mut AgentView) -> Option<(u16, u16)> {
+        let area = Rect::new(0, 0, 120, 40);
+        let mut buffer = Buffer::empty(area);
+        agent.draw(
+            area, &mut buffer, &ActionRegistry::defaults(), &mut ScratchBuffer::new(),
+            None, false, super::super::BannerSlotParams::none(), false,
+            &mut Vec::new(), AppRenderParams::default(),
+        ).0
+    }
+
+    #[test]
+    fn ssh_form_cursor_takes_focus_and_restores_chat_cursor_when_closed() {
+        let _guard = crate::theme::cache::pin_theme();
+        let mut agent = make_agent();
+        agent.set_active_pane(crate::views::agent::ActivePane::Prompt, false);
+        agent.prompt.append_text("chat draft");
+        let chat_cursor = draw_cursor(&mut agent).expect("focused composer cursor");
+        let mut manager = SshManagerState::new(None);
+        handle_ssh_key(&mut manager, &KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE));
+        agent.ssh_manager = Some(manager);
+        let host_cursor = draw_cursor(&mut agent).expect("active host field cursor");
+        assert_ne!(host_cursor, chat_cursor);
+        agent.handle_input(&Event::Paste("界a".into()), &ActionRegistry::defaults());
+        let moved = draw_cursor(&mut agent).unwrap();
+        assert_eq!(moved, (host_cursor.0 + 3, host_cursor.1));
+        assert_eq!(agent.prompt.text(), "chat draft");
+        agent.handle_input(
+            &Event::Key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)),
+            &ActionRegistry::defaults(),
+        );
+        let label_cursor = draw_cursor(&mut agent).unwrap();
+        assert_eq!(label_cursor.1, host_cursor.1 + 1);
+        for _ in 0..2 {
+            agent.handle_input(
+                &Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
+                &ActionRegistry::defaults(),
+            );
+        }
+        assert!(agent.ssh_manager.is_none());
+        assert_eq!(draw_cursor(&mut agent), Some(chat_cursor));
+    }
+
+    #[test]
+    fn ssh_sudo_wait_releases_chat_input_until_exact_password_challenge() {
+        let _guard = crate::theme::cache::pin_theme();
+        let mut agent = make_agent();
+        agent.set_active_pane(crate::views::agent::ActivePane::Prompt, false);
+        agent.prompt.append_text("chat draft");
+        let mut manager = SshManagerState::new(Some("sudo-session".into()));
+        manager.show_operation_approval(
+            SshOperationApprovalCard::new(
+                "root-review".into(), "binding".into(), "Fixture".into(),
+                None, "Root command".into(),
+                serde_json::json!({"args":{"command":"id -u","sudo":true}}),
+                xai_grok_shell::ssh::SshOperation::Execute,
+            ).with_allow_session(false).with_operation_id("root-operation"),
+        );
+        assert!(manager.submit_operation_approval("root-review", true));
+        manager.settle_operation_approval("root-review", None);
+        assert!(!manager.is_visible());
+        agent.ssh_manager = Some(manager);
+        agent.handle_input(&Event::Paste(" more".into()), &ActionRegistry::defaults());
+        assert_eq!(agent.prompt.text(), "chat draft more");
+        let chat_cursor = draw_cursor(&mut agent).expect("hidden manager releases cursor");
+        assert!(agent.ssh_manager.as_mut().unwrap().show_sudo_authentication(
+            7, "sudo-session", "root-operation",
+            SshAuthCard::new("sudo-secret".into(), 2, "fixture".into(),
+                SshAuthKind::SudoPassword { username:"operator".into(), message:String::new() }),
+        ));
+        let password_cursor = draw_cursor(&mut agent).expect("password input cursor");
+        assert_ne!(password_cursor, chat_cursor);
     }
 }

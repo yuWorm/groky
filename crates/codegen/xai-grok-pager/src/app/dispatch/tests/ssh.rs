@@ -448,6 +448,11 @@ fn matching_project_grant_uses_worker_canonical_root_after_user_changes_consent_
     assert!(app.agents.values().any(|agent| {
         agent.ssh_project_open_session_id.as_deref() == Some(SESSION_ID)
     }), "approval automatically starts the child without another keypress");
+    assert_eq!(
+        ssh_manager_owner(&app),
+        owner,
+        "project bootstrap retains its consent manager for the inherited session lifecycle",
+    );
 }
 #[test]
 fn matching_project_grant_denial_from_global_receiver_clears_pending_open() {
@@ -1241,6 +1246,133 @@ fn typed_operation_expiry_cannot_clobber_a_newer_approval() {
 }
 
 #[test]
+fn successful_operation_acknowledgement_closes_explicit_and_transient_cards() {
+    for explicitly_opened in [true, false] {
+        let mut app = test_app_with_agent();
+        let source = AgentId(0);
+        app.active_view = ActiveView::Agent(source);
+        let session_id = app.agents.get(&source).unwrap().session.session_id.as_ref().unwrap().to_string();
+        let initial_owner = if explicitly_opened {
+            dispatch(Action::OpenSshManager, &mut app);
+            ssh_manager_owner(&app)
+        } else {
+            None
+        };
+        let client_id = app.ssh_client_id;
+        apply_ssh_control_event(
+            &mut app,
+            Some(session_id.clone()),
+            initial_owner,
+            SshEvent::OperationApproval(operation_approval(
+                if explicitly_opened { "explicit-operation" } else { "transient-operation" },
+                &session_id,
+                client_id,
+            )),
+        );
+        let owner = ssh_manager_owner(&app).expect("approval card owns its acknowledgement");
+        let approval_id = if explicitly_opened {
+            "explicit-operation"
+        } else {
+            "transient-operation"
+        };
+        assert!(dispatch(
+            Action::ApproveSshOperation {
+                approval_id: approval_id.into(),
+                approved: true,
+                scope: xai_grok_shell::ssh::SshOperationApprovalScope::Once,
+            },
+            &mut app,
+        )
+        .iter()
+        .any(|effect| matches!(
+            effect,
+            Effect::SshApproveOperation { approval_id: actual, .. } if actual == approval_id
+        )));
+        dispatch(
+            Action::TaskComplete(TaskResult::SshOperationApprovalComplete {
+                session_id: Some(session_id),
+                client_id: app.ssh_client_id,
+                owner,
+                approval_id: approval_id.into(),
+                expired: false,
+                error: None,
+            }),
+            &mut app,
+        );
+        assert!(
+            app.agents.get(&source).unwrap().ssh_manager.is_none(),
+            "a matching successful approval must return to chat",
+        );
+    }
+}
+
+#[test]
+fn reopening_manager_during_dormant_root_wait_preserves_its_owner() {
+    let mut app = test_app_with_agent();
+    let source = AgentId(0);
+    app.active_view = ActiveView::Agent(source);
+    let session_id = app.agents.get(&source).unwrap().session.session_id.as_ref().unwrap().to_string();
+    let client_id = app.ssh_client_id;
+    apply_ssh_control_event(
+        &mut app,
+        None,
+        None,
+        SshEvent::OperationApproval(root_operation_approval(
+            "root-operation",
+            &session_id,
+            client_id,
+        )),
+    );
+    let owner = ssh_manager_owner(&app).expect("root approval owns its acknowledgement");
+    dispatch(
+        Action::ApproveSshOperation {
+            approval_id: "root-operation".into(),
+            approved: true,
+            scope: xai_grok_shell::ssh::SshOperationApprovalScope::Once,
+        },
+        &mut app,
+    );
+    dispatch(
+        Action::TaskComplete(TaskResult::SshOperationApprovalComplete {
+            session_id: Some(session_id),
+            client_id,
+            owner,
+            approval_id: "root-operation".into(),
+            expired: false,
+            error: None,
+        }),
+        &mut app,
+    );
+    assert!(
+        !app
+            .agents
+            .get(&source)
+            .and_then(|agent| agent.ssh_manager.as_ref())
+            .is_some_and(crate::views::ssh_modal::SshManagerState::is_visible),
+    );
+    close_ssh_manager_for_owner(&mut app, owner);
+    assert!(
+        app.agents
+            .get(&source)
+            .and_then(|agent| agent.ssh_manager.as_ref())
+            .is_some(),
+        "dismissing a dormant manager must retain its exact sudo correlation",
+    );
+
+    let reopened = dispatch(Action::OpenSshManager, &mut app);
+    let (_, reopened_owner) = ssh_target_list_request(&reopened);
+    assert_eq!(reopened_owner, owner);
+    assert!(
+        app
+            .agents
+            .get(&source)
+            .and_then(|agent| agent.ssh_manager.as_ref())
+            .is_some_and(crate::views::ssh_modal::SshManagerState::is_visible),
+        "explicit management may reopen the retained manager without dropping sudo correlation",
+    );
+}
+
+#[test]
 fn sudo_authentication_events_stay_on_their_original_client_session_and_operation() {
     let mut app = test_app_with_agent();
     let source_id = AgentId(0);
@@ -1269,6 +1401,32 @@ fn sudo_authentication_events_stay_on_their_original_client_session_and_operatio
         effect,
         Effect::SshApproveOperation { approval_id, .. } if approval_id == "root-operation"
     )));
+    let owner = ssh_manager_owner(&app).expect("root approval owns its acknowledgement");
+    let root_ack = dispatch(
+        Action::TaskComplete(TaskResult::SshOperationApprovalComplete {
+            session_id: Some(session_id.clone()),
+            client_id,
+            owner,
+            approval_id: "root-operation".into(),
+            expired: false,
+            error: None,
+        }),
+        &mut app,
+    );
+    assert!(
+        root_ack
+            .iter()
+            .all(|effect| !matches!(effect, Effect::SshListTargets { .. })),
+        "root acknowledgement must not reveal the server list while a password may be requested",
+    );
+    assert!(
+        !app
+            .agents
+            .get(&source_id)
+            .and_then(|agent| agent.ssh_manager.as_ref())
+            .is_some_and(crate::views::ssh_modal::SshManagerState::is_visible),
+        "NOPASSWD must leave the approval manager dormant rather than on the server list",
+    );
     let sudo_prompt = |event_client_id, event_session_id: String| SshEvent::SudoAuthentication {
         session_id: event_session_id,
         operation_id: "operation-root-operation".into(),
@@ -1298,17 +1456,6 @@ fn sudo_authentication_events_stay_on_their_original_client_session_and_operatio
         None,
         sudo_prompt(client_id, "different-session".into()),
     );
-    {
-        let manager = app
-            .agents
-            .get_mut(&source_id)
-            .and_then(|agent| agent.ssh_manager.as_mut())
-            .expect("root approval remains in its source manager");
-        assert!(matches!(
-            handle_ssh_key(manager, &KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE)),
-            SshModalOutcome::Unchanged
-        ));
-    }
 
     apply_ssh_control_event(
         &mut app,
@@ -1322,6 +1469,7 @@ fn sudo_authentication_events_stay_on_their_original_client_session_and_operatio
             .get_mut(&source_id)
             .and_then(|agent| agent.ssh_manager.as_mut())
             .expect("scoped sudo prompt uses its source manager");
+        assert!(manager.is_visible(), "the matching password challenge reopens its source");
         assert!(matches!(
             handle_ssh_key(manager, &KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
             SshModalOutcome::AnswerAuthentication { challenge_id, .. } if challenge_id == "sudo-challenge"
@@ -2028,6 +2176,10 @@ fn enter_authorizes_a_manual_selection_then_defaults_its_approved_binding() {
     assert!(effects.iter().any(|effect| matches!(effect,
         Effect::SshUseBinding { session_id: actual, binding_id, .. }
             if actual == &session_id && binding_id == "binding-id")));
+    assert!(
+        app.agents.get(&source).unwrap().ssh_manager.is_none(),
+        "the default-binding follow-up must be queued before its approval surface closes",
+    );
 }
 
 #[test]
@@ -2160,41 +2312,133 @@ fn owned_grant_failure_reports_the_original_tool_and_rejects_stale_reopen() {
 }
 
 #[test]
-fn ssh_tool_grant_resolution_closes_its_transient_prompt_after_direct_inspection() {
-    for approved in [false, true] {
-        let mut app = test_app_with_agent();
-        let source = AgentId(0);
-        app.active_view = ActiveView::Agent(source);
-        let session_id = app.agents.get(&source).unwrap().session.session_id.as_ref().unwrap().to_string();
-        let mut request = grant_request("waiting-tool", TARGET_ID, CANONICAL_ROOT, app.ssh_client_id);
+fn approved_tool_grant_closes_its_transient_prompt_after_direct_inspection() {
+    let mut app = test_app_with_agent();
+    let source = AgentId(0);
+    app.active_view = ActiveView::Agent(source);
+    let session_id = app.agents.get(&source).unwrap().session.session_id.as_ref().unwrap().to_string();
+    let mut request = grant_request("waiting-tool", TARGET_ID, CANONICAL_ROOT, app.ssh_client_id);
+    request.session_id = session_id.clone();
+    request.awaiting_tool = true;
+    request.verified_identity = None;
+    apply_ssh_control_event(&mut app, Some(session_id.clone()), None,
+        SshEvent::GrantRequested(request.clone()));
+    let owner = ssh_manager_owner(&app).expect("tool request must automatically open consent");
+    request.verified_identity = Some(binding(TARGET_ID, CANONICAL_ROOT).identity);
+    apply_ssh_control_event(&mut app, Some(session_id.clone()), Some(owner),
+        SshEvent::GrantRequested(request));
+    approve(&mut app, "waiting-tool", Some(TARGET_ID), Some(CANONICAL_ROOT));
+    let mut granted = binding(TARGET_ID, CANONICAL_ROOT);
+    granted.session_id = session_id.clone();
+    apply_ssh_control_event(&mut app, Some(session_id.clone()), None,
+        SshEvent::GrantResolved {
+            request_id: "waiting-tool".into(), approved: true, binding: Some(granted),
+        });
+    assert!(app.agents.get(&source).unwrap().ssh_manager.is_none(),
+        "approved access must return to the originating conversation");
+    dispatch(Action::TaskComplete(TaskResult::SshGrantInspected {
+        session_id: Some(session_id), request_id: "waiting-tool".into(),
+        client_id: app.ssh_client_id, owner, result: Err("late inspection failure".into()),
+    }), &mut app);
+    assert!(app.agents.get(&source).unwrap().ssh_manager.is_none(),
+        "a late inspection must not resurrect the resolved prompt");
+}
+
+#[test]
+fn approved_grant_closes_its_explicit_manager() {
+    let mut app = test_app_with_agent();
+    let source = AgentId(0);
+    app.active_view = ActiveView::Agent(source);
+    let opened = dispatch(Action::OpenSshManager, &mut app);
+    let (_, owner) = ssh_target_list_request(&opened);
+    let session_id = app.agents.get(&source).unwrap().session.session_id.as_ref().unwrap().to_string();
+    let mut request = grant_request("explicit-grant", TARGET_ID, CANONICAL_ROOT, app.ssh_client_id);
+    request.session_id = session_id.clone();
+    apply_ssh_control_event(
+        &mut app,
+        Some(session_id.clone()),
+        Some(owner),
+        SshEvent::GrantRequested(request),
+    );
+    approve(&mut app, "explicit-grant", Some(TARGET_ID), Some(CANONICAL_ROOT));
+    let mut granted = binding(TARGET_ID, CANONICAL_ROOT);
+    granted.session_id = session_id.clone();
+    apply_ssh_control_event(
+        &mut app,
+        Some(session_id),
+        Some(owner),
+        SshEvent::GrantResolved {
+            request_id: "explicit-grant".into(),
+            approved: true,
+            binding: Some(granted),
+        },
+    );
+
+    assert!(
+        app.agents.get(&source).unwrap().ssh_manager.is_none(),
+        "the matching successful explicit grant must return to chat",
+    );
+}
+
+#[test]
+fn stale_or_failed_grant_resolution_keeps_the_current_surface() {
+    let mut app = test_app_with_agent();
+    let source = AgentId(0);
+    app.active_view = ActiveView::Agent(source);
+    let opened = dispatch(Action::OpenSshManager, &mut app);
+    let (_, owner) = ssh_target_list_request(&opened);
+    let session_id = app.agents.get(&source).unwrap().session.session_id.as_ref().unwrap().to_string();
+    let client_id = app.ssh_client_id;
+    for request_id in ["old-grant", "current-grant"] {
+        let mut request = grant_request(request_id, TARGET_ID, CANONICAL_ROOT, client_id);
         request.session_id = session_id.clone();
-        request.awaiting_tool = true;
-        request.verified_identity = None;
-        apply_ssh_control_event(&mut app, Some(session_id.clone()), None,
-            SshEvent::GrantRequested(request.clone()));
-        let owner = ssh_manager_owner(&app).expect("tool request must automatically open consent");
-        request.verified_identity = Some(binding(TARGET_ID, CANONICAL_ROOT).identity);
-        apply_ssh_control_event(&mut app, Some(session_id.clone()), Some(owner),
-            SshEvent::GrantRequested(request));
-        let resolved_binding = if approved {
-            approve(&mut app, "waiting-tool", Some(TARGET_ID), Some(CANONICAL_ROOT));
-            let mut granted = binding(TARGET_ID, CANONICAL_ROOT);
-            granted.session_id = session_id.clone();
-            Some(granted)
-        } else { None };
-        apply_ssh_control_event(&mut app, Some(session_id.clone()), None,
-            SshEvent::GrantResolved {
-                request_id: "waiting-tool".into(), approved, binding: resolved_binding,
-            });
-        assert!(app.agents.get(&source).unwrap().ssh_manager.is_none(),
-            "both approval and cancellation must return to the originating conversation");
-        dispatch(Action::TaskComplete(TaskResult::SshGrantInspected {
-            session_id: Some(session_id), request_id: "waiting-tool".into(),
-            client_id: app.ssh_client_id, owner, result: Err("late inspection failure".into()),
-        }), &mut app);
-        assert!(app.agents.get(&source).unwrap().ssh_manager.is_none(),
-            "a late inspection must not resurrect the resolved prompt");
+        apply_ssh_control_event(
+            &mut app,
+            Some(session_id.clone()),
+            Some(owner),
+            SshEvent::GrantRequested(request),
+        );
     }
+
+    let mut stale_binding = binding(TARGET_ID, CANONICAL_ROOT);
+    stale_binding.session_id = session_id.clone();
+    apply_ssh_control_event(
+        &mut app,
+        Some(session_id.clone()),
+        Some(owner),
+        SshEvent::GrantResolved {
+            request_id: "old-grant".into(),
+            approved: true,
+            binding: Some(stale_binding),
+        },
+    );
+    assert_eq!(ssh_manager_owner(&app), Some(owner));
+    assert_eq!(
+        app.agents
+            .get(&source)
+            .and_then(|agent| agent.ssh_manager.as_ref())
+            .and_then(|manager| manager.grant_session_id_for("current-grant"))
+            .as_deref(),
+        Some(session_id.as_str()),
+        "a stale resolution must not consume the replacement consent",
+    );
+
+    apply_ssh_control_event(
+        &mut app,
+        Some(session_id.clone()),
+        Some(owner),
+        SshEvent::GrantFailed {
+            request_id: "current-grant".into(),
+            session_id,
+            client_id,
+            error: "control delivery failed".into(),
+        },
+    );
+    assert_eq!(
+        ssh_manager_owner(&app),
+        Some(owner),
+        "a failed grant must retain its diagnostic surface",
+    );
 }
 
 #[test]
