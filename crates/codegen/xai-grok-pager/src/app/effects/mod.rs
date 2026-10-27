@@ -1591,6 +1591,129 @@ pub(crate) fn execute(
                 });
             coordinator.install_abort_handle(seq, abort_handle);
         }
+        Effect::DiscoverImportSessions {
+            agent_id,
+            cwd,
+            target_cwd,
+            owner_session_id,
+            generation,
+        } => {
+            tasks.spawn(async move {
+                let discovery = tokio::task::spawn_blocking(move || {
+                    xai_grok_foreign_sessions::import::discover(cwd.as_deref())
+                })
+                .await
+                .unwrap_or_else(|error| {
+                    tracing::warn!(%error, "foreign session import discovery task failed");
+                    xai_grok_foreign_sessions::import::ImportDiscovery {
+                        sessions: Vec::new(),
+                        warnings: vec!["Foreign session discovery failed.".to_owned()],
+                    }
+                });
+                TaskResult::ImportSessionsDiscovered {
+                    agent_id,
+                    generation,
+                    target_cwd,
+                    owner_session_id,
+                    candidates: discovery.sessions,
+                    warnings: discovery.warnings,
+                }
+            });
+        }
+        Effect::PreviewImportSession {
+            agent_id,
+            generation,
+            candidate_index,
+            candidate,
+            target_cwd,
+            owner_session_id,
+        } => {
+            tasks.spawn(async move {
+                let result = tokio::task::spawn_blocking(move || {
+                    xai_grok_foreign_sessions::import::load(&candidate).map(|imported| {
+                        (imported.context.len(), imported.warnings)
+                    })
+                })
+                .await;
+                match result {
+                    Ok(Ok((context_count, warnings))) => TaskResult::ImportSessionPreviewed {
+                        agent_id,
+                        generation,
+                        candidate_index,
+                        target_cwd,
+                        owner_session_id,
+                        context_count,
+                        warnings,
+                        error: None,
+                    },
+                    Ok(Err(error)) => TaskResult::ImportSessionPreviewed {
+                        agent_id,
+                        generation,
+                        candidate_index,
+                        target_cwd,
+                        owner_session_id,
+                        context_count: 0,
+                        warnings: Vec::new(),
+                        error: Some(sanitize_user_error(&error.to_string())),
+                    },
+                    Err(error) => {
+                        tracing::warn!(%error, "foreign session preview task failed");
+                        TaskResult::ImportSessionPreviewed {
+                            agent_id,
+                            generation,
+                            candidate_index,
+                            target_cwd,
+                            owner_session_id,
+                            context_count: 0,
+                            warnings: Vec::new(),
+                            error: Some("Could not inspect the selected foreign session.".to_owned()),
+                        }
+                    }
+                }
+            });
+        }
+        Effect::ImportSession {
+            agent_id,
+            generation,
+            candidate_index,
+            candidate,
+            target_cwd,
+            owner_session_id,
+            model_id,
+        } => {
+            tasks.spawn(async move {
+                match xai_grok_shell::session::import::import_session(
+                    candidate,
+                    target_cwd.clone(),
+                    model_id,
+                )
+                .await
+                {
+                    Ok(result) => TaskResult::ImportSessionCompleted {
+                        agent_id,
+                        generation,
+                        candidate_index,
+                        target_cwd,
+                        owner_session_id,
+                        session_id: Some(result.session_id),
+                        message_count: result.message_count,
+                        warnings: result.warnings,
+                        error: None,
+                    },
+                    Err(error) => TaskResult::ImportSessionCompleted {
+                        agent_id,
+                        generation,
+                        candidate_index,
+                        target_cwd,
+                        owner_session_id,
+                        session_id: None,
+                        message_count: 0,
+                        warnings: Vec::new(),
+                        error: Some(sanitize_user_error(&error.to_string())),
+                    },
+                }
+            });
+        }
         Effect::CanonicalizeForeignResumeCwd { requested_cwd, launch_token } => {
             tasks
                 .spawn(async move {

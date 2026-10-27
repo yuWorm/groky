@@ -14872,6 +14872,7 @@ dependencies = [
 name = "xai-grok-foreign-sessions"
 version = "0.1.0"
 dependencies = [
+ "base64 0.22.1",
  "chrono",
  "dirs 6.0.0",
  "dunce",
@@ -14880,6 +14881,7 @@ dependencies = [
  "libc",
  "md5",
  "rusqlite",
+ "serde",
  "serde_json",
  "tempfile",
  "uuid",

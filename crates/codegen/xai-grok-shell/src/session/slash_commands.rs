@@ -502,6 +502,7 @@ pub const PAGER_COMMAND_KEYS: &[&str] = &[
     "imagine",
     "imagine-video",
     "import-claude",
+    "import-session",
     "jump",
     "login",
     "logout",

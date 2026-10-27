@@ -25,3 +25,5 @@ Voice: `**Lead** rest.` Lead is the noun the user already knows (`/default`, `Re
 ### Unreleased
 
 Next groky version after `v0.1.29`.
+
+- **/import-session** discovers omp, pi, Claude Code, Codex, and OpenCode sessions for the current directory, previews migration warnings, and imports a new native session without changing the source or rerunning historical tools; `groky sessions import` provides the same local import from IDs or paths.

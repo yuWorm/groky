@@ -5,7 +5,7 @@
     unreachable_code,
     dead_code
 )]
-//! Bounded, metadata-only listing of foreign coding-agent sessions.
+//! Bounded discovery and explicit, read-only import of foreign coding-agent sessions.
 //! Foreign SQLite stores are opened only when `xai_sqlite_journal::JournalMode` selects local WAL.
 //! The direct read-only/query-only transaction makes no logical writes, though WAL coordination may update shared-memory read marks.
 //! Network filesystems fail soft before SQLite open, conversion, or writes.
@@ -17,6 +17,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 mod capability;
 mod claude;
 mod codex;
+pub mod import;
 use capability::{ApprovedRoot, open_sqlite_transaction};
 pub const MAX_SESSIONS_PER_TOOL: usize = 50;
 pub const MAX_SESSION_AGE: Duration = Duration::from_secs(30 * 24 * 60 * 60);

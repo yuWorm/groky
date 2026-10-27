@@ -79,6 +79,43 @@ Confirms, then permanently removes the session history. Returns to the welcome s
 
 ---
 
+## Importing Other Agents
+
+Run `/import-session` to find **omp, pi, Claude Code, Codex, and OpenCode**
+sessions for the current working directory. Paths are matched canonically rather
+than by directory-name prefixes. The picker lists source, title and last activity;
+`f` switches to all projects, including sessions from other worktrees.
+
+Press `Enter` to inspect a session's effective-context count and migration
+warnings, then `Enter` again to confirm. `Esc` cancels the preview. Import creates
+a new native ID in the current directory and opens its history without sending
+a model prompt. The original agent's session is not changed.
+
+For non-interactive use:
+
+```sh
+groky sessions import --list --json
+groky sessions import --from omp SESSION_ID
+groky sessions import --from claude /path/to/session.jsonl
+groky sessions import --from opencode /path/to/opencode.db --id SESSION_ID
+```
+
+Omitting the ID/path only lists candidates; `--all` includes other projects.
+Explicit paths require `--from`. Import runs locally without authenticating.
+It uses the configured Groky model (or the normal bundled default), not the
+source model; an explicit global `--model` overrides that choice. Deployments
+using an external model catalogue must configure a model rather than inherit
+the bundled default.
+
+The importer separates visible history from effective model context, preserving
+branch selection, compaction and supported rollback semantics. Incomplete tool
+interactions remain historical notes, never pending work. Credentials,
+permissions, running processes and filesystem checkpoints are not migrated.
+Missing attachments and unsupported provider data can produce warnings; opaque
+checkpoints that prevent context reconstruction produce an error.
+
+---
+
 ## Resuming Sessions
 
 ### From the TUI

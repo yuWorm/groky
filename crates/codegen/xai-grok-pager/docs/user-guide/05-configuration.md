@@ -397,7 +397,7 @@ disabled = ["wip-skill"]              # skill names to keep listed but inactive
 
 ### Harness compatibility
 
-Control vendor compatibility for Cursor, Claude, and Codex. Every cell defaults to `true`. Session cells stay staged and inert until a foreign-session scanner consumes them, and each tool needs both its `sessions` cell and the matching `resume-claude`, `resume-codex`, or `resume-cursor` skill — a missing skill means zero foreign-session filesystem I/O.
+Control vendor compatibility for Cursor, Claude, and Codex. Every cell defaults to `true`. Claude and Codex `sessions` cells gate automatic discovery in the resume surfaces; selected sessions use the native import picker and do not require a resume skill. Cursor retains its `resume-cursor` skill gate. The explicit `/import-session` and `groky sessions import` commands are opt-in scans of the supported local stores.
 
 ```toml
 [compat.cursor]
@@ -414,10 +414,10 @@ rules = true      # scan ~/.claude/rules/ and <dir>/.claude/rules/
 agents = true     # scan ~/.claude/ and <dir>/.claude/CLAUDE*.md
 mcps = true       # scan ~/.claude.json for MCP servers
 hooks = true      # scan ~/.claude/settings.json for hooks
-sessions = true   # staged; no scanner consumer yet
+sessions = true   # automatic Claude Code session discovery
 
 [compat.codex]
-sessions = true   # staged; no scanner consumer yet
+sessions = true   # automatic Codex session discovery
 ```
 
 Codex's `skills`, `rules`, `agents`, `mcps`, and `hooks` cells are reserved and currently inert — they do not enable `.codex` discovery.

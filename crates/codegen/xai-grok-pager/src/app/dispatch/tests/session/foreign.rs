@@ -1251,60 +1251,22 @@ fn gated_foreign_pick_replaces_all_prior_startup_intents() {
     );
     let new_id = AgentId(1);
     assert_eq!(app.active_view, ActiveView::Agent(new_id));
-    assert_eq!(
-        app.agents
-            .get(&new_id)
-            .and_then(|a| a.session.pending_prompts.front())
-            .map(|prompt| prompt.text.as_str()),
-        Some("/resume-codex codex-deferred")
-    );
+    let imported = app.agents.get(&new_id).unwrap();
+    assert!(imported.session.pending_prompts.is_empty());
+    assert!(matches!(imported.active_modal.as_ref(),
+        Some(crate::views::modal::ActiveModal::SessionPicker { import: Some(_), .. })));
 }
 
 #[test]
-fn welcome_and_modal_foreign_picks_always_target_fresh_sessions() {
+fn welcome_foreign_pick_opens_native_import_without_a_model_prompt() {
     let mut welcome = test_app();
     welcome.session_picker_entries =
         Some(vec![make_foreign_entry("codex-native", "codex", "/repo")]);
     let effects = dispatch(Action::PickSession(0), &mut welcome);
-    assert!(
-        effects
-            .iter()
-            .any(|effect| matches!(effect, Effect::CreateSession { .. }))
-    );
-    assert_eq!(
-        welcome
-            .agents
-            .get(&AgentId(0))
-            .and_then(|a| a.session.pending_prompts.front())
-            .map(|prompt| prompt.text.as_str()),
-        Some("/resume-codex codex-native")
-    );
-
-    let mut modal = test_app_with_agent();
-    open_session_picker_with(
-        &mut modal,
-        vec![make_foreign_entry("cursor-native", "cursor", "/repo")],
-    );
-    let effects = dispatch(Action::PickSession(0), &mut modal);
-    assert!(
-        effects
-            .iter()
-            .any(|effect| matches!(effect, Effect::CreateSession { .. }))
-    );
-    assert!(
-        modal
-            .agents
-            .get(&AgentId(0))
-            .is_some_and(|a| a.session.pending_prompts.is_empty())
-    );
-    assert_eq!(
-        modal
-            .agents
-            .get(&AgentId(1))
-            .and_then(|a| a.session.pending_prompts.front())
-            .map(|prompt| prompt.text.as_str()),
-        Some("/resume-cursor cursor-native")
-    );
+    assert!(effects.iter().any(|effect| matches!(effect, Effect::DiscoverImportSessions { .. })));
+    assert!(welcome.agents.values().all(|agent| agent.session.pending_prompts.is_empty()));
+    assert!(welcome.agents.values().any(|agent| matches!(agent.active_modal.as_ref(),
+        Some(crate::views::modal::ActiveModal::SessionPicker { import: Some(_), .. }))));
 }
 
 #[test]

@@ -65,6 +65,7 @@ groky
 | Remove a custom provider | `/provider-login` → highlight it → `d` (or `Delete`) → `Enter` to confirm; `Esc` cancels |
 | Check subscription / gateway quotas | `/provider-usage` (aliases `/pusage`, `/usage providers`) |
 | Switch model | `/model` |
+| Continue another agent's conversation | `/import-session` — automatically discover sessions for the current directory |
 | Fast mode (GPT, including custom OpenAI-compatible relays) | `/fast` |
 | Sign out a provider (all its accounts) | `/provider-logout` |
 | Refresh vendor model lists | `/sync-models-dev` (alias `/refresh-models`); provider picker `r`; custom model list `Ctrl+R` |
@@ -99,6 +100,37 @@ labels and manual renames; token refresh never changes the label. Missing or
 unusable email metadata does not block login. Accounts with identical labels
 show their account IDs separately in the account manager. Email is display
 metadata only; credentials, model catalogs, and quotas remain keyed by account ID.
+
+### Import sessions
+
+`/import-session` discovers **omp, pi, Claude Code, Codex, and OpenCode** sessions
+whose recorded working directory matches the current directory (including symlink
+aliases). Select a row and press **Enter** to inspect its active-context count and
+migration warnings, then **Enter** again to import; **Esc** cancels the preview.
+Press **f** to switch between the current project and all projects.
+
+The import creates a new native session and opens it without sending a prompt.
+The source remains unchanged. Selected branches and compaction boundaries are
+reconstructed before continuation; historical tools are never rerun. The new
+session uses Groky's model, instructions and permissions, not the source agent's
+credentials, running tasks or filesystem checkpoints.
+
+The CLI import is local-only and does not require login:
+
+```sh
+groky sessions import --list
+groky sessions import --from pi SESSION_ID
+groky sessions import --from codex /path/to/rollout.jsonl
+groky sessions import --from opencode /path/to/opencode.db --id SESSION_ID
+groky --resume NEW_SESSION_ID
+```
+
+With no ID/path, the command lists candidates rather than importing them.
+Use `--all` to find sessions from other directories and `--json` for structured
+output. Source storage overrides such as `CODEX_HOME`, `CLAUDE_CONFIG_DIR`,
+OMP/Pi directory settings and OpenCode's XDG/`OPENCODE_DB` location are respected.
+Opaque provider checkpoints cannot be decrypted; unreconstructable context is
+rejected rather than silently replaced with an invented summary.
 
 ### Provider quotas
 

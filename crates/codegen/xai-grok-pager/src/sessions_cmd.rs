@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{Result, bail};
 use clap::Subcommand;
 use xai_grok_login::{AuthManager, try_ensure_fresh_auth};
 use xai_grok_shell::agent::config::Config as AgentConfig;
@@ -31,9 +31,55 @@ enum SessionsCommand {
         /// Session id to delete.
         id: String,
     },
+    /// Discover and import a foreign agent transcript as a native Groky session.
+    Import {
+        /// A discovered session ID or an explicit transcript, store, or database path.
+        #[arg(value_name = "ID_OR_PATH")]
+        target: Option<String>,
+        /// Session ID within a discovered or explicit multi-session store.
+        #[arg(long, value_name = "ID")]
+        id: Option<String>,
+        /// Foreign session source for an explicit path, or to filter discovery.
+        #[arg(long = "from", value_name = "SOURCE")]
+        source: Option<xai_grok_foreign_sessions::import::ImportSource>,
+        /// Search every project instead of only the current directory.
+        #[arg(long)]
+        all: bool,
+        /// Print candidates without importing one.
+        #[arg(long)]
+        list: bool,
+        /// Emit machine-readable candidate or import output.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 pub async fn run(args: SessionsArgs, agent_config: &AgentConfig) -> Result<()> {
+    let cwd = std::env::current_dir().unwrap_or_else(|_| ".".into());
+
+    // Import is local-only. It must not refresh auth or construct a network registry client.
+    if let SessionsCommand::Import {
+        target,
+        id,
+        source,
+        all,
+        list,
+        json,
+    } = &args.command
+    {
+        return run_import(
+            target.as_deref(),
+            id.as_deref(),
+            *source,
+            *all,
+            *list,
+            *json,
+            &cwd,
+            agent_config,
+        )
+        .await;
+    }
+
     // Best-effort only: never force an interactive public login here. Enterprise deployments may configure only a
     // deployment_key and a custom xai_api_base_url. Otherwise we still proceed so the SessionRegistryClient can use
     // the deployment_key when talking to the custom proxy.
@@ -57,7 +103,6 @@ pub async fn run(args: SessionsArgs, agent_config: &AgentConfig) -> Result<()> {
     .with_alpha_test_key(agent_config.endpoints.alpha_test_key.clone())
     .with_auth(auth_manager.clone());
 
-    let cwd = std::env::current_dir().unwrap_or_else(|_| ".".into());
 
     match args.command {
         SessionsCommand::List { limit } => {
@@ -197,10 +242,185 @@ pub async fn run(args: SessionsArgs, agent_config: &AgentConfig) -> Result<()> {
                 println!("No session found with id {id}.");
             }
         }
+        SessionsCommand::Import { .. } => unreachable!("local import returns before auth setup"),
     }
 
     Ok(())
 }
+fn safe_cli_display(value: &str) -> String {
+    crate::views::session_title::sanitize_display_text(value)
+        .trim()
+        .chars()
+        .take(240)
+        .collect()
+}
+
+fn print_import_candidates(
+    candidates: &[xai_grok_foreign_sessions::import::ImportCandidate],
+    warnings: &[String],
+    json: bool,
+) -> Result<()> {
+    if json {
+        let sessions: Vec<serde_json::Value> = candidates
+            .iter()
+            .map(|candidate| {
+                serde_json::json!({
+                    "source": candidate.source.as_str(),
+                    "id": &candidate.id,
+                    "path": &candidate.path,
+                    "cwd": &candidate.cwd,
+                    "title": &candidate.title,
+                    "modified": chrono::DateTime::<chrono::Utc>::from(candidate.modified).to_rfc3339(),
+                })
+            })
+            .collect();
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "sessions": sessions,
+                "warnings": warnings,
+            }))?
+        );
+        return Ok(());
+    }
+
+    let warnings: Vec<String> = warnings
+        .iter()
+        .map(|warning| safe_cli_display(warning))
+        .filter(|warning| !warning.is_empty())
+        .collect();
+
+    for warning in &warnings {
+        eprintln!("warning: {warning}");
+    }
+    if candidates.is_empty() {
+        println!("No importable foreign sessions found.");
+        return Ok(());
+    }
+    for candidate in candidates {
+        let modified = chrono::DateTime::<chrono::Utc>::from(candidate.modified)
+            .with_timezone(&chrono::Local)
+            .format("%b %d, %l:%M%P");
+        let id = safe_cli_display(&candidate.id);
+        let title = safe_cli_display(&candidate.title);
+        let cwd = safe_cli_display(&candidate.cwd.to_string_lossy());
+        println!(
+            "{} {}  {}\n  {}\n  {}",
+            candidate.source.as_str(),
+            id,
+            modified,
+            summary_or_untitled(&title),
+            cwd,
+        );
+    }
+    Ok(())
+}
+
+async fn run_import(
+    target: Option<&str>,
+    id: Option<&str>,
+    source: Option<xai_grok_foreign_sessions::import::ImportSource>,
+    all: bool,
+    list: bool,
+    json: bool,
+    cwd: &std::path::Path,
+    agent_config: &AgentConfig,
+) -> Result<()> {
+    let explicit_path = target
+        .map(|target| std::path::Path::new(target))
+        .filter(|path| path.exists());
+    let discovered_id = if explicit_path.is_some() {
+        id
+    } else {
+        id.or(target)
+    };
+    if explicit_path.is_some() && all {
+        bail!("--all applies to discovery and cannot be combined with an explicit PATH");
+    }
+
+    let (mut candidates, warnings) = if let Some(path) = explicit_path {
+        let source = source.ok_or_else(|| anyhow::anyhow!("--from is required with PATH"))?;
+        (
+            vec![xai_grok_foreign_sessions::import::inspect(
+                source,
+                path,
+                discovered_id,
+            )
+            .map_err(|error| anyhow::anyhow!(safe_cli_display(&error.to_string())))?],
+            Vec::new(),
+        )
+    } else {
+        let discovery = xai_grok_foreign_sessions::import::discover((!all).then_some(cwd));
+        (discovery.sessions, discovery.warnings)
+    };
+
+    candidates.retain(|candidate| {
+        source.is_none_or(|source| candidate.source == source)
+            && discovered_id.is_none_or(|id| candidate.id == id)
+    });
+
+    // No target always lists. It must never implicitly import every current-directory match.
+    if list || (explicit_path.is_none() && discovered_id.is_none()) {
+        return print_import_candidates(&candidates, &warnings, json);
+    }
+
+    let candidate = match candidates.as_slice() {
+        [candidate] => candidate.clone(),
+        [] => bail!("No matching foreign session found; use --list or --all to inspect candidates."),
+        _ => bail!("More than one foreign session matched; pass --from or an explicit PATH."),
+    };
+    let model_id = agent_config
+        .default_model_override
+        .clone()
+        .or_else(|| std::env::var("GROK_DEFAULT_MODEL").ok().filter(|id| !id.trim().is_empty()))
+        .or_else(|| agent_config.models.default.clone())
+        .or_else(|| {
+            // Match ModelsManager's offline fallback: external model catalogues
+            // must not silently inherit a bundled xAI model.
+            (agent_config.grok_com_config.auth_provider_command.is_none()
+                || !agent_config.endpoints.has_custom_endpoint())
+                .then(|| xai_grok_shell::models::default_model().to_owned())
+        })
+        .ok_or_else(|| anyhow::anyhow!("No Groky default model is configured."))?;
+    let imported = xai_grok_shell::session::import::import_session(
+        candidate,
+        cwd.to_path_buf(),
+        model_id,
+    )
+    .await
+    .map_err(|error| anyhow::anyhow!(safe_cli_display(&error.to_string())))?;
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "sessionId": &imported.session_id,
+                "cwd": &imported.cwd,
+                "messageCount": imported.message_count,
+                "warnings": &imported.warnings,
+                "resume": format!("groky --resume {}", imported.session_id),
+            }))?
+        );
+        return Ok(());
+    }
+
+    let warnings: Vec<String> = imported
+        .warnings
+        .iter()
+        .map(|warning| safe_cli_display(warning))
+        .filter(|warning| !warning.is_empty())
+        .collect();
+
+    for warning in &warnings {
+        eprintln!("warning: {warning}");
+    }
+    println!(
+        "Imported {} messages as native session {}.",
+        imported.message_count, imported.session_id
+    );
+    println!("Resume with:\n  groky --resume {}", imported.session_id);
+    Ok(())
+}
+
 
 /// The placeholder every session listing shows for a blank title
 pub(crate) fn summary_or_untitled(title: &str) -> &str {

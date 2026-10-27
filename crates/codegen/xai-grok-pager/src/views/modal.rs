@@ -172,6 +172,28 @@ pub fn session_picker_modal(previous_palette: Option<PaletteSnapshot>) -> Active
         entries_query: None,
         source_filter: crate::views::session_picker::SourceFilter::default(),
         pending_delete: None,
+        import: None,
+    }
+}
+
+/// Returns the shared picker configured for read-only foreign session discovery.
+pub fn import_session_picker_modal() -> ActiveModal {
+    ActiveModal::SessionPicker {
+        state: crate::views::picker::PickerState::default(),
+        entries: None,
+        loading: true,
+        lanes: Default::default(),
+        previous_palette: None,
+        window: ModalWindowState::new(),
+        content_results: None,
+        content_loading: false,
+        deep_search_seq: 0,
+        generation: 0,
+        detail_seq: 0,
+        entries_query: None,
+        source_filter: crate::views::session_picker::SourceFilter::External,
+        pending_delete: None,
+        import: Some(crate::views::session_picker::ImportSessionPickerState::new()),
     }
 }
 /// The currently active modal dialog, if any.
@@ -243,6 +265,8 @@ pub enum ActiveModal {
         source_filter: crate::views::session_picker::SourceFilter,
         /// Session armed for delete via `d` (see [`crate::views::session_picker::PendingDelete`]).
         pending_delete: Option<crate::views::session_picker::PendingDelete>,
+        /// Import-specific data; `None` keeps ordinary resume-picker behavior.
+        import: Option<crate::views::session_picker::ImportSessionPickerState>,
     },
     /// How-to documentation list modal (wider picker style).
     DocPicker {
@@ -680,7 +704,13 @@ impl ActiveModal {
                 }
             }
             ActiveModal::CommandPalette { .. } => "Commands",
-            ActiveModal::SessionPicker { .. } => "Resume session",
+            ActiveModal::SessionPicker { import, .. } => {
+                if import.is_some() {
+                    "Import session"
+                } else {
+                    "Resume session"
+                }
+            }
             ActiveModal::ArgPicker {
                 command,
                 args_query,

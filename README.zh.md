@@ -61,6 +61,7 @@ groky
 | 删除自定义供应商 | `/provider-login` → 选中供应商 → `d`（或 `Delete`）→ `Enter` 确认；`Esc` 取消 |
 | 查询订阅 / 网关额度 | `/provider-usage`（别名 `/pusage`、`/usage providers`） |
 | 切换模型 | `/model` |
+| 接着其他 agent 的会话继续工作 | `/import-session` —— 自动发现当前目录的会话 |
 | Fast 模式（GPT，含自定义 OpenAI 兼容中转站） | `/fast` |
 | 退出供应商的所有账号 | `/provider-logout` |
 | 刷新供应商模型列表 | `/sync-models-dev`（别名 `/refresh-models`）；供应商列表 `r`；自定义模型列表 `Ctrl+R` |
@@ -92,6 +93,32 @@ Codex 各账号分别保存凭据和模型目录。在 `/provider-accounts` 中�
 尚未修改的默认账号 ID 备注；已有邮箱备注、手动备注都会保留，刷新 token 也不会
 改写备注。缺少邮箱或邮箱信息不可用不影响登录。同名账号在管理列表中单独展示
 账号 ID 以便区分。邮箱仅用于显示，凭据、模型目录和额度仍按账号 ID 隔离。
+
+### 导入会话
+
+`/import-session` 自动发现 **omp、pi、Claude Code、Codex、OpenCode** 中工作目录
+与当前目录匹配的会话，支持符号链接路径匹配。选择一条记录，按 **Enter** 查看
+有效上下文条数和迁移警告，再按 **Enter** 确认导入；**Esc** 取消预览。
+按 **f** 可在当前项目和全部项目之间切换。
+
+导入会创建并打开新的 groky 原生会话，不自动发送消息，也不修改来源文件。
+继续对话前会重建选定分支和压缩边界，历史工具调用不会重新执行。
+新会话使用 groky 的模型、指令和权限，不继承来源 agent 的凭据、运行中任务或文件回滚状态。
+
+命令行导入只操作本地文件，不要求登录：
+
+```sh
+groky sessions import --list
+groky sessions import --from pi SESSION_ID
+groky sessions import --from codex /path/to/rollout.jsonl
+groky sessions import --from opencode /path/to/opencode.db --id SESSION_ID
+groky --resume NEW_SESSION_ID
+```
+
+不指定 ID 或路径时只列出候选，不会批量导入。`--all` 扩大到其他目录，
+`--json` 输出结构化结果。扫描尊重 `CODEX_HOME`、`CLAUDE_CONFIG_DIR`、
+omp/pi 的目录设置及 OpenCode 的 XDG/`OPENCODE_DB` 路径。
+供应商加密检查点无法解密；无法重建有效上下文时会报错，不会用编造的摘要代替。
 
 ### 供应商额度
 

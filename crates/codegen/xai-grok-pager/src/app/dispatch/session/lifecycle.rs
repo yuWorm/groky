@@ -1068,13 +1068,17 @@ pub(in crate::app::dispatch) fn drain_startup_actions(app: &mut AppView) -> Vec<
         }
         Some(DeferredSessionStartup::ForeignResume { tool, native_id }) => {
             effects.extend(dispatch_new_session_inner(app, None));
-            effects.extend(dispatch(
-                Action::SendPrompt(
-                    crate::app::foreign_sessions::ForeignPickerSource::from_tool(tool)
-                        .resume_prompt(&native_id),
-                ),
-                app,
-            ));
+            if matches!(tool, xai_grok_foreign_sessions::ForeignSessionTool::Claude
+                | xai_grok_foreign_sessions::ForeignSessionTool::Codex) {
+                effects.extend(super::import::dispatch_show_import_session_picker(app));
+            } else {
+                effects.extend(dispatch(
+                    Action::SendPrompt(
+                        crate::app::foreign_sessions::cursor_resume_prompt(&native_id),
+                    ),
+                    app,
+                ));
+            }
         }
         None => {
             if pending_chat {

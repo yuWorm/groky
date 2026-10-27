@@ -30,6 +30,10 @@ use super::session::foreign::{
 use super::session::fork::{
     handle_fork_session_failed, handle_fork_session_ready, handle_worktree_forked,
 };
+use super::session::import::{
+    handle_import_session_completed, handle_import_session_previewed,
+    handle_import_sessions_discovered,
+};
 use super::session::lifecycle::{
     dispatch_exit_session, handle_session_created, handle_session_failed,
     handle_switch_model_complete, handle_worktree_session_created, handle_worktree_session_failed,
@@ -1174,6 +1178,64 @@ pub(super) fn dispatch_task_result(result: TaskResult, app: &mut AppView) -> Vec
         TaskResult::ForeignSessionsScanned { entries, seq } => {
             handle_foreign_sessions_scanned(app, entries, seq)
         }
+        TaskResult::ImportSessionsDiscovered {
+            agent_id,
+            generation,
+            target_cwd,
+            owner_session_id,
+            candidates,
+            warnings,
+        } => handle_import_sessions_discovered(
+            app,
+            agent_id,
+            generation,
+            target_cwd,
+            owner_session_id,
+            candidates,
+            warnings,
+        ),
+        TaskResult::ImportSessionPreviewed {
+            agent_id,
+            generation,
+            candidate_index,
+            target_cwd,
+            owner_session_id,
+            context_count,
+            warnings,
+            error,
+        } => handle_import_session_previewed(
+            app,
+            agent_id,
+            generation,
+            candidate_index,
+            target_cwd,
+            owner_session_id,
+            context_count,
+            warnings,
+            error,
+        ),
+        TaskResult::ImportSessionCompleted {
+            agent_id,
+            generation,
+            candidate_index,
+            target_cwd,
+            owner_session_id,
+            session_id,
+            message_count,
+            warnings,
+            error,
+        } => handle_import_session_completed(
+            app,
+            agent_id,
+            generation,
+            candidate_index,
+            target_cwd,
+            owner_session_id,
+            session_id,
+            message_count,
+            warnings,
+            error,
+        ),
         TaskResult::ForeignResumeCwdCanonicalized {
             requested_cwd,
             canonical_cwd,

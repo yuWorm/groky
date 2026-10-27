@@ -371,7 +371,8 @@ pub(in crate::app::dispatch) fn dispatch_pick_session(
     if let Some(foreign_source) =
         crate::app::foreign_sessions::ForeignPickerSource::from_picker_source(&source)
     {
-        let prompt = foreign_source.resume_prompt(&session_id);
+        // Claude and Codex imports now persist a native Groky session before loading it.
+        // Cursor remains on its existing prompt-resume compatibility path.
         clear_startup_actions(app);
         if !app.session_startup_allowed() {
             app.deferred_startup.session = Some(
@@ -382,6 +383,14 @@ pub(in crate::app::dispatch) fn dispatch_pick_session(
             );
             return vec![];
         }
+        if matches!(
+            foreign_source,
+            crate::app::foreign_sessions::ForeignPickerSource::Claude
+                | crate::app::foreign_sessions::ForeignPickerSource::Codex
+        ) {
+            return super::import::dispatch_show_import_session_picker(app);
+        }
+        let prompt = crate::app::foreign_sessions::cursor_resume_prompt(&session_id);
         let mut effects = dispatch_new_session_inner(app, None);
         effects.extend(dispatch(Action::SendPrompt(prompt), app));
         return effects;

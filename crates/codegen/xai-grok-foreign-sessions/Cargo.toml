@@ -3,12 +3,14 @@ license = "Apache-2.0"
 name = "xai-grok-foreign-sessions"
 version = "0.1.0"
 edition.workspace = true
-description = "Bounded, metadata-only discovery of foreign coding-agent sessions"
+description = "Bounded discovery and read-only import of foreign coding-agent sessions"
 
 [features]
 default = []
 
 [dependencies]
+base64 = { workspace = true }
+serde = { workspace = true }
 # Rollout-filename date windows for the Codex file scanner.
 chrono = { workspace = true }
 # Home/config discovery for the per-tool session stores.

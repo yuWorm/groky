@@ -24,8 +24,13 @@ writes the items you selected into your `.grok` config. Re-run it anytime.
 
 ## Pick up where you left off
 
-The **`/resume-claude`**, **`/resume-codex`**, and **`/resume-cursor`**
-skills continue a recent session from those tools right here.
+Use **`/import-session`** to discover omp, pi, Claude Code, Codex, and OpenCode
+sessions for the current directory. Inspect a row, review any migration warnings,
+then confirm to open a new native Groky session. Source files are unchanged and
+historical tools are not rerun. Press `f` to include other projects.
+
+For scripts or explicit transcript paths, use **`groky sessions import`**.
+Cursor remains on its existing **`/resume-cursor`** skill path.
 
 ## Check what was discovered
 

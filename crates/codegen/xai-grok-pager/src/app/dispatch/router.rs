@@ -59,6 +59,11 @@ use super::session::fork::{
     apply_persist_worktree_mode, dispatch_fork, dispatch_fork_resolved,
     dispatch_startup_fork_session,
 };
+use super::session::import::{
+    dispatch_cancel_import_session_preview, dispatch_confirm_import_session,
+    dispatch_preview_import_session, dispatch_show_import_session_picker,
+    dispatch_toggle_import_session_scope,
+};
 use super::session::lifecycle::{
     clear_startup_actions, dispatch_accept_consent, dispatch_agent_type_mismatch_answered,
     dispatch_delete_current_session_answered, dispatch_exit_session, dispatch_new_session,
@@ -183,7 +188,21 @@ fn dispatch_inner(action: Action, app: &mut AppView) -> Vec<Effect> {
                 age_secs = hint.age.as_secs(),
                 "foreign_resume accepted"
             );
-            let prompt = source.resume_prompt(&hint.native_id);
+            if matches!(hint.tool,
+                xai_grok_foreign_sessions::ForeignSessionTool::Claude
+                    | xai_grok_foreign_sessions::ForeignSessionTool::Codex) {
+                if !app.session_startup_allowed() {
+                    app.deferred_startup.session = Some(
+                        crate::app::session_startup::DeferredSessionStartup::ForeignResume {
+                            tool: hint.tool,
+                            native_id: hint.native_id,
+                        },
+                    );
+                    return vec![];
+                }
+                return dispatch_show_import_session_picker(app);
+            }
+            let prompt = crate::app::foreign_sessions::cursor_resume_prompt(&hint.native_id);
             if !app.session_startup_allowed() {
                 app.deferred_startup.prompt = Some(prompt);
                 return vec![];
@@ -303,6 +322,21 @@ fn dispatch_inner(action: Action, app: &mut AppView) -> Vec<Effect> {
             }
         }
         Action::SessionPickerClosed => dispatch_session_picker_closed(app),
+        Action::ShowImportSessionPicker => dispatch_show_import_session_picker(app),
+        Action::PreviewImportSession {
+            generation,
+            candidate_index,
+        } => dispatch_preview_import_session(app, generation, candidate_index),
+        Action::ToggleImportSessionScope { generation } => {
+            dispatch_toggle_import_session_scope(app, generation)
+        }
+        Action::ConfirmImportSession {
+            generation,
+            candidate_index,
+        } => dispatch_confirm_import_session(app, generation, candidate_index),
+        Action::CancelImportSessionPreview { generation } => {
+            dispatch_cancel_import_session_preview(app, generation)
+        }
         Action::PickSession(index) => dispatch_pick_session(app, index),
         Action::PickSessionInWorktree(index) => dispatch_pick_session_in_worktree(app, index),
         Action::CopySessionId(index) => dispatch_copy_session_id(app, index),

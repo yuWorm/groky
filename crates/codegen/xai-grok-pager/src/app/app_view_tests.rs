@@ -941,6 +941,7 @@ fn tick_demand_fast_while_modal_session_picker_loads() {
             entries_query: None,
             source_filter: crate::views::session_picker::SourceFilter::default(),
             pending_delete: None,
+            import: None,
         });
     assert_eq!(
         app.tick_demand(),

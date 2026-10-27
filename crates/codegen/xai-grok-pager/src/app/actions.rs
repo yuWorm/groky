@@ -145,6 +145,26 @@ pub enum Action {
     /// The session picker overlay was dismissed without a pick.
     /// Invalidate any in-flight list/search/foreign scan so a late response can't fall through to the welcome picker fields.
     SessionPickerClosed,
+    /// Discover foreign transcripts for the current project in the shared session picker.
+    ShowImportSessionPicker,
+    /// Inspect one foreign transcript before asking the user to create a native session.
+    PreviewImportSession {
+        generation: u64,
+        candidate_index: usize,
+    },
+    /// Switch the import picker between the current project and every discovered project.
+    ToggleImportSessionScope {
+        generation: u64,
+    },
+    /// Create a native session from the inspected foreign transcript.
+    ConfirmImportSession {
+        generation: u64,
+        candidate_index: usize,
+    },
+    /// Leave import preview mode without closing the picker.
+    CancelImportSessionPreview {
+        generation: u64,
+    },
     /// Create a new session in a git worktree from the welcome screen.
     /// `load_session_id`: when `Some`, loads that session in the new worktree instead of creating a fresh one (`--resume` with `--worktree`).
     /// `label`: optional human-readable label from CLI `-w <label>` or dialog.
@@ -1673,6 +1693,36 @@ pub enum Effect {
         coordinator: crate::app::ForeignScanCoordinator,
         seq: u64,
     },
+    /// Discover the supported foreign session stores on the blocking pool.
+    DiscoverImportSessions {
+        agent_id: AgentId,
+        /// `None` intentionally widens discovery to every project.
+        cwd: Option<std::path::PathBuf>,
+        /// The live directory when discovery began; used to drop stale results.
+        target_cwd: std::path::PathBuf,
+        /// Active native session when discovery began; guards an agent slot reused for another session.
+        owner_session_id: Option<String>,
+        generation: u64,
+    },
+    /// Decode one selected transcript only to show import losses before confirmation.
+    PreviewImportSession {
+        agent_id: AgentId,
+        generation: u64,
+        candidate_index: usize,
+        candidate: xai_grok_foreign_sessions::import::ImportCandidate,
+        target_cwd: std::path::PathBuf,
+        owner_session_id: Option<String>,
+    },
+    /// Persist one confirmed transcript as a native session without contacting a model.
+    ImportSession {
+        agent_id: AgentId,
+        generation: u64,
+        candidate_index: usize,
+        candidate: xai_grok_foreign_sessions::import::ImportCandidate,
+        target_cwd: std::path::PathBuf,
+        owner_session_id: Option<String>,
+        model_id: String,
+    },
     /// Canonicalize the launch cwd off the event-loop thread before store access.
     CanonicalizeForeignResumeCwd {
         requested_cwd: std::path::PathBuf,
@@ -3180,6 +3230,38 @@ pub enum TaskResult {
     ForeignSessionsScanned {
         entries: Vec<crate::app::app_view::SessionPickerEntry>,
         seq: u64,
+    },
+    /// Current-project or all-project foreign transcript discovery completed.
+    ImportSessionsDiscovered {
+        agent_id: AgentId,
+        generation: u64,
+        target_cwd: std::path::PathBuf,
+        owner_session_id: Option<String>,
+        candidates: Vec<xai_grok_foreign_sessions::import::ImportCandidate>,
+        warnings: Vec<String>,
+    },
+    /// A selected transcript was decoded solely for the import confirmation.
+    ImportSessionPreviewed {
+        agent_id: AgentId,
+        generation: u64,
+        candidate_index: usize,
+        target_cwd: std::path::PathBuf,
+        owner_session_id: Option<String>,
+        context_count: usize,
+        warnings: Vec<String>,
+        error: Option<String>,
+    },
+    /// Confirmed native import completed; completion is still generation- and owner-gated.
+    ImportSessionCompleted {
+        agent_id: AgentId,
+        generation: u64,
+        candidate_index: usize,
+        target_cwd: std::path::PathBuf,
+        owner_session_id: Option<String>,
+        session_id: Option<String>,
+        message_count: usize,
+        warnings: Vec<String>,
+        error: Option<String>,
     },
     /// Launch cwd canonicalization completed before foreign store access.
     ForeignResumeCwdCanonicalized {

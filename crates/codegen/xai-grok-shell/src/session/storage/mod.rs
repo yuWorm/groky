@@ -265,8 +265,10 @@ pub(crate) mod chat_rebuild {
         AssistantItem, ContentPart, ConversationItem, SyntheticReason, ToolCall, UserItem,
     };
 
-    /// Rebuild `chat_history.jsonl` from `updates.jsonl` alone. Builds a temp file and renames it over the target.
-    /// A failed rebuild leaves the existing cache intact rather than a truncated partial that load would trust.
+    /// Rebuild the derived history from the durable update stream. Compaction
+    /// checkpoints are replacement boundaries: the checkpoint artifact is the
+    /// exact continuation base, while preceding ACP updates remain available to
+    /// the client replay stream as display history.
     pub(crate) fn rebuild_chat_history(dir: &Path) -> io::Result<usize> {
         use std::io::{Seek, Write};
 
@@ -277,48 +279,96 @@ pub(crate) mod chat_rebuild {
 
         let chat_path = dir.join(CHAT_HISTORY_FILE);
         let tmp_path = dir.join(format!("{CHAT_HISTORY_FILE}.{}.tmp", uuid::Uuid::now_v7()));
-        let file = std::fs::File::create(&tmp_path)?;
-        let mut writer = std::io::BufWriter::new(file);
-        let mut reducer = ChatReducer::new();
+        let result = (|| -> io::Result<usize> {
+            let file = std::fs::File::create(&tmp_path)?;
+            set_file_owner_only(&tmp_path)?;
+            let mut writer = std::io::BufWriter::new(file);
+            let mut reducer = ChatReducer::new();
 
-        for result in iter {
-            let update = match result {
-                Ok(u) => u,
-                Err(_) => continue,
-            };
+            for result in iter {
+                let update = match result {
+                    Ok(u) => u,
+                    Err(_) => continue,
+                };
+                let items = reducer.process(&update, dir)?;
 
-            for item in reducer.process(&update) {
-                if let Ok(line) = serde_json::to_string(&item) {
-                    let _ = writer.write_all(line.as_bytes());
-                    let _ = writer.write_all(b"\n");
+                // A checkpoint replaces every preceding cache item. Its
+                // artifact is written immediately after the truncate, then
+                // later updates become the retained tail.
+                if reducer.should_truncate() {
+                    reducer.clear_truncate_flag();
+                    writer.seek(std::io::SeekFrom::Start(0))?;
+                    writer.get_mut().set_len(0)?;
                 }
+                write_items(&mut writer, items)?;
             }
 
-            // CompactionCheckpoint: truncate file and reset
-            if reducer.should_truncate() {
-                reducer.clear_truncate_flag();
-                let _ = writer.seek(std::io::SeekFrom::Start(0));
-                let _ = writer.get_mut().set_len(0);
+            write_items(&mut writer, reducer.flush())?;
+            writer.flush()?;
+            Ok(reducer.count())
+        })();
+        let count = match result {
+            Ok(count) => count,
+            Err(error) => {
+                let _ = std::fs::remove_file(&tmp_path);
+                return Err(error);
             }
-        }
-
-        for item in reducer.flush() {
-            if let Ok(line) = serde_json::to_string(&item) {
-                let _ = writer.write_all(line.as_bytes());
-                let _ = writer.write_all(b"\n");
-            }
-        }
-
-        if let Err(e) = writer.flush() {
-            let _ = std::fs::remove_file(&tmp_path);
-            return Err(e);
-        }
-        drop(writer);
+        };
         if let Err(e) = std::fs::rename(&tmp_path, &chat_path) {
             let _ = std::fs::remove_file(&tmp_path);
             return Err(e);
         }
-        Ok(reducer.count())
+        Ok(count)
+    }
+
+    fn write_items(
+        writer: &mut std::io::BufWriter<std::fs::File>,
+        items: impl IntoIterator<Item = ConversationItem>,
+    ) -> io::Result<()> {
+        use std::io::Write;
+
+        for item in items {
+            serde_json::to_writer(&mut *writer, &item)
+                .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+            writer.write_all(b"\n")?;
+        }
+        Ok(())
+    }
+
+    fn set_file_owner_only(path: &Path) -> io::Result<()> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+        }
+        #[cfg(not(unix))]
+        let _ = path;
+        Ok(())
+    }
+
+    fn load_checkpoint_history(
+        session_dir: &Path,
+        info: &crate::extensions::notification::CompactionCheckpointInfo,
+    ) -> io::Result<Vec<ConversationItem>> {
+        let checkpoint_file = Path::new(&info.checkpoint_file);
+        if checkpoint_file.parent() != Some(Path::new("compaction_checkpoints")) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "compaction checkpoint path is outside compaction_checkpoints",
+            ));
+        }
+        let path = session_dir.join(checkpoint_file);
+        let bytes = std::fs::read(&path)?;
+        let checkpoint: crate::extensions::notification::CompactionCheckpointFile =
+            serde_json::from_slice(&bytes)
+                .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+        if checkpoint.checkpoint_id != info.checkpoint_id {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "compaction checkpoint ID does not match its update",
+            ));
+        }
+        Ok(checkpoint.compacted_history)
     }
 
     /// Turn boundaries: a switch from user to agent flushes the user item, and a switch from agent to user flushes the agent item.
@@ -354,10 +404,14 @@ pub(crate) mod chat_rebuild {
             }
         }
 
-        fn process(&mut self, update: &SessionUpdate) -> Vec<ConversationItem> {
+        fn process(
+            &mut self,
+            update: &SessionUpdate,
+            session_dir: &Path,
+        ) -> io::Result<Vec<ConversationItem>> {
             match update {
-                SessionUpdate::Acp(n) => self.handle_acp(&n.update),
-                SessionUpdate::Xai(n) => self.handle_xai(&n.update),
+                SessionUpdate::Acp(n) => Ok(self.handle_acp(&n.update)),
+                SessionUpdate::Xai(n) => self.handle_xai(&n.update, session_dir),
             }
         }
 
@@ -374,16 +428,34 @@ pub(crate) mod chat_rebuild {
         fn handle_xai(
             &mut self,
             update: &crate::extensions::notification::SessionUpdate,
-        ) -> Vec<ConversationItem> {
+            session_dir: &Path,
+        ) -> io::Result<Vec<ConversationItem>> {
             use crate::extensions::notification::SessionUpdate as XaiUpdate;
 
             match update {
-                XaiUpdate::CompactionCheckpoint(_) => {
+                XaiUpdate::CompactionCheckpoint(info) => {
+                    let history = match load_checkpoint_history(session_dir, info) {
+                        Ok(history) => history,
+                        // Schema v2 marks a structural import checkpoint. It
+                        // is the only authoritative continuation snapshot, so
+                        // falling back to the pre-checkpoint display stream
+                        // would resurrect compacted context incorrectly.
+                        Err(error) if info.schema_version >= 2 => return Err(error),
+                        Err(error) => {
+                            tracing::warn!(
+                                checkpoint = %info.checkpoint_file,
+                                %error,
+                                "chat rebuild could not hydrate compaction checkpoint; retaining legacy reset behavior"
+                            );
+                            Vec::new()
+                        }
+                    };
                     self.reset();
+                    self.item_count = history.len();
                     self.needs_truncate = true;
-                    Vec::new()
+                    Ok(history)
                 }
-                _ => Vec::new(), // DiffReview, MemoryFlush, etc. not needed
+                _ => Ok(Vec::new()), // DiffReview, MemoryFlush, etc. not needed
             }
         }
 
@@ -2343,6 +2415,71 @@ mod tests {
                 ]
             );
         }
+    }
+
+    #[test]
+    fn rebuild_checkpoint_replaces_display_history_with_checkpoint_context() {
+        use crate::extensions::notification::{
+            CompactionCheckpointFile, CompactionCheckpointInfo,
+            SessionNotification as XaiSessionNotification,
+            SessionUpdate as XaiSessionUpdate,
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+        let checkpoint_id = "import-context";
+        let checkpoint_dir = dir.path().join("compaction_checkpoints");
+        std::fs::create_dir(&checkpoint_dir).unwrap();
+        let checkpoint = CompactionCheckpointFile {
+            checkpoint_id: checkpoint_id.to_owned(),
+            prompt_index_at_compaction: 1,
+            compacted_history: vec![ConversationItem::user("retained context")],
+            schema_version: 1,
+            created_at: "2026-10-27T00:00:00Z".to_owned(),
+            original_user_info: None,
+            reread_file_paths: Vec::new(),
+        };
+        std::fs::write(
+            checkpoint_dir.join(format!("{checkpoint_id}.json")),
+            serde_json::to_vec(&checkpoint).unwrap(),
+        )
+        .unwrap();
+
+        let sid = acp::SessionId::new("imported");
+        let old_display = SessionUpdate::Acp(Box::new(acp::SessionNotification::new(
+            sid.clone(),
+            acp::SessionUpdate::UserMessageChunk(acp::ContentChunk::new(
+                acp::ContentBlock::Text(acp::TextContent::new("compacted-away display")),
+            )),
+        )));
+        let marker = SessionUpdate::Xai(Box::new(XaiSessionNotification {
+            session_id: sid.clone(),
+            update: XaiSessionUpdate::CompactionCheckpoint(Box::new(CompactionCheckpointInfo {
+                checkpoint_id: checkpoint_id.to_owned(),
+                prompt_index_at_compaction: 1,
+                checkpoint_file: format!("compaction_checkpoints/{checkpoint_id}.json"),
+                auto_continue: None,
+                schema_version: 1,
+                created_at: "2026-10-27T00:00:00Z".to_owned(),
+            })),
+            meta: None,
+        }));
+        let retained_tail = SessionUpdate::Acp(Box::new(acp::SessionNotification::new(
+            sid,
+            acp::SessionUpdate::AgentMessageChunk(acp::ContentChunk::new(
+                acp::ContentBlock::Text(acp::TextContent::new("retained tail")),
+            )),
+        )));
+        let envelopes = [old_display, marker, retained_tail]
+            .into_iter()
+            .map(|update| SessionUpdateEnvelope::from_update(&update).unwrap())
+            .collect::<Vec<_>>();
+        write_jsonl_atomic(&dir.path().join(UPDATES_FILE), &envelopes).unwrap();
+
+        chat_rebuild::rebuild_chat_history(dir.path()).unwrap();
+        let rebuilt = std::fs::read_to_string(dir.path().join(CHAT_HISTORY_FILE)).unwrap();
+        assert!(rebuilt.contains("retained context"));
+        assert!(rebuilt.contains("retained tail"));
+        assert!(!rebuilt.contains("compacted-away display"));
     }
 
     #[test]

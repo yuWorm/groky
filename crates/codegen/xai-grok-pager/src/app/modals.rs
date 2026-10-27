@@ -117,6 +117,19 @@ impl AgentView {
             return InputOutcome::Changed;
         };
 
+        if let ActiveModal::SessionPicker {
+            generation,
+            import: Some(import),
+            ..
+        } = modal
+            && import.preview.is_some()
+            && key.kind == KeyEventKind::Press
+            && matches!(key.code, KeyCode::Esc | KeyCode::Char('n'))
+        {
+            return InputOutcome::Action(Action::CancelImportSessionPreview {
+                generation: *generation,
+            });
+        }
         // Picker-based modals: route Esc through ModalWindow chrome first, then delegate remaining keys to the picker input handler
         if matches!(
             modal,
@@ -956,6 +969,8 @@ impl AgentView {
                 entries_query,
                 source_filter,
                 pending_delete,
+                generation,
+                import,
                 ..
             } => {
                 use crate::views::session_picker::{
@@ -992,11 +1007,25 @@ impl AgentView {
                         }),
                     _ => false,
                 };
+                let import_picker = import.is_some();
+                let import_preview = import
+                    .as_ref()
+                    .and_then(|import| import.preview.as_ref())
+                    .map(|preview| preview.candidate_index);
+                let import_busy = import.as_ref().is_some_and(|import| {
+                    import.inspecting.is_some() || import.importing.is_some()
+                });
+                let import_all_projects =
+                    import.as_ref().is_some_and(|import| import.all_projects);
 
-                // Chat-mode picker lists conversations only: the source filter and local-disk delete are dead weight there
-                let chat_mode = self.app_chat_mode;
+                // Chat-mode picker lists conversations only: the source filter and local-disk delete are dead weight there.
+                let chat_mode = self.app_chat_mode && !import_picker;
                 let config = PickerConfig {
-                    title: Some("Resume session"),
+                    title: Some(if import_picker {
+                        "Import session"
+                    } else {
+                        "Resume session"
+                    }),
                     show_search_hint: true,
                     expandable: true,
                     esc_clears_query: true,
@@ -1007,11 +1036,23 @@ impl AgentView {
                     shortcuts_area: None,
                     tabs: None,
                     active_tab: 0,
-                    filter_label: (!chat_mode).then(|| source_filter.label()),
+                    filter_label: if import_picker {
+                        Some(if import_all_projects {
+                            "All projects"
+                        } else {
+                            "Current project"
+                        })
+                    } else {
+                        (!chat_mode).then(|| source_filter.label())
+                    },
                     filter_key_hint: (!chat_mode).then_some("f"),
-                    filter_active: !chat_mode && source_filter.is_active(),
+                    filter_active: if import_picker {
+                        import_all_projects
+                    } else {
+                        !chat_mode && source_filter.is_active()
+                    },
                     header_note: None,
-                    action_keys: if chat_mode || focused_is_foreign {
+                    action_keys: if import_picker || chat_mode || focused_is_foreign {
                         &[]
                     } else {
                         &[('d', "delete")]
@@ -1022,22 +1063,42 @@ impl AgentView {
                     vim_normal_first: crate::appearance::cache::load_vim_mode(),
                 };
 
-                match crate::views::session_picker::handle_pending_delete_key(pending_delete, ev) {
-                    crate::views::session_picker::PendingDeleteKey::Confirm(pd) => {
-                        return InputOutcome::Action(Action::DeleteSession {
-                            source: pd.source,
-                            session_id: pd.session_id,
-                            cwd: pd.cwd,
+                if let Some(candidate_index) = import_preview {
+                    if let crossterm::event::Event::Key(key) = ev
+                        && key.kind == KeyEventKind::Press
+                        && matches!(key.code, KeyCode::Enter)
+                    {
+                        return InputOutcome::Action(Action::ConfirmImportSession {
+                            generation: *generation,
+                            candidate_index,
                         });
                     }
-                    crate::views::session_picker::PendingDeleteKey::Cancel => {
-                        return InputOutcome::Changed;
-                    }
-                    crate::views::session_picker::PendingDeleteKey::Disarmed
-                    | crate::views::session_picker::PendingDeleteKey::NotArmed => {}
+                    return InputOutcome::Changed;
+                }
+                if import_busy {
+                    return InputOutcome::Changed;
                 }
 
-                if let crossterm::event::Event::Key(key) = ev
+                if !import_picker {
+                    match crate::views::session_picker::handle_pending_delete_key(pending_delete, ev)
+                    {
+                        crate::views::session_picker::PendingDeleteKey::Confirm(pd) => {
+                            return InputOutcome::Action(Action::DeleteSession {
+                                source: pd.source,
+                                session_id: pd.session_id,
+                                cwd: pd.cwd,
+                            });
+                        }
+                        crate::views::session_picker::PendingDeleteKey::Cancel => {
+                            return InputOutcome::Changed;
+                        }
+                        crate::views::session_picker::PendingDeleteKey::Disarmed
+                        | crate::views::session_picker::PendingDeleteKey::NotArmed => {}
+                    }
+                }
+
+                if !import_picker
+                    && let crossterm::event::Event::Key(key) = ev
                     && let Some(selection) = session_picker_worktree_selection(
                         key,
                         state,
@@ -1067,9 +1128,15 @@ impl AgentView {
                 }
                 match outcome {
                     PickerOutcome::Selected(i) => {
-                        match entry_map.get(i).and_then(|e| e.as_ref()) {
+                        match entry_map.get(i).and_then(|entry| entry.as_ref()) {
+                            Some(PickerItem::Fuzzy { original_index }) if import_picker => {
+                                InputOutcome::Action(Action::PreviewImportSession {
+                                    generation: *generation,
+                                    candidate_index: *original_index,
+                                })
+                            }
                             Some(PickerItem::Fuzzy { original_index }) => {
-                                // Don't clear active_modal here; dispatch_pick_session reads entries from it before clearing
+                                // Don't clear active_modal here; dispatch_pick_session reads entries from it before clearing.
                                 InputOutcome::Action(Action::PickSession(*original_index))
                             }
                             Some(PickerItem::Content { hit_index }) => {
@@ -1087,9 +1154,10 @@ impl AgentView {
                             None => InputOutcome::Changed,
                         }
                     }
+                    PickerOutcome::SubmitQuery if import_picker => InputOutcome::Unchanged,
                     PickerOutcome::SubmitQuery => {
                         // Free-text load only for a UUID session id.
-                        // Own the id before clearing the modal (state is a reborrow of `active_modal`)
+                        // Own the id before clearing the modal (state is a reborrow of `active_modal`).
                         let load_id =
                             crate::views::session_picker::session_id_for_direct_load(state.query())
                                 .map(str::to_owned);
@@ -1113,6 +1181,20 @@ impl AgentView {
                         // A search/list fetch may still be in flight
                         // The dispatch layer must invalidate it now that the modal (its landing surface) is gone
                         InputOutcome::Action(Action::SessionPickerClosed)
+                    }
+                    PickerOutcome::Expand(i) if import_picker => {
+                        if let Some(Some(PickerItem::Fuzzy { original_index })) = entry_map.get(i)
+                        {
+                            state.expanded.insert(*original_index);
+                        }
+                        InputOutcome::Changed
+                    }
+                    PickerOutcome::Collapse(i) if import_picker => {
+                        if let Some(Some(PickerItem::Fuzzy { original_index })) = entry_map.get(i)
+                        {
+                            state.expanded.remove(original_index);
+                        }
+                        InputOutcome::Changed
                     }
                     PickerOutcome::Expand(i) => match entry_map.get(i).and_then(|e| e.as_ref()) {
                         Some(PickerItem::Fuzzy { original_index }) => {
@@ -1193,11 +1275,16 @@ impl AgentView {
                             *source_filter,
                             Some(current_repo.as_str()),
                         );
-                        InputOutcome::Action(Action::TriggerDeepSearch)
+                        if import_picker {
+                            InputOutcome::Changed
+                        } else {
+                            InputOutcome::Action(Action::TriggerDeepSearch)
+                        }
                     }
                     PickerOutcome::Changed => InputOutcome::Changed,
                     PickerOutcome::Unchanged => {
-                        if let crossterm::event::Event::Key(key) = ev
+                        if !import_picker
+                            && let crossterm::event::Event::Key(key) = ev
                             && key.kind == KeyEventKind::Press
                             && crate::key!('/', CONTROL).matches(key)
                             && !state.query().trim().is_empty()
@@ -1205,6 +1292,11 @@ impl AgentView {
                             return InputOutcome::Action(Action::ForceDeepSearch);
                         }
                         InputOutcome::Unchanged
+                    }
+                    PickerOutcome::FilterCycled if import_picker => {
+                        InputOutcome::Action(Action::ToggleImportSessionScope {
+                            generation: *generation,
+                        })
                     }
                     PickerOutcome::FilterCycled => {
                         InputOutcome::Action(Action::CycleSessionSourceFilter)
@@ -1891,6 +1983,7 @@ impl AgentView {
                 entries_query,
                 source_filter,
                 pending_delete,
+                import,
                 ..
             } = active_modal
             {
@@ -1900,11 +1993,68 @@ impl AgentView {
                 use crate::views::session_picker::{
                     build_content_entry_data, build_content_header_label,
                 };
-                // While a delete confirmation is armed, the footer swaps to a "y confirm / n cancel" prompt
-                // Otherwise show the normal hints plus the `d delete` action
-                // Chat mode drops the deep-search / filter / delete hints (local-disk-row actions)
-                let chat_mode = self.app_chat_mode;
-                let session_shortcuts: Vec<Shortcut> = if pending_delete.is_some() {
+                let import_state = import.as_ref();
+                let import_preview = import_state.and_then(|import| import.preview.as_ref());
+                let import_busy = import_state.is_some_and(|import| {
+                    import.inspecting.is_some() || import.importing.is_some()
+                });
+                let import_all_projects =
+                    import_state.is_some_and(|import| import.all_projects);
+                let chat_mode = self.app_chat_mode && import_state.is_none();
+                let session_shortcuts: Vec<Shortcut> = if import_preview.is_some() {
+                    vec![
+                        Shortcut {
+                            label: "Enter import",
+                            clickable: false,
+                            id: 0,
+                        },
+                        Shortcut {
+                            label: "Esc cancel",
+                            clickable: false,
+                            id: 0,
+                        },
+                    ]
+                } else if import_busy {
+                    vec![Shortcut {
+                        label: import_state.is_some_and(|import| import.importing.is_some())
+                            .then_some("Importing session…")
+                            .unwrap_or("Inspecting transcript…"),
+                        clickable: false,
+                        id: 0,
+                    }]
+                } else if import_state.is_some() {
+                    vec![
+                        Shortcut {
+                            label: "\u{2191}\u{2193} nav",
+                            clickable: false,
+                            id: 0,
+                        },
+                        Shortcut {
+                            label: "Enter inspect",
+                            clickable: false,
+                            id: 0,
+                        },
+                        Shortcut {
+                            label: "e preview",
+                            clickable: false,
+                            id: 0,
+                        },
+                        Shortcut {
+                            label: if import_all_projects {
+                                "f current project"
+                            } else {
+                                "f all projects"
+                            },
+                            clickable: false,
+                            id: 0,
+                        },
+                        Shortcut {
+                            label: "Esc close",
+                            clickable: false,
+                            id: 0,
+                        },
+                    ]
+                } else if pending_delete.is_some() {
                     vec![
                         Shortcut {
                             label: "y confirm delete",
@@ -1955,7 +2105,11 @@ impl AgentView {
                 };
                 let compact = self.scrollback.appearance().prompt.compact;
                 let modal_config = ModalWindowConfig {
-                    title: "Resume session",
+                    title: if import_state.is_some() {
+                        "Import session"
+                    } else {
+                        "Resume session"
+                    },
                     tabs: None,
                     shortcuts: &session_shortcuts,
                     sizing: ModalSizing {
@@ -1979,19 +2133,33 @@ impl AgentView {
                         &theme,
                         state,
                     );
-                    // Render filter indicator on the search bar row (hidden in chat mode; every row is a conversation)
+                    // Render scope on import pickers and source filters on ordinary resume pickers.
                     if chat_mode {
                         state.filter_area = None;
                     } else {
+                        let filter_label = if import_state.is_some() {
+                            if import_all_projects {
+                                "All projects"
+                            } else {
+                                "Current project"
+                            }
+                        } else {
+                            source_filter.label()
+                        };
+                        let filter_active = if import_state.is_some() {
+                            import_all_projects
+                        } else {
+                            source_filter.is_active()
+                        };
                         let filter_rect = picker::render_filter_indicator(
                             buf,
                             content_area.x,
                             content_area.y,
                             content_area.width,
                             &theme,
-                            source_filter.label(),
+                            filter_label,
                             "f",
-                            source_filter.is_active(),
+                            filter_active,
                             state.filter_hovered,
                         );
                         state.filter_area = Some(filter_rect);
@@ -2022,12 +2190,22 @@ impl AgentView {
                     let entries_data = entries.as_deref().unwrap_or(&[]);
                     let filtered_indices =
                         filter_session_entries(entries.as_deref(), filter_query, *source_filter);
-                    let built = crate::views::session_picker::build_session_entry_data(
-                        entries_data,
-                        &filtered_indices,
-                        state,
-                        content_area.width,
-                    );
+                    let built = if let Some(import) = import_state {
+                        crate::views::session_picker::build_import_session_entry_data(
+                            entries_data,
+                            &filtered_indices,
+                            state,
+                            content_area.width,
+                            import,
+                        )
+                    } else {
+                        crate::views::session_picker::build_session_entry_data(
+                            entries_data,
+                            &filtered_indices,
+                            state,
+                            content_area.width,
+                        )
+                    };
                     let fields_vecs: Vec<Vec<PickerField>> = built
                         .iter()
                         .map(|b| {
@@ -2470,6 +2648,7 @@ mod session_picker_delete_tests {
             entries_query: None,
             source_filter: crate::views::session_picker::SourceFilter::default(),
             pending_delete: None,
+            import: None,
         });
     }
 

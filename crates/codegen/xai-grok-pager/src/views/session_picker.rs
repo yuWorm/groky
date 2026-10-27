@@ -6,6 +6,7 @@ use crate::app::app_view::SessionPickerEntry;
 use crate::views::picker::{PickerEntry, PickerField, PickerRow, PickerState};
 use indexmap::IndexMap;
 use std::collections::HashSet;
+use xai_grok_foreign_sessions::import::ImportCandidate;
 /// Offset added to content-hit indices in the picker `expanded` set so they don't collide with fuzzy-entry indices.
 pub const CONTENT_EXPAND_OFFSET: usize = 100_000;
 /// Session id for free-text Enter (`SubmitQuery` with no selectable rows).
@@ -163,6 +164,41 @@ impl SessionPickerLanes {
         }
     }
 }
+/// Session-import state hosted inside the shared session picker.
+///
+/// Keeping candidates with the picker means a discovery completion can only
+/// target the modal that issued it; it never falls through to a resume picker.
+#[derive(Debug, Clone)]
+pub struct ImportSessionPickerState {
+    pub(crate) candidates: Vec<ImportCandidate>,
+    pub(crate) discovery_warnings: Vec<String>,
+    pub(crate) all_projects: bool,
+    pub(crate) preview: Option<ImportSessionPreview>,
+    pub(crate) inspecting: Option<usize>,
+    pub(crate) importing: Option<usize>,
+}
+
+impl ImportSessionPickerState {
+    pub(crate) fn new() -> Self {
+        Self {
+            candidates: Vec::new(),
+            discovery_warnings: Vec::new(),
+            all_projects: false,
+            preview: None,
+            inspecting: None,
+            importing: None,
+        }
+    }
+}
+
+/// Read-only inspection data shown before native session creation.
+#[derive(Debug, Clone)]
+pub(crate) struct ImportSessionPreview {
+    pub(crate) candidate_index: usize,
+    pub(crate) context_count: usize,
+    pub(crate) warnings: Vec<String>,
+}
+
 /// Loading gate for a session picker's spinner. The empty state must wait until both lanes settle.
 /// Shared by rendering, redraw forcing, and tick demand so the three cannot drift. A spinner that
 /// renders without demanding ticks parks on its first frame.
@@ -195,7 +231,7 @@ pub(crate) fn loading_spinner_active(
 /// [`Self::Grok`]: native Grok sessions only (local / remote / conversation).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum SourceFilter {
-    /// Native Grok sessions only; excludes Claude/Codex/Cursor foreign rows.
+    /// Native Grok sessions only; excludes external-agent rows.
     #[default]
     Grok,
     /// `grok -p` one-shots only (`session_kind == "headless"`).
@@ -247,8 +283,8 @@ impl SourceFilter {
         }
     }
     /// Returns `true` if a session with the given `source` string and `session_kind` passes the filter.
-    /// Foreign sources (`claude` / `codex` / `cursor`) only pass `External` and `All`. Headless rows
-    /// pass only `Headless`; every other page excludes them, mirroring the server-side fetch policy.
+    /// External sources only pass `External` and `All`. Headless rows pass only `Headless`;
+    /// every other page excludes them, mirroring the server-side fetch policy.
     pub fn matches(self, source: &str, session_kind: Option<&str>) -> bool {
         let is_headless = session_kind == Some("headless");
         match self {
@@ -654,6 +690,40 @@ pub(crate) fn build_session_entry_data(
     state: &PickerState,
     content_width: u16,
 ) -> Vec<SessionEntryData> {
+    build_session_entry_data_with_import(
+        entries_data,
+        filtered_indices,
+        state,
+        content_width,
+        None,
+    )
+}
+
+/// Build rows for the shared picker while a selected foreign transcript is being
+/// inspected for native import.
+pub(crate) fn build_import_session_entry_data(
+    entries_data: &[SessionPickerEntry],
+    filtered_indices: &[usize],
+    state: &PickerState,
+    content_width: u16,
+    import: &ImportSessionPickerState,
+) -> Vec<SessionEntryData> {
+    build_session_entry_data_with_import(
+        entries_data,
+        filtered_indices,
+        state,
+        content_width,
+        Some(import),
+    )
+}
+
+fn build_session_entry_data_with_import(
+    entries_data: &[SessionPickerEntry],
+    filtered_indices: &[usize],
+    state: &PickerState,
+    content_width: u16,
+    import: Option<&ImportSessionPickerState>,
+) -> Vec<SessionEntryData> {
     use crate::render::line_utils::truncate_str;
     filtered_indices
         .iter()
@@ -678,7 +748,8 @@ pub(crate) fn build_session_entry_data(
             };
             let right_text = format_time_ago(entry.last_active_at.unwrap_or(entry.updated_at));
             let is_selected = !state.selection_hidden && fi == state.selected;
-            let collapsible = !crate::app::is_foreign_picker_source(&entry.source);
+            let import_row = import.is_some_and(|state| state.candidates.get(orig_idx).is_some());
+            let collapsible = import_row || !crate::app::is_foreign_picker_source(&entry.source);
             let is_expanded = collapsible && state.expanded.contains(&orig_idx);
             let mut field_data: Vec<(String, String)> = Vec::new();
             if is_expanded {
@@ -720,6 +791,26 @@ pub(crate) fn build_session_entry_data(
                     if !detail.first_prompt_preview.is_empty() {
                         let preview = truncate_str(&detail.first_prompt_preview, max_w);
                         field_data.push(("Prompt".into(), preview));
+                    }
+                }
+                if let Some(import) = import {
+                    for warning in &import.discovery_warnings {
+                        field_data.push((
+                            "Discovery warning".into(),
+                            truncate_str(warning, max_w),
+                        ));
+                    }
+                }
+                if let Some(preview) = import
+                    .and_then(|state| state.preview.as_ref())
+                    .filter(|preview| preview.candidate_index == orig_idx)
+                {
+                    field_data.push((
+                        "Active context".into(),
+                        format!("{} messages", preview.context_count),
+                    ));
+                    for warning in &preview.warnings {
+                        field_data.push(("Warning".into(), truncate_str(warning, max_w)));
                     }
                 }
             }

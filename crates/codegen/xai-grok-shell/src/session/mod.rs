@@ -7,6 +7,7 @@ pub(crate) mod compaction_config;
 pub(crate) mod doom_loop_telemetry;
 pub(crate) mod fork_status;
 pub mod handle;
+pub mod import;
 pub(crate) mod memory_state;
 pub mod merge;
 pub(crate) mod message_delivery;

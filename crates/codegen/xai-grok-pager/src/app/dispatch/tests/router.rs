@@ -27,6 +27,148 @@ fn auth_copy_dispatch_preserves_all_delivery_states() {
     }
 }
 #[test]
+fn import_picker_survives_optimistic_home_binding_without_sending_a_prompt() {
+    let mut app = test_app_with_agent();
+    let ActiveView::Agent(agent_id) = app.active_view else { panic!("agent view") };
+    app.agents.get_mut(&agent_id).unwrap().session.session_id = None;
+    let effects = dispatch(Action::ShowImportSessionPicker, &mut app);
+    let (generation, target_cwd, owner_session_id) = match effects.as_slice() {
+        [Effect::DiscoverImportSessions { generation, target_cwd, owner_session_id, .. }] =>
+            (*generation, target_cwd.clone(), owner_session_id.clone()),
+        other => panic!("expected local discovery, got {other:?}"),
+    };
+    assert!(owner_session_id.is_none());
+    app.agents.get_mut(&agent_id).unwrap().session.session_id =
+        Some(agent_client_protocol::SessionId::new("newly-bound-home"));
+    let candidate = xai_grok_foreign_sessions::import::ImportCandidate {
+        source: xai_grok_foreign_sessions::import::ImportSource::Pi,
+        id: "foreign".into(),
+        path: "/fixture/session.jsonl".into(),
+        cwd: target_cwd.clone(),
+        title: "Saved work".into(),
+        modified: std::time::SystemTime::UNIX_EPOCH,
+        leaf_id: None,
+    };
+    let effects = dispatch(Action::TaskComplete(TaskResult::ImportSessionsDiscovered {
+        agent_id, generation, target_cwd, owner_session_id,
+        candidates: vec![candidate], warnings: Vec::new(),
+    }), &mut app);
+    assert!(effects.is_empty());
+    let agent = app.agents.get(&agent_id).unwrap();
+    assert!(agent.session.pending_prompts.is_empty());
+    assert!(matches!(agent.active_modal.as_ref(),
+        Some(crate::views::modal::ActiveModal::SessionPicker {
+            loading: false, import: Some(import), ..
+        }) if import.candidates.first().is_some_and(|candidate| candidate.id == "foreign")));
+}
+#[test]
+fn stale_import_discovery_cannot_mutate_a_picker_after_cwd_changes() {
+    let mut app = test_app_with_agent();
+    let effects = dispatch(Action::ShowImportSessionPicker, &mut app);
+    let (agent_id, generation, target_cwd, owner_session_id) = match effects.as_slice() {
+        [Effect::DiscoverImportSessions {
+            agent_id,
+            generation,
+            target_cwd,
+            owner_session_id,
+            ..
+        }] => (*agent_id, *generation, target_cwd.clone(), owner_session_id.clone()),
+        other => panic!("expected import discovery effect, got {other:?}"),
+    };
+    app.cwd = std::path::PathBuf::from("/different-project");
+    let candidate = xai_grok_foreign_sessions::import::ImportCandidate {
+        source: xai_grok_foreign_sessions::import::ImportSource::Pi,
+        id: "foreign-1".into(),
+        path: std::path::PathBuf::from("/fixture/session.jsonl"),
+        cwd: target_cwd.clone(),
+        title: "Imported transcript".into(),
+        modified: std::time::SystemTime::now(),
+        leaf_id: None,
+    };
+
+    let _ = dispatch(
+        Action::TaskComplete(TaskResult::ImportSessionsDiscovered {
+            agent_id,
+            generation,
+            target_cwd,
+            owner_session_id,
+            candidates: vec![candidate],
+            warnings: Vec::new(),
+        }),
+        &mut app,
+    );
+
+    let Some(crate::views::modal::ActiveModal::SessionPicker {
+        entries,
+        loading,
+        import: Some(import),
+        ..
+    }) = app
+        .agents
+        .get(&agent_id)
+        .and_then(|agent| agent.active_modal.as_ref())
+    else {
+        panic!("expected import picker");
+    };
+    assert!(entries.is_none());
+    assert!(*loading);
+    assert!(import.candidates.is_empty());
+}
+#[test]
+fn switching_import_scope_invalidates_the_previous_discovery_token() {
+    let mut app = test_app_with_agent();
+    let first = dispatch(Action::ShowImportSessionPicker, &mut app);
+    let (agent_id, first_generation, target_cwd, owner_session_id) = match first.as_slice() {
+        [Effect::DiscoverImportSessions {
+            agent_id,
+            generation,
+            target_cwd,
+            owner_session_id,
+            ..
+        }] => (*agent_id, *generation, target_cwd.clone(), owner_session_id.clone()),
+        other => panic!("expected import discovery effect, got {other:?}"),
+    };
+    let second = dispatch(
+        Action::ToggleImportSessionScope {
+            generation: first_generation,
+        },
+        &mut app,
+    );
+    let second_generation = match second.as_slice() {
+        [Effect::DiscoverImportSessions { generation, .. }] => *generation,
+        other => panic!("expected replacement discovery effect, got {other:?}"),
+    };
+    assert_ne!(second_generation, first_generation);
+
+    let _ = dispatch(
+        Action::TaskComplete(TaskResult::ImportSessionsDiscovered {
+            agent_id,
+            generation: first_generation,
+            target_cwd,
+            owner_session_id,
+            candidates: Vec::new(),
+            warnings: Vec::new(),
+        }),
+        &mut app,
+    );
+
+    let Some(crate::views::modal::ActiveModal::SessionPicker {
+        generation,
+        loading,
+        import: Some(import),
+        ..
+    }) = app
+        .agents
+        .get(&agent_id)
+        .and_then(|agent| agent.active_modal.as_ref())
+    else {
+        panic!("expected import picker");
+    };
+    assert_eq!(*generation, second_generation);
+    assert!(*loading);
+    assert!(import.candidates.is_empty());
+}
+#[test]
 fn external_prompt_editor_arms_typed_request_and_preserves_composer_modes() {
     use crate::app::agent_view::PromptInputMode;
     for mode in [
@@ -401,32 +543,36 @@ fn quit_returns_quit_effect() {
     assert!(matches!(effects.as_slice(), [Effect::Quit]));
 }
 #[test]
-fn resume_foreign_session_consumes_hint_and_uses_each_tools_prompt() {
+fn native_foreign_resume_hints_open_import_without_queuing_model_work() {
     use xai_grok_foreign_sessions::ForeignSessionTool;
-    for (tool, prompt) in [
-        (ForeignSessionTool::Claude, "/resume-claude native-id"),
-        (ForeignSessionTool::Codex, "/resume-codex native-id"),
-        (ForeignSessionTool::Cursor, "/resume-cursor native-id"),
-    ] {
+    for tool in [ForeignSessionTool::Claude, ForeignSessionTool::Codex] {
         let mut app = test_app();
         seed_foreign_resume_hint(&mut app, tool);
         let effects = dispatch(Action::ResumeForeignSession, &mut app);
         assert!(app.foreign_resume_hint().is_none());
-        assert!(
-            effects
-                .iter()
-                .any(|effect| matches!(effect, Effect::CreateSession { .. }))
-        );
-        assert_eq!(
-            agent_ref(&app, AgentId(0))
-                .session
-                .pending_prompts
-                .front()
-                .map(|pending| pending.text.as_str()),
-            Some(prompt)
-        );
+        assert!(effects.iter().any(|effect| matches!(effect, Effect::DiscoverImportSessions { .. })));
+        assert!(app.agents.values().all(|agent| agent.session.pending_prompts.is_empty()));
+        assert!(app.agents.values().any(|agent| matches!(agent.active_modal.as_ref(),
+            Some(crate::views::modal::ActiveModal::SessionPicker { import: Some(_), .. }))));
     }
 }
+
+#[test]
+fn gated_native_foreign_resume_defers_import_not_an_inference_prompt() {
+    use xai_grok_foreign_sessions::ForeignSessionTool;
+    let mut app = test_app();
+    app.trust_state = TrustState::Pending { workspace: "/work/proj".into() };
+    seed_foreign_resume_hint(&mut app, ForeignSessionTool::Codex);
+    app.deferred_startup.prompt = Some("stale prompt".into());
+    let effects = dispatch(Action::ResumeForeignSession, &mut app);
+    assert!(effects.is_empty());
+    assert!(app.deferred_startup.prompt.is_none());
+    assert!(matches!(app.deferred_startup.session,
+        Some(crate::app::session_startup::DeferredSessionStartup::ForeignResume {
+            tool: ForeignSessionTool::Codex, ..
+        })));
+}
+
 #[test]
 fn resume_foreign_session_without_hint_is_noop() {
     let mut app = test_app();
@@ -434,54 +580,6 @@ fn resume_foreign_session_without_hint_is_noop() {
     let effects = dispatch(Action::ResumeForeignSession, &mut app);
     assert!(effects.is_empty(), "no hint → no effects");
     assert!(app.foreign_resume_hint().is_none());
-}
-#[test]
-fn resume_foreign_session_stashes_prompt_behind_trust_and_auth() {
-    use xai_grok_foreign_sessions::ForeignSessionTool;
-    for (tool, prompt, auth_pending) in [
-        (ForeignSessionTool::Codex, "/resume-codex native-id", false),
-        (ForeignSessionTool::Cursor, "/resume-cursor native-id", true),
-    ] {
-        let mut app = test_app();
-        if auth_pending {
-            app.auth_state = AuthState::Pending { error: None };
-        } else {
-            app.trust_state = TrustState::Pending {
-                workspace: std::path::PathBuf::from("/work/proj"),
-            };
-        }
-        seed_foreign_resume_hint(&mut app, tool);
-        app.deferred_startup.session =
-            Some(crate::app::session_startup::DeferredSessionStartup::Load {
-                session_id: "must-not-load".into(),
-                session_cwd: Some(std::path::PathBuf::from("/other")),
-                chat_kind: true,
-            });
-        app.deferred_startup.worktree = true;
-        app.deferred_startup.worktree_label = Some("stale".into());
-        app.deferred_startup.worktree_ref = Some("stale-ref".into());
-        app.deferred_startup.preferred_session_id = Some("stale-id".into());
-        app.deferred_startup.new_session = true;
-        app.deferred_startup.prompt = Some("stale prompt".into());
-        app.deferred_startup.open_dashboard = true;
-        app.deferred_startup.pending_chat = true;
-        assert!(
-            app.foreign_resume_hint().is_some(),
-            "the explicit nudge remains available to supersede deferred intents"
-        );
-        let effects = dispatch(Action::ResumeForeignSession, &mut app);
-        assert!(effects.is_empty());
-        assert!(app.foreign_resume_hint().is_none());
-        assert_eq!(app.deferred_startup.prompt.as_deref(), Some(prompt));
-        assert!(app.deferred_startup.session.is_none());
-        assert!(!app.deferred_startup.worktree);
-        assert!(app.deferred_startup.worktree_label.is_none());
-        assert!(app.deferred_startup.worktree_ref.is_none());
-        assert!(app.deferred_startup.preferred_session_id.is_none());
-        assert!(!app.deferred_startup.new_session);
-        assert!(!app.deferred_startup.open_dashboard);
-        assert!(!app.deferred_startup.pending_chat);
-    }
 }
 #[test]
 fn follow_up_chip_does_not_execute_slash_command() {
