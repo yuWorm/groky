@@ -1056,12 +1056,7 @@ fn broadcast_duplicate_of_a_direct_grant_reply_cannot_reopen_a_dismissed_manager
         app.welcome_ssh_manager.is_none(),
         "the duplicate must not be routed through Welcome"
     );
-    assert!(
-        effects
-            .iter()
-            .all(|effect| matches!(effect, Effect::SshAwaitEvent { .. })),
-        "the duplicate only re-arms the global control receiver"
-    );
+    assert!(effects.is_empty(), "a duplicate grant reply must not restart work");
 }
 
 #[test]
@@ -1578,7 +1573,7 @@ fn worker_fallback_keeps_its_source_actionable_through_inherited_child_bootstrap
             client_id,
         )),
     );
-    assert!(matches!(effects.as_slice(), [Effect::SshAwaitEvent { .. }]));
+    assert!(effects.is_empty());
     let action = match app.handle_input(&Event::Key(KeyEvent::new(
         KeyCode::Char('y'),
         KeyModifiers::NONE,
@@ -1704,7 +1699,6 @@ fn worker_fallback_for_closed_source_is_rejected_without_touching_replacement_ma
     assert!(matches!(
         effects.as_slice(),
         [
-            Effect::SshAwaitEvent { .. },
             Effect::SshRejectWorkerInstall {
                 request_id,
                 session_id,
@@ -1801,10 +1795,7 @@ fn resumed_ssh_project_fallback_uses_loading_placeholder_input_and_clears_on_suc
         None,
         SshEvent::WorkerInstallRequested(request.clone()),
     );
-    assert!(matches!(
-        effects.as_slice(),
-        [Effect::SshAwaitEvent { .. }]
-    ));
+    assert!(effects.is_empty());
     let owner = app
         .agents
         .get(&agent_id)
@@ -1870,7 +1861,6 @@ fn resumed_ssh_project_fallback_uses_loading_placeholder_input_and_clears_on_suc
         matches!(
             effects.as_slice(),
             [
-                Effect::SshAwaitEvent { .. },
                 Effect::SshRejectWorkerInstall { .. }
             ]
         ),
@@ -1916,7 +1906,8 @@ fn resumed_worker_fallback_never_reopens_a_replaced_manager_or_steals_focus() {
         .and_then(|agent| agent.ssh_project_resume_install.as_ref())
         .map(|install| install.owner)
         .expect("trusted loading placeholder receives one transient owner");
-    close_ssh_manager_for_owner(&mut app, original_owner);
+    // Model session teardown retiring the owner. A normal overlay close now preserves live work.
+    app.agents.get_mut(&resumed_id).unwrap().ssh_manager = None;
     app.active_view = ActiveView::Agent(resumed_id);
     let opened = dispatch(Action::OpenSshManager, &mut app);
     let (_, replacement_owner) = ssh_target_list_request(&opened);
@@ -1931,7 +1922,6 @@ fn resumed_worker_fallback_never_reopens_a_replaced_manager_or_steals_focus() {
     assert!(matches!(
         effects.as_slice(),
         [
-            Effect::SshAwaitEvent { .. },
             Effect::SshRejectWorkerInstall { .. }
         ]
     ));
@@ -1963,7 +1953,7 @@ fn resumed_worker_fallback_never_reopens_a_replaced_manager_or_steals_focus() {
         }),
     );
     assert!(
-        matches!(effects.as_slice(), [Effect::SshAwaitEvent { .. }]),
+        effects.is_empty(),
         "late resume progress must not be applied to the replacement manager"
     );
     let resumed = app.agents.get(&resumed_id).unwrap();
@@ -2021,7 +2011,8 @@ fn remembered_project_opens_once_and_never_on_a_replacement_manager() {
         &mut app, owner, request_id, TARGET_ID.into(), SESSION_ID.into(), ready(),
     );
     assert!(opened_project_root(&duplicate).is_none());
-    close_ssh_manager_for_owner(&mut app, owner);
+    // Model an owner retired by its completed session/project lifecycle.
+    app.welcome_ssh_manager = None;
     dispatch(Action::OpenSshManager, &mut app);
     let replacement = ssh_manager_owner(&app).unwrap();
     assert_ne!(owner, replacement);
@@ -2611,7 +2602,7 @@ fn ssh_picker_connects_before_adding_target_to_its_original_draft() {
     let effects = apply_ssh_control_event(
         &mut app, Some("test-session".into()), Some(owner), status(),
     );
-    assert!(matches!(effects.as_slice(), [Effect::SshAwaitEvent { .. }]));
+    assert!(effects.is_empty());
     assert_eq!(app.active_view, ActiveView::Welcome);
     let agent = app.agents.get(&id).unwrap();
     assert!(agent.prompt.text().contains("Keep this request"));
@@ -2701,4 +2692,191 @@ fn ssh_picker_connect_result_does_not_dismiss_an_operation_approval() {
         SshModalOutcome::ApproveOperation { approval_id, approved: false, .. }
             if approval_id == "while-connecting"
     ));
+}
+
+fn press_current_ssh_interaction(app: &mut AppView, code: KeyCode) -> SshModalOutcome {
+    let manager = app.agents.get_mut(&AgentId(0)).unwrap().ssh_manager.as_mut()
+        .expect("a pending interaction must retain its UI owner");
+    let area = ratatui::layout::Rect::new(0, 0, 160, 50);
+    let mut buffer = ratatui::buffer::Buffer::empty(area);
+    crate::views::ssh_modal::render_ssh_modal(
+        &mut buffer, area, manager, false, &crate::theme::Theme::default(),
+    );
+    handle_ssh_key(manager, &KeyEvent::new(code, KeyModifiers::NONE))
+}
+
+fn interaction_grant(app: &AppView, request_id: &str) -> SshGrantRequest {
+    let mut request = grant_request(request_id, TARGET_ID, CANONICAL_ROOT, app.ssh_client_id);
+    request.session_id = app.agents.get(&AgentId(0)).unwrap().session.session_id.as_ref().unwrap().to_string();
+    request.awaiting_tool = true;
+    request
+}
+
+#[test]
+fn ssh_operation_ack_advances_to_pending_access_without_dropping_it() {
+    let mut app = test_app_with_agent();
+    let request = interaction_grant(&app, "queued-access");
+    let session_id = request.session_id.clone();
+    let client_id = app.ssh_client_id;
+    apply_ssh_control_event(&mut app, None, None,
+        SshEvent::OperationApproval(operation_approval("active-operation", &session_id, client_id)));
+    let owner = ssh_manager_owner(&app).unwrap();
+    apply_ssh_control_event(&mut app, None, None, SshEvent::GrantRequested(request));
+    assert!(matches!(press_current_ssh_interaction(&mut app, KeyCode::Char('y')),
+        SshModalOutcome::ApproveOperation { approval_id, approved:true, .. }
+            if approval_id == "active-operation"));
+    dispatch(Action::ApproveSshOperation {
+        approval_id:"active-operation".into(), approved:true,
+        scope:xai_grok_shell::ssh::SshOperationApprovalScope::Once,
+    }, &mut app);
+    dispatch(Action::TaskComplete(TaskResult::SshOperationApprovalComplete {
+        session_id:Some(session_id), client_id, owner, approval_id:"active-operation".into(),
+        expired:false, error:None,
+    }), &mut app);
+    assert!(matches!(press_current_ssh_interaction(&mut app, KeyCode::Esc),
+        SshModalOutcome::CancelGrant { request_id } if request_id == "queued-access"),
+        "operation success must expose, not destroy, the unrelated pending access request");
+}
+
+#[test]
+fn ssh_active_access_timeout_advances_to_queued_operation() {
+    let mut app = test_app_with_agent();
+    let request = interaction_grant(&app, "expired-access");
+    let session_id = request.session_id.clone();
+    let client_id = app.ssh_client_id;
+    apply_ssh_control_event(&mut app, None, None, SshEvent::GrantRequested(request));
+    apply_ssh_control_event(&mut app, None, None,
+        SshEvent::OperationApproval(operation_approval("queued-operation", &session_id, client_id)));
+    apply_ssh_control_event(&mut app, Some(session_id), None,
+        SshEvent::GrantResolved { request_id:"expired-access".into(), approved:false, binding:None });
+    assert!(matches!(press_current_ssh_interaction(&mut app, KeyCode::Esc),
+        SshModalOutcome::ApproveOperation { approval_id, approved:false, .. }
+            if approval_id == "queued-operation"));
+}
+
+#[test]
+fn ssh_queued_access_terminal_events_do_not_replace_current_operation() {
+    for terminal in ["timeout", "cancel", "failure"] {
+        let mut app = test_app_with_agent();
+        let request = interaction_grant(&app, "queued-access");
+        let session_id = request.session_id.clone();
+        let client_id = app.ssh_client_id;
+        apply_ssh_control_event(&mut app, None, None,
+            SshEvent::OperationApproval(operation_approval("active-operation", &session_id, client_id)));
+        apply_ssh_control_event(&mut app, None, None, SshEvent::GrantRequested(request));
+        let event = match terminal {
+            "timeout" => SshEvent::GrantResolved {
+                request_id:"queued-access".into(), approved:false, binding:None,
+            },
+            "cancel" => SshEvent::GrantCancelled {
+                request_id:"queued-access".into(), session_id:session_id.clone(), client_id,
+            },
+            _ => SshEvent::GrantFailed {
+                request_id:"queued-access".into(), session_id:session_id.clone(), client_id,
+                error:"isolated inspection failure".into(),
+            },
+        };
+        apply_ssh_control_event(&mut app, Some(session_id), None, event);
+        assert!(matches!(press_current_ssh_interaction(&mut app, KeyCode::Esc),
+            SshModalOutcome::ApproveOperation { approval_id, approved:false, .. }
+                if approval_id == "active-operation"),
+            "{terminal} of queued access must not clear the current operation");
+    }
+}
+
+#[test]
+fn ssh_stream_failure_reports_error_and_recovery_restores_only_current_generation() {
+    let mut app = test_app_with_agent();
+    let client_id = app.ssh_client_id;
+    app.ssh_event_pump_generation = 11;
+    app.ssh_event_control_generation = 1;
+    app.ssh_event_client_id = Some(client_id);
+    dispatch(Action::TaskComplete(TaskResult::SshEventStreamFailed {
+        pump_generation:11, control_generation:1, client_id:Some(client_id),
+        error:"fixture transport closed".into(),
+    }), &mut app);
+    assert_eq!(app.ssh_event_client_id, None, "failed reader cannot remain marked healthy");
+    assert!(app.agents.get(&AgentId(0)).unwrap().toast.as_ref()
+        .is_some_and(|(text, _)| text.contains("fixture transport closed")));
+
+    let mut request = interaction_grant(&app, "recovered-access");
+    let session_id = request.session_id.clone();
+    let recovered_client = client_id.wrapping_add(1);
+    request.client_id = Some(recovered_client);
+    let snapshot = xai_grok_shell::ssh::PendingSshInteractions {
+        client_id:recovered_client, sequence:42, grants:vec![request],
+        ..Default::default()
+    };
+    dispatch(Action::TaskComplete(TaskResult::SshEventStreamRecovered {
+        pump_generation:11, control_generation:2, client_id:recovered_client, snapshot,
+    }), &mut app);
+    assert_eq!(app.ssh_event_client_id, Some(recovered_client));
+    dispatch(Action::TaskComplete(TaskResult::SshEventStreamEvent {
+        pump_generation:11, control_generation:1, client_id,
+        event:SshEvent::OperationApproval(operation_approval("stale-operation", &session_id, client_id)),
+    }), &mut app);
+    dispatch(Action::TaskComplete(TaskResult::SshEventStreamRecovered {
+        pump_generation:10, control_generation:99, client_id,
+        snapshot:xai_grok_shell::ssh::PendingSshInteractions {client_id,..Default::default()},
+    }), &mut app);
+    assert!(matches!(press_current_ssh_interaction(&mut app, KeyCode::Esc),
+        SshModalOutcome::CancelGrant { request_id } if request_id == "recovered-access"));
+}
+
+#[test]
+fn ssh_authentication_ack_error_does_not_replace_a_newer_consent_card() {
+    let mut app = test_app_with_agent();
+    let session_id = app.agents.get(&AgentId(0)).unwrap().session.session_id.as_ref().unwrap().to_string();
+    let client_id = app.ssh_client_id;
+    apply_ssh_control_event(&mut app, None, None,
+        SshEvent::OperationApproval(operation_approval("current-operation", &session_id, client_id)));
+    let owner = ssh_manager_owner(&app).unwrap();
+    dispatch(Action::TaskComplete(TaskResult::SshAuthenticationComplete {
+        client_id, owner, challenge_id:"earlier-challenge".into(), connection_generation:1,
+        target_id:"target-a".into(), error:Some("fixture authentication transport failure".into()),
+    }), &mut app);
+    assert!(matches!(press_current_ssh_interaction(&mut app, KeyCode::Esc),
+        SshModalOutcome::ApproveOperation { approval_id, approved:false, .. }
+            if approval_id == "current-operation"));
+    assert!(app.agents.get(&AgentId(0)).unwrap().toast.as_ref()
+        .is_some_and(|(text, _)| text.contains("target-a") && text.contains("fixture authentication transport failure")));
+}
+
+#[test]
+fn ssh_recovery_restores_authoritative_sudo_prompt_and_preserves_typed_secret() {
+    let mut app = test_app_with_agent();
+    let session_id = app.agents.get(&AgentId(0)).unwrap().session.session_id.as_ref().unwrap().to_string();
+    let client_id = app.ssh_client_id;
+    app.ssh_event_pump_generation = 7;
+    let snapshot = xai_grok_shell::ssh::PendingSshInteractions {
+        client_id, sequence:10, active_operation_ids:vec!["live-root-operation".into()],
+        sudo_authentication:vec![xai_grok_shell::ssh::SshPendingSudoAuthentication {
+            session_id, operation_id:"live-root-operation".into(),
+            prompt:SshAuthPrompt {
+                client_id, connection_generation:3, challenge_id:"live-root-password".into(),
+                target_id:"fixture".into(), kind:SshAuthPromptKind::SudoPassword,
+                detail:SshAuthPromptDetail::Secret {
+                    username:"operator".into(), message:String::new(), allow_remember:false,
+                },
+            },
+        }],
+        ..Default::default()
+    };
+    let recover = |snapshot| Action::TaskComplete(TaskResult::SshEventStreamRecovered {
+        pump_generation:7, control_generation:1, client_id, snapshot,
+    });
+    let effects = dispatch(recover(snapshot.clone()), &mut app);
+    assert!(!effects.iter().any(|effect| matches!(effect, Effect::SshApproveOperation { .. } | Effect::SshApproveGrant { .. })));
+    crate::views::ssh_modal::handle_ssh_paste(
+        app.agents.get_mut(&AgentId(0)).unwrap().ssh_manager.as_mut().unwrap(),
+        "fixture-only-password",
+    );
+    dispatch(recover(snapshot), &mut app);
+    let SshModalOutcome::AnswerAuthentication { challenge_id, secret:Some(secret), remember:false, .. } =
+        press_current_ssh_interaction(&mut app, KeyCode::Enter)
+    else {
+        panic!("live recovered sudo challenge must stay answerable with retained input");
+    };
+    assert_eq!(challenge_id, "live-root-password");
+    assert_eq!(secret.into_bytes(), b"fixture-only-password");
 }

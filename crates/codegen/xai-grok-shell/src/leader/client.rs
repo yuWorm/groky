@@ -77,7 +77,7 @@ pub struct LeaderClient {
     /// Last `ShuttingDown` reason received from the server.
     /// `None` means no `ShuttingDown` message has arrived yet (unplanned disconnect or still connected).
     shutting_down_rx: watch::Receiver<Option<super::protocol::ShutdownReason>>,
-    ssh_events: broadcast::Sender<crate::ssh::SshEvent>,
+    ssh_events: broadcast::Sender<crate::ssh::SshEventEnvelope>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -160,7 +160,7 @@ impl LeaderClient {
 
     /// Receives local-only SSH control/authentication events. These events
     /// never enter ACP or model/session replay.
-    pub fn subscribe_ssh_events(&self) -> broadcast::Receiver<crate::ssh::SshEvent> {
+    pub fn subscribe_ssh_events(&self) -> broadcast::Receiver<crate::ssh::SshEventEnvelope> {
         self.ssh_events.subscribe()
     }
 
@@ -203,6 +203,11 @@ impl LeaderClient {
             ));
         }
 
+        let mut disconnect = self.disconnect_reason();
+        if *disconnect.borrow() != DisconnectReason::Connected {
+            return Err(ClientError::ConnectionClosed);
+        }
+
         let request_id = self
             .next_request_id
             .fetch_add(1, Ordering::Relaxed)
@@ -225,7 +230,17 @@ impl LeaderClient {
             return Err(ClientError::ConnectionClosed);
         }
 
-        rx.await.map_err(|_| ClientError::ControlResponseDropped)
+        let result = tokio::select! {
+            biased;
+            reply = rx => reply.map_err(|_| ClientError::ControlResponseDropped),
+            _ = disconnect.wait_for(|reason| *reason != DisconnectReason::Connected) => {
+                Err(ClientError::ConnectionClosed)
+            }
+        };
+        if result.is_err() {
+            self.pending_control.lock().await.remove(&request_id);
+        }
+        result
     }
 
     pub async fn recv(&mut self) -> Option<String> {
@@ -326,7 +341,7 @@ async fn register(
     cancel: CancellationToken,
     disconnect_tx: watch::Sender<DisconnectReason>,
     shutting_down_tx: watch::Sender<Option<super::protocol::ShutdownReason>>,
-    ssh_events: broadcast::Sender<crate::ssh::SshEvent>,
+    ssh_events: broadcast::Sender<crate::ssh::SshEventEnvelope>,
 ) -> Result<(LeaderRegistration, bool), ClientError> {
     write_message(
         &mut writer,
@@ -763,6 +778,42 @@ mod tests {
 
         client.cancel();
         handle.cancel.cancel();
+    }
+
+    #[tokio::test]
+    async fn control_request_after_disconnect_fails_without_waiting_for_keepalive() {
+        let temp = TempDir::new().unwrap();
+        let sock_path = temp.path().join("test.sock");
+        let handle = spawn_leader_server(sock_path.clone()).await.unwrap();
+        let client = LeaderClient::connect(
+            sock_path,
+            "test",
+            ClientMode::Stdio,
+            ClientCapabilities::default(),
+        )
+        .await
+        .unwrap();
+        let mut disconnect = client.disconnect_reason();
+        handle.cancel.cancel();
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            disconnect.wait_for(|reason| *reason != DisconnectReason::Connected),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(1),
+            client.send_control(ControlCommand::Ssh(
+                crate::ssh::SshControlCommand::SnapshotPendingInteractions,
+            )),
+        )
+        .await
+        .expect("a disconnected control request must not wait for another socket read");
+        assert!(matches!(result, Err(ClientError::ConnectionClosed)));
+        assert!(client.pending_control.lock().await.is_empty());
+        client.cancel();
     }
 
     #[derive(Debug)]

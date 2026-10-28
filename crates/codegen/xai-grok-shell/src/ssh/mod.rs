@@ -15,12 +15,13 @@ mod worker_install;
 pub use control::{SshAuthControlResponse, SshControlCommand, SshControlReply};
 pub use control_client::{SshControlClient, SshControlClientError};
 pub use model::{
-    PersistedSshGrant, PersistedSshState, ProjectSshBinding, RevokeStatus, SshAuthPrompt,
-    SshAuthPromptDetail, SshAuthPromptKind, SshAuthResponse, SshConnectionState,
-    SshDirectoryEntry, SshDirectoryListing, SshDispatchRequest, SshDispatchResult, SshEvent,
-    SshGrantDecision, SshGrantRequest, SshGrantScope, SshGrantStatus, SshHostKeyDecision,
-    SshKeyboardInteractiveQuestion, SshOperationApproval, SshOperationApprovalDecision,
-    SshOperationApprovalScope, SshProjectPreparation, SshSessionWorkerEvent, SshTargetAccess,
+    PendingSshInteractions, PersistedSshGrant, PersistedSshState, ProjectSshBinding,
+    RevokeStatus, SshAuthPrompt, SshAuthPromptDetail, SshAuthPromptKind, SshAuthResponse,
+    SshConnectionState, SshDirectoryEntry, SshDirectoryListing, SshDispatchRequest,
+    SshDispatchResult, SshEvent, SshEventEnvelope, SshGrantDecision, SshGrantRequest,
+    SshGrantScope, SshGrantStatus, SshHostKeyDecision, SshKeyboardInteractiveQuestion,
+    SshOperationApproval, SshOperationApprovalDecision, SshOperationApprovalScope,
+    SshPendingSudoAuthentication, SshProjectPreparation, SshSessionWorkerEvent, SshTargetAccess,
     SshTargetCandidate, SshTargetCandidateSource, SshTargetDiscovery, SshTargetStatus,
     SshWorkerInstallDecision, SshWorkerInstallProgress, SshWorkerInstallRequest,
 };
@@ -30,4 +31,7 @@ pub use tools::register_tool_pack;
 pub use xai_grok_workspace_types::ssh::{
     ProjectLocation, ResolvedSshInvocation, SshBinding, SshCapabilities, SshHostIdentity,
     SshOperation,
+};
+pub use xai_grok_workspace_types::ssh_wire::{
+    SshOperationRecord, SshOperationState, SshWorkerEvent,
 };

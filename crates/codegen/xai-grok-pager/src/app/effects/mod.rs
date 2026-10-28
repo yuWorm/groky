@@ -949,6 +949,7 @@ pub(crate) fn execute(
         Effect::SshSubmitAuthentication {
             client_id,
             challenge_id,
+            target_id,
             connection_generation,
             host_key_decision,
             remember,
@@ -961,7 +962,7 @@ pub(crate) fn execute(
                 let response = xai_grok_shell::ssh::SshAuthControlResponse {
                     client_id,
                     connection_generation,
-                    challenge_id,
+                    challenge_id: challenge_id.clone(),
                     accepted: None,
                     host_key_decision,
                     remember,
@@ -971,15 +972,17 @@ pub(crate) fn execute(
                         .map(crate::views::ssh_modal::SshSecret::into_bytes)
                         .collect(),
                 };
-                ssh_action(
-                    None,
-                    None,
-                    client_id,
-                    owner,
+                let result = ssh_control_reply(
                     xai_grok_shell::ssh::SshControlCommand::SubmitAuthentication(response),
-                    "SSH authentication response sent to the local service.",
-                )
-                .await
+                    client_id,
+                ).await;
+                let (client_id, error) = match result {
+                    Ok((client_id, _)) => (client_id, None),
+                    Err((client_id, error)) => (client_id, Some(error)),
+                };
+                TaskResult::SshAuthenticationComplete {
+                    client_id, owner, challenge_id, connection_generation, target_id, error,
+                }
             });
         }
         Effect::SshApproveOperation {
@@ -1111,12 +1114,6 @@ pub(crate) fn execute(
                     error,
                 }
             });
-        }
-        Effect::SshAwaitEvent {
-            client_id,
-            session_id,
-        } => {
-            tasks.spawn(async move { await_ssh_event(session_id, client_id).await });
         }
         Effect::OpenSshProject {
             agent_id,
@@ -6312,24 +6309,6 @@ async fn ssh_control_client_id(fallback_client_id: u64) -> u64 {
         .unwrap_or(fallback_client_id)
 }
 
-async fn await_ssh_event(session_id: Option<String>, fallback_client_id: u64) -> TaskResult {
-    match crate::app::ssh_control::next_event().await {
-        Ok((client_id, event)) => TaskResult::SshControlEvent {
-            session_id,
-            client_id,
-            event,
-            owner: None,
-        },
-        Err(error) => TaskResult::SshActionComplete {
-            session_id,
-            client_id: fallback_client_id,
-            target_id: None,
-            message: None,
-            error: Some(sanitize_user_error_full(&error.to_string())),
-            owner: None,
-        },
-    }
-}
 
 /// Apply the authoritative status returned by connect/disconnect immediately.
 ///

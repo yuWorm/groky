@@ -1058,8 +1058,13 @@ pub struct AppView {
     pub(crate) welcome_ssh_manager: Option<crate::views::ssh_modal::SshManagerState>,
     /// Stable local-control identity for SSH authentication and consent events.
     pub(crate) ssh_client_id: u64,
-    /// Exactly one local-control receiver owns this pager connection's SSH event stream.
-    pub(crate) ssh_event_consumer_active: bool,
+    /// Monotonic identity of the one pager-owned SSH event pump.
+    pub(crate) ssh_event_pump_generation: u64,
+    /// Current recovery generation within that pump. It changes only after the
+    /// reader recovers or the backend/client changes.
+    pub(crate) ssh_event_control_generation: u64,
+    /// Exact client currently represented by the event pump snapshot.
+    pub(crate) ssh_event_client_id: Option<u64>,
     /// Direct replies are deduplicated by request and phase: an inspection reply must not hide
     /// a later tool-cancellation resolution delivered only through the event stream.
     pub(crate) direct_ssh_grant_replies:
@@ -1585,7 +1590,9 @@ impl AppView {
             welcome_vendor_login: None,
             welcome_ssh_manager: None,
             ssh_client_id: rand::random(),
-            ssh_event_consumer_active: false,
+            ssh_event_pump_generation: 0,
+            ssh_event_control_generation: 0,
+            ssh_event_client_id: None,
             direct_ssh_grant_replies: Default::default(),
             welcome_doc_viewer: None,
             screen_mode: ScreenMode::Inline,

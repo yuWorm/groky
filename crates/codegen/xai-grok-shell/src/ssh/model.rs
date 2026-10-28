@@ -307,6 +307,54 @@ pub enum SshEvent {
     TargetStatus(SshTargetStatus),
 }
 
+/// One local-control event with a service-local ordering token.
+///
+/// The token lets a recovering client discard buffered events that predate an
+/// authoritative pending-interaction snapshot. It has no authority outside
+/// this service instance.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum SshEventEnvelope {
+    Event {
+        sequence: u64,
+        event: SshEvent,
+    },
+    /// The leader's service subscription lagged. Clients must reconcile an
+    /// authoritative snapshot before accepting later events.
+    ResyncRequired,
+}
+
+/// Active local-only interactions for exactly one control client.
+///
+/// This is safe to transport across the leader IPC because it contains only
+/// human-readable descriptors; authentication answers and every other secret
+/// remain in the service waiter.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct PendingSshInteractions {
+    pub client_id: u64,
+    /// Every interaction state mutation through this event sequence is
+    /// reflected in this snapshot. Receivers must ignore envelopes at or
+    /// below this barrier after reconciliation.
+    pub sequence: u64,
+    /// Nonterminal native operation IDs scoped to this exact client. This
+    /// covers the valid interval after approval and before a sudo prompt, and
+    /// NOPASSWD execution where no password prompt exists.
+    pub active_operation_ids: Vec<String>,
+    pub grants: Vec<SshGrantRequest>,
+    pub authentication: Vec<SshAuthPrompt>,
+    pub sudo_authentication: Vec<SshPendingSudoAuthentication>,
+    pub operation_approvals: Vec<SshOperationApproval>,
+    pub worker_installs: Vec<SshWorkerInstallRequest>,
+}
+
+/// One root-password descriptor retained while its exact operation waits.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SshPendingSudoAuthentication {
+    pub session_id: String,
+    pub operation_id: String,
+    pub prompt: SshAuthPrompt,
+}
+
 /// A current remote-worker approval request. It is sent only to the client
 /// that originated the call and is not replayed in conversation history.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

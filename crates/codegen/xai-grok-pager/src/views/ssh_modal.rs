@@ -17,6 +17,7 @@ use ratatui::text::{Line, Span};
 use serde_json::Value;
 use std::{
     borrow::Cow,
+    collections::VecDeque,
     sync::atomic::{AtomicU64, Ordering},
 };
 use xai_grok_shell::ssh::{
@@ -1360,9 +1361,60 @@ struct SubmittedOperationApproval {
 /// The tuple remains local so an event from a retired operation cannot replace another modal.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct PendingSudoAuthentication {
+    approval_id: String,
     operation_id: String,
     client_id: Option<u64>,
     challenge_id: Option<String>,
+}
+
+/// A not-yet-displayed request keeps only non-secret server data. User edits live in the
+/// active surface and are never copied into this queue.
+struct QueuedGrant {
+    session_id: String,
+    request: SshIncomingGrant,
+}
+
+/// A complete local surface temporarily displaced by a scoped sudo challenge.
+///
+/// This moves (rather than clones) editors, browsers, and secret buffers. Restoring it after
+/// the exact challenge settles therefore cannot leak a password or reset human input.
+struct SuspendedSshSurface {
+    page: SshModalPage,
+    project_browser: Option<SshProjectBrowser>,
+    pending_project_open: Option<PendingProjectOpen>,
+    resume_project_browser_after_authentication: bool,
+    pending_grant: Option<SshIncomingGrant>,
+    submitted_grant: Option<SubmittedGrantDecision>,
+    pending_grant_session_id: Option<String>,
+    pending_grant_follow_up: Option<SshGrantFollowUp>,
+    local_grant_options: Option<LocalGrantOptions>,
+}
+
+/// Pending remote work is independent from the one modal page currently accepting input.
+///
+/// FIFO preserves arrival order for unrelated requests. A suspended surface is inserted at the
+/// front only when an exact sudo continuation must preempt it.
+enum PendingSshInteraction {
+    Grant(QueuedGrant),
+    Operation(SshOperationApprovalCard),
+    Authentication(SshAuthCard),
+    WorkerInstall(SshWorkerInstallFallbackCard),
+    Suspended(SuspendedSshSurface),
+}
+
+/// Authoritative identities from a recovered control-stream snapshot.
+///
+/// Values are exact opaque correlations, not display text. The dispatcher constructs this from
+/// the service DTO before replaying only snapshot-live prompt cards into the modal.
+pub struct SshLiveInteractionIds {
+    pub grant_ids: Vec<String>,
+    pub authentication: Vec<(String, u64, String)>,
+    pub operation_approval_ids: Vec<String>,
+    /// `(client, request, session, binding)` is the opaque worker-install correlation.
+    pub worker_install_ids: Vec<(u64, String, String, String)>,
+    /// Includes root operations between approval acknowledgement and password publication and
+    /// NOPASSWD execution, so absence from prompt lists alone never retires a valid sudo wait.
+    pub active_operation_ids: Vec<String>,
 }
 
 struct SshDeleteConfirmation {
@@ -1470,6 +1522,12 @@ pub struct SshManagerState {
     pending_connection_is_connecting: bool,
     /// Immutable request retained while a directory selection or identity inspection is pending.
     pending_grant: Option<SshIncomingGrant>,
+    /// Unrelated remote interactions wait here without replacing the current card, browser, or
+    /// draft. Items are moved, never cloned, so authentication secrets retain zeroization.
+    pending_interactions: VecDeque<PendingSshInteraction>,
+    /// Effectful continuation emitted while promoting queued grant work. Dispatch drains it only
+    /// after the borrowed manager is released.
+    pending_interaction_continuation: Option<SshModalOutcome>,
     /// Request IDs whose inspection has been dispatched. This suppresses duplicated grant events
     /// until the matching verified event arrives.
     inspecting_grant_ids: Vec<String>,
@@ -1491,10 +1549,11 @@ pub struct SshManagerState {
     /// Session whose grants are shown. `None` is Welcome: connect/config actions remain usable,
     /// but granting and selecting a default requires creating or opening a session first.
     pub session_id: Option<String>,
-    /// Exact operation decision awaiting its local-control acknowledgement.
-    submitted_operation_approval: Option<SubmittedOperationApproval>,
+    /// Exact operation decisions awaiting local-control acknowledgement, retained independently
+    /// so a later approval cannot overwrite an earlier one.
+    submitted_operation_approvals: Vec<SubmittedOperationApproval>,
     /// Root authentication is accepted only for the exact approved operation in this manager.
-    pending_sudo_authentication: Option<PendingSudoAuthentication>,
+    pending_sudo_authentications: Vec<PendingSudoAuthentication>,
 }
 
 impl SshManagerState {
@@ -1523,6 +1582,8 @@ impl SshManagerState {
             pending_connection: None,
             pending_connection_is_connecting: false,
             pending_grant: None,
+            pending_interactions: VecDeque::new(),
+            pending_interaction_continuation: None,
             inspecting_grant_ids: Vec::new(),
             cancelled_grant_ids: Vec::new(),
             submitted_grant: None,
@@ -1532,8 +1593,8 @@ impl SshManagerState {
             settled_grant_follow_up: None,
             local_grant_options: None,
             session_id,
-            submitted_operation_approval: None,
-            pending_sudo_authentication: None,
+            submitted_operation_approvals: Vec::new(),
+            pending_sudo_authentications: Vec::new(),
         }
     }
 
@@ -1575,9 +1636,17 @@ impl SshManagerState {
         self.pending_target_reference = None;
     }
 
-    /// True means the caller must retain this manager for an outstanding sudo challenge.
+    /// True means the caller must retain this manager for pending human work or an outstanding
+    /// sudo challenge. Closing an overlay may hide it, but must never destroy queued cards.
     pub fn hide_if_waiting_for_sudo(&mut self) -> bool {
-        if self.pending_sudo_authentication.is_none() {
+        if self.has_protected_surface() {
+            return true;
+        }
+        if !self.pending_interactions.is_empty() {
+            self.activate_next_pending_interaction();
+            return true;
+        }
+        if self.pending_sudo_authentications.is_empty() {
             return false;
         }
         if matches!(&self.page, SshModalPage::Authentication(card)
@@ -1589,6 +1658,99 @@ impl SshManagerState {
         self.page = SshModalPage::Manager;
         self.resume_project_browser_after_authentication = false;
         true
+    }
+
+    fn has_protected_surface(&self) -> bool {
+        self.pending_grant.is_some()
+            || self.project_browser.is_some()
+            || !matches!(&self.page, SshModalPage::Manager)
+    }
+
+    fn queue_interaction(&mut self, interaction: PendingSshInteraction) {
+        self.pending_interactions.push_back(interaction);
+    }
+
+    fn suspended_surface(&mut self) -> Option<SuspendedSshSurface> {
+        if !self.has_protected_surface() {
+            return None;
+        }
+        Some(SuspendedSshSurface {
+            page: std::mem::replace(&mut self.page, SshModalPage::Manager),
+            project_browser: self.project_browser.take(),
+            pending_project_open: self.pending_project_open.take(),
+            resume_project_browser_after_authentication: std::mem::take(
+                &mut self.resume_project_browser_after_authentication,
+            ),
+            pending_grant: self.pending_grant.take(),
+            submitted_grant: self.submitted_grant.take(),
+            pending_grant_session_id: self.pending_grant_session_id.take(),
+            pending_grant_follow_up: self.pending_grant_follow_up.take(),
+            local_grant_options: self.local_grant_options.take(),
+        })
+    }
+
+    fn restore_suspended_surface(&mut self, surface: SuspendedSshSurface) {
+        self.page = surface.page;
+        self.project_browser = surface.project_browser;
+        self.pending_project_open = surface.pending_project_open;
+        self.resume_project_browser_after_authentication =
+            surface.resume_project_browser_after_authentication;
+        self.pending_grant = surface.pending_grant;
+        self.submitted_grant = surface.submitted_grant;
+        self.pending_grant_session_id = surface.pending_grant_session_id;
+        self.pending_grant_follow_up = surface.pending_grant_follow_up;
+        self.local_grant_options = surface.local_grant_options;
+        if matches!(&self.page, SshModalPage::Manager) {
+            self.promote_verified_active_grant();
+        }
+        self.visible = true;
+    }
+
+    fn retain_promotion_continuation(&mut self, outcome: SshModalOutcome) {
+        if matches!(
+            &outcome,
+            SshModalOutcome::BrowseProjectDirectory { .. }
+                | SshModalOutcome::InspectGrantTarget { .. }
+                | SshModalOutcome::ApproveGrant { approved: false, .. }
+                | SshModalOutcome::CancelGrant { .. }
+        ) {
+            self.pending_interaction_continuation = Some(outcome);
+        }
+    }
+
+    /// Take the effectful follow-up produced while activating queued grant work.
+    ///
+    /// The dispatcher calls this only after releasing its manager borrow, preserving the exact
+    /// owner and preventing an unrelated event from starting a duplicate inspection.
+    pub fn take_pending_interaction_continuation(&mut self) -> Option<SshModalOutcome> {
+        self.pending_interaction_continuation.take()
+    }
+
+    /// Promote exactly one queued interaction after the active flow finishes.
+    fn activate_next_pending_interaction(&mut self) {
+        let Some(interaction) = self.pending_interactions.pop_front() else {
+            return;
+        };
+        match interaction {
+            PendingSshInteraction::Suspended(surface) => self.restore_suspended_surface(surface),
+            PendingSshInteraction::Operation(card) => {
+                self.visible = true;
+                self.page = SshModalPage::OperationApproval(card);
+            }
+            PendingSshInteraction::Authentication(card) => {
+                self.resume_project_browser_after_authentication = false;
+                self.visible = true;
+                self.page = SshModalPage::Authentication(card);
+            }
+            PendingSshInteraction::WorkerInstall(card) => {
+                self.visible = true;
+                self.page = SshModalPage::WorkerInstallFallback(card);
+            }
+            PendingSshInteraction::Grant(grant) => {
+                let outcome = self.show_incoming_grant(grant.session_id, grant.request);
+                self.retain_promotion_continuation(outcome);
+            }
+        }
     }
 
 
@@ -2298,7 +2460,8 @@ impl SshManagerState {
         true
     }
 
-    /// Return the pre-minted or current session that owns a displayed/pending grant request.
+    /// Return the pre-minted or current session that owns a displayed, queued, or suspended
+    /// grant request.
     pub fn grant_session_id_for(&self, request_id: &str) -> Option<String> {
         let request_matches = self
             .pending_grant
@@ -2307,6 +2470,30 @@ impl SshManagerState {
             || matches!(&self.page, SshModalPage::Grant(card) if card.request_id == request_id);
         if request_matches {
             return self.pending_grant_session_id.clone();
+        }
+        if let Some(session_id) = self.pending_interactions.iter().find_map(|interaction| {
+            match interaction {
+                PendingSshInteraction::Grant(queued)
+                    if queued.request.request_id == request_id =>
+                {
+                    Some(queued.session_id.clone())
+                }
+                PendingSshInteraction::Suspended(surface)
+                    if surface
+                        .pending_grant
+                        .as_ref()
+                        .is_some_and(|request| request.request_id == request_id) =>
+                {
+                    surface.pending_grant_session_id.clone()
+                }
+                PendingSshInteraction::Grant(_)
+                | PendingSshInteraction::Operation(_)
+                | PendingSshInteraction::Authentication(_)
+                | PendingSshInteraction::WorkerInstall(_)
+                | PendingSshInteraction::Suspended(_) => None,
+            }
+        }) {
+            return Some(session_id);
         }
         (self
             .local_grant_options
@@ -2511,43 +2698,110 @@ impl SshManagerState {
     }
 
     pub fn show_authentication(&mut self, card: SshAuthCard) {
-        self.resume_project_browser_after_authentication =
-            matches!(&self.page, SshModalPage::ProjectBrowser)
-                && self
-                    .project_browser
-                    .as_ref()
-                    .is_some_and(|browser| browser.target_id == card.target_id);
+        let same_active = matches!(
+            &self.page,
+            SshModalPage::Authentication(current)
+                if current.challenge_id == card.challenge_id
+                    && current.connection_generation == card.connection_generation
+                    && current.target_id == card.target_id
+        );
+        if same_active
+            || self.pending_interactions.iter().any(|interaction| match interaction {
+                PendingSshInteraction::Authentication(current) => {
+                    current.challenge_id == card.challenge_id
+                        && current.connection_generation == card.connection_generation
+                        && current.target_id == card.target_id
+                }
+                PendingSshInteraction::Suspended(surface) => matches!(
+                    &surface.page,
+                    SshModalPage::Authentication(current)
+                        if current.challenge_id == card.challenge_id
+                            && current.connection_generation == card.connection_generation
+                            && current.target_id == card.target_id
+                ),
+                PendingSshInteraction::Grant(_)
+                | PendingSshInteraction::Operation(_)
+                | PendingSshInteraction::WorkerInstall(_) => false,
+            })
+        {
+            return;
+        }
+        let belongs_to_active_flow =
+            self.pending_authentication_target_id() == Some(card.target_id.as_str());
+        let resumes_browser = matches!(&self.page, SshModalPage::ProjectBrowser)
+            && self
+                .project_browser
+                .as_ref()
+                .is_some_and(|browser| browser.target_id == card.target_id);
+        if self.has_protected_surface() && !belongs_to_active_flow {
+            self.queue_interaction(PendingSshInteraction::Authentication(card));
+            return;
+        }
+        if self.has_protected_surface() && !resumes_browser {
+            if let Some(surface) = self.suspended_surface() {
+                self.pending_interactions
+                    .push_front(PendingSshInteraction::Suspended(surface));
+            }
+        }
+        self.resume_project_browser_after_authentication = resumes_browser;
         self.visible = true;
         self.page = SshModalPage::Authentication(card);
     }
 
-    /// Display a remote operation approval card.
+    /// Display a remote operation approval card without replacing unrelated local work.
     pub fn show_operation_approval(&mut self, card: SshOperationApprovalCard) {
+        let approval_id = card.approval_id.as_str();
+        if matches!(
+            &self.page,
+            SshModalPage::OperationApproval(current) if current.approval_id == approval_id
+        ) || self.pending_interactions.iter().any(|interaction| match interaction {
+            PendingSshInteraction::Operation(current) => current.approval_id == approval_id,
+            PendingSshInteraction::Suspended(surface) => matches!(
+                &surface.page,
+                SshModalPage::OperationApproval(current) if current.approval_id == approval_id
+            ),
+            PendingSshInteraction::Grant(_)
+            | PendingSshInteraction::Authentication(_)
+            | PendingSshInteraction::WorkerInstall(_) => false,
+        }) {
+            return;
+        }
+        if self.has_protected_surface() {
+            self.queue_interaction(PendingSshInteraction::Operation(card));
+            return;
+        }
         self.visible = true;
         self.page = SshModalPage::OperationApproval(card);
-        self.submitted_operation_approval = None;
-        self.pending_sudo_authentication = None;
     }
 
     /// Mark the exact visible card as submitted. Stale input cannot decide another operation.
     pub fn submit_operation_approval(&mut self, approval_id: &str, approved: bool) -> bool {
-        let SshModalPage::OperationApproval(card) = &mut self.page else {
-            return false;
+        let pending_sudo = {
+            let SshModalPage::OperationApproval(card) = &mut self.page else {
+                return false;
+            };
+            if card.approval_id != approval_id || card.submitting {
+                return false;
+            }
+            card.submitting = true;
+            card.error = None;
+            (approved && card.is_sudo())
+                .then(|| card.operation_id.clone())
+                .flatten()
         };
-        if card.approval_id != approval_id || card.submitting {
-            return false;
-        }
-        card.submitting = true;
-        card.error = None;
-        self.pending_sudo_authentication = (approved && card.is_sudo())
-            .then(|| card.operation_id.as_ref())
-            .flatten()
-            .map(|operation_id| PendingSudoAuthentication {
-                operation_id: operation_id.clone(),
+        if let Some(operation_id) = pending_sudo {
+            self.pending_sudo_authentications
+                .retain(|pending| pending.approval_id != approval_id);
+            self.pending_sudo_authentications.push(PendingSudoAuthentication {
+                approval_id: approval_id.to_owned(),
+                operation_id,
                 client_id: None,
                 challenge_id: None,
             });
-        self.submitted_operation_approval = Some(SubmittedOperationApproval {
+        }
+        self.submitted_operation_approvals
+            .retain(|submitted| submitted.approval_id != approval_id);
+        self.submitted_operation_approvals.push(SubmittedOperationApproval {
             approval_id: approval_id.to_owned(),
             approved,
         });
@@ -2555,7 +2809,8 @@ impl SshManagerState {
     }
 
     /// Display a root-password challenge only for the exact root operation that was approved in
-    /// this session. A stale challenge is ignored rather than replacing unrelated user input.
+    /// this session. An unrelated authentication prompt keeps its own input and queues this
+    /// challenge; the already-submitted root approval itself is obsolete and is never suspended.
     pub fn show_sudo_authentication(
         &mut self,
         client_id: u64,
@@ -2566,36 +2821,140 @@ impl SshManagerState {
         if self.session_id.as_deref() != Some(session_id) {
             return false;
         }
-        let matches_submitted_root = matches!(
+        let Some(index) = self
+            .pending_sudo_authentications
+            .iter()
+            .position(|pending| pending.operation_id == operation_id)
+        else {
+            return false;
+        };
+        let pending = &self.pending_sudo_authentications[index];
+        let duplicate = |current: &SshAuthCard| {
+            pending.client_id == Some(client_id)
+                && pending.challenge_id.as_deref() == Some(card.challenge_id.as_str())
+                && current.challenge_id == card.challenge_id
+                && current.connection_generation == card.connection_generation
+                && current.target_id == card.target_id
+                && matches!(&current.kind, SshAuthKind::SudoPassword { .. })
+        };
+        if matches!(&self.page, SshModalPage::Authentication(current) if duplicate(current))
+            || self.pending_interactions.iter().any(|interaction| match interaction {
+                PendingSshInteraction::Authentication(current) => duplicate(current),
+                PendingSshInteraction::Suspended(surface) => matches!(
+                    &surface.page,
+                    SshModalPage::Authentication(current) if duplicate(current)
+                ),
+                PendingSshInteraction::Grant(_)
+                | PendingSshInteraction::Operation(_)
+                | PendingSshInteraction::WorkerInstall(_) => false,
+            })
+        {
+            return true;
+        }
+        let approval_id = pending.approval_id.clone();
+        self.pending_sudo_authentications[index].client_id = Some(client_id);
+        self.pending_sudo_authentications[index].challenge_id = Some(card.challenge_id.clone());
+        let replaces_own_submitted_card = matches!(
             &self.page,
             SshModalPage::OperationApproval(approval)
                 if approval.submitting
                     && approval.is_sudo()
                     && approval.operation_id.as_deref() == Some(operation_id)
+                    && approval.approval_id == approval_id
         );
-        let Some(pending) = self.pending_sudo_authentication.as_mut() else {
-            return false;
-        };
-        if pending.operation_id != operation_id {
-            return false;
+        if matches!(&self.page, SshModalPage::Authentication(_)) {
+            self.pending_interactions
+                .push_front(PendingSshInteraction::Authentication(card));
+            return true;
         }
-        if let SshModalPage::Authentication(current) = &self.page {
-            return pending.client_id == Some(client_id)
-                && pending.challenge_id.as_deref() == Some(card.challenge_id.as_str())
-                && current.challenge_id == card.challenge_id
-                && current.connection_generation == card.connection_generation
-                && current.target_id == card.target_id
-                && matches!(&current.kind, SshAuthKind::SudoPassword { .. });
+        if !replaces_own_submitted_card {
+            if let Some(surface) = self.suspended_surface() {
+                self.pending_interactions
+                    .push_front(PendingSshInteraction::Suspended(surface));
+            }
         }
-        if !matches_submitted_root && !matches!(&self.page, SshModalPage::Manager) {
-            return false;
-        }
-        pending.client_id = Some(client_id);
-        pending.challenge_id = Some(card.challenge_id.clone());
         self.resume_project_browser_after_authentication = false;
         self.page = SshModalPage::Authentication(card);
         self.visible = true;
         true
+    }
+
+    /// Recover a password prompt from an authoritative pending-interaction snapshot.
+    ///
+    /// The active-operation list proves only that this client already has a live native
+    /// operation. It does not create an approval or replay a command; it merely restores the
+    /// exact password challenge that the service is still waiting to receive.
+    pub fn recover_sudo_authentication(
+        &mut self,
+        client_id: u64,
+        session_id: &str,
+        operation_id: &str,
+        active_operation_ids: &[String],
+        card: SshAuthCard,
+    ) -> bool {
+        if self.session_id.as_deref() != Some(session_id)
+            || !active_operation_ids.iter().any(|candidate| candidate == operation_id)
+        {
+            return false;
+        }
+        if !self
+            .pending_sudo_authentications
+            .iter()
+            .any(|pending| pending.operation_id == operation_id)
+        {
+            self.pending_sudo_authentications.push(PendingSudoAuthentication {
+                // There is no pending approval ID in this snapshot stage. The operation ID is
+                // opaque, exact, and only used to retire this recovered display correlation.
+                approval_id: operation_id.to_owned(),
+                operation_id: operation_id.to_owned(),
+                client_id: None,
+                challenge_id: None,
+            });
+        }
+        self.show_sudo_authentication(client_id, session_id, operation_id, card)
+    }
+
+    /// Drop only one exact sudo card wherever it is retained, including a queued card whose
+    /// secret editor must be zeroized without disturbing the unrelated suspended surface.
+    fn retire_sudo_authentication_card(&mut self, challenge_id: &str) -> bool {
+        let visible = matches!(
+            &self.page,
+            SshModalPage::Authentication(card)
+                if card.challenge_id == challenge_id
+                    && matches!(&card.kind, SshAuthKind::SudoPassword { .. })
+        );
+        let mut retired = false;
+        self.pending_interactions.retain_mut(|interaction| match interaction {
+            PendingSshInteraction::Authentication(card) => {
+                let keep = !(card.challenge_id == challenge_id
+                    && matches!(&card.kind, SshAuthKind::SudoPassword { .. }));
+                retired |= !keep;
+                keep
+            }
+            PendingSshInteraction::Suspended(surface) => {
+                if matches!(
+                    &surface.page,
+                    SshModalPage::Authentication(card)
+                        if card.challenge_id == challenge_id
+                            && matches!(&card.kind, SshAuthKind::SudoPassword { .. })
+                ) {
+                    surface.page = SshModalPage::Manager;
+                    retired = true;
+                }
+                true
+            }
+            PendingSshInteraction::Grant(_)
+            | PendingSshInteraction::Operation(_)
+            | PendingSshInteraction::WorkerInstall(_) => true,
+        });
+        if visible {
+            if let SshModalPage::Authentication(card) = &mut self.page {
+                card.clear_answers();
+            }
+            self.return_after_authentication();
+            retired = true;
+        }
+        retired
     }
 
     /// Retire only the sudo challenge that belongs to this manager's exact client and session.
@@ -2612,153 +2971,416 @@ impl SshManagerState {
         if self.session_id.as_deref() != Some(session_id) {
             return false;
         }
-        let Some(pending) = self.pending_sudo_authentication.as_ref() else {
+        let Some(index) = self.pending_sudo_authentications.iter().position(|pending| {
+            pending.client_id == Some(client_id)
+                && pending.challenge_id.as_deref() == Some(challenge_id)
+        }) else {
             return false;
         };
-        if pending.client_id != Some(client_id)
-            || pending.challenge_id.as_deref() != Some(challenge_id)
+        self.pending_sudo_authentications.remove(index);
+        let retired = self.retire_sudo_authentication_card(challenge_id);
+        if retired
+            && matches!(&self.page, SshModalPage::Manager)
+            && self.pending_grant.is_none()
+            && self.project_browser.is_none()
+            && self.pending_interactions.is_empty()
+            && error.is_none()
         {
-            return false;
+            self.visible = false;
         }
-        self.pending_sudo_authentication = None;
-        let visible = matches!(
-            &self.page,
-            SshModalPage::Authentication(card)
-                if card.challenge_id == challenge_id
-                    && matches!(&card.kind, SshAuthKind::SudoPassword { .. })
-        );
-        if visible {
-            if let SshModalPage::Authentication(card) = &mut self.page {
-                card.clear_answers();
-            }
-            self.return_after_authentication();
-            if error.is_some() {
-                self.show_info(
-                    "Root authentication was cancelled or timed out; the command was not run.",
-                );
-            } else {
-                self.visible = false;
-            }
+        if error.is_some() {
+            self.show_info(
+                "Root authentication was cancelled or timed out; the command was not run.",
+            );
         }
         true
     }
 
-    /// Retire a specific approval that the local SSH service has expired.
+    /// Retire an approved root-operation correlation only after its exact worker operation is
+    /// terminal. This covers both NOPASSWD execution and a terminal record missed while a
+    /// password challenge was hidden; absent prompt/approval snapshots alone are not evidence.
+    pub fn settle_terminal_operation(&mut self, operation_id: &str) -> bool {
+        let Some(index) = self
+            .pending_sudo_authentications
+            .iter()
+            .position(|pending| pending.operation_id == operation_id)
+        else {
+            return false;
+        };
+        let pending = self.pending_sudo_authentications.remove(index);
+        self.submitted_operation_approvals
+            .retain(|submitted| submitted.approval_id != pending.approval_id);
+        if let Some(challenge_id) = pending.challenge_id.as_deref() {
+            self.retire_sudo_authentication_card(challenge_id);
+        }
+        if matches!(&self.page, SshModalPage::Manager)
+            && self.pending_grant.is_none()
+            && self.project_browser.is_none()
+            && self.pending_interactions.is_empty()
+        {
+            self.visible = false;
+        }
+        true
+    }
+
+    /// Reconcile locally retained interaction state against one authoritative stream snapshot.
     ///
-    /// Only the currently displayed matching card is removed, so a late expiration cannot
-    /// dismiss a newer request. No local decision is emitted for the retired operation.
+    /// Exact live correlations preserve active card edits. Absent grants/cards retire without
+    /// touching unrelated surfaces; root waits are retired only by `active_operation_ids`, which
+    /// deliberately spans the valid pre-password and NOPASSWD gaps.
+    pub fn reconcile_live_interaction_ids(&mut self, live: &SshLiveInteractionIds) {
+        let grant_live = |request_id: &str| live.grant_ids.iter().any(|id| id == request_id);
+        let auth_live = |challenge_id: &str, generation: u64, target_id: &str| {
+            live.authentication.iter().any(|(candidate, candidate_generation, candidate_target)| {
+                candidate == challenge_id
+                    && *candidate_generation == generation
+                    && candidate_target == target_id
+            })
+        };
+        let operation_live = |approval_id: &str| {
+            live.operation_approval_ids.iter().any(|id| id == approval_id)
+        };
+        let operation_card_live = |card: &SshOperationApprovalCard| {
+            operation_live(&card.approval_id)
+                || card.operation_id.as_ref().is_some_and(|operation_id| {
+                    live.active_operation_ids
+                        .iter()
+                        .any(|candidate| candidate == operation_id)
+                })
+        };
+        let worker_live = |card: &SshWorkerInstallFallbackCard| {
+            live.worker_install_ids.iter().any(|(client, request, session, binding)| {
+                *client == card.client_id
+                    && request == &card.request_id
+                    && session == &card.session_id
+                    && binding == &card.binding_id
+            })
+        };
+        let stale_active_grant = self
+            .pending_grant
+            .as_ref()
+            .map(|request| request.request_id.clone())
+            .filter(|request_id| !grant_live(request_id));
+        if let Some(request_id) = stale_active_grant {
+            let browser_owns_request = self.project_browser.as_ref().is_some_and(|browser| {
+                matches!(
+                    &browser.purpose,
+                    SshDirectoryPurpose::PendingGrant {
+                        request_id: pending_request_id,
+                    } if pending_request_id == &request_id
+                )
+            });
+            self.clear_terminal_grant(&request_id);
+            self.remember_terminal_grant_id(&request_id);
+            if browser_owns_request {
+                self.project_browser = None;
+            }
+            if matches!(
+                &self.page,
+                SshModalPage::Grant(card) if card.request_id == request_id
+            ) || (browser_owns_request && matches!(&self.page, SshModalPage::ProjectBrowser))
+            {
+                self.page = SshModalPage::Manager;
+            }
+        }
+
+        let active_auth_stale = match &self.page {
+            SshModalPage::Authentication(card) if !matches!(&card.kind, SshAuthKind::SudoPassword { .. }) => {
+                !auth_live(&card.challenge_id, card.connection_generation, &card.target_id)
+            }
+            _ => false,
+        };
+        if active_auth_stale {
+            self.return_after_authentication();
+        }
+
+        let active_operation_stale = matches!(
+            &self.page,
+            SshModalPage::OperationApproval(card) if !operation_card_live(card)
+        );
+        if active_operation_stale {
+            self.page = SshModalPage::Manager;
+            self.activate_next_pending_interaction();
+        }
+
+        let active_worker_stale = matches!(
+            &self.page,
+            SshModalPage::WorkerInstallFallback(card) if !worker_live(card)
+        );
+        if active_worker_stale {
+            self.page = SshModalPage::Manager;
+            self.activate_next_pending_interaction();
+        }
+
+        let mut retired_grants = Vec::new();
+        self.pending_interactions.retain_mut(|interaction| match interaction {
+            PendingSshInteraction::Grant(queued) => {
+                let keep = grant_live(&queued.request.request_id);
+                if !keep {
+                    retired_grants.push(queued.request.request_id.clone());
+                }
+                keep
+            }
+            PendingSshInteraction::Authentication(card) => {
+                auth_live(&card.challenge_id, card.connection_generation, &card.target_id)
+            }
+            PendingSshInteraction::Operation(card) => operation_card_live(card),
+            PendingSshInteraction::WorkerInstall(card) => worker_live(card),
+            PendingSshInteraction::Suspended(surface) => {
+                if let Some(request_id) = surface
+                    .pending_grant
+                    .as_ref()
+                    .map(|request| request.request_id.clone())
+                    .filter(|request_id| !grant_live(request_id))
+                {
+                    retired_grants.push(request_id);
+                    surface.pending_grant = None;
+                    surface.submitted_grant = None;
+                    surface.pending_grant_session_id = None;
+                    surface.pending_grant_follow_up = None;
+                    surface.local_grant_options = None;
+                    if matches!(&surface.page, SshModalPage::Grant(_)) {
+                        surface.page = SshModalPage::Manager;
+                    }
+                }
+                let stale_operation = matches!(
+                    &surface.page,
+                    SshModalPage::OperationApproval(card) if !operation_card_live(card)
+                );
+                let stale_authentication = matches!(
+                    &surface.page,
+                    SshModalPage::Authentication(card)
+                        if !matches!(&card.kind, SshAuthKind::SudoPassword { .. })
+                            && !auth_live(
+                                &card.challenge_id,
+                                card.connection_generation,
+                                &card.target_id,
+                            )
+                );
+                let stale_worker = matches!(
+                    &surface.page,
+                    SshModalPage::WorkerInstallFallback(card) if !worker_live(card)
+                );
+                if stale_operation || stale_authentication || stale_worker {
+                    surface.page = SshModalPage::Manager;
+                }
+                true
+            }
+        });
+        for request_id in retired_grants {
+            self.remember_terminal_grant_id(&request_id);
+            self.inspecting_grant_ids.retain(|id| id != &request_id);
+        }
+
+        let retired_sudo_challenges = self
+            .pending_sudo_authentications
+            .iter()
+            .filter(|pending| {
+                !live
+                    .active_operation_ids
+                    .iter()
+                    .any(|operation_id| operation_id == &pending.operation_id)
+            })
+            .filter_map(|pending| pending.challenge_id.clone())
+            .collect::<Vec<_>>();
+        self.pending_sudo_authentications.retain(|pending| {
+            live.active_operation_ids
+                .iter()
+                .any(|operation_id| operation_id == &pending.operation_id)
+        });
+        for challenge_id in retired_sudo_challenges {
+            self.retire_sudo_authentication_card(&challenge_id);
+        }
+        if matches!(&self.page, SshModalPage::Manager)
+            && self.pending_grant.is_none()
+            && !self.pending_interactions.is_empty()
+        {
+            self.activate_next_pending_interaction();
+        }
+    }
+
+    /// Retire only the matching approval. A terminal event for queued work must not touch the
+    /// foreground card or silently deny another operation.
     pub fn expire_operation_approval(&mut self, approval_id: &str) -> bool {
-        if !matches!(
+        let displayed = matches!(
             &self.page,
             SshModalPage::OperationApproval(card) if card.approval_id == approval_id
-        ) {
+        );
+        let mut queued = false;
+        self.pending_interactions.retain_mut(|interaction| match interaction {
+            PendingSshInteraction::Operation(card) => {
+                let keep = card.approval_id != approval_id;
+                queued |= !keep;
+                keep
+            }
+            PendingSshInteraction::Suspended(surface) => {
+                if matches!(
+                    &surface.page,
+                    SshModalPage::OperationApproval(card) if card.approval_id == approval_id
+                ) {
+                    surface.page = SshModalPage::Manager;
+                    queued = true;
+                }
+                true
+            }
+            PendingSshInteraction::Grant(_)
+            | PendingSshInteraction::Authentication(_)
+            | PendingSshInteraction::WorkerInstall(_) => true,
+        });
+        if !displayed && !queued {
             return false;
         }
-        if self
-            .submitted_operation_approval
-            .as_ref()
-            .is_some_and(|submitted| submitted.approval_id == approval_id)
-        {
-            self.submitted_operation_approval = None;
+        self.submitted_operation_approvals
+            .retain(|submitted| submitted.approval_id != approval_id);
+        self.pending_sudo_authentications
+            .retain(|pending| pending.approval_id != approval_id);
+        if displayed {
+            self.loading = true;
+            self.return_to_manager();
+            self.show_info(
+                "Retry operation for a new approval; prior approval expired. \
+                 No remote command was authorized.",
+            );
+            self.activate_next_pending_interaction();
         }
-        self.pending_sudo_authentication = None;
-        self.loading = true;
-        self.return_to_manager();
-        self.show_info(
-            "Retry operation for a new approval; prior approval expired. \
-             No remote command was authorized.",
-        );
         true
     }
 
     /// Settle one exact local-control submission without allowing a stale acknowledgement to
-    /// dismiss a replacement card.
+    /// dismiss, fail, or clear a replacement card.
     pub fn settle_operation_approval(
         &mut self,
         approval_id: &str,
         error: Option<String>,
     ) -> SshOperationApprovalSettlement {
-        let Some(submitted) = self.submitted_operation_approval.as_ref() else {
+        let Some(position) = self
+            .submitted_operation_approvals
+            .iter()
+            .position(|submitted| submitted.approval_id == approval_id)
+        else {
             return SshOperationApprovalSettlement::KeepVisible;
         };
-        if submitted.approval_id != approval_id {
-            return SshOperationApprovalSettlement::KeepVisible;
-        }
-        let submitted = self
-            .submitted_operation_approval
-            .take()
-            .expect("submitted operation approval was checked above");
+        let submitted = self.submitted_operation_approvals.remove(position);
         let displayed = matches!(
             &self.page,
             SshModalPage::OperationApproval(card) if card.approval_id == approval_id
         );
-        let awaiting_sudo_authentication = self.pending_sudo_authentication.is_some();
+        let awaiting_sudo_authentication = self
+            .pending_sudo_authentications
+            .iter()
+            .any(|pending| pending.approval_id == approval_id);
         if let Some(error) = error {
-            self.pending_sudo_authentication = None;
+            self.pending_sudo_authentications
+                .retain(|pending| pending.approval_id != approval_id);
             if let SshModalPage::OperationApproval(card) = &mut self.page
                 && card.approval_id == approval_id
             {
                 card.submitting = false;
                 card.error = Some(error);
-            } else if awaiting_sudo_authentication
-                && matches!(
-                    &self.page,
-                    SshModalPage::Authentication(card)
-                        if matches!(&card.kind, SshAuthKind::SudoPassword { .. })
-                )
-            {
-                if let SshModalPage::Authentication(card) = &mut self.page {
-                    card.clear_answers();
-                }
-                self.return_after_authentication();
-                self.show_error(error);
             } else {
-                self.show_error(error);
+                for interaction in &mut self.pending_interactions {
+                    match interaction {
+                        PendingSshInteraction::Operation(card)
+                            if card.approval_id == approval_id =>
+                        {
+                            card.submitting = false;
+                            card.error = Some(error.clone());
+                            break;
+                        }
+                        PendingSshInteraction::Suspended(surface)
+                            if matches!(
+                                &surface.page,
+                                SshModalPage::OperationApproval(card)
+                                    if card.approval_id == approval_id
+                            ) =>
+                        {
+                            if let SshModalPage::OperationApproval(card) = &mut surface.page {
+                                card.submitting = false;
+                                card.error = Some(error.clone());
+                            }
+                            break;
+                        }
+                        PendingSshInteraction::Grant(_)
+                        | PendingSshInteraction::Authentication(_)
+                        | PendingSshInteraction::WorkerInstall(_)
+                        | PendingSshInteraction::Operation(_)
+                        | PendingSshInteraction::Suspended(_) => {}
+                    }
+                }
             }
             return SshOperationApprovalSettlement::KeepVisible;
         }
         if awaiting_sudo_authentication {
             if displayed {
-                // The root command can either request a password later or reach its READY gate
-                // immediately. Hide the manager but retain this exact pending tuple for either.
                 self.return_to_manager();
                 self.visible = false;
-                return SshOperationApprovalSettlement::AwaitingSudoAuthentication;
+                self.activate_next_pending_interaction();
+                return if self.visible {
+                    SshOperationApprovalSettlement::KeepVisible
+                } else {
+                    SshOperationApprovalSettlement::AwaitingSudoAuthentication
+                };
             }
             return SshOperationApprovalSettlement::KeepVisible;
         }
-        if submitted.approved && displayed {
-            return SshOperationApprovalSettlement::Dismiss;
-        }
         if displayed {
             self.return_to_manager();
+            if submitted.approved {
+                self.activate_next_pending_interaction();
+                return if self.visible && !matches!(&self.page, SshModalPage::Manager) {
+                    SshOperationApprovalSettlement::KeepVisible
+                } else {
+                    SshOperationApprovalSettlement::Dismiss
+                };
+            }
             self.show_info("Remote operation denied.");
+            self.activate_next_pending_interaction();
         }
         SshOperationApprovalSettlement::KeepVisible
     }
 
-    /// Display the exact local-download/upload fallback for one managed worker installation.
-    ///
-    /// A duplicate event preserves the visible progress and a different request deliberately
-    /// replaces it: only the service's opaque request tuple decides which fallback is current.
+    /// Display the exact local-download/upload fallback without replacing unrelated consent,
+    /// authentication, project-browser, or configuration work.
     pub fn show_worker_install_fallback(
         &mut self,
         request: xai_grok_shell::ssh::SshWorkerInstallRequest,
     ) {
-        if matches!(
-            &self.page,
-            SshModalPage::WorkerInstallFallback(card)
-                if card.matches(
-                    request.client_id,
-                    &request.request_id,
-                    &request.session_id,
-                    &request.binding_id,
-                ) && card.target_id == request.target_id
-        ) {
+        let matches_request = |card: &SshWorkerInstallFallbackCard| {
+            card.matches(
+                request.client_id,
+                &request.request_id,
+                &request.session_id,
+                &request.binding_id,
+            ) && card.target_id == request.target_id
+        };
+        if matches!(&self.page, SshModalPage::WorkerInstallFallback(card) if matches_request(card))
+            || self.pending_interactions.iter().any(|interaction| match interaction {
+                PendingSshInteraction::WorkerInstall(card) => matches_request(card),
+                PendingSshInteraction::Suspended(surface) => matches!(
+                    &surface.page,
+                    SshModalPage::WorkerInstallFallback(card) if matches_request(card)
+                ),
+                PendingSshInteraction::Grant(_)
+                | PendingSshInteraction::Operation(_)
+                | PendingSshInteraction::Authentication(_) => false,
+            })
+        {
+            return;
+        }
+        let continues_project = self.pending_project_open.as_ref().is_some_and(|project| {
+            project.session_id == request.session_id && project.target_id == request.target_id
+        }) && matches!(&self.page, SshModalPage::ProjectBrowser);
+        let replaces_decided_attempt = matches!(&self.page, SshModalPage::WorkerInstallFallback(card)
+            if card.is_decided() && card.client_id == request.client_id
+                && card.session_id == request.session_id && card.binding_id == request.binding_id
+                && card.target_id == request.target_id);
+        let card = SshWorkerInstallFallbackCard::new(request);
+        if self.has_protected_surface() && !continues_project && !replaces_decided_attempt {
+            self.queue_interaction(PendingSshInteraction::WorkerInstall(card));
             return;
         }
         self.visible = true;
-        self.page = SshModalPage::WorkerInstallFallback(SshWorkerInstallFallbackCard::new(request));
+        self.page = SshModalPage::WorkerInstallFallback(card);
     }
 
     /// Submit exactly the fallback decision visible on this manager.
@@ -2794,18 +3416,91 @@ impl SshManagerState {
         approved: bool,
         error: Option<String>,
     ) {
-        let SshModalPage::WorkerInstallFallback(card) = &mut self.page else {
-            return;
-        };
-        if !card.matches(client_id, request_id, session_id, binding_id) || !card.submitting {
+        if let SshModalPage::WorkerInstallFallback(card) = &mut self.page
+            && card.matches(client_id, request_id, session_id, binding_id)
+            && card.submitting
+        {
+            card.submitting = false;
+            if let Some(error) = error {
+                card.error = Some(error);
+            } else {
+                card.decision_accepted = Some(approved);
+            }
             return;
         }
-        card.submitting = false;
-        if let Some(error) = error {
-            card.error = Some(error);
+        for interaction in &mut self.pending_interactions {
+            let card = match interaction {
+                PendingSshInteraction::WorkerInstall(card) => Some(card),
+                PendingSshInteraction::Suspended(surface) => match &mut surface.page {
+                    SshModalPage::WorkerInstallFallback(card) => Some(card),
+                    _ => None,
+                },
+                PendingSshInteraction::Grant(_)
+                | PendingSshInteraction::Operation(_)
+                | PendingSshInteraction::Authentication(_) => None,
+            };
+            let Some(card) = card else {
+                continue;
+            };
+            if !card.matches(client_id, request_id, session_id, binding_id) || !card.submitting {
+                continue;
+            }
+            card.submitting = false;
+            if let Some(error) = error {
+                card.error = Some(error);
+            } else {
+                card.decision_accepted = Some(approved);
+            }
             return;
         }
-        card.decision_accepted = Some(approved);
+    }
+
+    /// Retire exactly one completed worker-install fallback before its owner closes the modal.
+    ///
+    /// This avoids a decided fallback being mistaken for unrelated protected work while leaving
+    /// every other queued card and local surface intact.
+    pub fn settle_worker_install_completion(
+        &mut self,
+        client_id: u64,
+        request_id: &str,
+        session_id: &str,
+        binding_id: &str,
+    ) -> bool {
+        let displayed = matches!(
+            &self.page,
+            SshModalPage::WorkerInstallFallback(card)
+                if card.matches(client_id, request_id, session_id, binding_id)
+        );
+        let mut retired = false;
+        self.pending_interactions.retain_mut(|interaction| match interaction {
+            PendingSshInteraction::WorkerInstall(card) => {
+                let keep = !card.matches(client_id, request_id, session_id, binding_id);
+                retired |= !keep;
+                keep
+            }
+            PendingSshInteraction::Suspended(surface) => {
+                if matches!(
+                    &surface.page,
+                    SshModalPage::WorkerInstallFallback(card)
+                        if card.matches(client_id, request_id, session_id, binding_id)
+                ) {
+                    surface.page = SshModalPage::Manager;
+                    retired = true;
+                }
+                true
+            }
+            PendingSshInteraction::Grant(_)
+            | PendingSshInteraction::Operation(_)
+            | PendingSshInteraction::Authentication(_) => true,
+        });
+        if displayed {
+            self.page = SshModalPage::Manager;
+            retired = true;
+        }
+        if retired {
+            self.activate_next_pending_interaction();
+        }
+        retired
     }
 
     /// Update or clear only the matching fallback's phase text.
@@ -2818,13 +3513,31 @@ impl SshManagerState {
         target_id: &str,
         message: Option<String>,
     ) {
-        let SshModalPage::WorkerInstallFallback(card) = &mut self.page else {
-            return;
-        };
-        if card.matches(client_id, request_id, session_id, binding_id)
+        if let SshModalPage::WorkerInstallFallback(card) = &mut self.page
+            && card.matches(client_id, request_id, session_id, binding_id)
             && card.target_id == target_id
         {
-            card.progress = message;
+            card.progress = message.clone();
+            return;
+        }
+        for interaction in &mut self.pending_interactions {
+            let card = match interaction {
+                PendingSshInteraction::WorkerInstall(card) => Some(card),
+                PendingSshInteraction::Suspended(surface) => match &mut surface.page {
+                    SshModalPage::WorkerInstallFallback(card) => Some(card),
+                    _ => None,
+                },
+                PendingSshInteraction::Grant(_)
+                | PendingSshInteraction::Operation(_)
+                | PendingSshInteraction::Authentication(_) => None,
+            };
+            if let Some(card) = card
+                && card.matches(client_id, request_id, session_id, binding_id)
+                && card.target_id == target_id
+            {
+                card.progress = message;
+                return;
+            }
         }
     }
 
@@ -2842,7 +3555,6 @@ impl SshManagerState {
         if self.cancelled_grant_ids.iter().any(|id| id == &request_id) {
             return SshModalOutcome::Unchanged;
         }
-        self.visible = true;
         let cancelled_local_request = self
             .cancelled_local_grant_options
             .iter()
@@ -2864,14 +3576,72 @@ impl SshManagerState {
             self.cancelled_local_grant_options
                 .retain(|options| options.request_id.as_deref() != Some(request_id.as_str()));
             self.remember_terminal_grant_id(&request_id);
-            self.pending_grant_session_id = Some(session_id);
-            self.pending_grant = Some(request);
-            self.submitted_grant = None;
             return SshModalOutcome::CancelGrant { request_id };
         }
         if matches!(&self.page, SshModalPage::Grant(card) if card.request_id == request_id) {
             return SshModalOutcome::Unchanged;
         }
+        if let Some(queued) = self.pending_interactions.iter_mut().find_map(|interaction| {
+            match interaction {
+                PendingSshInteraction::Grant(queued)
+                    if queued.request.request_id == request_id =>
+                {
+                    Some(queued)
+                }
+                PendingSshInteraction::Grant(_)
+                | PendingSshInteraction::Operation(_)
+                | PendingSshInteraction::Authentication(_)
+                | PendingSshInteraction::WorkerInstall(_)
+                | PendingSshInteraction::Suspended(_) => None,
+            }
+        }) {
+            queued.session_id = session_id;
+            queued.request = request;
+            return SshModalOutcome::Unchanged;
+        }
+        if let Some(surface) = self.pending_interactions.iter_mut().find_map(|interaction| {
+            match interaction {
+                PendingSshInteraction::Suspended(surface)
+                    if surface
+                        .pending_grant
+                        .as_ref()
+                        .is_some_and(|pending| pending.request_id == request_id) =>
+                {
+                    Some(surface)
+                }
+                PendingSshInteraction::Grant(_)
+                | PendingSshInteraction::Operation(_)
+                | PendingSshInteraction::Authentication(_)
+                | PendingSshInteraction::WorkerInstall(_)
+                | PendingSshInteraction::Suspended(_) => None,
+            }
+        }) {
+            if !matches!(
+                &surface.page,
+                SshModalPage::Grant(card) if card.request_id == request_id
+            ) {
+                surface.pending_grant = Some(request);
+                surface.pending_grant_session_id = Some(session_id);
+            }
+            return SshModalOutcome::Unchanged;
+        }
+        let continues_local_grant = self.local_grant_options.as_ref().is_some_and(|options| {
+            options.request_id.as_deref() == Some(request_id.as_str())
+                && request.target_id.as_deref() == Some(options.target_id.as_str())
+        });
+        if self
+            .pending_grant
+            .as_ref()
+            .is_some_and(|pending| pending.request_id != request_id)
+            || (self.pending_grant.is_none() && self.has_protected_surface() && !continues_local_grant)
+        {
+            self.queue_interaction(PendingSshInteraction::Grant(QueuedGrant {
+                session_id,
+                request,
+            }));
+            return SshModalOutcome::Unchanged;
+        }
+        self.visible = true;
         if request.verified_identity.is_none()
             && self.pending_grant.as_ref().is_some_and(|pending| {
                 pending.request_id == request_id
@@ -2931,7 +3701,31 @@ impl SshManagerState {
             };
         }
 
-        self.inspecting_grant_ids.retain(|id| id != &request_id);
+        self.pending_grant = Some(request);
+        self.promote_verified_active_grant();
+        SshModalOutcome::Changed
+    }
+
+    /// Promote the currently retained inspected request without reconstructing its correlation.
+    ///
+    /// This is also used after a sudo challenge restores a suspended grant whose inspection
+    /// completed while it was queued.
+    fn promote_verified_active_grant(&mut self) -> bool {
+        let Some(request) = self.pending_grant.as_ref().cloned() else {
+            return false;
+        };
+        let Some(target_id) = request.target_id.as_deref() else {
+            return false;
+        };
+        if request
+            .root
+            .as_deref()
+            .is_none_or(|root| root.trim().is_empty())
+            || request.verified_identity.is_none()
+        {
+            return false;
+        }
+        self.inspecting_grant_ids.retain(|id| id != &request.request_id);
         let local_options = self
             .local_grant_options
             .as_ref()
@@ -2964,13 +3758,12 @@ impl SshManagerState {
             card.set_default = options.set_default;
             card.follow_up = self.pending_grant_follow_up;
         }
-        self.pending_grant = Some(request);
         self.project_browser = self
             .project_browser
             .take()
             .filter(|browser| browser.purpose.is_project_open());
         self.page = SshModalPage::Grant(card);
-        SshModalOutcome::Changed
+        true
     }
 
     pub fn begin_connection_action(&mut self, target_id: &str, connect: bool) {
@@ -3098,9 +3891,37 @@ impl SshManagerState {
         })
     }
 
-    /// Return an asynchronously resolved consent card to the manager or its retained browser.
+    /// Return an asynchronously resolved active consent card to its browser or promote the next
+    /// independent interaction. Callers that know the request ID should use
+    /// [`Self::settle_grant_for`] so a late terminal event cannot settle another flow.
     pub fn settle_grant(&mut self, approved: bool) {
-        let request_id = self.pending_grant.as_ref().map(|request| request.request_id.clone());
+        let Some(request_id) = self
+            .pending_grant
+            .as_ref()
+            .map(|request| request.request_id.clone())
+        else {
+            return;
+        };
+        let _ = self.settle_grant_for(&request_id, approved);
+    }
+
+    /// Settle one exact grant without disturbing an unrelated foreground interaction.
+    pub fn settle_grant_for(&mut self, request_id: &str, approved: bool) -> bool {
+        if !self
+            .pending_grant
+            .as_ref()
+            .is_some_and(|request| request.request_id == request_id)
+        {
+            let before = self.pending_interactions.len();
+            self.pending_interactions.retain(|interaction| {
+                !matches!(
+                    interaction,
+                    PendingSshInteraction::Grant(queued)
+                        if queued.request.request_id == request_id
+                )
+            });
+            return self.pending_interactions.len() != before;
+        }
         let (project_request_id, follow_up) = match &self.page {
             SshModalPage::Grant(card) => (
                 card.project.as_ref().map(|project| project.request_id),
@@ -3109,13 +3930,11 @@ impl SshManagerState {
             _ => (None, None),
         };
         if approved {
-            if let (Some(request_id), Some(follow_up)) = (request_id.clone(), follow_up) {
-                self.settled_grant_follow_up = Some((request_id, follow_up));
+            if let Some(follow_up) = follow_up {
+                self.settled_grant_follow_up = Some((request_id.to_owned(), follow_up));
             }
         }
-        if let Some(request_id) = request_id.as_deref() {
-            self.inspecting_grant_ids.retain(|id| id != request_id);
-        }
+        self.inspecting_grant_ids.retain(|id| id != request_id);
         self.pending_grant = None;
         self.submitted_grant = None;
         self.pending_grant_session_id = None;
@@ -3131,7 +3950,7 @@ impl SshManagerState {
                 });
             }
             self.page = SshModalPage::ProjectBrowser;
-            return;
+            return true;
         }
         self.page = SshModalPage::Manager;
         self.show_info(if approved {
@@ -3139,6 +3958,8 @@ impl SshManagerState {
         } else {
             "SSH access grant denied."
         });
+        self.activate_next_pending_interaction();
+        true
     }
 
     /// Return the project preparation tied to the exact displayed grant, if any.
@@ -3168,31 +3989,90 @@ impl SshManagerState {
     }
 
     /// Clear only the exact model request once the service has terminally settled it.
+    ///
+    /// A queued or suspended grant is simply retired; it must not rewrite the foreground page.
     fn clear_terminal_grant(&mut self, request_id: &str) -> bool {
-        if !self
+        let active = self
             .pending_grant
             .as_ref()
-            .is_some_and(|request| request.request_id == request_id)
-        {
-            return false;
+            .is_some_and(|request| request.request_id == request_id);
+        if active {
+            self.inspecting_grant_ids.retain(|id| id != request_id);
+            self.pending_grant = None;
+            self.submitted_grant = None;
+            self.pending_grant_session_id = None;
+            self.pending_grant_follow_up = None;
+            self.local_grant_options = None;
+            self.settled_grant_follow_up = None;
+            return true;
         }
-        self.inspecting_grant_ids.retain(|id| id != request_id);
-        self.pending_grant = None;
-        self.submitted_grant = None;
-        self.pending_grant_session_id = None;
-        self.pending_grant_follow_up = None;
-        self.local_grant_options = None;
-        self.settled_grant_follow_up = None;
-        true
+        let mut retired = false;
+        self.pending_interactions.retain_mut(|interaction| match interaction {
+            PendingSshInteraction::Grant(queued) => {
+                let keep = queued.request.request_id != request_id;
+                retired |= !keep;
+                keep
+            }
+            PendingSshInteraction::Suspended(surface) => {
+                if surface
+                    .pending_grant
+                    .as_ref()
+                    .is_some_and(|request| request.request_id == request_id)
+                {
+                    retired = true;
+                    surface.pending_grant = None;
+                    surface.submitted_grant = None;
+                    surface.pending_grant_session_id = None;
+                    surface.pending_grant_follow_up = None;
+                    surface.local_grant_options = None;
+                    if matches!(
+                        &surface.page,
+                        SshModalPage::Grant(card) if card.request_id == request_id
+                    ) {
+                        surface.page = SshModalPage::Manager;
+                    }
+                    if surface.project_browser.as_ref().is_some_and(|browser| {
+                        matches!(
+                            &browser.purpose,
+                            SshDirectoryPurpose::PendingGrant {
+                                request_id: pending_request_id,
+                            } if pending_request_id == request_id
+                        )
+                    }) {
+                        surface.project_browser = None;
+                        if matches!(&surface.page, SshModalPage::ProjectBrowser) {
+                            surface.page = SshModalPage::Manager;
+                        }
+                    }
+                }
+                true
+            }
+            PendingSshInteraction::Operation(_)
+            | PendingSshInteraction::Authentication(_)
+            | PendingSshInteraction::WorkerInstall(_) => true,
+        });
+        if retired {
+            self.inspecting_grant_ids.retain(|id| id != request_id);
+        }
+        retired
     }
 
     /// Finish an exact cancellation without treating it as an explicit human denial.
     pub fn settle_grant_cancellation(&mut self, request_id: &str) -> bool {
-        let project_request_id = self.project_preparation_for_grant(request_id);
+        let active = self
+            .pending_grant
+            .as_ref()
+            .is_some_and(|request| request.request_id == request_id);
+        let project_request_id = active
+            .then(|| self.project_preparation_for_grant(request_id))
+            .flatten();
         if !self.clear_terminal_grant(request_id) {
             return false;
         }
         self.remember_terminal_grant_id(request_id);
+        if !active {
+            return true;
+        }
         self.project_browser = self.project_browser.take().filter(|browser| {
             !matches!(
                 &browser.purpose,
@@ -3206,6 +4086,7 @@ impl SshManagerState {
         }
         self.page = SshModalPage::Manager;
         self.show_info("SSH access request cancelled.");
+        self.activate_next_pending_interaction();
         true
     }
 
@@ -3225,11 +4106,20 @@ impl SshManagerState {
 
     /// Finish an exact service failure while retaining its diagnostic surface.
     pub fn settle_grant_failure(&mut self, request_id: &str, error: String) -> bool {
-        let project_request_id = self.project_preparation_for_grant(request_id);
+        let active = self
+            .pending_grant
+            .as_ref()
+            .is_some_and(|request| request.request_id == request_id);
+        let project_request_id = active
+            .then(|| self.project_preparation_for_grant(request_id))
+            .flatten();
         if !self.clear_terminal_grant(request_id) {
             return false;
         }
         self.remember_terminal_grant_id(request_id);
+        if !active {
+            return true;
+        }
         if let Some(project_request_id) = project_request_id {
             self.finish_project_preparation(project_request_id, Some(error));
             return true;
@@ -3242,6 +4132,12 @@ impl SshManagerState {
                 } if pending_request_id == request_id
             )
         });
+        if !self.pending_interactions.is_empty() {
+            self.page = SshModalPage::Manager;
+            self.show_info(format!("SSH access request failed: {error}"));
+            self.activate_next_pending_interaction();
+            return true;
+        }
         if let SshModalPage::Diagnostic(card) = &mut self.page {
             // The diagnostic may have wrapped the in-progress card before the service sent its
             // terminal failure. Returning from it must never revive that settled request.
@@ -3334,13 +4230,19 @@ impl SshManagerState {
     /// Surface an exact pending-grant failure without allowing an old result to replace a
     /// newer request or revive a cancelled picker.
     pub fn fail_pending_grant(&mut self, request_id: &str, error: String) -> bool {
-        if self.cancelled_grant_ids.iter().any(|id| id == request_id)
-            || !self
-                .pending_grant
-                .as_ref()
-                .is_some_and(|request| request.request_id == request_id)
-        {
+        if self.cancelled_grant_ids.iter().any(|id| id == request_id) {
             return false;
+        }
+        let active = self
+            .pending_grant
+            .as_ref()
+            .is_some_and(|request| request.request_id == request_id);
+        if !active {
+            let retired = self.clear_terminal_grant(request_id);
+            if retired {
+                self.remember_terminal_grant_id(request_id);
+            }
+            return retired;
         }
         self.inspecting_grant_ids.retain(|id| id != request_id);
         let browser_owns_request = self.project_browser.as_ref().is_some_and(|browser| {
@@ -3439,12 +4341,17 @@ impl SshManagerState {
     }
 
     fn return_after_authentication(&mut self) {
-        if self.resume_project_browser_after_authentication && self.project_browser.is_some() {
-            self.page = SshModalPage::ProjectBrowser;
+        let resume_browser =
+            self.resume_project_browser_after_authentication && self.project_browser.is_some();
+        self.page = if resume_browser {
+            SshModalPage::ProjectBrowser
         } else {
-            self.page = SshModalPage::Manager;
-        }
+            SshModalPage::Manager
+        };
         self.resume_project_browser_after_authentication = false;
+        if !resume_browser {
+            self.activate_next_pending_interaction();
+        }
     }
 }
 
@@ -6834,6 +7741,12 @@ fn close_current_page(state: &mut SshManagerState) -> SshModalOutcome {
         return cancel_grant_once(state, request_id);
     }
     match &state.page {
+        SshModalPage::Manager if !state.pending_interactions.is_empty() => {
+            state.activate_next_pending_interaction();
+            state
+                .take_pending_interaction_continuation()
+                .unwrap_or(SshModalOutcome::Changed)
+        }
         SshModalPage::Manager => SshModalOutcome::Close,
         SshModalPage::OperationApproval(card) => SshModalOutcome::ApproveOperation {
             approval_id: card.approval_id.clone(),
@@ -8140,13 +9053,17 @@ mod tests {
     }
 
     #[test]
-    fn stale_operation_expiration_does_not_clobber_a_newer_card() {
+    fn expiring_active_operation_promotes_a_queued_newer_card() {
         let mut state = SshManagerState::new(Some("session-1".into()));
         state.show_operation_approval(approval("old-approval"));
         assert!(state.submit_operation_approval("old-approval", true));
         state.show_operation_approval(approval("new-approval"));
 
-        assert!(!state.expire_operation_approval("old-approval"));
+        assert!(state.expire_operation_approval("old-approval"));
+        assert!(matches!(
+            &state.page,
+            SshModalPage::OperationApproval(card) if card.approval_id == "new-approval"
+        ));
         assert!(state.submit_operation_approval("new-approval", true));
     }
 
@@ -8332,7 +9249,12 @@ mod tests {
                 ..
             }
         ));
-
+        assert!(state.submit_operation_approval("review-1", true));
+        assert_eq!(
+            state.settle_operation_approval("review-1", None),
+            SshOperationApprovalSettlement::Dismiss,
+        );
+        state.return_to_manager();
         state.show_operation_approval(approval("review-2"));
         assert!(matches!(
             &state.page,
@@ -8437,6 +9359,190 @@ mod tests {
     }
 
     #[test]
+    fn queued_operation_waits_for_the_active_grant_without_losing_its_card() {
+        let mut state = SshManagerState::new(Some("session-1".into()));
+        state.pending_grant = Some(SshIncomingGrant {
+            request_id: "grant-a".into(),
+            target_id: Some("target-1".into()),
+            root: Some("/srv/project".into()),
+            capabilities: SshCapabilitiesView::default(),
+            verified_identity: Some("build@host:22".into()),
+            reason: "Grant A".into(),
+            awaiting_tool: true,
+        });
+        state.pending_grant_session_id = Some("session-1".into());
+        state.page = SshModalPage::Grant(SshGrantCard::new(
+            "grant-a".into(),
+            "target-1".into(),
+            "build host".into(),
+            Some("build@host:22".into()),
+            "/srv/project",
+            Some("Grant A".into()),
+            true,
+        ));
+
+        state.show_operation_approval(approval("operation-b"));
+        assert!(matches!(
+            &state.page,
+            SshModalPage::Grant(card) if card.request_id == "grant-a"
+        ));
+
+        assert!(state.settle_grant_for("grant-a", false));
+        assert!(matches!(
+            &state.page,
+            SshModalPage::OperationApproval(card) if card.approval_id == "operation-b"
+        ));
+    }
+
+    #[test]
+    fn queued_grant_terminal_failure_preserves_visible_operation() {
+        let mut state = SshManagerState::new(Some("session-1".into()));
+        state.show_operation_approval(approval("operation-b"));
+        assert!(matches!(
+            state.show_incoming_grant(
+                "session-1".into(),
+                SshIncomingGrant {
+                    request_id: "grant-a".into(),
+                    target_id: Some("target-1".into()),
+                    root: Some("/srv/project".into()),
+                    capabilities: SshCapabilitiesView::default(),
+                    verified_identity: Some("build@host:22".into()),
+                    reason: "Grant A".into(),
+                    awaiting_tool: true,
+                },
+            ),
+            SshModalOutcome::Unchanged
+        ));
+
+        assert!(state.settle_grant_failure("grant-a", "inspection timed out".into()));
+        assert!(matches!(
+            &state.page,
+            SshModalPage::OperationApproval(card) if card.approval_id == "operation-b"
+        ));
+    }
+
+    #[test]
+    fn root_password_preempts_and_restores_an_unrelated_operation() {
+        let mut state = SshManagerState::new(Some("session-1".into()));
+        state.show_operation_approval(root_approval("root-a"));
+        assert!(state.submit_operation_approval("root-a", true));
+        assert_eq!(
+            state.settle_operation_approval("root-a", None),
+            SshOperationApprovalSettlement::AwaitingSudoAuthentication,
+        );
+        state.show_operation_approval(approval("operation-b"));
+        assert!(state.show_sudo_authentication(
+            7,
+            "session-1",
+            "operation-root-a",
+            SshAuthCard::new(
+                "sudo-a".into(),
+                9,
+                "target-1".into(),
+                SshAuthKind::SudoPassword {
+                    username: "build".into(),
+                    message: "Root password required".into(),
+                },
+            ),
+        ));
+        assert!(matches!(
+            &state.page,
+            SshModalPage::Authentication(card) if card.challenge_id == "sudo-a"
+        ));
+
+        assert!(state.resolve_sudo_authentication(7, "session-1", "sudo-a", None));
+        assert!(matches!(
+            &state.page,
+            SshModalPage::OperationApproval(card) if card.approval_id == "operation-b"
+        ));
+    }
+
+    #[test]
+    fn root_wait_survives_snapshot_pre_gate_and_retires_only_when_operation_terminal() {
+        let mut state = SshManagerState::new(Some("session-1".into()));
+        state.show_operation_approval(root_approval("root-a"));
+        assert!(state.submit_operation_approval("root-a", true));
+        assert_eq!(
+            state.settle_operation_approval("root-a", None),
+            SshOperationApprovalSettlement::AwaitingSudoAuthentication,
+        );
+
+        state.reconcile_live_interaction_ids(&SshLiveInteractionIds {
+            grant_ids: Vec::new(),
+            authentication: Vec::new(),
+            operation_approval_ids: Vec::new(),
+            worker_install_ids: Vec::new(),
+            active_operation_ids: vec!["operation-root-a".into()],
+        });
+        assert!(state.show_sudo_authentication(
+            7,
+            "session-1",
+            "operation-root-a",
+            SshAuthCard::new(
+                "sudo-a".into(),
+                9,
+                "target-1".into(),
+                SshAuthKind::SudoPassword {
+                    username: "build".into(),
+                    message: "Root password required".into(),
+                },
+            ),
+        ));
+        assert!(state.settle_terminal_operation("operation-root-a"));
+        assert!(!state.show_sudo_authentication(
+            7,
+            "session-1",
+            "operation-root-a",
+            SshAuthCard::new(
+                "sudo-late".into(),
+                9,
+                "target-1".into(),
+                SshAuthKind::SudoPassword {
+                    username: "build".into(),
+                    message: "late".into(),
+                },
+            ),
+        ));
+    }
+
+    #[test]
+    fn authentication_challenge_queue_preserves_the_first_response_owner() {
+        let mut state = SshManagerState::new(Some("session-1".into()));
+        state.show_authentication(SshAuthCard::new(
+            "challenge-a".into(),
+            1,
+            "target-a".into(),
+            SshAuthKind::HostKey {
+                hostname: "a.example.test".into(),
+                port: 22,
+                algorithm: "ssh-ed25519".into(),
+                fingerprint: "SHA256:a".into(),
+                status: "unknown".into(),
+                previous_keys: Vec::new(),
+                can_replace: false,
+            },
+        ));
+        state.show_authentication(SshAuthCard::new(
+            "challenge-b".into(),
+            2,
+            "target-b".into(),
+            SshAuthKind::Password {
+                username: "build".into(),
+                message: "Password required".into(),
+                allow_remember: false,
+            },
+        ));
+        assert!(matches!(
+            handle_ssh_key(&mut state, &key(KeyCode::Char('n'))),
+            SshModalOutcome::AnswerAuthentication { challenge_id, .. } if challenge_id == "challenge-a"
+        ));
+        assert!(matches!(
+            &state.page,
+            SshModalPage::Authentication(card) if card.challenge_id == "challenge-b"
+        ));
+    }
+
+    #[test]
     fn root_password_keeps_input_hidden_and_never_remembered() {
         let mut card = SshAuthCard::new(
             "sudo-challenge".into(),
@@ -8531,11 +9637,11 @@ mod tests {
         ));
 
         state.show_operation_approval(approval("new-operation"));
+        assert!(state.resolve_sudo_authentication(
+            7, "session-1", "sudo-challenge", None,
+        ));
         assert!(!state.resolve_sudo_authentication(
-            7,
-            "session-1",
-            "sudo-challenge",
-            Some("late".into()),
+            7, "session-1", "sudo-challenge", Some("duplicate completion".into()),
         ));
         assert!(matches!(
             &state.page,
@@ -10030,7 +11136,7 @@ mod tests {
             state.show_incoming_grant(
                 "source-session".into(),
                 SshIncomingGrant {
-                    request_id: "external-read-only".into(),
+                    request_id: "missing-target".into(),
                     target_id: Some("chosen-target".into()),
                     root: Some("/srv/build".into()),
                     capabilities: SshCapabilitiesView {

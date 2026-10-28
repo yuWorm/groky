@@ -5,7 +5,7 @@ use bytes::{Buf, BytesMut};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 use crate::cpu_profile::{ControlError, ProfileArtifactFormat};
-use crate::ssh::{SshControlCommand, SshControlReply, SshEvent};
+use crate::ssh::{SshControlCommand, SshControlReply, SshEventEnvelope};
 
 const MAX_MESSAGE_SIZE: u32 = 64 * 1024 * 1024;
 const FRAME_HEADER_LEN: usize = 4;
@@ -172,7 +172,7 @@ pub enum ClientMode {
     Stdio,
 }
 
-pub const LEADER_PROTOCOL_VERSION: u32 = 1;
+pub const LEADER_PROTOCOL_VERSION: u32 = 2;
 
 /// Client capabilities reported during registration.
 /// The leader uses them to customize behavior per client, such as injecting settings into session requests.
@@ -396,7 +396,7 @@ pub enum ControlCommand {
     Ssh(SshControlCommand),
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ControlPayload {
     LeaderInfo {
@@ -551,7 +551,7 @@ pub enum ServerMessage {
     },
     /// Local-only SSH event. It is not ACP, is never persisted in a session
     /// replay, and is routed to the originating local client by the leader.
-    SshEvent { event: SshEvent },
+    SshEvent { event: SshEventEnvelope },
     Pong,
     Error {
         code: i32,

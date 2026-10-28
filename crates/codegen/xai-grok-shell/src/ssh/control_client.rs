@@ -1,6 +1,8 @@
 use tokio::sync::broadcast;
 
-use super::{SessionSsh, SshControlCommand, SshControlReply, SshEvent, SshServiceError};
+use super::{
+    SessionSsh, SshControlCommand, SshControlReply, SshEventEnvelope, SshServiceError,
+};
 
 /// A thin local-leader control facade for pager and CLI code. It accepts both
 /// the public `LeaderConnection` returned by `connect_or_spawn` and an already
@@ -66,11 +68,11 @@ impl<'a> SshControlClient<'a> {
         }
     }
 
-    pub fn subscribe_events(&self) -> broadcast::Receiver<SshEvent> {
+    pub fn subscribe_events(&self) -> broadcast::Receiver<SshEventEnvelope> {
         match self.transport {
             ControlTransport::Client(leader) => leader.subscribe_ssh_events(),
             ControlTransport::Connection(leader) => leader.subscribe_ssh_events(),
-            ControlTransport::Service { service, .. } => service.subscribe_events(),
+            ControlTransport::Service { service, .. } => service.subscribe_control_events(),
         }
     }
     pub async fn request(

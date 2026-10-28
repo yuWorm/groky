@@ -43,7 +43,8 @@ enum ServerEvent {
     Disconnected(ClientId),
     Registered(ClientId, ClientMode, ClientCapabilities, String),
     Message(ClientId, ClientMessage),
-    SshEvent(crate::ssh::SshEvent),
+    SshEvent(crate::ssh::SshEventEnvelope),
+    SshEventsLagged,
 }
 enum LeaderServerPoll {
     Cancelled,
@@ -1557,7 +1558,7 @@ pub async fn run_leader_server(
     let listener = LeaderListener::bind(&socket_path)?;
     info!("Leader server listening");
     let (event_tx, mut event_rx) = mpsc::unbounded_channel::<ServerEvent>();
-    let mut ssh_events = control_state.ssh.subscribe_events();
+    let mut ssh_events = control_state.ssh.subscribe_control_events();
     let ssh_event_tx = event_tx.clone();
     let ssh_event_cancel = cancel.clone();
     tokio::spawn(async move {
@@ -1570,7 +1571,11 @@ pub async fn run_leader_server(
                             break;
                         }
                     }
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                        if ssh_event_tx.send(ServerEvent::SshEventsLagged).is_err() {
+                            break;
+                        }
+                    }
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                 },
             }
@@ -1643,7 +1648,12 @@ pub async fn run_leader_server(
             },
             LeaderServerPoll::Event(event) => match event {
                 ServerEvent::SshEvent(event) => {
-                    if let crate::ssh::SshEvent::Worker(worker_event) = &event {
+                    let crate::ssh::SshEventEnvelope::Event {
+                        event: ssh_event, ..
+                    } = &event else {
+                        continue;
+                    };
+                    if let crate::ssh::SshEvent::Worker(worker_event) = ssh_event {
                         if let Some(subscribers) = session_subscribers.get(&worker_event.session_id) {
                             for id in subscribers {
                                 if let Some(client) = clients.get(id) {
@@ -1657,7 +1667,7 @@ pub async fn run_leader_server(
                             }
                         }
                     } else {
-                        let target = match &event {
+                        let target = match ssh_event {
                             crate::ssh::SshEvent::Authentication(prompt) => Some(ClientId(prompt.client_id)),
                             crate::ssh::SshEvent::SudoAuthentication { prompt, .. } => {
                                 Some(ClientId(prompt.client_id))
@@ -1704,6 +1714,16 @@ pub async fn run_leader_server(
                                     .into());
                             }
                         }
+                    }
+                }
+                ServerEvent::SshEventsLagged => {
+                    for client in clients.values().filter(|client| client.registered) {
+                        let _ = client.tx.send(
+                            ServerMessage::SshEvent {
+                                event: crate::ssh::SshEventEnvelope::ResyncRequired,
+                            }
+                            .into(),
+                        );
                     }
                 }
                 ServerEvent::Registered(id, mode, capabilities, client_type) => {

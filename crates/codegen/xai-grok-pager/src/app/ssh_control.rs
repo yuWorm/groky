@@ -4,23 +4,27 @@
 //! leader-backed pager lazily attaches to the persistent leader instead.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use tokio::sync::{Mutex, OnceCell, broadcast};
 use xai_grok_shell::{
     leader::{ClientCapabilities, ClientMode, LeaderConnection, LeaderEnvUrls, connect_or_spawn},
-    ssh::{SessionSsh, SshControlClient, SshControlCommand, SshControlReply, SshEvent},
+    ssh::{
+        PendingSshInteractions, SessionSsh, SshControlClient, SshControlCommand, SshControlReply,
+        SshEventEnvelope,
+    },
 };
 
 pub(crate) struct EmbeddedSsh {
     service: Arc<SessionSsh>,
     client_id: u64,
-    events: Mutex<broadcast::Receiver<SshEvent>>,
+    events: Mutex<broadcast::Receiver<SshEventEnvelope>>,
 }
 
 pub(crate) struct LeaderSsh {
     connection: Arc<LeaderConnection>,
-    events: Mutex<broadcast::Receiver<SshEvent>>,
+    events: Mutex<broadcast::Receiver<SshEventEnvelope>>,
 }
 
 pub(crate) enum SshControlBackend {
@@ -28,34 +32,68 @@ pub(crate) enum SshControlBackend {
     Leader(LeaderSsh),
 }
 
-static SSH_CONTROL: OnceCell<SshControlBackend> = OnceCell::const_new();
+static SSH_CONTROL: OnceCell<Mutex<Option<Arc<SshControlBackend>>>> = OnceCell::const_new();
 
-/// Install the embedded agent's exact SSH service before any control request.
-/// The subscription is created up front, so authentication and approval events
-/// cannot be lost between individual control replies.
-pub(crate) async fn install_embedded(service: Arc<SessionSsh>, client_id: u64) -> Result<()> {
-    if SSH_CONTROL.get().is_some() {
-        anyhow::bail!("SSH control backend is already initialized");
-    }
-    let control = SshControlClient::from_service(service.as_ref(), client_id);
-    let events = Mutex::new(control.subscribe_events());
-    SSH_CONTROL
-        .set(SshControlBackend::Embedded(EmbeddedSsh {
-            service,
-            client_id,
-            events,
-        }))
-        .map_err(|_| anyhow::anyhow!("SSH control backend is already initialized"))
+async fn control_slot() -> &'static Mutex<Option<Arc<SshControlBackend>>> {
+    SSH_CONTROL.get_or_init(|| async { Mutex::new(None) }).await
 }
 
-async fn backend() -> Result<&'static SshControlBackend> {
-    SSH_CONTROL.get_or_try_init(standalone).await
+/// Install the embedded agent's exact SSH service before control requests.
+///
+/// Replacing a leader backend is intentional: the embedded service is the
+/// authority for this pager generation. Existing disconnected leader clients
+/// have their ephemeral interactions cancelled by the leader service.
+pub(crate) async fn install_embedded(service: Arc<SessionSsh>, client_id: u64) -> Result<()> {
+    let control = SshControlClient::from_service(service.as_ref(), client_id);
+    let events = Mutex::new(control.subscribe_events());
+    let backend = Arc::new(SshControlBackend::Embedded(EmbeddedSsh {
+        service,
+        client_id,
+        events,
+    }));
+    let mut slot = control_slot().await.lock().await;
+    if matches!(slot.as_deref(), Some(SshControlBackend::Embedded(_))) {
+        anyhow::bail!("SSH control backend is already initialized");
+    }
+    *slot = Some(backend);
+    Ok(())
+}
+
+async fn backend() -> Result<Arc<SshControlBackend>> {
+    let slot = control_slot().await;
+    if let Some(existing) = slot.lock().await.clone() {
+        return Ok(existing);
+    }
+
+    let created = Arc::new(standalone().await?);
+    let mut slot = slot.lock().await;
+    Ok(slot.get_or_insert_with(|| created.clone()).clone())
+}
+
+async fn discard_stale_leader(candidate: &Arc<SshControlBackend>) {
+    if !matches!(candidate.as_ref(), SshControlBackend::Leader(_)) {
+        return;
+    }
+    let mut slot = control_slot().await.lock().await;
+    if slot.as_ref().is_some_and(|current| Arc::ptr_eq(current, candidate)) {
+        *slot = None;
+    }
+}
+
+fn is_transport_error(error: &anyhow::Error) -> bool {
+    matches!(
+        error.downcast_ref::<xai_grok_shell::ssh::SshControlClientError>(),
+        Some(
+            xai_grok_shell::ssh::SshControlClientError::Client(_)
+                | xai_grok_shell::ssh::SshControlClientError::Connection(_)
+        )
+    )
 }
 
 /// An independently owned control connection. Dropping it leaves retained SSH
 /// connections in the leader, but releases this client's pending interactions.
-/// It never installs the global pager backend, so project handoff can still
-/// initialize the final embedded agent's exact service.
+/// It never installs the global pager backend, so standalone callers own their
+/// receiver and recovery lifecycle explicitly.
 pub(crate) async fn standalone() -> Result<SshControlBackend> {
     let raw = xai_grok_shell::config::load_effective_config()
         .map_err(|error| anyhow::anyhow!("failed to load local SSH configuration: {error}"))?;
@@ -80,21 +118,144 @@ pub(crate) async fn standalone() -> Result<SshControlBackend> {
 }
 
 pub(crate) async fn request(command: SshControlCommand) -> Result<(u64, SshControlReply)> {
-    backend().await?.request(command).await
+    let current = backend().await?;
+    let result = current.request(command).await;
+    if result.as_ref().err().is_some_and(is_transport_error) {
+        discard_stale_leader(&current).await;
+    }
+    result
 }
 
 pub(crate) async fn client_id() -> Result<u64> {
     backend().await?.client_id().await
 }
 
-pub(crate) async fn next_event() -> Result<(u64, SshEvent)> {
-    backend().await?.next_event().await
+
+pub(crate) async fn next_event_envelope() -> Result<(u64, SshEventEnvelope)> {
+    let current = backend().await?;
+    let result = current.next_event_envelope().await;
+    if result
+        .as_ref()
+        .err()
+        .is_some_and(|error| error.to_string().contains("event stream closed"))
+    {
+        discard_stale_leader(&current).await;
+    }
+    result
+}
+
+pub(crate) async fn pending_interactions() -> Result<(u64, PendingSshInteractions)> {
+    let current = backend().await?;
+    let result = current.pending_interactions().await;
+    if result.as_ref().err().is_some_and(is_transport_error) {
+        discard_stale_leader(&current).await;
+    }
+    result
 }
 
 pub(crate) async fn load_targets(
     session_id: Option<&str>,
 ) -> Result<(u64, Vec<crate::views::ssh_modal::SshTargetView>)> {
-    backend().await?.load_targets(session_id).await
+    let current = backend().await?;
+    let result = current.load_targets(session_id).await;
+    if result.as_ref().err().is_some_and(is_transport_error) {
+        discard_stale_leader(&current).await;
+    }
+    result
+}
+
+/// Run exactly one persistent event pump for a pager generation. RPC effects
+/// never create readers; this pump alone owns the receiver and issues only the
+/// safe pending-interactions snapshot while recovering.
+pub(crate) fn start_event_pump(
+    pump_generation: u64,
+    results: tokio::sync::mpsc::UnboundedSender<crate::app::actions::TaskResult>,
+) -> tokio::task::AbortHandle {
+    let handle = tokio::spawn(async move {
+        let mut control_generation = 0;
+        loop {
+            control_generation += 1;
+            let (client_id, snapshot) = match pending_interactions().await {
+                Ok(result) => result,
+                Err(error) => {
+                    if results
+                        .send(crate::app::actions::TaskResult::SshEventStreamFailed {
+                            pump_generation,
+                            control_generation,
+                            client_id: None,
+                            error: error.to_string(),
+                        })
+                        .is_err()
+                    {
+                        return;
+                    }
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                    continue;
+                }
+            };
+            let mut sequence = snapshot.sequence;
+            if results
+                .send(crate::app::actions::TaskResult::SshEventStreamRecovered {
+                    pump_generation,
+                    control_generation,
+                    client_id,
+                    snapshot,
+                })
+                .is_err()
+            {
+                return;
+            }
+
+            let mut retry = false;
+            loop {
+                match next_event_envelope().await {
+                    Ok((event_client_id, SshEventEnvelope::Event { sequence: event_sequence, event }))
+                        if event_client_id == client_id =>
+                    {
+                        if event_sequence <= sequence {
+                            continue;
+                        }
+                        sequence = event_sequence;
+                        if results
+                            .send(crate::app::actions::TaskResult::SshEventStreamEvent {
+                                pump_generation,
+                                control_generation,
+                                client_id,
+                                event,
+                            })
+                            .is_err()
+                        {
+                            return;
+                        }
+                    }
+                    Ok((_, SshEventEnvelope::Event { .. })) => {
+                        retry = true;
+                        break;
+                    }
+                    Ok((_, SshEventEnvelope::ResyncRequired)) => break,
+                    Err(error) => {
+                        retry = true;
+                        if results
+                            .send(crate::app::actions::TaskResult::SshEventStreamFailed {
+                                pump_generation,
+                                control_generation,
+                                client_id: Some(client_id),
+                                error: error.to_string(),
+                            })
+                            .is_err()
+                        {
+                            return;
+                        }
+                        break;
+                    }
+                }
+            }
+            if retry {
+                tokio::time::sleep(Duration::from_secs(1)).await;
+            }
+        }
+    });
+    handle.abort_handle()
 }
 
 impl SshControlBackend {
@@ -102,7 +263,8 @@ impl SshControlBackend {
         match self {
             Self::Embedded(embedded) => {
                 let reply = SshControlClient::from_service(&embedded.service, embedded.client_id)
-                    .request(command).await?;
+                    .request(command)
+                    .await?;
                 Ok((embedded.client_id, reply))
             }
             Self::Leader(leader) => {
@@ -120,9 +282,9 @@ impl SshControlBackend {
         })
     }
 
-    /// The receiver is subscribed before the first request. Only event
-    /// consumption is serialized; authentication replies can run concurrently.
-    pub(crate) async fn next_event(&self) -> Result<(u64, SshEvent)> {
+    /// One receiver is serialized per backend. Lag is surfaced to the
+    /// generation-owned pump instead of discarding authentication/grant events.
+    pub(crate) async fn next_event_envelope(&self) -> Result<(u64, SshEventEnvelope)> {
         let (client_id, events) = match self {
             Self::Embedded(embedded) => (embedded.client_id, &embedded.events),
             Self::Leader(leader) => (
@@ -130,16 +292,25 @@ impl SshControlBackend {
                 &leader.events,
             ),
         };
+        let disconnect = match self {
+            Self::Embedded(_) => None,
+            Self::Leader(leader) => Some(leader.connection.disconnect_reason()),
+        };
         let mut events = events.lock().await;
-        loop {
-            match events.recv().await {
-                Ok(event) => return Ok((client_id, event)),
-                Err(broadcast::error::RecvError::Lagged(_)) => continue,
-                Err(broadcast::error::RecvError::Closed) => {
-                    anyhow::bail!("SSH local event stream closed; reopen SSH manager to reconnect.")
-                }
-            }
+        let event = receive_ssh_envelope(&mut events, disconnect).await?;
+        Ok((client_id, event))
+    }
+
+
+    pub(crate) async fn pending_interactions(&self) -> Result<(u64, PendingSshInteractions)> {
+        let (client_id, reply) = self.request(SshControlCommand::SnapshotPendingInteractions).await?;
+        let SshControlReply::PendingInteractions(snapshot) = reply else {
+            anyhow::bail!("SSH local service returned an unexpected pending-interactions snapshot.");
+        };
+        if snapshot.client_id != client_id {
+            anyhow::bail!("SSH local service returned a pending-interactions snapshot for another client.");
         }
+        Ok((client_id, snapshot))
     }
 
     pub(crate) async fn load_targets(
@@ -273,4 +444,53 @@ pub(crate) fn authentication_card(
         _ => return Err("SSH authentication prompt kind did not match its local details.".into()),
     };
     Ok(SshAuthCard::new(prompt.challenge_id, prompt.connection_generation, prompt.target_id, kind))
+}
+
+async fn receive_ssh_envelope(
+    events: &mut broadcast::Receiver<SshEventEnvelope>,
+    disconnect: Option<tokio::sync::watch::Receiver<xai_grok_shell::leader::DisconnectReason>>,
+) -> Result<SshEventEnvelope> {
+    let received = if let Some(mut disconnect) = disconnect {
+        if *disconnect.borrow() != xai_grok_shell::leader::DisconnectReason::Connected {
+            anyhow::bail!("SSH local event stream closed; reconnecting");
+        }
+        tokio::select! {
+            biased;
+            _ = disconnect.changed() => {
+                anyhow::bail!("SSH local event stream closed; reconnecting");
+            }
+            event = events.recv() => event,
+        }
+    } else {
+        events.recv().await
+    };
+    match received {
+        Ok(event) => Ok(event),
+        Err(broadcast::error::RecvError::Lagged(count)) => {
+            anyhow::bail!("SSH local event stream lagged by {count} events; recovering pending interactions");
+        }
+        Err(broadcast::error::RecvError::Closed) => {
+            anyhow::bail!("SSH local event stream closed; reconnecting");
+        }
+    }
+}
+
+#[cfg(test)]
+mod stream_tests {
+    #[tokio::test]
+    async fn ssh_transport_disconnect_wakes_reader_even_while_sender_is_retained() {
+        use xai_grok_shell::leader::DisconnectReason;
+        let (sender, mut events) = tokio::sync::broadcast::channel(8);
+        let (disconnect, receiver) = tokio::sync::watch::channel(DisconnectReason::Connected);
+        let reading = tokio::spawn(async move {
+            super::receive_ssh_envelope(&mut events, Some(receiver)).await
+        });
+        tokio::task::yield_now().await;
+        disconnect.send(DisconnectReason::ConnectionLost).unwrap();
+        let result = tokio::time::timeout(std::time::Duration::from_secs(1), reading)
+            .await.expect("transport closure must not wait for the retained broadcast sender")
+            .unwrap();
+        assert!(result.unwrap_err().to_string().contains("event stream closed"));
+        drop(sender);
+    }
 }

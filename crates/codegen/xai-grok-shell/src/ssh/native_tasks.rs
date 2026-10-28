@@ -28,11 +28,11 @@ pub(super) struct NativeOperations {
 
 pub(super) struct NativeOperation {
     pub id: String,
+    client_id: Option<u64>,
     invocation: ResolvedSshInvocation,
     command: Option<String>,
     state: Mutex<OperationState>,
 }
-
 struct OperationState {
     record: SshOperationRecord,
     stdout: Vec<u8>,
@@ -47,6 +47,7 @@ impl NativeOperations {
     pub(super) async fn reserve(
         &self,
         request: &SshDispatchRequest,
+        client_id: Option<u64>,
     ) -> Result<Arc<NativeOperation>, String> {
         let mut entries = self.entries.lock().await;
         for entry in entries.values() {
@@ -66,6 +67,7 @@ impl NativeOperations {
         let id = format!("ssh-native-{}", Uuid::now_v7());
         let entry = Arc::new(NativeOperation {
             id: id.clone(),
+            client_id,
             invocation: request.invocation.clone(),
             command: if request.tool_name == "GrokBuild:run_terminal_cmd" {
                 Some(
@@ -101,6 +103,39 @@ impl NativeOperations {
         });
         entries.insert(id, entry.clone());
         Ok(entry)
+    }
+
+    /// Nonterminal operations owned by one interactive local client. The
+    /// caller must validate each invocation against its current session
+    /// binding before treating an ID as live.
+    pub(super) async fn active_operations_for_client(
+        &self,
+        client_id: u64,
+    ) -> Vec<(String, ResolvedSshInvocation)> {
+        let entries = self
+            .entries
+            .lock()
+            .await
+            .values()
+            .filter(|entry| entry.client_id == Some(client_id))
+            .cloned()
+            .collect::<Vec<_>>();
+        let mut operations = Vec::new();
+        for entry in entries {
+            if !entry.state.lock().await.record.state.is_terminal() {
+                operations.push((entry.id.clone(), entry.invocation.clone()));
+            }
+        }
+        operations.sort_by(|left, right| left.0.cmp(&right.0));
+        operations
+    }
+
+    pub(super) async fn active_ids_for_client(&self, client_id: u64) -> Vec<String> {
+        self.active_operations_for_client(client_id)
+            .await
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect()
     }
 
     async fn owned(
@@ -524,10 +559,10 @@ mod tests {
         let operations = NativeOperations::default();
         let binding = binding();
         let request = request(&binding);
-        let operation = operations.reserve(&request).await.unwrap();
-        assert!(operations.reserve(&request).await.is_err());
+        let operation = operations.reserve(&request, Some(7)).await.unwrap();
+        assert!(operations.reserve(&request, Some(7)).await.is_err());
         operation.state.lock().await.record.state = SshOperationState::Completed;
-        assert!(operations.reserve(&request).await.is_err());
+        assert!(operations.reserve(&request, Some(7)).await.is_err());
         assert_eq!(
             operations
                 .query(&binding, &operation.id)
@@ -539,10 +574,26 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn active_operation_ids_are_scoped_to_client_and_drop_at_terminal_state() {
+        let operations = NativeOperations::default();
+        let binding = binding();
+        let operation = operations.reserve(&request(&binding), Some(7)).await.unwrap();
+
+        assert_eq!(
+            operations.active_ids_for_client(7).await,
+            vec![operation.id.clone()]
+        );
+        assert!(operations.active_ids_for_client(8).await.is_empty());
+
+        operation.state.lock().await.record.state = SshOperationState::Completed;
+        assert!(operations.active_ids_for_client(7).await.is_empty());
+    }
+
+    #[tokio::test]
     async fn native_ssh_task_lookup_isolated_by_binding_session_and_epoch() {
         let operations = NativeOperations::default();
         let binding = binding();
-        let operation = operations.reserve(&request(&binding)).await.unwrap();
+        let operation = operations.reserve(&request(&binding), Some(7)).await.unwrap();
         let mut other_binding = binding.clone();
         other_binding.id = "binding-b".into();
         let mut other_session = binding.clone();
@@ -574,7 +625,7 @@ mod tests {
     async fn native_ssh_late_interruption_cannot_overwrite_confirmed_result() {
         let operations = NativeOperations::default();
         let binding = binding();
-        let operation = operations.reserve(&request(&binding)).await.unwrap();
+        let operation = operations.reserve(&request(&binding), Some(7)).await.unwrap();
         operation
             .finish(
                 Ok(SshDispatchResult {

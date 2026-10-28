@@ -1480,8 +1480,6 @@ pub(in crate::app::dispatch) fn handle_session_created(
     crate::app::workspace_sync::allow_loaded_session(app, session_id.0.as_ref());
     let agent_count = app.agents.len();
     let ssh_client_id = app.ssh_client_id;
-    let start_ssh_event_consumer = !app.ssh_event_consumer_active;
-    app.ssh_event_consumer_active = true;
     let switch_hint =
         crate::views::dashboard::session_switch_hint_command(app.screen_mode.is_minimal());
     let has_switch_target =
@@ -1586,14 +1584,6 @@ pub(in crate::app::dispatch) fn handle_session_created(
                 agent_id,
                 session_id_clone.clone(),
             ));
-        }
-        // SSH local-control prompts must remain consumed while the optional manager overlay is
-        // closed. One receiver serves this pager's local-control connection and re-arms itself.
-        if start_ssh_event_consumer {
-            effects.push(Effect::SshAwaitEvent {
-                client_id: ssh_client_id,
-                session_id: Some(session_id_clone.to_string()),
-            });
         }
         if let Some(owner) = refresh_ssh_targets_owner {
             effects.push(Effect::SshListTargets {

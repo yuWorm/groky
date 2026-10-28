@@ -1228,14 +1228,17 @@ pub(in crate::app::dispatch) fn dispatch_load_session_with_restore(
 /// The opaque request remains recorded to discard late events, while a user-created replacement
 /// manager has a distinct owner and survives this terminal load.
 fn clear_pending_ssh_project_resume(app: &mut AppView, agent_id: AgentId) {
-    let owner = app.agents.get_mut(&agent_id).and_then(|agent| {
+    let completed = app.agents.get_mut(&agent_id).and_then(|agent| {
         agent.ssh_project_resume_pending_session_id = None;
-        agent
-            .ssh_project_resume_install
-            .as_ref()
-            .map(|install| install.owner)
+        agent.ssh_project_resume_install.as_ref().map(|install| (
+            install.owner, install.client_id, install.request_id.clone(),
+            install.session_id.clone(), install.binding_id.clone(),
+        ))
     });
-    if let Some(owner) = owner {
+    if let Some((owner, client_id, request_id, session_id, binding_id)) = completed {
+        if let Some(manager) = super::super::ssh::ssh_manager_for_owner_mut(app, owner) {
+            manager.settle_worker_install_completion(client_id, &request_id, &session_id, &binding_id);
+        }
         super::super::ssh::close_ssh_manager_for_owner(app, owner);
     }
 }

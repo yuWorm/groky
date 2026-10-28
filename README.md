@@ -286,10 +286,17 @@ the actual granted folder and permissions to the same tool call, so work continu
 another chat message. Denial, cancellation, client disconnect, or session closure stops that
 request; a late approval cannot revive it.
 
-Successful access and command approvals close the dialog and return directly to chat;
-remote-project consent instead continues opening the project. A required sudo password
-challenge can still appear afterward, and successful password submission returns to chat
-without a server-list detour.
+SSH requests retain independent consent and authentication state. Concurrent requests queue
+without replacing the dialog or its input; a completed, cancelled, or expired request advances
+to the next pending interaction. When none remain, successful access and command approvals
+return directly to chat without a server-list detour. Remote-project consent continues opening
+the project. A required sudo password challenge stays tied to its approved command and restores
+any interrupted dialog after completion.
+
+The SSH authorization listener runs independently of tool calls. An interruption is reported
+visibly; recovery reconciles still-valid prompts with the local service instead of replaying
+commands or approval decisions. Requests cancelled by a client disconnect must be retried
+explicitly.
 
 SSH text fields show a native terminal cursor. Password, key-passphrase and keyboard-interactive
 fields remain masked while the cursor follows typing, navigation and the active answer.

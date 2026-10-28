@@ -27,3 +27,5 @@ Voice: `**Lead** rest.` Lead is the noun the user already knows (`/default`, `Re
 Next groky version after `v0.1.29`.
 
 - **/import-session** discovers omp, pi, Claude Code, Codex, and OpenCode sessions for the current directory, previews migration warnings, and imports a new native session without changing the source or rerunning historical tools; `groky sessions import` provides the same local import from IDs or paths.
+- **SSH approvals** preserve concurrent access, command, and authentication requests instead of overwriting dialogs; completion, cancellation, and expiry advance only the matching request, while sudo password prompts stay tied to their approved command.
+- **SSH authorization listener** reports interruptions and restores valid pending prompts after recovery without replaying commands or approval decisions.

@@ -769,7 +769,7 @@ pub(super) fn dispatch_task_result(result: TaskResult, app: &mut AppView) -> Vec
                     };
                     let failed = super::ssh::ssh_manager_for_owner_mut(app, owner)
                         .is_some_and(|manager| manager.fail_pending_grant(&request_id, error.clone()));
-                    failed
+                    let mut effects: Vec<_> = failed
                         .then(|| Effect::SshFailGrant {
                             session_id,
                             request_id,
@@ -778,7 +778,9 @@ pub(super) fn dispatch_task_result(result: TaskResult, app: &mut AppView) -> Vec
                             owner,
                         })
                         .into_iter()
-                        .collect()
+                        .collect();
+                    effects.extend(super::ssh::drain_ssh_pending_interaction_continuation(app, owner));
+                    effects
                 }
             }
         }
@@ -796,7 +798,7 @@ pub(super) fn dispatch_task_result(result: TaskResult, app: &mut AppView) -> Vec
             {
                 manager.restore_cancelled_grant(&request_id, error);
             }
-            vec![]
+            super::ssh::drain_ssh_pending_interaction_continuation(app, owner)
         }
         TaskResult::SshGrantFailureAcknowledged {
             client_id,
@@ -832,6 +834,7 @@ pub(super) fn dispatch_task_result(result: TaskResult, app: &mut AppView) -> Vec
                             owner,
                         });
                     }
+                    effects.extend(super::ssh::drain_ssh_pending_interaction_continuation(app, owner));
                     return effects;
                 }
             }
@@ -853,7 +856,33 @@ pub(super) fn dispatch_task_result(result: TaskResult, app: &mut AppView) -> Vec
                     session_id: manager.session_id.clone(), client_id, owner,
                 });
             }
+            effects.extend(super::ssh::drain_ssh_pending_interaction_continuation(app, owner));
             effects
+        }
+        TaskResult::SshAuthenticationComplete {
+            client_id, owner, challenge_id: _, connection_generation: _, target_id, error,
+        } => {
+            if app.ssh_event_client_id.is_some_and(|current| current != client_id)
+                || super::ssh::ssh_manager_for_owner_mut(app, owner).is_none()
+            {
+                return vec![];
+            }
+            if let Some(mut error) = error {
+                error.retain(|character| !character.is_control());
+                let message = format!("SSH authentication for {target_id} failed: {error}");
+                match owner.agent_id {
+                    Some(agent_id) => {
+                        if let Some(agent) = app.agents.get_mut(&agent_id) {
+                            agent.show_toast(&message);
+                        }
+                    }
+                    None if matches!(app.active_view, ActiveView::Welcome | ActiveView::AgentDashboard) => {
+                        app.show_toast(&message);
+                    }
+                    None => {}
+                }
+            }
+            super::ssh::drain_ssh_pending_interaction_continuation(app, owner)
         }
         TaskResult::SshActionComplete {
             session_id: _,
@@ -917,7 +946,7 @@ pub(super) fn dispatch_task_result(result: TaskResult, app: &mut AppView) -> Vec
                         None,
                     )
                 };
-            match settlement {
+            let mut effects = match settlement {
                 crate::views::ssh_modal::SshOperationApprovalSettlement::Dismiss => {
                     super::ssh::close_ssh_manager_for_owner(app, owner);
                     vec![]
@@ -936,7 +965,9 @@ pub(super) fn dispatch_task_result(result: TaskResult, app: &mut AppView) -> Vec
                         })
                         .unwrap_or_default()
                 }
-            }
+            };
+            effects.extend(super::ssh::drain_ssh_pending_interaction_continuation(app, owner));
+            effects
         }
         TaskResult::SshWorkerInstallApprovalComplete {
             client_id,
@@ -958,6 +989,46 @@ pub(super) fn dispatch_task_result(result: TaskResult, app: &mut AppView) -> Vec
                     error,
                 );
             }
+            super::ssh::drain_ssh_pending_interaction_continuation(app, owner)
+        }
+        TaskResult::SshEventStreamRecovered {
+            pump_generation, control_generation, client_id, snapshot,
+        } => {
+            if pump_generation != app.ssh_event_pump_generation
+                || control_generation < app.ssh_event_control_generation
+                || snapshot.client_id != client_id
+            {
+                return vec![];
+            }
+            app.ssh_event_control_generation = control_generation;
+            app.ssh_event_client_id = Some(client_id);
+            app.ssh_client_id = client_id;
+            super::ssh::reconcile_ssh_pending_interactions(app, snapshot)
+        }
+        TaskResult::SshEventStreamEvent {
+            pump_generation, control_generation, client_id, event,
+        } => {
+            if pump_generation != app.ssh_event_pump_generation
+                || control_generation != app.ssh_event_control_generation
+                || app.ssh_event_client_id != Some(client_id)
+            {
+                return vec![];
+            }
+            app.ssh_client_id = client_id;
+            super::ssh::apply_ssh_control_event(app, None, None, event)
+        }
+        TaskResult::SshEventStreamFailed {
+            pump_generation, control_generation, client_id: _, mut error,
+        } => {
+            if pump_generation != app.ssh_event_pump_generation
+                || control_generation < app.ssh_event_control_generation
+            {
+                return vec![];
+            }
+            app.ssh_event_control_generation = control_generation;
+            app.ssh_event_client_id = None;
+            error.retain(|character| !character.is_control());
+            app.show_toast(&format!("SSH authorization listener interrupted; reconnecting: {error}"));
             vec![]
         }
         TaskResult::SshControlEvent {

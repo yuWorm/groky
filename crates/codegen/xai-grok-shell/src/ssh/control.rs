@@ -4,8 +4,9 @@ use serde::{Deserialize, Serialize};
 use xai_grok_ssh::SshTarget;
 use xai_grok_workspace_types::ssh::{SshCapabilities, SshHostIdentity};
 use super::model::{
-    RevokeStatus, SshAuthResponse, SshDirectoryListing, SshOperationApprovalDecision,
-    SshOperationApprovalScope, SshProjectPreparation, SshTargetAccess, SshTargetStatus,
+    PendingSshInteractions, RevokeStatus, SshAuthResponse, SshDirectoryListing,
+    SshOperationApprovalDecision, SshOperationApprovalScope, SshProjectPreparation,
+    SshTargetAccess, SshTargetStatus,
 };
 use super::{SshGrantDecision, SshGrantRequest};
 
@@ -30,6 +31,9 @@ pub enum SshControlCommand {
     ListSessionTargets {
         session_id: String,
     },
+    /// Authoritative non-secret interaction state for the requesting local
+    /// client. Its sequence is a barrier for the ordered event stream.
+    SnapshotPendingInteractions,
     RequestGrant {
         session_id: String,
         #[serde(default)]
@@ -256,7 +260,7 @@ impl From<SshAuthControlResponse> for SshAuthResponse {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", content = "data", rename_all = "snake_case")]
 pub enum SshControlReply {
     /// Serialized configured targets are a UI-only listing. Model tools use
@@ -264,6 +268,7 @@ pub enum SshControlReply {
     /// current-session access without serializing raw target records.
     ConfiguredTargets(String),
     SessionTargets(Vec<SshTargetAccess>),
+    PendingInteractions(PendingSshInteractions),
     GrantRequested(SshGrantRequest),
     GrantResolved {
         binding: Option<xai_grok_workspace_types::ssh::SshBinding>,
@@ -309,6 +314,7 @@ mod tests {
         };
         for command in [
             SshControlCommand::ListConfiguredTargets,
+            SshControlCommand::SnapshotPendingInteractions,
             SshControlCommand::Connect {
                 target_id: "build-host".into(),
                 interactive: false,
@@ -383,6 +389,12 @@ mod tests {
         for reply in [
             SshControlReply::ConfiguredTargets("[{\"id\":\"build-host\"}]".into()),
             SshControlReply::SessionTargets(Vec::new()),
+            SshControlReply::PendingInteractions(PendingSshInteractions {
+                client_id: 7,
+                sequence: 3,
+                active_operation_ids: vec!["ssh-native-approval".into()],
+                ..Default::default()
+            }),
             SshControlReply::ProjectDirectories(SshDirectoryListing {
                 target_id: "build-host".into(),
                 identity: identity.clone(),

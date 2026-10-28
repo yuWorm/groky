@@ -143,6 +143,212 @@ fn map_ssh_modal_outcome(outcome: SshModalOutcome) -> InputOutcome {
     }
 }
 
+/// Drain a grant/browser continuation produced while a queued interaction becomes active.
+///
+/// The modal retains continuation state because promotion happens while it is mutably borrowed.
+/// This dispatcher seam releases that borrow before creating one exact owner-correlated local
+/// effect; it never replays a remote mutation.
+pub(super) fn drain_ssh_pending_interaction_continuation(
+    app: &mut AppView,
+    owner: SshManagerOwner,
+) -> Vec<Effect> {
+    let client_id = app.ssh_client_id;
+    let Some((outcome, manager_session_id, grant_session_id)) =
+        ssh_manager_for_owner_mut(app, owner).and_then(|manager| {
+            let outcome = manager.take_pending_interaction_continuation()?;
+            let grant_session_id = match &outcome {
+                SshModalOutcome::InspectGrantTarget { request_id, .. }
+                | SshModalOutcome::ApproveGrant { request_id, .. }
+                | SshModalOutcome::CancelGrant { request_id } => {
+                    manager.grant_session_id_for(request_id)
+                }
+                _ => None,
+            };
+            Some((outcome, manager.session_id.clone(), grant_session_id))
+        })
+    else {
+        return vec![];
+    };
+    match outcome {
+        SshModalOutcome::BrowseProjectDirectory {
+            request_id,
+            target_id,
+            path,
+        } => vec![Effect::SshBrowseProjectDirectory {
+            request_id,
+            target_id,
+            path,
+            client_id,
+            owner,
+        }],
+        SshModalOutcome::InspectGrantTarget {
+            request_id,
+            target_id,
+            selected_root,
+            expected_identity,
+        } => vec![Effect::SshInspectGrantTarget {
+            session_id: grant_session_id.or(manager_session_id),
+            request_id,
+            target_id,
+            selected_root,
+            expected_identity,
+            client_id,
+            owner,
+        }],
+        SshModalOutcome::ApproveGrant {
+            request_id,
+            approved: false,
+            target_id,
+            root,
+            capabilities,
+            lifetime,
+            set_default,
+        } => grant_session_id
+            .map(|session_id| {
+                vec![Effect::SshApproveGrant {
+                    session_id,
+                    request_id,
+                    approved: false,
+                    target_id,
+                    root,
+                    capabilities,
+                    lifetime,
+                    set_default,
+                    client_id,
+                    owner,
+                }]
+            })
+            .unwrap_or_default(),
+        SshModalOutcome::CancelGrant { request_id } => grant_session_id
+            .map(|session_id| {
+                vec![Effect::SshCancelGrant {
+                    session_id,
+                    request_id,
+                    client_id,
+                    owner,
+                }]
+            })
+            .unwrap_or_default(),
+        SshModalOutcome::Close
+        | SshModalOutcome::Changed
+        | SshModalOutcome::Unchanged
+        | SshModalOutcome::Refresh
+        | SshModalOutcome::AddTarget { .. }
+        | SshModalOutcome::UpdateTarget { .. }
+        | SshModalOutcome::RemoveTarget { .. }
+        | SshModalOutcome::SelectPromptTarget { .. }
+        | SshModalOutcome::Connect { .. }
+        | SshModalOutcome::Disconnect { .. }
+        | SshModalOutcome::RequestGrant { .. }
+        | SshModalOutcome::ApproveGrant { approved: true, .. }
+        | SshModalOutcome::UseBinding { .. }
+        | SshModalOutcome::RevokeBinding { .. }
+        | SshModalOutcome::ChooseProjectDirectory { .. }
+        | SshModalOutcome::CancelProjectOpen { .. }
+        | SshModalOutcome::ApproveOperation { .. }
+        | SshModalOutcome::ResetOperationApprovals { .. }
+        | SshModalOutcome::ApproveWorkerInstall { .. }
+        | SshModalOutcome::AnswerAuthentication { .. } => vec![],
+    }
+}
+
+/// Reconcile modal state with a sequence-barrier snapshot owned by the current local-control
+/// client. StreamRecovery drops envelopes at or below the snapshot sequence before invoking
+/// this; this function never retries a command, grant decision, or operation decision.
+pub(super) fn reconcile_ssh_pending_interactions(
+    app: &mut AppView,
+    snapshot: xai_grok_shell::ssh::PendingSshInteractions,
+) -> Vec<Effect> {
+    if snapshot.client_id != app.ssh_client_id {
+        return vec![];
+    }
+    let mut owners = Vec::new();
+    if let Some(manager) = app.welcome_ssh_manager.as_ref() {
+        owners.push(SshManagerOwner {
+            agent_id: None,
+            instance_id: manager.instance_id(),
+        });
+    }
+    owners.extend(app.agents.iter().filter_map(|(agent_id, agent)| {
+        agent.ssh_manager.as_ref().map(|manager| SshManagerOwner {
+            agent_id: Some(*agent_id),
+            instance_id: manager.instance_id(),
+        })
+    }));
+
+    let live = crate::views::ssh_modal::SshLiveInteractionIds {
+        // IDs are opaque and globally unique within this client. A worktree's grant or
+        // worker prompt may be displayed on its source manager, not its own session.
+        grant_ids: snapshot.grants.iter().map(|request| request.id.clone()).collect(),
+        authentication: snapshot.authentication.iter()
+            .chain(snapshot.sudo_authentication.iter().map(|pending| &pending.prompt))
+            .map(|prompt| (
+                prompt.challenge_id.clone(), prompt.connection_generation, prompt.target_id.clone(),
+            )).collect(),
+        operation_approval_ids: snapshot.operation_approvals.iter()
+            .map(|approval| approval.approval_id.clone()).collect(),
+        worker_install_ids: snapshot.worker_installs.iter().map(|request| (
+            request.client_id, request.request_id.clone(), request.session_id.clone(),
+            request.binding_id.clone(),
+        )).collect(),
+        active_operation_ids: snapshot.active_operation_ids.clone(),
+    };
+    let mut effects = Vec::new();
+    for owner in owners {
+        if let Some(manager) = ssh_manager_for_owner_mut(app, owner) {
+            manager.reconcile_live_interaction_ids(&live);
+        }
+        effects.extend(drain_ssh_pending_interaction_continuation(app, owner));
+    }
+
+    for request in snapshot.grants {
+        effects.extend(apply_ssh_control_event(
+            app,
+            Some(request.session_id.clone()),
+            None,
+            xai_grok_shell::ssh::SshEvent::GrantRequested(request),
+        ));
+    }
+    for prompt in snapshot.authentication {
+        effects.extend(apply_ssh_control_event(
+            app,
+            None,
+            ssh_manager_owner_for_authentication(app, &prompt.target_id),
+            xai_grok_shell::ssh::SshEvent::Authentication(prompt),
+        ));
+    }
+    for pending in snapshot.sudo_authentication {
+        if pending.prompt.client_id != snapshot.client_id {
+            continue;
+        }
+        if let Ok(card) = crate::app::ssh_control::authentication_card(pending.prompt)
+            && let Some(manager) = ssh_manager_for_session_mut(app, Some(&pending.session_id))
+        {
+            manager.recover_sudo_authentication(
+                snapshot.client_id, &pending.session_id, &pending.operation_id,
+                &snapshot.active_operation_ids, card,
+            );
+        }
+    }
+    for approval in snapshot.operation_approvals {
+        effects.extend(apply_ssh_control_event(
+            app,
+            Some(approval.session_id.clone()),
+            None,
+            xai_grok_shell::ssh::SshEvent::OperationApproval(approval),
+        ));
+    }
+    for request in snapshot.worker_installs {
+        effects.extend(apply_ssh_control_event(
+            app,
+            Some(request.session_id.clone()),
+            None,
+            xai_grok_shell::ssh::SshEvent::WorkerInstallRequested(request),
+        ));
+    }
+    effects
+}
+
 fn active_session_id(app: &AppView) -> Option<String> {
     active_agent_session_id(app).map(|session_id| session_id.to_string())
 }
@@ -716,37 +922,29 @@ fn new_ssh_surface_state(
 fn open_ssh_surface(app: &mut AppView, for_prompt: bool) -> Vec<Effect> {
     let session_id = active_session_id(app);
     if let Some(agent) = get_active_agent_mut(app) {
-        if let Some(manager) = agent.ssh_manager.as_mut().filter(|manager| !manager.is_visible()) {
-            manager.reopen(for_prompt);
+        if let Some(manager) = agent.ssh_manager.as_mut() {
+            if !manager.is_visible() {
+                manager.reopen(for_prompt);
+            }
         } else {
             agent.ssh_manager = Some(new_ssh_surface_state(for_prompt, session_id.clone()));
         }
-    } else if let Some(manager) = app
-        .welcome_ssh_manager
-        .as_mut()
-        .filter(|manager| !manager.is_visible())
-    {
-        manager.reopen(for_prompt);
+    } else if let Some(manager) = app.welcome_ssh_manager.as_mut() {
+        if !manager.is_visible() {
+            manager.reopen(for_prompt);
+        }
     } else {
         app.welcome_ssh_manager = Some(new_ssh_surface_state(for_prompt, session_id.clone()));
     }
     let owner = ssh_manager_owner(app).expect("the SSH manager was just installed");
-    let mut effects = Vec::with_capacity(2);
-    // One receiver owns this pager client's event stream for all sessions. It is deliberately
-    // independent of overlay visibility and re-arms itself after every event.
-    if !app.ssh_event_consumer_active {
-        app.ssh_event_consumer_active = true;
-        effects.push(Effect::SshAwaitEvent {
-            client_id: app.ssh_client_id,
-            session_id: session_id.clone(),
-        });
-    }
-    effects.push(Effect::SshListTargets {
+    let session_id = ssh_manager_for_owner_mut(app, owner)
+        .map(|manager| manager.session_id.clone())
+        .expect("the SSH manager was just installed");
+    vec![Effect::SshListTargets {
         session_id,
         client_id: app.ssh_client_id,
         owner,
-    });
-    effects
+    }]
 }
 
 pub(super) fn dispatch_select_ssh_target(app: &mut AppView, reference: String) -> Vec<Effect> {
@@ -1330,7 +1528,7 @@ pub(super) fn dispatch_submit_ssh_authentication(
     app: &mut AppView,
     challenge_id: String,
     connection_generation: u64,
-    _target_id: String,
+    target_id: String,
     host_key_decision: Option<xai_grok_shell::ssh::SshHostKeyDecision>,
     remember: bool,
     secret: Option<crate::views::ssh_modal::SshSecret>,
@@ -1339,16 +1537,19 @@ pub(super) fn dispatch_submit_ssh_authentication(
     let Some(owner) = ssh_manager_owner(app) else {
         return vec![];
     };
-    vec![Effect::SshSubmitAuthentication {
+    let mut effects = vec![Effect::SshSubmitAuthentication {
         client_id: app.ssh_client_id,
         owner,
         challenge_id,
+        target_id,
         connection_generation,
         host_key_decision,
         remember,
         secret,
         answers,
-    }]
+    }];
+    effects.extend(drain_ssh_pending_interaction_continuation(app, owner));
+    effects
 }
 
 pub(super) fn dispatch_approve_ssh_operation(
@@ -1604,7 +1805,7 @@ pub(super) fn apply_ssh_control_event(
         _ => true,
     };
     if !event_targets_this_client {
-        return vec![Effect::SshAwaitEvent { client_id, session_id }];
+        return vec![];
     }
     let owner = match &event {
         xai_grok_shell::ssh::SshEvent::SudoAuthentication { session_id, .. }
@@ -1617,10 +1818,7 @@ pub(super) fn apply_ssh_control_event(
     };
     match &event {
         xai_grok_shell::ssh::SshEvent::WorkerInstallRequested(request) => {
-            let mut effects = vec![Effect::SshAwaitEvent {
-                client_id,
-                session_id,
-            }];
+            let mut effects = Vec::new();
             if request.client_id != client_id {
                 return effects;
             }
@@ -1700,10 +1898,7 @@ pub(super) fn apply_ssh_control_event(
                     progress.message.clone(),
                 );
             }
-            return vec![Effect::SshAwaitEvent {
-                client_id,
-                session_id,
-            }];
+            return vec![];
         }
         _ => {}
     }
@@ -1722,10 +1917,7 @@ pub(super) fn apply_ssh_control_event(
         if owner.is_some() {
             remember_direct_ssh_grant_reply(app, request_id, kind);
         } else if is_direct_ssh_grant_reply(app, request_id, kind) {
-            return vec![Effect::SshAwaitEvent {
-                client_id,
-                session_id,
-            }];
+            return vec![];
         }
     }
     let event_session_id = match &event {
@@ -1752,14 +1944,7 @@ pub(super) fn apply_ssh_control_event(
         xai_grok_shell::ssh::SshEvent::WorkerInstallProgress(progress) => {
             Some(progress.session_id.clone())
         }
-        // Worker progress is delivered to the session's ACP subscriber. Keep the manager
-        // control stream alive without creating a local SSH manager overlay.
-        xai_grok_shell::ssh::SshEvent::Worker(_) => {
-            return vec![Effect::SshAwaitEvent {
-                client_id,
-                session_id,
-            }];
-        }
+        xai_grok_shell::ssh::SshEvent::Worker(worker) => Some(worker.session_id.clone()),
     };
     let manager_session_id = match &event {
         xai_grok_shell::ssh::SshEvent::GrantRequested(request) => {
@@ -1777,7 +1962,6 @@ pub(super) fn apply_ssh_control_event(
         .or_else(|| ssh_manager_owner_for_session(app, manager_session_id.as_deref()));
     let mut grant_resolution = None;
     let mut dismiss_approved_grant_manager = false;
-    let mut terminal_grant_failed = false;
     let mut project_resolution = None;
     let mut grant_follow_up = None;
     let mut grant_continuation = SshModalOutcome::Unchanged;
@@ -1792,7 +1976,8 @@ pub(super) fn apply_ssh_control_event(
             | xai_grok_shell::ssh::SshEvent::GrantFailed { .. }
             | xai_grok_shell::ssh::SshEvent::OperationApprovalExpired { .. }
             | xai_grok_shell::ssh::SshEvent::SudoAuthentication { .. }
-            | xai_grok_shell::ssh::SshEvent::SudoAuthenticationResolved { .. } => {
+            | xai_grok_shell::ssh::SshEvent::SudoAuthenticationResolved { .. }
+            | xai_grok_shell::ssh::SshEvent::Worker(_) => {
                 existing_ssh_manager_for_session_mut(app, manager_session_id.as_deref())
             }
             xai_grok_shell::ssh::SshEvent::GrantRequested(_)
@@ -1801,8 +1986,7 @@ pub(super) fn apply_ssh_control_event(
                 ssh_manager_for_session_mut(app, manager_session_id.as_deref())
             }
             xai_grok_shell::ssh::SshEvent::WorkerInstallRequested(_)
-            | xai_grok_shell::ssh::SshEvent::WorkerInstallProgress(_)
-            | xai_grok_shell::ssh::SshEvent::Worker(_) => None,
+            | xai_grok_shell::ssh::SshEvent::WorkerInstallProgress(_) => None,
         },
     };
     if let Some(manager) = manager {
@@ -1850,7 +2034,7 @@ pub(super) fn apply_ssh_control_event(
                         && binding.is_some()
                         && pending_project.is_none()
                         && manager.current_grant_surface_matches(&request_id);
-                    manager.settle_grant(approved);
+                    manager.settle_grant_for(&request_id, approved);
                     if !approved
                         && let Some(request_id) = project_resolution
                     {
@@ -1884,9 +2068,8 @@ pub(super) fn apply_ssh_control_event(
                 if grant_client_id == client_id
                     && manager.grant_session_id_for(&request_id).as_deref()
                         == Some(grant_session_id.as_str())
-                    && manager.settle_grant_failure(&request_id, error)
                 {
-                    terminal_grant_failed = true;
+                    manager.settle_grant_failure(&request_id, error);
                 }
             }
             xai_grok_shell::ssh::SshEvent::BindingRevoked {
@@ -1991,20 +2174,19 @@ pub(super) fn apply_ssh_control_event(
             | xai_grok_shell::ssh::SshEvent::WorkerInstallProgress(_) => {
                 unreachable!("worker install events were handled before manager routing")
             }
-            xai_grok_shell::ssh::SshEvent::Worker(_) => {
-                return vec![Effect::SshAwaitEvent {
-                    client_id,
-                    session_id,
-                }];
+            xai_grok_shell::ssh::SshEvent::Worker(worker) => {
+                if manager.session_id.as_deref() == Some(worker.session_id.as_str())
+                    && let xai_grok_shell::ssh::SshWorkerEvent::Operation(record) = worker.event
+                    && record.state.is_terminal()
+                {
+                    manager.settle_terminal_operation(&record.operation_id);
+                }
             }
-        }
+    }
     }
     if let (Some(owner), Some(target_id)) = (owner, selected_prompt_target) {
         choose_ssh_prompt_target_for_owner(app, owner, &target_id);
-        return vec![Effect::SshAwaitEvent { client_id, session_id }];
-    }
-    if terminal_grant_failed {
-        return vec![Effect::SshAwaitEvent { client_id, session_id }];
+        return vec![];
     }
     if let Some((true, Some(binding))) = grant_resolution {
         if project_resolution.is_some() {
@@ -2031,17 +2213,14 @@ pub(super) fn apply_ssh_control_event(
         && let Some(owner) = resolution_owner
     {
         close_ssh_manager_for_owner(app, owner);
-        return vec![Effect::SshAwaitEvent { client_id, session_id }];
+        return vec![];
     }
     let refresh = owner
         .or_else(|| ssh_manager_owner_for_session(app, manager_session_id.as_deref()))
         .and_then(|owner| {
             ssh_manager_for_owner_mut(app, owner).map(|manager| (owner, manager.session_id.clone()))
         });
-    let mut effects = vec![Effect::SshAwaitEvent {
-        client_id,
-        session_id,
-    }];
+    let mut effects = Vec::new();
     if let Some((owner, session_id)) = refresh {
         effects.push(Effect::SshListTargets {
             session_id,
@@ -2074,6 +2253,7 @@ pub(super) fn apply_ssh_control_event(
             }
             _ => {}
         }
+        effects.extend(drain_ssh_pending_interaction_continuation(app, owner));
     }
     effects
 }

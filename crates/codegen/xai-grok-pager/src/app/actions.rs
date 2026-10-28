@@ -2750,6 +2750,7 @@ pub enum Effect {
         client_id: u64,
         owner: SshManagerOwner,
         challenge_id: String,
+        target_id: String,
         connection_generation: u64,
         host_key_decision: Option<xai_grok_shell::ssh::SshHostKeyDecision>,
         remember: bool,
@@ -2787,11 +2788,6 @@ pub enum Effect {
         request_id: String,
         session_id: String,
         binding_id: String,
-    },
-    /// Wait for exactly one targeted SSH control event while the SSH manager is active.
-    SshAwaitEvent {
-        client_id: u64,
-        session_id: Option<String>,
     },
     ApplyDoctorFix {
         target: DoctorFixTarget,
@@ -2966,6 +2962,15 @@ pub enum TaskResult {
         submission_id: u64,
         result: Result<xai_grok_ssh::SshTarget, String>,
     },
+    /// Authentication acknowledgement is not an error on whatever card is now visible.
+    SshAuthenticationComplete {
+        client_id: u64,
+        owner: SshManagerOwner,
+        challenge_id: String,
+        connection_generation: u64,
+        target_id: String,
+        error: Option<String>,
+    },
     /// A correlated local-control acknowledgement for a remote operation decision.
     SshOperationApprovalComplete {
         session_id: Option<String>,
@@ -2996,6 +3001,30 @@ pub enum TaskResult {
         /// `None` belongs to the global event receiver; a direct request must retain its origin.
         owner: Option<SshManagerOwner>,
         event: xai_grok_shell::ssh::SshEvent,
+    },
+    /// The generation-owned SSH event pump has reconciled the exact current
+    /// client's authoritative, non-secret pending-interaction snapshot.
+    SshEventStreamRecovered {
+        pump_generation: u64,
+        control_generation: u64,
+        client_id: u64,
+        snapshot: xai_grok_shell::ssh::PendingSshInteractions,
+    },
+    /// One event from the generation-owned SSH stream after its recovery
+    /// barrier. It is never produced by an RPC effect.
+    SshEventStreamEvent {
+        pump_generation: u64,
+        control_generation: u64,
+        client_id: u64,
+        event: xai_grok_shell::ssh::SshEvent,
+    },
+    /// The event pump observed a real reader or recovery failure and will
+    /// safely retry only stream/snapshot recovery.
+    SshEventStreamFailed {
+        pump_generation: u64,
+        control_generation: u64,
+        client_id: Option<u64>,
+        error: String,
     },
     /// Inspection is correlated to the original grant, including failure after cancellation.
     SshGrantInspected {

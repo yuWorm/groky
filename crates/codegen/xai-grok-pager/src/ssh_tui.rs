@@ -154,6 +154,11 @@ enum UiMessage {
         client_id: u64,
         event: SshEvent,
     },
+    EventStreamRecovered {
+        client_id: u64,
+        backend: Arc<ssh_control::SshControlBackend>,
+        snapshot: xai_grok_shell::ssh::PendingSshInteractions,
+    },
     EventStreamClosed(String),
 }
 
@@ -244,16 +249,50 @@ impl StandaloneSshRunner {
         let backend = Arc::clone(&self.backend);
         let tx = self.messages_tx.clone();
         self.jobs.spawn(async move {
-            loop {
-                match backend.next_event().await {
-                    Ok((client_id, event)) => {
-                        if tx.send(UiMessage::Event { client_id, event }).is_err() {
+            let mut backend = backend;
+            'recover: loop {
+                let (client_id, snapshot) = match backend.pending_interactions().await {
+                    Ok(snapshot) => snapshot,
+                    Err(error) => {
+                        if tx.send(UiMessage::EventStreamClosed(format!("{error:#}"))).is_err() {
                             break;
                         }
+                        tokio::time::sleep(Duration::from_secs(1)).await;
+                        match ssh_control::standalone().await {
+                            Ok(reconnected) => backend = Arc::new(reconnected),
+                            Err(error) => {
+                                if tx.send(UiMessage::EventStreamClosed(format!("{error:#}"))).is_err() {
+                                    break;
+                                }
+                            }
+                        }
+                        continue;
                     }
-                    Err(error) => {
-                        let _ = tx.send(UiMessage::EventStreamClosed(format!("{error:#}")));
-                        break;
+                };
+                let barrier = snapshot.sequence;
+                if tx.send(UiMessage::EventStreamRecovered {
+                    client_id, backend: Arc::clone(&backend), snapshot,
+                }).is_err() {
+                    break;
+                }
+                loop {
+                    match backend.next_event_envelope().await {
+                        Ok((event_client_id, xai_grok_shell::ssh::SshEventEnvelope::Event { sequence, event })) => {
+                            if event_client_id != client_id {
+                                continue 'recover;
+                            }
+                            if sequence > barrier && tx.send(UiMessage::Event { client_id, event }).is_err() {
+                                break 'recover;
+                            }
+                        }
+                        Ok((_, xai_grok_shell::ssh::SshEventEnvelope::ResyncRequired)) => continue 'recover,
+                        Err(error) => {
+                            if tx.send(UiMessage::EventStreamClosed(format!("{error:#}"))).is_err() {
+                                break 'recover;
+                            }
+                            tokio::time::sleep(Duration::from_secs(1)).await;
+                            continue 'recover;
+                        }
                     }
                 }
             }
@@ -716,6 +755,33 @@ impl StandaloneSshRunner {
                 }
                 return self.route_control_event(event);
             }
+            UiMessage::EventStreamRecovered { client_id, backend, snapshot } => {
+                // A restarted leader can reuse the same numeric client ID.
+                let changed_client = client_id != self.client_id
+                    || !Arc::ptr_eq(&backend, &self.backend);
+                self.backend = backend;
+                self.client_id = client_id;
+                let live = crate::views::ssh_modal::SshLiveInteractionIds {
+                    grant_ids: Vec::new(), operation_approval_ids: Vec::new(),
+                    active_operation_ids: Vec::new(),
+                    worker_install_ids: Vec::new(),
+                    authentication: snapshot.authentication.iter().map(|prompt| (
+                        prompt.challenge_id.clone(), prompt.connection_generation, prompt.target_id.clone(),
+                    )).collect(),
+                };
+                self.state.reconcile_live_interaction_ids(&live);
+                if changed_client {
+                    Self::next_generation(&mut self.target_generation);
+                    Self::next_generation(&mut self.connection_generation);
+                    self.connection_attempt = None;
+                    self.last_authentication_submission = None;
+                    self.state.show_error("SSH control reconnected. Previous pending interactions were cancelled; retry the connection explicitly.");
+                    self.refresh_targets();
+                }
+                for prompt in snapshot.authentication {
+                    self.route_control_event(SshEvent::Authentication(prompt));
+                }
+            }
             UiMessage::EventStreamClosed(error) => self.state.show_error(error),
         }
         LoopAction::Continue
@@ -729,7 +795,8 @@ impl StandaloneSshRunner {
                         &prompt.kind,
                         xai_grok_shell::ssh::SshAuthPromptKind::SudoPassword
                     )
-                    && self.state.pending_authentication_target_id() == Some(prompt.target_id.as_str()) =>
+                    && (self.state.pending_authentication_target_id() == Some(prompt.target_id.as_str())
+                        || self.connection_attempt.as_ref().is_some_and(|attempt| attempt.target_id == prompt.target_id)) =>
             {
                 if self.last_authentication_submission.as_ref().is_some_and(|submitted| {
                     submitted.challenge_id == prompt.challenge_id

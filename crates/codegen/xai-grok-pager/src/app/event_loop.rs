@@ -243,6 +243,15 @@ struct ReconnectReinit {
     /// Reconnect generation that opened the reload windows.
     generation: u64,
 }
+
+/// Cancels the persistent SSH reader when this event-loop generation exits.
+struct AbortOnDrop(tokio::task::AbortHandle);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
 /// Result of a reconnect re-initialization task.
 struct ReinitOutcome {
     /// Whether initialize/authenticate succeeded; when false no load was attempted and `loads` is empty (every window finalizes as failed).
@@ -1662,6 +1671,8 @@ pub(crate) async fn run(
     let connection_cancel = connection.cancel;
     let mut leader_status_rx = connection.leader_status_rx;
     let mut tasks: JoinSet<TaskResult> = JoinSet::new();
+    let (ssh_event_tx, mut ssh_event_rx) =
+        tokio::sync::mpsc::unbounded_channel::<TaskResult>();
     let mut session_load_barrier = SessionLoadBarrier::new();
     let mut acp_peek: Option<AcpClientMessage> = None;
     let (progress_tx, mut progress_rx) =
@@ -1704,15 +1715,14 @@ pub(crate) async fn run(
     presenter.request_presentation(&mut app, terminal, false);
     // Consume local-control events before starting any session load. Restoring an
     // SSH project can require authentication before SessionCreated/SessionLoaded.
-    // The same receiver also owns later approvals while the manager is closed.
-    app.ssh_event_consumer_active = true;
-    let ssh_events = vec![super::actions::Effect::SshAwaitEvent {
-        client_id: app.ssh_client_id,
-        session_id: None,
-    }];
-    if process_effects(ssh_events, &mut tasks, &mut app, &progress_tx) {
-        return Ok(finish_run(&mut app));
-    }
+    // This generation-owned pump remains independent from modal actions and
+    // direct control replies for the entire pager lifetime.
+    app.ssh_event_pump_generation = app.ssh_event_pump_generation.wrapping_add(1);
+    let ssh_pump_generation = app.ssh_event_pump_generation;
+    let _ssh_event_pump = AbortOnDrop(crate::app::ssh_control::start_event_pump(
+        ssh_pump_generation,
+        ssh_event_tx,
+    ));
     if matches!(app.auth_state, AuthState::Done) {
         let effs = dispatch::dispatch(Action::RequestBundleStatus, &mut app);
         if process_effects(effs, &mut tasks, &mut app, &progress_tx) {
@@ -2375,6 +2385,24 @@ pub(crate) async fn run(
                         app.update_notifications();
                     }
                 }
+            }
+
+            Some(result) = ssh_event_rx.recv() => {
+                let effs = dispatch::dispatch(Action::TaskComplete(result), &mut app);
+                if process_effects(effs, &mut tasks, &mut app, &progress_tx) {
+                    break;
+                }
+                after_task_complete_dispatch(
+                    &app,
+                    &mut animation_tick_at,
+                    tick_interval,
+                    &mut resize_debounce_at,
+                    &mut billing_poll_at,
+                    BILLING_POLL_INTERVAL,
+                    &mut gate_poll_at,
+                    GATE_POLL_INTERVAL,
+                    &mut presenter,
+                );
             }
 
             Some(join_result) = tasks.join_next() => {

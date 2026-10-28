@@ -295,7 +295,7 @@ async fn fetch_live_leader_info(socket_path: &Path) -> Result<LiveLeaderInfo, Le
                 ),
             )
         })?;
-        if protocol_version < LEADER_PROTOCOL_VERSION {
+        if protocol_version != LEADER_PROTOCOL_VERSION {
             return Err(LeaderTargetError::new(
                 LeaderTargetErrorCode::UnsupportedProtocol,
                 format!(
@@ -869,8 +869,14 @@ impl LeaderConnection {
 
     /// Subscribe to local-only SSH events such as host-key, password/MFA, and
     /// remote operation approval prompts. They are not ACP/session replay data.
-    pub fn subscribe_ssh_events(&self) -> tokio::sync::broadcast::Receiver<crate::ssh::SshEvent> {
+    pub fn subscribe_ssh_events(
+        &self,
+    ) -> tokio::sync::broadcast::Receiver<crate::ssh::SshEventEnvelope> {
         self.client.subscribe_ssh_events()
+    }
+    /// Observe transport termination without consuming this connection's ACP channel.
+    pub fn disconnect_reason(&self) -> tokio::sync::watch::Receiver<DisconnectReason> {
+        self.client.disconnect_reason()
     }
     /// Decompose this connection into raw channels.
     ///
@@ -1092,19 +1098,24 @@ async fn wait_for_pid_exit(pid: u32, timeout: Duration) {
         "Evicted leader still alive after grace; reclaiming socket anyway"
     );
 }
-/// Whether the leader on `conn` is below this client's version floor (see [`should_evict`]).
+/// Whether the leader on `conn` is below this client's binary or protocol
+/// floor. A protocol mismatch is never adopted because the recoverable SSH
+/// event envelope has a different wire shape.
 fn should_evict_conn(conn: &LeaderConnection) -> bool {
-    should_evict(
-        conn.registration().leader_binary_version.as_deref(),
-        CLIENT_LEADER_VERSION,
-    )
+    conn.registration().leader_protocol_version != Some(LEADER_PROTOCOL_VERSION)
+        || should_evict(
+            conn.registration().leader_binary_version.as_deref(),
+            CLIENT_LEADER_VERSION,
+        )
 }
 /// Ask a stale leader to vacate so it releases the flock: graceful `RelaunchForUpdate` if relaunch-capable (the leader dedupes concurrent requests
 /// and re-checks the directional guard, so this is idempotent and never downgrades), else SIGTERM its pid.
 /// Best-effort and non-waiting; the caller retries the spawn loop, where the replacement is created under the flock.
 async fn request_leader_vacate(conn: &LeaderConnection, pid: Option<u32>) {
     let leader_version = conn.registration().leader_binary_version.clone();
-    let (method, outcome) = if conn.registration().supports_relaunch() {
+    let protocol_compatible =
+        conn.registration().leader_protocol_version == Some(LEADER_PROTOCOL_VERSION);
+    let (method, outcome) = if protocol_compatible && conn.registration().supports_relaunch() {
         let outcome = match conn
             .send_control(ControlCommand::RelaunchForUpdate {
                 to_version: CLIENT_LEADER_VERSION.to_string(),
@@ -2177,6 +2188,35 @@ mod tests {
             drop(conn);
             fake.cancel();
         }
+    }
+
+    #[tokio::test]
+    async fn should_evict_conn_rejects_old_protocol_even_at_same_binary_version() {
+        let temp = TempDir::new().unwrap();
+        let sock_path = temp.path().join("old-protocol.sock");
+        let fake = spawn_fake_leader(
+            sock_path.clone(),
+            FakeLeaderBehavior::Normal {
+                versions: FakeVersions {
+                    protocol_version: Some(LEADER_PROTOCOL_VERSION - 1),
+                    binary_version: Some(CLIENT_LEADER_VERSION.to_string()),
+                },
+                caps: fake_caps(true, false),
+            },
+        )
+        .await;
+        let conn = connect_to_leader(
+            &sock_path,
+            "test",
+            ClientMode::Stdio,
+            ClientCapabilities::default(),
+        )
+        .await
+        .unwrap();
+
+        assert!(should_evict_conn(&conn));
+        drop(conn);
+        fake.cancel();
     }
     /// A leader that closes right after `Registered` still yields a usable registration (version metadata for the eviction decision);
     /// the disconnect is observed afterwards, not during connect.
