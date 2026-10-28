@@ -128,13 +128,14 @@ impl SessionActor {
             setup.strip_reasoning,
             setup.context_window,
         );
-        // Deliberately tool-free: unlike the turn summary, the request carries no tools
-        // The model then can't spend the call on a tool invocation that would leave empty text and burn the checkpoint
-        // (The conversation prefix still shares the parent prompt-cache key.)
+        // Same tools as the main turn: tools serialize ahead of the conversation, so dropping them shares no cached prefix
+        // `ToolChoice::None` keeps the call tool-free, so no tool invocation can leave empty text and burn the checkpoint
+        let tool_specs = self.turn_base_tool_specs(&self.prepare_tool_definitions().await);
         let request = self.parent_cached_request(AuxCall {
             items,
-            tools: Vec::new(),
-            hosted_tools: Vec::new(),
+            tools: tool_specs,
+            hosted_tools: self.hosted_tools_for_turn(),
+            tool_choice: Some(xai_grok_sampling_types::ConversationToolChoice::None),
             model: setup.model.clone(),
             reasoning_effort: setup.reasoning_effort,
             backend: setup.client.api_backend(),

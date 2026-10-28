@@ -167,7 +167,11 @@ pub struct ToolParam {
 pub enum ToolChoiceParam {
     Auto,
     Any,
-    Tool { name: String },
+    Tool {
+        name: String,
+    },
+    /// Tools stay declared (so the cached prefix matches) but the model may not call them.
+    None,
 }
 
 /// Three modes per the Anthropic Messages API: Adaptive: 4.6+ models, API decides budget; Enabled: 4.0-4.5 models,

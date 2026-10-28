@@ -72,6 +72,99 @@ fn apply_cache_breakpoints(
     }
 }
 
+/// Anthropic accepts tool ids matching `^[a-zA-Z0-9_-]+$`, at most 64 chars.
+const MAX_TOOL_CALL_ID_LEN: usize = 64;
+
+/// Maps any tool call id onto Anthropic's id grammar; tool_use and tool_result both go through here, so the pair stays matched.
+/// Over-long ids (Responses ids run to hundreds of chars) keep a prefix plus a stable hash of the full id, so distinct ids stay distinct.
+fn anthropic_tool_call_id(id: &str) -> String {
+    let sanitized: String = id
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '_' || c == '-' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    if sanitized.is_empty() {
+        return format!("toolu_{:016x}", fnv1a64(id.as_bytes()));
+    }
+    if sanitized.len() <= MAX_TOOL_CALL_ID_LEN {
+        return sanitized;
+    }
+    // 47 + "_" + 16 hex = 64; `sanitized` is pure ASCII, so the byte slice is a char boundary
+    format!("{}_{:016x}", &sanitized[..47], fnv1a64(id.as_bytes()))
+}
+
+/// Stable across processes and releases, unlike `DefaultHasher`, so a resumed session rebuilds byte-identical ids and keeps its prompt cache.
+fn fnv1a64(bytes: &[u8]) -> u64 {
+    bytes.iter().fold(0xcbf2_9ce4_8422_2325, |hash, byte| {
+        (hash ^ u64::from(*byte)).wrapping_mul(0x0000_0100_0000_01b3)
+    })
+}
+
+/// For each item, the `model_id` of the assistant turn a `Reasoning` item belongs to.
+/// Reasoning precedes its assistant item within one turn, so a reverse scan carries the model back until a turn boundary.
+fn reasoning_owner_models(items: &[ConversationItem]) -> Vec<Option<&str>> {
+    let mut owners = vec![None; items.len()];
+    let mut next_model: Option<&str> = None;
+    for (index, item) in items.iter().enumerate().rev() {
+        match item {
+            ConversationItem::Assistant(a) => next_model = a.model_id.as_deref(),
+            ConversationItem::Reasoning(_) => owners[index] = next_model,
+            ConversationItem::BackendToolCall(_) => {}
+            ConversationItem::System(_)
+            | ConversationItem::User(_)
+            | ConversationItem::ToolResult(_) => next_model = None,
+        }
+    }
+    owners
+}
+
+/// Whether a thinking block produced by `owner` can be replayed natively to `target`; otherwise its signature is foreign and the API rejects it.
+/// Gateways echo dated snapshots (`claude-opus-4-8-20261001`) or remap Claude aliases, so any Claude pair counts; Anthropic checks signatures, not model names.
+/// An unknown side keeps the native replay that sessions persisted before `model_id` relied on.
+fn thinking_replays_natively(owner: Option<&str>, target: Option<&str>) -> bool {
+    let (Some(owner), Some(target)) = (owner, target) else {
+        return true;
+    };
+    let is_claude = |model: &str| model.to_ascii_lowercase().contains("claude");
+    owner == target || (is_claude(owner) && is_claude(target))
+}
+
+/// `metadata.user_id` in the JSON shape Claude Code sends; Claude gateways (sub2api) key sticky account routing, and so prompt-cache reuse, on it.
+/// `device_id` is a one-way hash of the install id so the raw id never leaves the machine.
+fn messages_metadata(
+    install_id: Option<&str>,
+    session_id: Option<&str>,
+) -> Option<crate::messages::Metadata> {
+    use sha2::{Digest, Sha256};
+    use std::fmt::Write as _;
+
+    let install_id = install_id.filter(|id| !id.is_empty())?;
+    let session_id = session_id.filter(|id| !id.is_empty())?;
+    let digest = Sha256::new()
+        .chain_update("groky-claude-device-id-v1:")
+        .chain_update(install_id)
+        .finalize();
+    let device_id = digest
+        .iter()
+        .fold(String::with_capacity(64), |mut hex, byte| {
+            let _ = write!(hex, "{byte:02x}");
+            hex
+        });
+    let user_id = serde_json::json!({
+        "device_id": device_id,
+        "account_uuid": "",
+        "session_id": session_id,
+    });
+    Some(crate::messages::Metadata {
+        user_id: Some(user_id.to_string()),
+    })
+}
+
 pub fn build_messages_request(req: &ConversationRequest) -> crate::messages::MessagesRequest {
     use crate::messages::{
         ContentBlock, ImageSource, Message, MessageContent, MessageRole, MessagesRequest,
@@ -83,17 +176,8 @@ pub fn build_messages_request(req: &ConversationRequest) -> crate::messages::Mes
     let mut pending_assistant: Vec<ContentBlock> = Vec::new();
     let mut pending_tool_results: Vec<ContentBlock> = Vec::new();
 
-    let sanitize_tool_call_id = |id: &str| -> String {
-        id.chars()
-            .map(|c| {
-                if c.is_alphanumeric() || c == '_' || c == '-' {
-                    c
-                } else {
-                    '_'
-                }
-            })
-            .collect()
-    };
+    let owner_models = reasoning_owner_models(&req.items);
+    let target_model = req.model.as_deref();
 
     let content_parts_to_anthropic_blocks = |parts: &[ContentPart]| -> Vec<ContentBlock> {
         parts
@@ -164,7 +248,7 @@ pub fn build_messages_request(req: &ConversationRequest) -> crate::messages::Mes
         }
     };
 
-    for item in &req.items {
+    for (index, item) in req.items.iter().enumerate() {
         match item {
             ConversationItem::System(s) => {
                 flush_assistant(&mut pending_assistant, &mut messages);
@@ -178,11 +262,30 @@ pub fn build_messages_request(req: &ConversationRequest) -> crate::messages::Mes
             ConversationItem::User(u) => {
                 flush_assistant(&mut pending_assistant, &mut messages);
                 flush_tool_results(&mut pending_tool_results, &mut messages);
-                let blocks = content_parts_to_anthropic_blocks(&u.content);
-                messages.push(Message {
-                    role: MessageRole::User,
-                    content: MessageContent::Blocks(blocks),
-                });
+                // The API rejects empty text blocks, and an empty user turn with them
+                let mut blocks = content_parts_to_anthropic_blocks(&u.content);
+                blocks.retain(
+                    |block| !matches!(block, ContentBlock::Text { text, .. } if text.is_empty()),
+                );
+                if blocks.is_empty() {
+                    continue;
+                }
+                // Text after a tool run joins the tool_result turn, the shape the API documents, instead of a second user turn
+                match messages.last_mut() {
+                    Some(Message {
+                        role: MessageRole::User,
+                        content: MessageContent::Blocks(prev),
+                    }) if prev
+                        .iter()
+                        .all(|block| matches!(block, ContentBlock::ToolResult { .. })) =>
+                    {
+                        prev.extend(blocks);
+                    }
+                    _ => messages.push(Message {
+                        role: MessageRole::User,
+                        content: MessageContent::Blocks(blocks),
+                    }),
+                }
             }
             ConversationItem::Assistant(a) => {
                 flush_tool_results(&mut pending_tool_results, &mut messages);
@@ -198,7 +301,7 @@ pub fn build_messages_request(req: &ConversationRequest) -> crate::messages::Mes
                     let input =
                         serde_json::from_str(&tc.arguments).unwrap_or(serde_json::json!({}));
                     pending_assistant.push(ContentBlock::ToolUse {
-                        id: sanitize_tool_call_id(&tc.id),
+                        id: anthropic_tool_call_id(&tc.id),
                         name: tc.name.clone(),
                         input,
                         cache_control: None,
@@ -210,10 +313,14 @@ pub fn build_messages_request(req: &ConversationRequest) -> crate::messages::Mes
                 let content = if t.images.is_empty() {
                     ToolResultContent::Text(t.content.as_ref().to_owned())
                 } else {
-                    let mut blocks = vec![ContentBlock::Text {
-                        text: t.content.as_ref().to_owned(),
-                        cache_control: None,
-                    }];
+                    // The API rejects an empty text block; the images alone carry the result
+                    let mut blocks = Vec::with_capacity(t.images.len() + 1);
+                    if !t.content.is_empty() {
+                        blocks.push(ContentBlock::Text {
+                            text: t.content.as_ref().to_owned(),
+                            cache_control: None,
+                        });
+                    }
                     for img in &t.images {
                         if let ContentPart::Image { url } = img {
                             let source = if let Some(rest) = url.strip_prefix("data:") {
@@ -241,7 +348,7 @@ pub fn build_messages_request(req: &ConversationRequest) -> crate::messages::Mes
                     ToolResultContent::Blocks(blocks)
                 };
                 pending_tool_results.push(ContentBlock::ToolResult {
-                    tool_use_id: sanitize_tool_call_id(&t.tool_call_id),
+                    tool_use_id: anthropic_tool_call_id(&t.tool_call_id),
                     content,
                     cache_control: None,
                 });
@@ -258,15 +365,20 @@ pub fn build_messages_request(req: &ConversationRequest) -> crate::messages::Mes
             ConversationItem::Reasoning(r) => {
                 flush_tool_results(&mut pending_tool_results, &mut messages);
                 let thinking = reasoning_item_text(r);
-                let signature = r
-                    .encrypted_content
-                    .as_deref()
-                    .map(str::to_owned)
-                    .unwrap_or_default();
-                if !thinking.is_empty() || !signature.is_empty() {
+                let signature = r.encrypted_content.as_deref().unwrap_or_default();
+                if !signature.is_empty()
+                    && thinking_replays_natively(owner_models[index], target_model)
+                {
                     pending_assistant.push(ContentBlock::Thinking {
                         thinking,
-                        signature,
+                        signature: signature.to_owned(),
+                    });
+                } else if !thinking.is_empty() {
+                    // Unsigned or foreign-signed thinking is rejected as a thinking block, so it survives as prose.
+                    // Bare text, no `<thinking>` wrapper: Claude's classifier refuses replayed tagged reasoning (omp `renderDemotedThinking`).
+                    pending_assistant.push(ContentBlock::Text {
+                        text: thinking,
+                        cache_control: None,
                     });
                 }
             }
@@ -303,15 +415,28 @@ pub fn build_messages_request(req: &ConversationRequest) -> crate::messages::Mes
         )
     };
 
-    let tool_choice: Option<ToolChoiceParam> = req.tool_choice.as_ref().map(|tc| match tc {
-        ConversationToolChoice::Auto => ToolChoiceParam::Auto,
-        ConversationToolChoice::Required => ToolChoiceParam::Any,
-        ConversationToolChoice::Function(name) => ToolChoiceParam::Tool { name: name.clone() },
-        ConversationToolChoice::None => ToolChoiceParam::Auto, // ToolChoiceParam has no none variant, so fall back to the default
-    });
+    // The API rejects a `tool_choice` without `tools`
+    let tool_choice: Option<ToolChoiceParam> =
+        tools
+            .as_ref()
+            .and(req.tool_choice.as_ref())
+            .map(|tc| match tc {
+                ConversationToolChoice::Auto => ToolChoiceParam::Auto,
+                ConversationToolChoice::Required => ToolChoiceParam::Any,
+                ConversationToolChoice::Function(name) => {
+                    ToolChoiceParam::Tool { name: name.clone() }
+                }
+                ConversationToolChoice::None => ToolChoiceParam::None,
+            });
+    // The API rejects thinking on a forced tool call, so that turn samples without it (omp `disableThinkingIfToolChoiceForced`)
+    let forced_tool = matches!(
+        tool_choice,
+        Some(ToolChoiceParam::Any | ToolChoiceParam::Tool { .. })
+    );
 
     let effort = req
         .reasoning_effort
+        .filter(|_| !forced_tool)
         .and_then(|e| e.to_messages_api())
         .map(|s| s.to_string());
 
@@ -350,7 +475,10 @@ pub fn build_messages_request(req: &ConversationRequest) -> crate::messages::Mes
         stop_sequences: None,
         thinking,
         output_config,
-        metadata: None,
+        metadata: messages_metadata(
+            req.x_grok_agent_id.as_deref(),
+            req.x_grok_session_id.as_deref(),
+        ),
     }
 }
 

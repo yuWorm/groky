@@ -1498,6 +1498,7 @@ async fn parent_cached_request_pins_fail_length_policy() {
         items: Vec::new(),
         tools: Vec::new(),
         hosted_tools: Vec::new(),
+        tool_choice: None,
         model: "test-model".to_string(),
         reasoning_effort: None,
         backend: crate::sampling::ApiBackend::Messages,

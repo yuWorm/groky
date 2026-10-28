@@ -123,12 +123,24 @@ pub fn stream_messages<'a>(
         // Tool-call index counter for per-tool deltas (separate from the block index, which can be interleaved with text/thinking blocks)
         let mut next_tool_index: u32 = 0;
         let mut block_to_tool_index: BTreeMap<u32, u32> = BTreeMap::new();
+        let mut saw_message_stop = false;
 
         let mut stream = raw_stream;
         loop {
             let event_result = match tokio::time::timeout(idle_timeout, stream.next()).await {
                 Ok(Some(event_result)) => event_result,
-                Ok(None) => break,
+                // A cut connection ends the stream cleanly too; only a terminal event proves the message is whole
+                Ok(None) if saw_message_stop || final_stop_reason.is_some() => break,
+                Ok(None) => {
+                    let err = SamplingError::EventStreamError(
+                        "Messages stream ended before message_stop".to_owned(),
+                    );
+                    yield SamplingEvent::Failed {
+                        request_id: request_id.clone(),
+                        error: SamplingErrorInfo::from(&err),
+                    };
+                    return;
+                }
                 Err(_elapsed) => {
                     let err = SamplingError::IdleTimeout {
                         elapsed_secs: idle_timeout.as_secs(),
@@ -461,7 +473,8 @@ pub fn stream_messages<'a>(
                 }
 
                 MessageStreamEvent::MessageStop => {
-                    // Final message complete; the loop exits naturally when the underlying stream ends
+                    // The loop exits when the underlying stream ends
+                    saw_message_stop = true;
                 }
 
                 MessageStreamEvent::Ping => {

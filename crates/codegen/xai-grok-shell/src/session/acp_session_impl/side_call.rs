@@ -69,6 +69,8 @@ pub(crate) struct AuxCall {
     pub(crate) items: Vec<ConversationItem>,
     pub(crate) tools: Vec<ToolSpec>,
     pub(crate) hosted_tools: Vec<xai_grok_sampling_types::HostedTool>,
+    /// `None` (the choice) keeps the tools in the cached prefix while forbidding calls to them.
+    pub(crate) tool_choice: Option<xai_grok_sampling_types::ConversationToolChoice>,
     pub(crate) model: String,
     /// Must match the main turn's, or the prompt differs before the conversation history even starts.
     pub(crate) reasoning_effort: Option<xai_grok_sampling_types::ReasoningEffort>,
@@ -116,6 +118,7 @@ impl SessionActor {
                 .into_items(),
             tools: call.tools,
             hosted_tools: call.hosted_tools,
+            tool_choice: call.tool_choice,
             model: Some(call.model),
             temperature: None,
             // Effort changes the prompt ahead of the conversation history, so dropping it here would share no prefix with the main turn.

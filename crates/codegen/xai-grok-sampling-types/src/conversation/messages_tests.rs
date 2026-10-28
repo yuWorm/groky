@@ -218,7 +218,10 @@ fn test_messages_request_cache_breakpoint_marks_an_image_tip() {
 fn test_messages_request_cache_breakpoint_skips_thinking() {
     let req = ConversationRequest::from_items(vec![
         ConversationItem::user("Fix the bug"),
-        ConversationItem::Reasoning(synthesized_reasoning_item("weighing options")),
+        ConversationItem::Reasoning(rs::ReasoningItem {
+            encrypted_content: Some("sig".to_string()),
+            ..synthesized_reasoning_item("weighing options")
+        }),
         ConversationItem::assistant("Fixed it."),
     ])
     .with_model("messages-compatible-model");
@@ -416,4 +419,209 @@ fn upgrade_legacy_reasoning_singular_anthropic_no_id() {
     };
     assert_eq!(r.id, "");
     assert_eq!(r.encrypted_content.as_deref(), Some("signature-bytes-here"));
+}
+
+fn signed_reasoning(text: &str, signature: &str) -> ConversationItem {
+    ConversationItem::Reasoning(rs::ReasoningItem {
+        encrypted_content: Some(signature.to_string()),
+        ..synthesized_reasoning_item(text)
+    })
+}
+
+fn assistant_block_types(json: &serde_json::Value, index: usize) -> Vec<String> {
+    json["messages"][index]["content"]
+        .as_array()
+        .unwrap_or_else(|| panic!("messages[{index}] content array: {json:#}"))
+        .iter()
+        .map(|b| b["type"].as_str().unwrap_or_default().to_string())
+        .collect()
+}
+
+/// A signature only verifies on the model family that minted it; anything else must not reach the API as a thinking block.
+#[test]
+fn thinking_replays_natively_only_with_a_matching_signature() {
+    let cases = [
+        // (label, reasoning, owner model, expected assistant block types)
+        (
+            "same model",
+            signed_reasoning("plan", "sig"),
+            "claude-opus-5",
+            vec!["thinking", "text"],
+        ),
+        (
+            "dated snapshot",
+            signed_reasoning("plan", "sig"),
+            "claude-opus-5-20261001",
+            vec!["thinking", "text"],
+        ),
+        (
+            "foreign signature demotes",
+            signed_reasoning("plan", "enc_grok"),
+            "grok-4.6",
+            vec!["text", "text"],
+        ),
+        (
+            "foreign signature-only drops",
+            signed_reasoning("", "enc_grok"),
+            "grok-4.6",
+            vec!["text"],
+        ),
+        (
+            "unsigned demotes",
+            ConversationItem::Reasoning(synthesized_reasoning_item("plan")),
+            "claude-opus-5",
+            vec!["text", "text"],
+        ),
+    ];
+    for (label, reasoning, owner, expected) in cases {
+        let req = ConversationRequest::from_items(vec![
+            ConversationItem::user("go"),
+            reasoning,
+            ConversationItem::assistant_with_model("done", owner),
+            ConversationItem::user("next"),
+        ])
+        .with_model("claude-opus-5");
+        let json = serde_json::to_value(build_messages_request(&req)).unwrap();
+        assert_eq!(
+            assistant_block_types(&json, 1),
+            expected,
+            "{label}: {json:#}"
+        );
+    }
+}
+
+#[test]
+fn demoted_thinking_is_bare_prose() {
+    let req = ConversationRequest::from_items(vec![
+        ConversationItem::user("go"),
+        ConversationItem::Reasoning(synthesized_reasoning_item("weigh it")),
+        ConversationItem::assistant_with_model("done", "grok-4.6"),
+    ])
+    .with_model("claude-opus-5");
+    let json = serde_json::to_value(build_messages_request(&req)).unwrap();
+    assert_eq!(
+        json["messages"][1]["content"][0]["text"], "weigh it",
+        "{json:#}"
+    );
+}
+
+/// Responses call ids run to hundreds of chars with `|`; Anthropic allows `^[a-zA-Z0-9_-]{1,64}$` and the pair must still match.
+#[test]
+fn tool_call_ids_fit_anthropic_grammar_and_stay_paired() {
+    let long_a = format!("call_{}|fc_{}", "a".repeat(200), "x".repeat(60));
+    let long_b = format!("call_{}|fc_{}", "a".repeat(200), "y".repeat(60));
+    let call = |id: &str| ToolCall {
+        id: id.into(),
+        name: "read".to_string(),
+        arguments: "{}".into(),
+    };
+    let req = ConversationRequest::from_items(vec![
+        ConversationItem::user("go"),
+        ConversationItem::assistant_tool_calls(vec![call(&long_a), call(&long_b), call("")]),
+        ConversationItem::tool_result(long_a.clone(), "a"),
+        ConversationItem::tool_result(long_b.clone(), "b"),
+        ConversationItem::tool_result("", "c"),
+    ]);
+    let json = serde_json::to_value(build_messages_request(&req)).unwrap();
+    let ids = |index: usize, key: &str| -> Vec<String> {
+        json["messages"][index]["content"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|b| b[key].as_str().unwrap().to_string())
+            .collect()
+    };
+    let uses = ids(1, "id");
+    assert_eq!(uses, ids(2, "tool_use_id"), "{json:#}");
+    for id in &uses {
+        assert!(
+            (1..=64).contains(&id.len())
+                && id
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-'),
+            "invalid id {id:?}"
+        );
+    }
+    assert_ne!(uses[0], uses[1], "distinct long ids must not collide");
+}
+
+#[test]
+fn tool_choice_mapping_and_forced_tool_drops_thinking() {
+    let spec = ToolSpec {
+        name: "read".to_string(),
+        description: None,
+        parameters: serde_json::json!({"type": "object"}),
+    };
+    let build = |choice: ConversationToolChoice, tools: Vec<ToolSpec>| {
+        let mut req = messages_test_request(Some(crate::ReasoningEffort::High));
+        req.tools = tools;
+        req.tool_choice = Some(choice);
+        serde_json::to_value(build_messages_request(&req)).unwrap()
+    };
+
+    let none = build(ConversationToolChoice::None, vec![spec.clone()]);
+    assert_eq!(none["tool_choice"], serde_json::json!({"type": "none"}));
+    assert!(none.get("thinking").is_some(), "{none:#}");
+
+    for forced in [
+        ConversationToolChoice::Required,
+        ConversationToolChoice::Function("read".to_string()),
+    ] {
+        let json = build(forced, vec![spec.clone()]);
+        assert!(json.get("thinking").is_none(), "{json:#}");
+        assert!(json.get("output_config").is_none(), "{json:#}");
+    }
+
+    let toolless = build(ConversationToolChoice::None, Vec::new());
+    assert!(toolless.get("tool_choice").is_none(), "{toolless:#}");
+}
+
+/// sub2api keys sticky account routing, and so prompt-cache reuse, on `metadata.user_id`; it needs both device_id and session_id.
+#[test]
+fn metadata_user_id_carries_stable_device_and_session() {
+    let build = |agent: Option<&str>, session: Option<&str>| {
+        let mut req = messages_test_request(None);
+        req.x_grok_agent_id = agent.map(str::to_owned);
+        req.x_grok_session_id = session.map(str::to_owned);
+        build_messages_request(&req)
+            .metadata
+            .and_then(|m| m.user_id)
+    };
+    let user_id = build(Some("install-1"), Some("sess-1")).expect("user_id");
+    let parsed: serde_json::Value = serde_json::from_str(&user_id).unwrap();
+    assert_eq!(parsed["session_id"], "sess-1");
+    let device_id = parsed["device_id"].as_str().unwrap();
+    assert!(device_id.len() == 64 && device_id.bytes().all(|b| b.is_ascii_hexdigit()));
+    assert!(
+        !user_id.contains("install-1"),
+        "raw install id must not leak"
+    );
+    assert_eq!(
+        build(Some("install-1"), Some("sess-1")).as_deref(),
+        Some(user_id.as_str())
+    );
+    assert_ne!(
+        build(Some("install-2"), Some("sess-1")).as_deref(),
+        Some(user_id.as_str())
+    );
+    assert_eq!(build(None, Some("sess-1")), None);
+    assert_eq!(build(Some("install-1"), None), None);
+}
+
+#[test]
+fn user_text_after_tool_results_joins_their_turn() {
+    let req = ConversationRequest::from_items(vec![
+        ConversationItem::user("go"),
+        ConversationItem::assistant_tool_calls(vec![ToolCall {
+            id: "t1".into(),
+            name: "read".to_string(),
+            arguments: "{}".into(),
+        }]),
+        ConversationItem::tool_result("t1", "ok"),
+        ConversationItem::user("reminder"),
+        ConversationItem::user(""),
+    ]);
+    let json = serde_json::to_value(build_messages_request(&req)).unwrap();
+    assert_eq!(json["messages"].as_array().unwrap().len(), 3, "{json:#}");
+    assert_eq!(assistant_block_types(&json, 2), vec!["tool_result", "text"]);
 }

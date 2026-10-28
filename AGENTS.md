@@ -25,3 +25,11 @@ Voice: `**Lead** rest.` Lead is the noun the user already knows (`/default`, `Re
 ### Unreleased
 
 Next groky version after `v0.1.30`.
+
+#### Bug Fixes
+
+- **Messages backend** prompt cache now survives Claude gateways such as sub2api: requests send a stable `metadata.user_id` per session, so cache reads no longer drop to zero every few turns.
+- **Messages backend** no longer fails after switching from another provider mid-session: foreign or unsigned reasoning replays as plain text, and long tool call ids are shortened to Anthropic's 64-char limit.
+- **Messages backend** retries a stream that ends before `message_stop` instead of committing a truncated reply.
+- **Messages backend** forced tool calls turn thinking off, and `tool_choice: none` is sent as `none` rather than `auto`.
+- **Title refresh** reuses the conversation's prompt cache on Claude models instead of re-reading the whole session.

@@ -153,6 +153,7 @@ impl SessionActor {
             items,
             tools: tool_specs,
             hosted_tools,
+            tool_choice: None,
             model: model.clone(),
             reasoning_effort,
             backend: sampling_client.api_backend(),

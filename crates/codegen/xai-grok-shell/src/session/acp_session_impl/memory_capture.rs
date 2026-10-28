@@ -344,6 +344,7 @@ fn build_extraction_request(
         x_grok_conv_id: Some(format!("memory-capture-{}", uuid::Uuid::new_v4())),
         x_grok_req_id: Some(format!("xai-memory-capture-{}", uuid::Uuid::new_v4())),
         x_grok_session_id: Some(session_id.to_owned()),
+        x_grok_agent_id: Some(xai_grok_telemetry::id::agent_id()),
         ..Default::default()
     }
 }

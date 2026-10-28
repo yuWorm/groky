@@ -148,16 +148,33 @@ fn channel_tokens(evs: &[SamplingEvent], channel: SamplingChannel) -> Vec<&str> 
         .collect()
 }
 
+/// A dropped connection ends the byte stream cleanly, so a stream without a terminal event must fail (and retry) rather than commit a partial turn.
 #[tokio::test]
-async fn empty_stream_yields_started_then_completed() {
-    let raw = stream::iter(Vec::<Result<MessageStreamEvent, SamplingError>>::new()).boxed();
-    let events = collect(stream_messages(raw, None, rid(), Duration::from_secs(60))).await;
-    assert_eq!(events.len(), 2);
-    assert!(matches!(
-        nth(&events, 0),
-        SamplingEvent::StreamStarted { .. }
-    ));
-    assert!(matches!(nth(&events, 1), SamplingEvent::Completed { .. }));
+async fn stream_ending_before_message_stop_fails() {
+    for (label, raw_events) in [
+        ("empty", Vec::new()),
+        (
+            "mid-text",
+            vec![
+                Ok(message_start()),
+                Ok(text_block_start(0)),
+                Ok(text_delta(0, "Hello, ")),
+            ],
+        ),
+    ] {
+        let raw = stream::iter(raw_events).boxed();
+        let events = collect(stream_messages(raw, None, rid(), Duration::from_secs(60))).await;
+        assert!(
+            matches!(events.last(), Some(SamplingEvent::Failed { .. })),
+            "{label}: expected Failed, got {events:?}"
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, SamplingEvent::Completed { .. })),
+            "{label}: a truncated stream must not complete"
+        );
+    }
 }
 
 #[tokio::test]
