@@ -3836,7 +3836,7 @@ mod tests {
     }
 
     #[test]
-    fn ssh_argument_completion_filters_labels_and_inserts_stable_ids_for_aliases() {
+    fn ssh_argument_completion_filters_labels_and_inserts_stable_ids() {
         let mut ctrl = SlashController::with_builtins(std::path::PathBuf::from("."));
         ctrl.set_ssh_candidates(vec![
             ssh_arg(
@@ -3889,16 +3889,15 @@ mod tests {
             vec!["target-east", "target-west"],
         );
 
-        for text in ["/ssh target-west", "/remote target-west"] {
-            ctrl.refresh(&state, text, text.len(), &models);
-            let snapshot = state.snapshot();
-            assert!(snapshot.open, "exact ID did not complete for {text:?}");
-            assert_eq!(
-                snapshot.selection().map(|row| row.insert_text.as_str()),
-                Some("target-west"),
-                "completion must replace a duplicate label with its stable target ID for {text:?}",
-            );
-        }
+        let text = "/ssh target-west";
+        ctrl.refresh(&state, text, text.len(), &models);
+        let snapshot = state.snapshot();
+        assert!(snapshot.open, "exact ID did not complete for {text:?}");
+        assert_eq!(
+            snapshot.selection().map(|row| row.insert_text.as_str()),
+            Some("target-west"),
+            "completion must replace a duplicate label with its stable target ID",
+        );
 
         let text = "/ssh qqqqq";
         ctrl.refresh(&state, text, text.len(), &models);

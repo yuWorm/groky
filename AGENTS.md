@@ -26,6 +26,11 @@ Voice: `**Lead** rest.` Lead is the noun the user already knows (`/default`, `Re
 
 Next groky version after `v0.1.30`.
 
+#### Features
+
+- **`/remote`** lists remote SSH projects from remembered access and past sessions, with Tab to switch All / Remembered / Recent; Enter starts a new session in the project and Ctrl+R resumes its latest one.
+- **`/ssh`** server picker gains `o` to jump to remote projects; `/remote` is no longer an alias of `/ssh`.
+
 #### Bug Fixes
 
 - **Messages backend** prompt cache now survives Claude gateways such as sub2api: requests send a stable `metadata.user_id` per session, so cache reads no longer drop to zero every few turns.

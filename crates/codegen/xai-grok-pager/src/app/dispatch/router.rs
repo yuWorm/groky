@@ -1313,6 +1313,7 @@ fn dispatch_inner(action: Action, app: &mut AppView) -> Vec<Effect> {
         }
         Action::OpenSshManager => super::ssh::dispatch_open_ssh_manager(app),
         Action::OpenSshTargetPicker => super::ssh::dispatch_open_ssh_target_picker(app),
+        Action::ShowRemoteProjects => super::ssh::dispatch_show_remote_projects(app),
         Action::ChooseSshPromptTarget { target_id } => {
             super::ssh::dispatch_choose_ssh_prompt_target(app, target_id)
         }

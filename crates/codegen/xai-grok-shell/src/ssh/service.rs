@@ -26,7 +26,7 @@ use xai_grok_workspace_types::ssh_wire::{
     SshPostToolHookOutcome, SshTaskRecord, SshToolProgress, SshWorkerEvent,
 };
 
-use super::control::{SshControlCommand, SshControlReply};
+use super::control::{RememberedSshProject, SshControlCommand, SshControlReply};
 use super::model::{
     PendingSshInteractions, PersistedSshGrant, PersistedSshState, ProjectSshBinding,
     RevokeStatus, SshAuthPrompt, SshAuthPromptDetail, SshAuthPromptKind, SshAuthResponse,
@@ -917,6 +917,27 @@ impl SessionSsh {
             .is_some_and(|registration| registration.project_open_prepared)
     }
 
+    /// List persisted SSH projects without exposing their saved authority.
+    ///
+    /// A malformed rule store is intentionally reported to the caller: silently
+    /// replacing the user's project list with an empty one would make recovery
+    /// impossible to diagnose.
+    pub async fn remembered_projects(&self) -> Result<Vec<RememberedSshProject>, SshServiceError> {
+        let rules = self.inner.project_rules.lock().await;
+        match &*rules {
+            ProjectRuleStore::Loaded(file) => Ok(file
+                .rules
+                .iter()
+                .filter(|rule| !rule.target_id.trim().is_empty() && !rule.root.trim().is_empty())
+                .map(|rule| RememberedSshProject {
+                    target_id: rule.target_id.clone(),
+                    root: rule.root.clone(),
+                })
+                .collect()),
+            ProjectRuleStore::Invalid(error) => Err(SshServiceError::ProjectRuleStorage(error.clone())),
+        }
+    }
+
     /// Recreates saved grants only for their exact originating local or SSH
     /// project. Target/root authority is independent of that owner location
     /// and is revalidated on the first worker bind.
@@ -1416,6 +1437,9 @@ impl SessionSsh {
         command: SshControlCommand,
     ) -> Result<SshControlReply, SshServiceError> {
         match command {
+            SshControlCommand::ListRememberedProjects => Ok(SshControlReply::RememberedProjects(
+                self.remembered_projects().await?,
+            )),
             SshControlCommand::ListConfiguredTargets => {
                 let targets = self.list_configured_targets().await?;
                 let encoded = serde_json::to_string(&targets)

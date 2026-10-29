@@ -1459,6 +1459,7 @@ enum SshModalPage {
     WorkerInstallFallback(SshWorkerInstallFallbackCard),
     Authentication(SshAuthCard),
     Diagnostic(SshDiagnosticCard),
+    RemoteProjects,
 }
 
 #[derive(Clone)]
@@ -1554,6 +1555,8 @@ pub struct SshManagerState {
     submitted_operation_approvals: Vec<SubmittedOperationApproval>,
     /// Root authentication is accepted only for the exact approved operation in this manager.
     pending_sudo_authentications: Vec<PendingSudoAuthentication>,
+    remote_projects: Option<crate::views::remote_projects::RemoteProjectsState>,
+    remote_projects_generation: u64,
 }
 
 impl SshManagerState {
@@ -1595,6 +1598,8 @@ impl SshManagerState {
             session_id,
             submitted_operation_approvals: Vec::new(),
             pending_sudo_authentications: Vec::new(),
+            remote_projects: None,
+            remote_projects_generation: 0,
         }
     }
 
@@ -1613,6 +1618,11 @@ impl SshManagerState {
         self.mode == SshManagerMode::PromptPicker
     }
 
+    /// Whether the remote-project picker currently owns this manager's surface.
+    pub(crate) fn is_remote_projects(&self) -> bool {
+        matches!(&self.page, SshModalPage::RemoteProjects)
+    }
+
     /// Globally unique identity for matching asynchronous local-control completions to this
     /// concrete manager instance after an overlay is closed and re-opened.
     pub fn instance_id(&self) -> u64 {
@@ -1628,12 +1638,50 @@ impl SshManagerState {
     }
 
     /// Reopen local management without discarding an approved root operation's correlation.
-    pub fn reopen(&mut self, for_prompt: bool) {
+    pub(crate) fn reopen(&mut self, for_prompt: bool) {
         self.visible = true;
         self.mode = if for_prompt { SshManagerMode::PromptPicker } else { SshManagerMode::Manage };
         self.manager_advanced = false;
         self.page = SshModalPage::Manager;
         self.pending_target_reference = None;
+        self.remote_projects = None;
+    }
+
+    /// Replace the target manager surface with the independent remote-project picker.
+    pub(crate) fn open_remote_projects(&mut self) -> u64 {
+        self.visible = true;
+        self.mode = SshManagerMode::Manage;
+        self.remote_projects_generation = self.remote_projects_generation.wrapping_add(1).max(1);
+        let generation = self.remote_projects_generation;
+        self.remote_projects = Some(crate::views::remote_projects::RemoteProjectsState::loading(
+            generation,
+        ));
+        self.page = SshModalPage::RemoteProjects;
+        generation
+    }
+
+    /// Install a completed remote-project catalog only for its owning picker incarnation.
+    pub(crate) fn apply_remote_projects(
+        &mut self,
+        generation: u64,
+        result: Result<
+            (
+                crate::views::remote_projects::RemoteProjectCatalog,
+                Vec<crate::views::remote_projects::RemoteProjectSession>,
+            ),
+            String,
+        >,
+    ) {
+        if matches!(&self.page, SshModalPage::RemoteProjects) {
+            if let Some(remote_projects) = self.remote_projects.as_mut() {
+                remote_projects.apply(generation, result);
+            }
+        }
+    }
+
+    fn close_remote_projects(&mut self) {
+        self.remote_projects = None;
+        self.page = SshModalPage::Manager;
     }
 
     /// True means the caller must retain this manager for pending human work or an outstanding
@@ -1663,7 +1711,7 @@ impl SshManagerState {
     fn has_protected_surface(&self) -> bool {
         self.pending_grant.is_some()
             || self.project_browser.is_some()
-            || !matches!(&self.page, SshModalPage::Manager)
+            || !matches!(&self.page, SshModalPage::Manager | SshModalPage::RemoteProjects)
     }
 
     fn queue_interaction(&mut self, interaction: PendingSshInteraction) {
@@ -1769,6 +1817,7 @@ impl SshManagerState {
                     )
                 }),
                 SshModalPage::Add(_)
+                | SshModalPage::RemoteProjects
                 | SshModalPage::ConfirmDelete(_)
                 | SshModalPage::OperationApproval(_)
                 | SshModalPage::WorkerInstallFallback(_)
@@ -4434,6 +4483,18 @@ pub enum SshModalOutcome {
         approved: bool,
         scope: SshOperationApprovalScope,
     },
+    /// Open the distinct remote-project picker from the SSH draft-target picker.
+    OpenRemoteProjects,
+    /// Start a new remote project session after the picker has chosen its project.
+    BeginRemoteProject {
+        target_id: String,
+        root: String,
+    },
+    /// Resume the most recently active session for the selected remote project.
+    ResumeRemoteProject {
+        session_id: String,
+        cwd: String,
+    },
     ResetOperationApprovals {
         binding_id: String,
     },
@@ -4467,6 +4528,7 @@ const FOOTER_MANAGER_USE: usize = 112;
 const FOOTER_MANAGER_REVOKE: usize = 113;
 const FOOTER_MANAGER_RESET_OPERATION_APPROVALS: usize = 114;
 const FOOTER_MANAGER_CLOSE: usize = 108;
+const FOOTER_MANAGER_REMOTE_PROJECTS: usize = 115;
 const FOOTER_DELETE_CONFIRM: usize = 203;
 const FOOTER_DELETE_CANCEL: usize = 204;
 const FOOTER_ADD_SAVE: usize = 201;
@@ -4513,9 +4575,9 @@ const PROMPT_MANAGER_SHORTCUTS: &[Shortcut<'static>] = &[
         id: FOOTER_MANAGER_CONNECTION,
     },
     Shortcut {
-        label: "o open project (worker)",
+        label: "o remote projects…",
         clickable: true,
-        id: FOOTER_MANAGER_PROJECT,
+        id: FOOTER_MANAGER_REMOTE_PROJECTS,
     },
     Shortcut {
         label: "g grant",
@@ -5225,12 +5287,26 @@ pub fn render_ssh_modal(
         SshModalPage::Add(form) => form.field_hits.clear(),
         SshModalPage::Grant(card) => card.control_hits.clear(),
         SshModalPage::Manager
+        | SshModalPage::RemoteProjects
         | SshModalPage::ConfirmDelete(_)
         | SshModalPage::ProjectBrowser
         | SshModalPage::OperationApproval(_)
         | SshModalPage::WorkerInstallFallback(_)
         | SshModalPage::Authentication(_)
         | SshModalPage::Diagnostic(_) => {}
+    }
+    if matches!(&state.page, SshModalPage::RemoteProjects) {
+        if let Some(remote_projects) = state.remote_projects.as_mut() {
+            crate::views::remote_projects::render_remote_projects(
+                buf,
+                area,
+                &mut state.window,
+                remote_projects,
+                compact || area.height < 16,
+                theme,
+            );
+        }
+        return None;
     }
     let (title, shortcuts): (&str, &[Shortcut<'_>]) = match &state.page {
         SshModalPage::Manager
@@ -5338,6 +5414,7 @@ pub fn render_ssh_modal(
             },
             DIAGNOSTIC_SHORTCUTS,
         ),
+        SshModalPage::RemoteProjects => unreachable!("remote projects rendered before title match"),
     };
     let config = window_config(title, compact || area.height < 16, shortcuts);
     let areas = modal_window::render_modal_window(buf, area, &mut state.window, &config, theme)?;
@@ -5362,7 +5439,9 @@ pub fn render_ssh_modal(
             }
             SshModalPage::Authentication(card) => return render_authentication(buf, content, card, theme),
             SshModalPage::Diagnostic(card) => render_diagnostic(buf, content, card, theme),
-            SshModalPage::Manager => unreachable!("manager rendered before mutable page match"),
+            SshModalPage::Manager | SshModalPage::RemoteProjects => {
+                unreachable!("manager or remote projects rendered before mutable page match")
+            }
         }
     }
     None
@@ -7123,6 +7202,33 @@ pub fn handle_ssh_key(state: &mut SshManagerState, key: &KeyEvent) -> SshModalOu
         ModalWindowOutcome::Unhandled => {}
         _ => {}
     }
+    if matches!(&state.page, SshModalPage::RemoteProjects) {
+        let Some(remote_projects) = state.remote_projects.as_mut() else {
+            return SshModalOutcome::Unchanged;
+        };
+        return match crate::views::remote_projects::handle_remote_projects_event(
+            remote_projects,
+            &mut state.window,
+            &crossterm::event::Event::Key(*key),
+        ) {
+            crate::views::remote_projects::RemoteProjectsOutcome::Close => {
+                state.close_remote_projects();
+                SshModalOutcome::Close
+            }
+            crate::views::remote_projects::RemoteProjectsOutcome::Changed => SshModalOutcome::Changed,
+            crate::views::remote_projects::RemoteProjectsOutcome::Unchanged => {
+                SshModalOutcome::Unchanged
+            }
+            crate::views::remote_projects::RemoteProjectsOutcome::StartNew { target_id, root } => {
+                SshModalOutcome::BeginRemoteProject { target_id, root }
+            }
+            crate::views::remote_projects::RemoteProjectsOutcome::Resume { session_id, cwd } => {
+                state.close_remote_projects();
+                state.visible = false;
+                SshModalOutcome::ResumeRemoteProject { session_id, cwd }
+            }
+        };
+    }
     if matches!(&state.page, SshModalPage::Manager) {
         return handle_manager_key(state, key);
     }
@@ -7139,8 +7245,11 @@ pub fn handle_ssh_key(state: &mut SshManagerState, key: &KeyEvent) -> SshModalOu
         SshModalPage::WorkerInstallFallback(card) => handle_worker_install_fallback_key(card, key),
         SshModalPage::Authentication(card) => handle_authentication_key(card, key),
         SshModalPage::Diagnostic(card) => handle_diagnostic_key(card, key),
-        SshModalPage::Manager | SshModalPage::ConfirmDelete(_) | SshModalPage::ProjectBrowser => {
-            unreachable!("manager, deletion, and browser pages are handled before borrowing modal page")
+        SshModalPage::Manager
+        | SshModalPage::RemoteProjects
+        | SshModalPage::ConfirmDelete(_)
+        | SshModalPage::ProjectBrowser => {
+            unreachable!("manager, remote projects, deletion, and browser pages are handled before borrowing modal page")
         }
     };
     if let SshModalOutcome::AnswerAuthentication {
@@ -7183,6 +7292,7 @@ fn footer_key_for(page: &SshModalPage, id: usize) -> Option<KeyEvent> {
         }
         (SshModalPage::Manager, FOOTER_MANAGER_DIAGNOSTIC) => Some(key(KeyCode::Char('d'))),
         (SshModalPage::Manager, FOOTER_MANAGER_CLOSE) => Some(key(KeyCode::Esc)),
+        (SshModalPage::Manager, FOOTER_MANAGER_REMOTE_PROJECTS) => Some(key(KeyCode::Char('o'))),
         (SshModalPage::Add(form), FOOTER_ADD_SAVE) if !form.submitting => Some(key(KeyCode::Enter)),
         (SshModalPage::Add(_), FOOTER_ADD_CANCEL) => Some(key(KeyCode::Esc)),
         (SshModalPage::ConfirmDelete(card), FOOTER_DELETE_CONFIRM) if !card.submitting => {
@@ -7294,6 +7404,33 @@ fn footer_key_for(page: &SshModalPage, id: usize) -> Option<KeyEvent> {
 /// Paste directly into the focused non-secret or secret local editor. The paste is never placed in
 /// chat state, notifications, or a replay buffer.
 pub fn handle_ssh_paste(state: &mut SshManagerState, text: &str) -> SshModalOutcome {
+    if matches!(&state.page, SshModalPage::RemoteProjects) {
+        let Some(remote_projects) = state.remote_projects.as_mut() else {
+            return SshModalOutcome::Unchanged;
+        };
+        return match crate::views::remote_projects::handle_remote_projects_event(
+            remote_projects,
+            &mut state.window,
+            &crossterm::event::Event::Paste(text.to_owned()),
+        ) {
+            crate::views::remote_projects::RemoteProjectsOutcome::Changed => SshModalOutcome::Changed,
+            crate::views::remote_projects::RemoteProjectsOutcome::Unchanged => {
+                SshModalOutcome::Unchanged
+            }
+            crate::views::remote_projects::RemoteProjectsOutcome::Close => {
+                state.close_remote_projects();
+                SshModalOutcome::Close
+            }
+            crate::views::remote_projects::RemoteProjectsOutcome::StartNew { target_id, root } => {
+                SshModalOutcome::BeginRemoteProject { target_id, root }
+            }
+            crate::views::remote_projects::RemoteProjectsOutcome::Resume { session_id, cwd } => {
+                state.close_remote_projects();
+                state.visible = false;
+                SshModalOutcome::ResumeRemoteProject { session_id, cwd }
+            }
+        };
+    }
     if matches!(&state.page, SshModalPage::ProjectBrowser) {
         let Some(browser) = state.project_browser.as_mut() else {
             return SshModalOutcome::Unchanged;
@@ -7327,6 +7464,7 @@ pub fn handle_ssh_paste(state: &mut SshManagerState, text: &str) -> SshModalOutc
         }
         SshModalPage::Grant(_)
         | SshModalPage::Manager
+        | SshModalPage::RemoteProjects
         | SshModalPage::ConfirmDelete(_)
         | SshModalPage::OperationApproval(_)
         | SshModalPage::WorkerInstallFallback(_)
@@ -7346,6 +7484,58 @@ pub fn handle_ssh_paste(state: &mut SshManagerState, text: &str) -> SshModalOutc
 /// deliberately translated back into their keyboard event so mouse and keyboard share consent,
 /// validation, and pending-operation semantics.
 pub fn handle_ssh_mouse(state: &mut SshManagerState, mouse: &MouseEvent) -> SshModalOutcome {
+    if matches!(&state.page, SshModalPage::RemoteProjects) {
+        match modal_window::handle_modal_mouse(
+            &mut state.window,
+            mouse.kind,
+            mouse.column,
+            mouse.row,
+        ) {
+            ModalWindowOutcome::CloseRequested => {
+                state.close_remote_projects();
+                return SshModalOutcome::Close;
+            }
+            ModalWindowOutcome::TabChanged(tab) => {
+                if let Some(remote_projects) = state.remote_projects.as_mut() {
+                    remote_projects.set_tab_from_index(tab, &mut state.window);
+                }
+                return SshModalOutcome::Changed;
+            }
+            ModalWindowOutcome::Handled => return SshModalOutcome::Changed,
+            ModalWindowOutcome::Unhandled => {}
+            ModalWindowOutcome::ShortcutActivated(_)
+            | ModalWindowOutcome::CollapseGroup
+            | ModalWindowOutcome::ExpandGroup
+            | ModalWindowOutcome::CollapseDetails
+            | ModalWindowOutcome::ExpandDetails
+            | ModalWindowOutcome::JumpToParent(_) => return SshModalOutcome::Unchanged,
+        }
+        let Some(remote_projects) = state.remote_projects.as_mut() else {
+            return SshModalOutcome::Unchanged;
+        };
+        return match crate::views::remote_projects::handle_remote_projects_event(
+            remote_projects,
+            &mut state.window,
+            &crossterm::event::Event::Mouse(*mouse),
+        ) {
+            crate::views::remote_projects::RemoteProjectsOutcome::Close => {
+                state.close_remote_projects();
+                SshModalOutcome::Close
+            }
+            crate::views::remote_projects::RemoteProjectsOutcome::Changed => SshModalOutcome::Changed,
+            crate::views::remote_projects::RemoteProjectsOutcome::Unchanged => {
+                SshModalOutcome::Unchanged
+            }
+            crate::views::remote_projects::RemoteProjectsOutcome::StartNew { target_id, root } => {
+                SshModalOutcome::BeginRemoteProject { target_id, root }
+            }
+            crate::views::remote_projects::RemoteProjectsOutcome::Resume { session_id, cwd } => {
+                state.close_remote_projects();
+                state.visible = false;
+                SshModalOutcome::ResumeRemoteProject { session_id, cwd }
+            }
+        };
+    }
     match modal_window::handle_modal_mouse(&mut state.window, mouse.kind, mouse.column, mouse.row) {
         ModalWindowOutcome::CloseRequested => return close_current_page(state),
         ModalWindowOutcome::ShortcutActivated(id) => {
@@ -7452,6 +7642,7 @@ pub fn handle_ssh_mouse(state: &mut SshManagerState, mouse: &MouseEvent) -> SshM
                 unreachable!("browser mouse rows are handled before borrowing modal page")
             }
             SshModalPage::Manager
+            | SshModalPage::RemoteProjects
             | SshModalPage::ConfirmDelete(_)
             | SshModalPage::Add(_)
             | SshModalPage::OperationApproval(_)
@@ -7537,9 +7728,10 @@ pub fn handle_ssh_mouse(state: &mut SshManagerState, mouse: &MouseEvent) -> SshM
         SshModalPage::ProjectBrowser => {
             unreachable!("browser scrolling is handled before borrowing modal page")
         }
-        SshModalPage::Manager | SshModalPage::ConfirmDelete(_) | SshModalPage::Add(_) => {
-            SshModalOutcome::Unchanged
-        }
+        SshModalPage::Manager
+        | SshModalPage::RemoteProjects
+        | SshModalPage::ConfirmDelete(_)
+        | SshModalPage::Add(_) => SshModalOutcome::Unchanged,
     }
 }
 
@@ -7730,6 +7922,7 @@ fn close_current_page(state: &mut SshManagerState) -> SshModalOutcome {
             .map(|request| request.request_id.clone()),
         SshModalPage::Grant(card) => Some(card.request_id.clone()),
         SshModalPage::Add(_)
+        | SshModalPage::RemoteProjects
         | SshModalPage::ConfirmDelete(_)
         | SshModalPage::ProjectBrowser
         | SshModalPage::OperationApproval(_)
@@ -7748,6 +7941,10 @@ fn close_current_page(state: &mut SshManagerState) -> SshModalOutcome {
                 .unwrap_or(SshModalOutcome::Changed)
         }
         SshModalPage::Manager => SshModalOutcome::Close,
+        SshModalPage::RemoteProjects => {
+            state.close_remote_projects();
+            SshModalOutcome::Close
+        }
         SshModalPage::OperationApproval(card) => SshModalOutcome::ApproveOperation {
             approval_id: card.approval_id.clone(),
             approved: false,
@@ -7897,6 +8094,14 @@ fn handle_manager_key(state: &mut SshManagerState, key: &KeyEvent) -> SshModalOu
                 state.selected += 1;
             }
             SshModalOutcome::Changed
+        }
+        KeyCode::Char('o')
+            if key.modifiers.is_empty()
+                && state.is_prompt_picker()
+                && !state.manager_advanced
+                && state.pending_grant.is_none() =>
+        {
+            SshModalOutcome::OpenRemoteProjects
         }
         KeyCode::Char('a') if key.modifiers.is_empty() => {
             state.page = SshModalPage::Add(Default::default());
@@ -12011,5 +12216,47 @@ mod tests {
         assert!(render_project_browser(&mut Buffer::empty(area), area, &mut browser, &theme).is_none());
         let mut manager = SshManagerState::new(None);
         assert!(render_ssh_modal(&mut Buffer::empty(area), area, &mut manager, false, &theme).is_none());
+    }
+
+    #[test]
+    fn remote_project_picker_keys_emit_open_and_resume_intents() {
+        let mut state = SshManagerState::new(None);
+        let generation = state.open_remote_projects();
+        state.apply_remote_projects(
+            generation,
+            Ok((
+                crate::views::remote_projects::RemoteProjectCatalog::default(),
+                vec![crate::views::remote_projects::RemoteProjectSession {
+                    target_id: "build".into(),
+                    root: "/srv/build".into(),
+                    session_id: "recent-session".into(),
+                    cwd: "/srv/build".into(),
+                    last_active_at: chrono::DateTime::<chrono::Utc>::UNIX_EPOCH,
+                }],
+            )),
+        );
+
+        assert!(matches!(
+            handle_ssh_key(&mut state, &key(KeyCode::Enter)),
+            SshModalOutcome::BeginRemoteProject { target_id, root }
+                if target_id == "build" && root == "/srv/build"
+        ));
+        assert!(matches!(
+            handle_ssh_key(
+                &mut state,
+                &KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL)
+            ),
+            SshModalOutcome::ResumeRemoteProject { session_id, cwd }
+                if session_id == "recent-session" && cwd == "/srv/build"
+        ));
+    }
+
+    #[test]
+    fn prompt_target_picker_opens_remote_projects_with_o() {
+        let mut state = SshManagerState::for_prompt(None);
+        assert!(matches!(
+            handle_ssh_key(&mut state, &key(KeyCode::Char('o'))),
+            SshModalOutcome::OpenRemoteProjects
+        ));
     }
 }

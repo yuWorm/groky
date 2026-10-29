@@ -565,10 +565,20 @@ impl StandaloneSshRunner {
                 project_session_id: uuid::Uuid::now_v7().to_string(),
                 expected_identity: Some(identity),
             })),
+            SshModalOutcome::BeginRemoteProject { target_id, root } => {
+                LoopAction::Exit(Some(SshProjectOpen {
+                    target_id,
+                    root,
+                    project_session_id: uuid::Uuid::now_v7().to_string(),
+                    expected_identity: None,
+                }))
+            }
             // Standalone management must not mint or manipulate model-visible authority.  These
             // outcomes are unreachable from the session-less shortcuts, but refusing them here
             // also prevents a future modal change from turning this surface into a grant engine.
-            SshModalOutcome::RequestGrant { .. }
+            SshModalOutcome::OpenRemoteProjects
+            | SshModalOutcome::ResumeRemoteProject { .. }
+            | SshModalOutcome::RequestGrant { .. }
             | SshModalOutcome::SelectPromptTarget { .. }
             | SshModalOutcome::ApproveGrant { .. }
             | SshModalOutcome::CancelGrant { .. }

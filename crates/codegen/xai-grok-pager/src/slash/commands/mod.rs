@@ -57,6 +57,7 @@ pub mod release_notes;
 pub mod remember;
 pub mod rename;
 pub mod resume;
+pub mod remote;
 pub mod rewind;
 pub mod screen_mode_switch;
 pub mod session_info;
@@ -89,6 +90,7 @@ pub fn builtin_commands() -> Vec<Arc<dyn SlashCommand>> {
         Arc::new(tutorial::TutorialCommand),
         Arc::new(settings_cmd::SettingsCommand),
         Arc::new(ssh::SshCommand),
+        Arc::new(remote::RemoteCommand),
         Arc::new(dashboard::DashboardCommand),
         Arc::new(workflows::WorkflowsCommand),
         Arc::new(plugin::PluginsCommand),
@@ -616,6 +618,14 @@ mod tests {
             reg.get("tasks").is_some(),
             "/tasks should be registered in builtins"
         );
+    }
+
+    #[test]
+    fn remote_is_its_own_command_and_ssh_no_longer_claims_it() {
+        let registry = CommandRegistry::new(builtin_commands());
+        assert_eq!(registry.get("remote").map(|command| command.name()), Some("remote"));
+        assert_eq!(registry.get("ssh").map(|command| command.name()), Some("ssh"));
+        assert!(!registry.get("ssh").unwrap().aliases().contains(&"remote"));
     }
     #[test]
     fn cost_aliases_usage() {

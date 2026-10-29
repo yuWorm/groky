@@ -63,6 +63,7 @@ struct UploadTraceRequest {
 }
 const SESSION_LIST_LIMIT: u64 = 30;
 const DASHBOARD_SESSION_LIST_LIMIT: u64 = 100;
+const REMOTE_PROJECT_SESSION_LIST_LIMIT: u64 = 200;
 /// MCP discovery reads and parses several config sources (global and project, from `cwd` up to the repository root),
 /// so it runs on the blocking pool rather than the UI thread or a tokio worker.
 /// Session-open paths have no resolved per-vendor compat in scope; the default (all-on) preserves existing behavior.
@@ -549,6 +550,25 @@ pub(crate) fn execute(
             owner,
         } => {
             tasks.spawn(async move { load_ssh_targets(session_id, client_id, owner).await });
+        }
+        Effect::LoadRemoteProjects { owner, generation } => {
+            let tx = acp_tx.clone();
+            tasks.spawn(async move {
+                let (catalog, sessions) = tokio::join!(
+                    crate::app::ssh_control::load_remote_project_catalog(),
+                    load_remote_project_sessions(&tx),
+                );
+                let result = match (catalog, sessions) {
+                    (Ok(catalog), Ok(sessions)) => Ok((catalog, sessions)),
+                    (Err(error), _) => Err(format!("SSH local service: {error:#}")),
+                    (_, Err(error)) => Err(error),
+                };
+                TaskResult::RemoteProjectsLoaded {
+                    owner,
+                    generation,
+                    result,
+                }
+            });
         }
         Effect::SshAddTarget {
             session_id,
@@ -6503,6 +6523,61 @@ async fn load_ssh_targets(
             ),
         };
     TaskResult::SshTargetsLoaded { session_id, client_id, owner, targets, error }
+}
+
+/// Fetch every SSH project session without passing the pager's local cwd. Project
+/// location is carried by the existing session-list row metadata, so the picker
+/// never reaches into session directories itself.
+async fn load_remote_project_sessions(
+    tx: &AcpAgentTx,
+) -> Result<Vec<crate::views::remote_projects::RemoteProjectSession>, String> {
+    // No `cwd`: SSH project sessions are stored apart from the local launch dir.
+    let params = serde_json::json!({
+        "limit": REMOTE_PROJECT_SESSION_LIST_LIMIT,
+        "headless": xai_grok_shell::session::unified_list::HeadlessPolicy::Include.as_wire_str(),
+    });
+    let request = acp::ExtRequest::new(
+        "x.ai/session/list",
+        serde_json::value::to_raw_value(&params)
+            .expect("serialize remote project session list params")
+            .into(),
+    );
+    let response = acp_send(request, tx)
+        .await
+        .map_err(|error| sanitize_user_error(&format!("could not list remote project sessions: {error}")))?;
+    let payload = read_session_list_response(response.0.get())?;
+    Ok(parse_remote_project_sessions(&payload))
+}
+
+fn parse_remote_project_sessions(
+    payload: &serde_json::Value,
+) -> Vec<crate::views::remote_projects::RemoteProjectSession> {
+    let Some(sessions) = payload.get("sessions").and_then(serde_json::Value::as_array) else {
+        return Vec::new();
+    };
+    sessions
+        .iter()
+        .filter_map(|session| {
+            let location = parse_ssh_project_location_value(session.get("projectLocation"))?;
+            let target_id = location.target_id;
+            let root = location.root;
+            let session_id = session.get("sessionId")?.as_str()?.to_owned();
+            let last_active_at = session
+                .get("lastActiveAt")
+                .or_else(|| session.get("updatedAt"))
+                .and_then(serde_json::Value::as_str)
+                .and_then(|timestamp| timestamp.parse().ok())
+                .unwrap_or(chrono::DateTime::<chrono::Utc>::UNIX_EPOCH);
+            let cwd = session.get("cwd")?.as_str()?.to_owned();
+            Some(crate::views::remote_projects::RemoteProjectSession {
+                target_id,
+                root,
+                session_id,
+                cwd,
+                last_active_at,
+            })
+        })
+        .collect()
 }
 
 

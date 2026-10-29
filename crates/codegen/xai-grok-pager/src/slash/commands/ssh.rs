@@ -62,7 +62,6 @@ pub struct SshCommand;
 impl SlashCommand for SshCommand {
     slash_meta! {
         name: "ssh",
-        aliases: ["remote"],
         description: "Choose an SSH server for this chat draft",
         usage: "/ssh [server name or target ID]",
         takes_args: true,

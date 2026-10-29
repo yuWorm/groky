@@ -697,6 +697,8 @@ pub enum Action {
     OpenSshManager,
     /// Choose a server to include in an editable chat draft, without granting access or sending.
     OpenSshTargetPicker,
+    /// Open the independent list of remembered and recently used SSH projects.
+    ShowRemoteProjects,
     /// Add a connected target selected by the current picker to its owning composer.
     ChooseSshPromptTarget { target_id: String },
     /// Resolve a configured target by exact name or ID for the current chat draft.
@@ -2617,6 +2619,11 @@ pub enum Effect {
         client_id: u64,
         owner: SshManagerOwner,
     },
+    /// Load configured targets and remembered SSH projects for the remote-project picker.
+    LoadRemoteProjects {
+        owner: SshManagerOwner,
+        generation: u64,
+    },
     /// Persist a manually entered SSH target without credential material.
     SshAddTarget {
         session_id: Option<String>,
@@ -2924,6 +2931,18 @@ pub enum TaskResult {
         owner: SshManagerOwner,
         targets: Vec<crate::views::ssh_modal::SshTargetView>,
         error: Option<String>,
+    },
+    /// Remote project configuration and session history loaded for one picker incarnation.
+    RemoteProjectsLoaded {
+        owner: SshManagerOwner,
+        generation: u64,
+        result: Result<
+            (
+                crate::views::remote_projects::RemoteProjectCatalog,
+                Vec<crate::views::remote_projects::RemoteProjectSession>,
+            ),
+            String,
+        >,
     },
     /// A manually configured SSH target save completed.
     SshTargetAdded {

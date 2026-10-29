@@ -154,7 +154,7 @@ pub struct AppCtx<'a> {
     /// Saved or built-in workflow definitions advertised by the shell (`_meta.workflowSource`).
     /// Backs `/workflow` argument suggestions.
     pub saved_workflows: &'a [WorkflowChoice],
-    /// Configured SSH targets for `/ssh` and its `/remote` alias.
+    /// Configured SSH targets for `/ssh` argument completion.
     /// Owned by the controller so completion performs no I/O.
     pub ssh_candidates: &'a [ArgItem],
     /// Live session runs.

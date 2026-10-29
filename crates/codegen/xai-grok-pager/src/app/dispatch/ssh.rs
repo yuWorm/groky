@@ -12,6 +12,22 @@ fn map_ssh_modal_outcome(outcome: SshModalOutcome) -> InputOutcome {
         SshModalOutcome::Close => InputOutcome::Unchanged,
         SshModalOutcome::Changed => InputOutcome::Changed,
         SshModalOutcome::Unchanged => InputOutcome::Unchanged,
+        SshModalOutcome::OpenRemoteProjects => InputOutcome::Action(Action::ShowRemoteProjects),
+        SshModalOutcome::BeginRemoteProject { target_id, root } => {
+            InputOutcome::Action(Action::BeginSshProjectOpen(crate::app::cli::SshProjectOpen {
+                target_id,
+                root,
+                project_session_id: uuid::Uuid::now_v7().to_string(),
+                expected_identity: None,
+            }))
+        }
+        SshModalOutcome::ResumeRemoteProject { session_id, cwd } => {
+            InputOutcome::Action(Action::LoadSession(
+                session_id,
+                crate::app::session_startup::local_cwd_from_session_storage(&cwd),
+                false,
+            ))
+        }
         SshModalOutcome::Refresh => InputOutcome::Action(Action::RefreshSshTargets),
         SshModalOutcome::AddTarget {
             draft,
@@ -233,6 +249,9 @@ pub(super) fn drain_ssh_pending_interaction_continuation(
         | SshModalOutcome::Changed
         | SshModalOutcome::Unchanged
         | SshModalOutcome::Refresh
+        | SshModalOutcome::OpenRemoteProjects
+        | SshModalOutcome::BeginRemoteProject { .. }
+        | SshModalOutcome::ResumeRemoteProject { .. }
         | SshModalOutcome::AddTarget { .. }
         | SshModalOutcome::UpdateTarget { .. }
         | SshModalOutcome::RemoveTarget { .. }
@@ -908,6 +927,14 @@ pub(super) fn dispatch_open_ssh_target_picker(app: &mut AppView) -> Vec<Effect> 
     open_ssh_surface(app, true)
 }
 
+pub(super) fn dispatch_show_remote_projects(app: &mut AppView) -> Vec<Effect> {
+    let owner = ensure_ssh_surface(app, false);
+    let generation = ssh_manager_for_owner_mut(app, owner)
+        .expect("the SSH manager was just installed")
+        .open_remote_projects();
+    vec![Effect::LoadRemoteProjects { owner, generation }]
+}
+
 fn new_ssh_surface_state(
     for_prompt: bool,
     session_id: Option<String>,
@@ -919,24 +946,28 @@ fn new_ssh_surface_state(
     }
 }
 
-fn open_ssh_surface(app: &mut AppView, for_prompt: bool) -> Vec<Effect> {
+fn ensure_ssh_surface(app: &mut AppView, for_prompt: bool) -> SshManagerOwner {
     let session_id = active_session_id(app);
     if let Some(agent) = get_active_agent_mut(app) {
         if let Some(manager) = agent.ssh_manager.as_mut() {
-            if !manager.is_visible() {
+            if !manager.is_visible() || manager.is_remote_projects() {
                 manager.reopen(for_prompt);
             }
         } else {
             agent.ssh_manager = Some(new_ssh_surface_state(for_prompt, session_id.clone()));
         }
     } else if let Some(manager) = app.welcome_ssh_manager.as_mut() {
-        if !manager.is_visible() {
+        if !manager.is_visible() || manager.is_remote_projects() {
             manager.reopen(for_prompt);
         }
     } else {
-        app.welcome_ssh_manager = Some(new_ssh_surface_state(for_prompt, session_id.clone()));
+        app.welcome_ssh_manager = Some(new_ssh_surface_state(for_prompt, session_id));
     }
-    let owner = ssh_manager_owner(app).expect("the SSH manager was just installed");
+    ssh_manager_owner(app).expect("the SSH manager was just installed")
+}
+
+fn open_ssh_surface(app: &mut AppView, for_prompt: bool) -> Vec<Effect> {
+    let owner = ensure_ssh_surface(app, for_prompt);
     let session_id = ssh_manager_for_owner_mut(app, owner)
         .map(|manager| manager.session_id.clone())
         .expect("the SSH manager was just installed");
@@ -1033,6 +1064,23 @@ pub(super) fn dispatch_begin_ssh_project_open(
         });
     }
     effects
+}
+
+pub(super) fn apply_remote_projects_loaded(
+    app: &mut AppView,
+    owner: SshManagerOwner,
+    generation: u64,
+    result: Result<
+        (
+            crate::views::remote_projects::RemoteProjectCatalog,
+            Vec<crate::views::remote_projects::RemoteProjectSession>,
+        ),
+        String,
+    >,
+) {
+    if let Some(manager) = ssh_manager_for_owner_mut(app, owner) {
+        manager.apply_remote_projects(generation, result);
+    }
 }
 
 pub(super) fn dispatch_browse_ssh_project_directory(

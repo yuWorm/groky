@@ -3236,3 +3236,29 @@ async fn ssh_worker_installation_outlives_local_session_deadline_without_losing_
         }
     }
 }
+#[test]
+fn remote_project_history_reads_ssh_project_location_from_session_rows() {
+    let payload = serde_json::json!({
+        "sessions": [
+            {
+                "sessionId": "remote-session",
+                "cwd": "/srv/build",
+                "updatedAt": "2026-01-01T00:00:00Z",
+                "projectLocation": {
+                    "type": "ssh",
+                    "data": {"target_id": "build-host", "root": "/srv/build"}
+                }
+            },
+            {
+                "sessionId": "local-session",
+                "projectLocation": {"type": "local", "data": {"root": "/tmp"}}
+            }
+        ]
+    });
+
+    let sessions = parse_remote_project_sessions(&payload);
+    assert_eq!(sessions.len(), 1);
+    assert_eq!(sessions[0].target_id, "build-host");
+    assert_eq!(sessions[0].root, "/srv/build");
+    assert_eq!(sessions[0].session_id, "remote-session");
+}

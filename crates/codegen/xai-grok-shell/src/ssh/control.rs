@@ -13,10 +13,21 @@ use super::{SshGrantDecision, SshGrantRequest};
 /// Leader IPC commands available without provider or model authentication. Every
 /// command runs against the leader-held `SessionSsh`, which is why CLI connect
 /// leases survive after the short-lived CLI process exits.
+
+/// A previously authorized SSH project. This read-only control DTO deliberately
+/// excludes the authority, identity, and owner metadata kept by the service.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RememberedSshProject {
+    pub target_id: String,
+    pub root: String,
+}
+
 #[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", content = "data", rename_all = "snake_case")]
 pub enum SshControlCommand {
     ListConfiguredTargets,
+    /// Lists valid remembered SSH project rules owned by the local SSH service.
+    ListRememberedProjects,
     /// Atomically replace an existing manual target when its full original
     /// snapshot still matches. Imported aliases are read-only.
     UpdateTarget {
@@ -268,6 +279,7 @@ pub enum SshControlReply {
     /// current-session access without serializing raw target records.
     ConfiguredTargets(String),
     SessionTargets(Vec<SshTargetAccess>),
+    RememberedProjects(Vec<RememberedSshProject>),
     PendingInteractions(PendingSshInteractions),
     GrantRequested(SshGrantRequest),
     GrantResolved {
@@ -314,6 +326,7 @@ mod tests {
         };
         for command in [
             SshControlCommand::ListConfiguredTargets,
+            SshControlCommand::ListRememberedProjects,
             SshControlCommand::SnapshotPendingInteractions,
             SshControlCommand::Connect {
                 target_id: "build-host".into(),
@@ -388,6 +401,10 @@ mod tests {
         }
         for reply in [
             SshControlReply::ConfiguredTargets("[{\"id\":\"build-host\"}]".into()),
+            SshControlReply::RememberedProjects(vec![RememberedSshProject {
+                target_id: "build-host".into(),
+                root: "/srv/project".into(),
+            }]),
             SshControlReply::SessionTargets(Vec::new()),
             SshControlReply::PendingInteractions(PendingSshInteractions {
                 client_id: 7,

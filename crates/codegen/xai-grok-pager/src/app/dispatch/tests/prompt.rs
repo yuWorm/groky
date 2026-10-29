@@ -93,7 +93,7 @@ fn ssh_picker_command_after_selected_target_keeps_context_until_reselection() {
     let id = AgentId(0);
     let prompt = &mut app.agents.get_mut(&id).unwrap().prompt;
     prompt.set_ssh_target_context("previous-host", "Previous host", "user@previous-host:22");
-    prompt.append_text("/remote next-host");
+    prompt.append_text("/ssh next-host");
     let text = prompt.text().to_owned();
     let effects = dispatch_send_prompt(&mut app, text);
     assert!(effects.iter().any(|effect| matches!(effect, Effect::SshListTargets { .. })));
@@ -101,7 +101,7 @@ fn ssh_picker_command_after_selected_target_keeps_context_until_reselection() {
     assert!(!agent.session.state.is_turn_running());
     assert!(agent.session.pending_prompts.is_empty());
     assert!(agent.prompt.text().contains("previous-host"));
-    assert!(!agent.prompt.text().contains("/remote"));
+    assert!(!agent.prompt.text().contains("/ssh"));
     assert!(!agent.prompt.text().contains("next-host"));
 }
 

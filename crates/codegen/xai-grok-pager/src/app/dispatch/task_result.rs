@@ -632,6 +632,14 @@ pub(super) fn dispatch_task_result(result: TaskResult, app: &mut AppView) -> Vec
             }
             vec![]
         }
+        TaskResult::RemoteProjectsLoaded {
+            owner,
+            generation,
+            result,
+        } => {
+            super::ssh::apply_remote_projects_loaded(app, owner, generation, result);
+            vec![]
+        }
         TaskResult::SshTargetsLoaded {
             session_id,
             client_id,

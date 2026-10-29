@@ -43,6 +43,7 @@ pub mod prompt_widget;
 pub mod question_view;
 pub(crate) mod queue_mutation;
 pub mod queue_pane;
+pub mod remote_projects;
 pub mod rewind;
 pub(crate) mod scheduled_next;
 pub mod scroll_debug_hud;

@@ -164,6 +164,17 @@ pub(crate) async fn load_targets(
     result
 }
 
+/// Load only the local service data required to label remembered remote projects.
+pub(crate) async fn load_remote_project_catalog(
+) -> Result<crate::views::remote_projects::RemoteProjectCatalog> {
+    let current = backend().await?;
+    let result = current.load_remote_project_catalog().await;
+    if result.as_ref().err().is_some_and(is_transport_error) {
+        discard_stale_leader(&current).await;
+    }
+    result
+}
+
 /// Run exactly one persistent event pump for a pager generation. RPC effects
 /// never create readers; this pump alone owns the receiver and issues only the
 /// safe pending-interactions snapshot while recovering.
@@ -393,6 +404,42 @@ impl SshControlBackend {
             views.push(view);
         }
         Ok((client_id, views))
+    }
+
+    pub(crate) async fn load_remote_project_catalog(
+        &self,
+    ) -> Result<crate::views::remote_projects::RemoteProjectCatalog> {
+        use crate::views::remote_projects::{
+            RememberedRemoteProject, RemoteProjectCatalog, RemoteProjectTarget,
+        };
+
+        let (_, reply) = self.request(SshControlCommand::ListConfiguredTargets).await?;
+        let SshControlReply::ConfiguredTargets(configured) = reply else {
+            anyhow::bail!("SSH local service returned an unexpected target list.");
+        };
+        let configured: Vec<xai_grok_ssh::SshTarget> = serde_json::from_str(&configured)
+            .context("Could not read SSH target configuration")?;
+        let (_, reply) = self.request(SshControlCommand::ListRememberedProjects).await?;
+        let SshControlReply::RememberedProjects(remembered) = reply else {
+            anyhow::bail!("SSH local service returned an unexpected remembered-project list.");
+        };
+        Ok(RemoteProjectCatalog {
+            targets: configured
+                .into_iter()
+                .map(|target| RemoteProjectTarget {
+                    target_id: target.id,
+                    label: target.label,
+                    host: target.host,
+                })
+                .collect(),
+            remembered: remembered
+                .into_iter()
+                .map(|project| RememberedRemoteProject {
+                    target_id: project.target_id,
+                    root: project.root,
+                })
+                .collect(),
+        })
     }
 }
 

@@ -177,6 +177,22 @@ impl AgentView {
             }
             SshModalOutcome::Changed => InputOutcome::Changed,
             SshModalOutcome::Unchanged => InputOutcome::Unchanged,
+            SshModalOutcome::OpenRemoteProjects => InputOutcome::Action(Action::ShowRemoteProjects),
+            SshModalOutcome::BeginRemoteProject { target_id, root } => {
+                InputOutcome::Action(Action::BeginSshProjectOpen(crate::app::cli::SshProjectOpen {
+                    target_id,
+                    root,
+                    project_session_id: uuid::Uuid::now_v7().to_string(),
+                    expected_identity: None,
+                }))
+            }
+            SshModalOutcome::ResumeRemoteProject { session_id, cwd } => {
+                InputOutcome::Action(Action::LoadSession(
+                    session_id,
+                    crate::app::session_startup::local_cwd_from_session_storage(&cwd),
+                    false,
+                ))
+            }
             SshModalOutcome::Refresh => InputOutcome::Action(Action::RefreshSshTargets),
             SshModalOutcome::AddTarget {
                 draft,

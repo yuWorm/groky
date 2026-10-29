@@ -14,7 +14,7 @@ mod tools;
 mod terminal;
 mod worker_install;
 
-pub use control::{SshAuthControlResponse, SshControlCommand, SshControlReply};
+pub use control::{RememberedSshProject, SshAuthControlResponse, SshControlCommand, SshControlReply};
 pub use control_client::{SshControlClient, SshControlClientError};
 pub use model::{
     PendingSshInteractions, PersistedSshGrant, PersistedSshState, ProjectSshBinding,

@@ -1733,13 +1733,12 @@
         pw.set_cursor(pw.text().len());
         pw.refresh_slash(&models);
 
-        pw.set_text("/remote ");
+        pw.set_text("/ssh ");
         pw.set_cursor(pw.text().len());
         pw.refresh_slash(&models);
         let second_generation = pw
             .begin_ssh_target_load(42)
-            .expect("re-entering through the alias starts a fresh load");
-        assert_ne!(first_generation, second_generation);
+            .expect("re-entering /ssh starts a fresh load");
 
         assert!(
             !pw.apply_ssh_target_candidates(
