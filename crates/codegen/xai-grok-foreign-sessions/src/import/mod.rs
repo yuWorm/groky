@@ -192,6 +192,26 @@ pub fn discover(cwd: Option<&Path>) -> ImportDiscovery {
     out
 }
 
+/// Keep the candidates a user-typed session ID refers to. Exact IDs win; otherwise a
+/// case-insensitive prefix of at least four characters matches, so UUIDs can be abbreviated.
+pub fn match_id(candidates: Vec<ImportCandidate>, id: &str) -> Vec<ImportCandidate> {
+    let id = id.trim();
+    if candidates.iter().any(|candidate| candidate.id == id) {
+        return candidates
+            .into_iter()
+            .filter(|candidate| candidate.id == id)
+            .collect();
+    }
+    if id.chars().count() < 4 {
+        return Vec::new();
+    }
+    let prefix = id.to_lowercase();
+    candidates
+        .into_iter()
+        .filter(|candidate| candidate.id.to_lowercase().starts_with(&prefix))
+        .collect()
+}
+
 /// Inspect an explicitly selected transcript or store. Multi-session stores need
 /// `id`; this function never picks an arbitrary session from a database.
 pub fn inspect(source: ImportSource, path: &Path, id: Option<&str>) -> io::Result<ImportCandidate> {
@@ -342,6 +362,23 @@ mod tests {
             modified: SystemTime::UNIX_EPOCH,
             leaf_id: None,
         })
+    }
+
+    fn with_id(id: &str) -> ImportCandidate {
+        ImportCandidate {
+            id: id.into(),
+            ..session().candidate
+        }
+    }
+
+    #[test]
+    fn exact_id_beats_prefix_and_short_prefixes_match_nothing() {
+        let candidates = vec![with_id("abcd"), with_id("abcdef")];
+        let matched = match_id(candidates.clone(), "abcd");
+        assert_eq!(matched.len(), 1);
+        assert_eq!(matched[0].id, "abcd");
+        assert_eq!(match_id(candidates.clone(), "ABCDE").len(), 1);
+        assert!(match_id(candidates, "abc").is_empty());
     }
 
     #[test]

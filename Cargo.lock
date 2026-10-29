@@ -15222,6 +15222,7 @@ dependencies = [
  "git2",
  "image",
  "indexmap",
+ "indicatif",
  "insta",
  "libc",
  "nix 0.30.1",

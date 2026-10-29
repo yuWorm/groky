@@ -388,7 +388,8 @@ pub(in crate::app::dispatch) fn dispatch_pick_session(
             crate::app::foreign_sessions::ForeignPickerSource::Claude
                 | crate::app::foreign_sessions::ForeignPickerSource::Codex
         ) {
-            return super::import::dispatch_show_import_session_picker(app);
+            let request = super::import::foreign_resume_request(foreign_source.tool(), session_id);
+            return super::import::dispatch_show_import_session_picker(app, request);
         }
         let prompt = crate::app::foreign_sessions::cursor_resume_prompt(&session_id);
         let mut effects = dispatch_new_session_inner(app, None);

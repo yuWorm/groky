@@ -145,8 +145,14 @@ pub enum Action {
     /// The session picker overlay was dismissed without a pick.
     /// Invalidate any in-flight list/search/foreign scan so a late response can't fall through to the welcome picker fields.
     SessionPickerClosed,
-    /// Discover foreign transcripts for the current project in the shared session picker.
-    ShowImportSessionPicker,
+    /// Discover foreign transcripts for a project in the shared session picker.
+    ShowImportSessionPicker {
+        request: crate::views::session_picker::ImportSessionRequest,
+    },
+    /// Import every discovered candidate not already imported into the current project.
+    ImportAllSessions {
+        generation: u64,
+    },
     /// Inspect one foreign transcript before asking the user to create a native session.
     PreviewImportSession {
         generation: u64,
@@ -3286,6 +3292,8 @@ pub enum TaskResult {
         target_cwd: std::path::PathBuf,
         owner_session_id: Option<String>,
         candidates: Vec<xai_grok_foreign_sessions::import::ImportCandidate>,
+        /// Previous imports into `target_cwd`, keyed by `(source, source_id)`.
+        imported: std::collections::HashMap<(String, String), String>,
         warnings: Vec<String>,
     },
     /// A selected transcript was decoded solely for the import confirmation.

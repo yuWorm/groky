@@ -61,7 +61,8 @@ use super::session::fork::{
 };
 use super::session::import::{
     dispatch_cancel_import_session_preview, dispatch_confirm_import_session,
-    dispatch_preview_import_session, dispatch_show_import_session_picker,
+    dispatch_import_all_sessions, dispatch_preview_import_session,
+    dispatch_show_import_session_picker,
     dispatch_toggle_import_session_scope,
 };
 use super::session::lifecycle::{
@@ -200,7 +201,9 @@ fn dispatch_inner(action: Action, app: &mut AppView) -> Vec<Effect> {
                     );
                     return vec![];
                 }
-                return dispatch_show_import_session_picker(app);
+                let request =
+                    super::session::import::foreign_resume_request(hint.tool, hint.native_id);
+                return dispatch_show_import_session_picker(app, request);
             }
             let prompt = crate::app::foreign_sessions::cursor_resume_prompt(&hint.native_id);
             if !app.session_startup_allowed() {
@@ -322,7 +325,10 @@ fn dispatch_inner(action: Action, app: &mut AppView) -> Vec<Effect> {
             }
         }
         Action::SessionPickerClosed => dispatch_session_picker_closed(app),
-        Action::ShowImportSessionPicker => dispatch_show_import_session_picker(app),
+        Action::ShowImportSessionPicker { request } => {
+            dispatch_show_import_session_picker(app, request)
+        }
+        Action::ImportAllSessions { generation } => dispatch_import_all_sessions(app, generation),
         Action::PreviewImportSession {
             generation,
             candidate_index,

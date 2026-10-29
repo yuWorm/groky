@@ -1263,6 +1263,7 @@ pub(super) fn dispatch_task_result(result: TaskResult, app: &mut AppView) -> Vec
             target_cwd,
             owner_session_id,
             candidates,
+            imported,
             warnings,
         } => handle_import_sessions_discovered(
             app,
@@ -1271,6 +1272,7 @@ pub(super) fn dispatch_task_result(result: TaskResult, app: &mut AppView) -> Vec
             target_cwd,
             owner_session_id,
             candidates,
+            imported,
             warnings,
         ),
         TaskResult::ImportSessionPreviewed {

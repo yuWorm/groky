@@ -31,7 +31,7 @@ fn import_picker_survives_optimistic_home_binding_without_sending_a_prompt() {
     let mut app = test_app_with_agent();
     let ActiveView::Agent(agent_id) = app.active_view else { panic!("agent view") };
     app.agents.get_mut(&agent_id).unwrap().session.session_id = None;
-    let effects = dispatch(Action::ShowImportSessionPicker, &mut app);
+    let effects = dispatch(Action::ShowImportSessionPicker { request: Default::default() }, &mut app);
     let (generation, target_cwd, owner_session_id) = match effects.as_slice() {
         [Effect::DiscoverImportSessions { generation, target_cwd, owner_session_id, .. }] =>
             (*generation, target_cwd.clone(), owner_session_id.clone()),
@@ -51,7 +51,7 @@ fn import_picker_survives_optimistic_home_binding_without_sending_a_prompt() {
     };
     let effects = dispatch(Action::TaskComplete(TaskResult::ImportSessionsDiscovered {
         agent_id, generation, target_cwd, owner_session_id,
-        candidates: vec![candidate], warnings: Vec::new(),
+        candidates: vec![candidate], imported: Default::default(), warnings: Vec::new(),
     }), &mut app);
     assert!(effects.is_empty());
     let agent = app.agents.get(&agent_id).unwrap();
@@ -64,7 +64,7 @@ fn import_picker_survives_optimistic_home_binding_without_sending_a_prompt() {
 #[test]
 fn stale_import_discovery_cannot_mutate_a_picker_after_cwd_changes() {
     let mut app = test_app_with_agent();
-    let effects = dispatch(Action::ShowImportSessionPicker, &mut app);
+    let effects = dispatch(Action::ShowImportSessionPicker { request: Default::default() }, &mut app);
     let (agent_id, generation, target_cwd, owner_session_id) = match effects.as_slice() {
         [Effect::DiscoverImportSessions {
             agent_id,
@@ -93,6 +93,7 @@ fn stale_import_discovery_cannot_mutate_a_picker_after_cwd_changes() {
             target_cwd,
             owner_session_id,
             candidates: vec![candidate],
+            imported: Default::default(),
             warnings: Vec::new(),
         }),
         &mut app,
@@ -117,7 +118,7 @@ fn stale_import_discovery_cannot_mutate_a_picker_after_cwd_changes() {
 #[test]
 fn switching_import_scope_invalidates_the_previous_discovery_token() {
     let mut app = test_app_with_agent();
-    let first = dispatch(Action::ShowImportSessionPicker, &mut app);
+    let first = dispatch(Action::ShowImportSessionPicker { request: Default::default() }, &mut app);
     let (agent_id, first_generation, target_cwd, owner_session_id) = match first.as_slice() {
         [Effect::DiscoverImportSessions {
             agent_id,
@@ -147,6 +148,7 @@ fn switching_import_scope_invalidates_the_previous_discovery_token() {
             target_cwd,
             owner_session_id,
             candidates: Vec::new(),
+            imported: Default::default(),
             warnings: Vec::new(),
         }),
         &mut app,
@@ -167,6 +169,116 @@ fn switching_import_scope_invalidates_the_previous_discovery_token() {
     assert_eq!(*generation, second_generation);
     assert!(*loading);
     assert!(import.candidates.is_empty());
+}
+fn import_candidate(id: &str, cwd: &std::path::Path) -> xai_grok_foreign_sessions::import::ImportCandidate {
+    xai_grok_foreign_sessions::import::ImportCandidate {
+        source: xai_grok_foreign_sessions::import::ImportSource::Claude,
+        id: id.into(),
+        path: format!("/fixture/{id}.jsonl").into(),
+        cwd: cwd.to_path_buf(),
+        title: format!("Session {id}"),
+        modified: std::time::SystemTime::UNIX_EPOCH,
+        leaf_id: None,
+    }
+}
+#[test]
+fn import_request_scans_dir_and_jumps_to_the_matching_session() {
+    let mut app = test_app_with_agent();
+    let request = crate::views::session_picker::ImportSessionRequest {
+        dir: Some("other-project".into()),
+        id: Some("0199abcd".into()),
+        ..Default::default()
+    };
+    let effects = dispatch(Action::ShowImportSessionPicker { request }, &mut app);
+    let (agent_id, generation, target_cwd, owner_session_id) = match effects.as_slice() {
+        [.., Effect::DiscoverImportSessions { agent_id, generation, cwd, target_cwd, owner_session_id }] => {
+            assert_eq!(cwd.as_deref(), Some(app.cwd.join("other-project").as_path()));
+            assert_eq!(target_cwd, &app.cwd);
+            (*agent_id, *generation, target_cwd.clone(), owner_session_id.clone())
+        }
+        other => panic!("expected scoped discovery, got {other:?}"),
+    };
+    let effects = dispatch(
+        Action::TaskComplete(TaskResult::ImportSessionsDiscovered {
+            agent_id,
+            generation,
+            target_cwd: target_cwd.clone(),
+            owner_session_id,
+            candidates: vec![
+                import_candidate("0199abcd-full-id", &target_cwd),
+                import_candidate("ffff0000", &target_cwd),
+            ],
+            imported: Default::default(),
+            warnings: Vec::new(),
+        }),
+        &mut app,
+    );
+    assert!(
+        matches!(effects.as_slice(), [Effect::PreviewImportSession { candidate, .. }] if candidate.id == "0199abcd-full-id"),
+        "expected an automatic preview, got {effects:?}"
+    );
+}
+#[test]
+fn import_all_skips_previous_imports_and_chains_one_session_at_a_time() {
+    let mut app = test_app_with_agent();
+    app.persisted_default_model = Some("grok-test".to_owned());
+    let request = crate::views::session_picker::ImportSessionRequest {
+        all: true,
+        ..Default::default()
+    };
+    let effects = dispatch(Action::ShowImportSessionPicker { request }, &mut app);
+    let (agent_id, generation, target_cwd, owner_session_id) = match effects.as_slice() {
+        [.., Effect::DiscoverImportSessions { agent_id, generation, target_cwd, owner_session_id, .. }] =>
+            (*agent_id, *generation, target_cwd.clone(), owner_session_id.clone()),
+        other => panic!("expected discovery, got {other:?}"),
+    };
+    let imported = std::collections::HashMap::from([(
+        ("claude".to_owned(), "done".to_owned()),
+        "native-done".to_owned(),
+    )]);
+    let effects = dispatch(
+        Action::TaskComplete(TaskResult::ImportSessionsDiscovered {
+            agent_id,
+            generation,
+            target_cwd: target_cwd.clone(),
+            owner_session_id: owner_session_id.clone(),
+            candidates: vec![
+                import_candidate("first", &target_cwd),
+                import_candidate("done", &target_cwd),
+                import_candidate("second", &target_cwd),
+            ],
+            imported,
+            warnings: Vec::new(),
+        }),
+        &mut app,
+    );
+    let first_index = match effects.as_slice() {
+        [Effect::ImportSession { candidate, candidate_index, .. }] if candidate.id == "first" => *candidate_index,
+        other => panic!("expected first import, got {other:?}"),
+    };
+    let complete = |candidate_index, session_id: &str| {
+        Action::TaskComplete(TaskResult::ImportSessionCompleted {
+            agent_id,
+            generation,
+            candidate_index,
+            target_cwd: target_cwd.clone(),
+            owner_session_id: owner_session_id.clone(),
+            session_id: Some(session_id.to_owned()),
+            message_count: 2,
+            warnings: Vec::new(),
+            error: None,
+        })
+    };
+    let effects = dispatch(complete(first_index, "native-first"), &mut app);
+    let second_index = match effects.as_slice() {
+        [Effect::ImportSession { candidate, candidate_index, .. }] if candidate.id == "second" => *candidate_index,
+        other => panic!("expected second import, got {other:?}"),
+    };
+    let _ = dispatch(complete(second_index, "native-second"), &mut app);
+    assert!(
+        app.agents.get(&agent_id).unwrap().active_modal.is_none(),
+        "a finished multi-session batch closes the picker"
+    );
 }
 #[test]
 fn external_prompt_editor_arms_typed_request_and_preserves_composer_modes() {

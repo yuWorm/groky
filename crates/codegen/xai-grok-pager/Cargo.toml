@@ -30,6 +30,7 @@ crossterm = { workspace = true, features = ["event-stream", "bracketed-paste"] }
 textwrap = { workspace = true }
 regex = { workspace = true }
 unicode-width = { workspace = true }
+indicatif = { workspace = true }
 unicode-segmentation = { workspace = true }
 strip-ansi-escapes = { workspace = true }
 

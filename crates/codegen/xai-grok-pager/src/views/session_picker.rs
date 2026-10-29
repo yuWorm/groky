@@ -171,23 +171,64 @@ impl SessionPickerLanes {
 #[derive(Debug, Clone)]
 pub struct ImportSessionPickerState {
     pub(crate) candidates: Vec<ImportCandidate>,
+    /// Native session ID of a previous import of each candidate into the live cwd.
+    pub(crate) imported_as: Vec<Option<String>>,
     pub(crate) discovery_warnings: Vec<String>,
+    /// Project scanned when not showing every project; imports still land in the live cwd.
+    pub(crate) scope_dir: std::path::PathBuf,
     pub(crate) all_projects: bool,
+    /// `/import-session` arguments still to apply when discovery completes.
+    pub(crate) request: ImportSessionRequest,
     pub(crate) preview: Option<ImportSessionPreview>,
     pub(crate) inspecting: Option<usize>,
     pub(crate) importing: Option<usize>,
+    pub(crate) batch: Option<ImportBatch>,
 }
 
 impl ImportSessionPickerState {
-    pub(crate) fn new() -> Self {
+    pub(crate) fn new(scope_dir: std::path::PathBuf, request: ImportSessionRequest) -> Self {
         Self {
             candidates: Vec::new(),
+            imported_as: Vec::new(),
             discovery_warnings: Vec::new(),
-            all_projects: false,
+            scope_dir,
+            all_projects: request.all_projects,
+            request,
             preview: None,
             inspecting: None,
             importing: None,
+            batch: None,
         }
+    }
+}
+
+/// Arguments to `/import-session`, mirroring `groky sessions import`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ImportSessionRequest {
+    /// Project to scan instead of the live cwd (relative to it when not absolute).
+    pub dir: Option<std::path::PathBuf>,
+    /// Session ID or unique prefix to inspect as soon as discovery finds it.
+    pub id: Option<String>,
+    pub source: Option<xai_grok_foreign_sessions::import::ImportSource>,
+    pub all_projects: bool,
+    /// Import every not-yet-imported candidate as soon as discovery completes.
+    pub all: bool,
+}
+
+/// Progress of an "import all" run. Candidates import one at a time so each completion
+/// stays generation-gated and closing the picker stops the run after the current session.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct ImportBatch {
+    pub(crate) queue: std::collections::VecDeque<usize>,
+    pub(crate) total: usize,
+    pub(crate) imported: Vec<String>,
+    pub(crate) failed: usize,
+    pub(crate) skipped: usize,
+}
+
+impl ImportBatch {
+    pub(crate) fn done(&self) -> usize {
+        self.imported.len() + self.failed
     }
 }
 

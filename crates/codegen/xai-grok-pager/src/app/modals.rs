@@ -1052,7 +1052,9 @@ impl AgentView {
                         !chat_mode && source_filter.is_active()
                     },
                     header_note: None,
-                    action_keys: if import_picker || chat_mode || focused_is_foreign {
+                    action_keys: if import_picker {
+                        &[('a', "import all")]
+                    } else if chat_mode || focused_is_foreign {
                         &[]
                     } else {
                         &[('d', "delete")]
@@ -1292,6 +1294,11 @@ impl AgentView {
                             return InputOutcome::Action(Action::ForceDeepSearch);
                         }
                         InputOutcome::Unchanged
+                    }
+                    PickerOutcome::Action('a') if import_picker => {
+                        InputOutcome::Action(Action::ImportAllSessions {
+                            generation: *generation,
+                        })
                     }
                     PickerOutcome::FilterCycled if import_picker => {
                         InputOutcome::Action(Action::ToggleImportSessionScope {
@@ -2001,7 +2008,22 @@ impl AgentView {
                 let import_all_projects =
                     import_state.is_some_and(|import| import.all_projects);
                 let chat_mode = self.app_chat_mode && import_state.is_none();
-                let session_shortcuts: Vec<Shortcut> = if import_preview.is_some() {
+                let batch_label = import_state
+                    .and_then(|import| import.batch.as_ref())
+                    .map(|batch| {
+                        format!(
+                            "Importing {}/{}… Esc stops after this session",
+                            (batch.done() + 1).min(batch.total),
+                            batch.total
+                        )
+                    });
+                let session_shortcuts: Vec<Shortcut> = if let Some(label) = &batch_label {
+                    vec![Shortcut {
+                        label,
+                        clickable: false,
+                        id: 0,
+                    }]
+                } else if import_preview.is_some() {
                     vec![
                         Shortcut {
                             label: "Enter import",
@@ -2036,6 +2058,11 @@ impl AgentView {
                         },
                         Shortcut {
                             label: "e preview",
+                            clickable: false,
+                            id: 0,
+                        },
+                        Shortcut {
+                            label: "a import all",
                             clickable: false,
                             id: 0,
                         },

@@ -1616,16 +1616,23 @@ pub(crate) fn execute(
             generation,
         } => {
             tasks.spawn(async move {
-                let discovery = tokio::task::spawn_blocking(move || {
-                    xai_grok_foreign_sessions::import::discover(cwd.as_deref())
+                let imported_cwd = target_cwd.clone();
+                let (discovery, imported) = tokio::task::spawn_blocking(move || {
+                    (
+                        xai_grok_foreign_sessions::import::discover(cwd.as_deref()),
+                        xai_grok_shell::session::import::imported_sources(&imported_cwd),
+                    )
                 })
                 .await
                 .unwrap_or_else(|error| {
                     tracing::warn!(%error, "foreign session import discovery task failed");
-                    xai_grok_foreign_sessions::import::ImportDiscovery {
-                        sessions: Vec::new(),
-                        warnings: vec!["Foreign session discovery failed.".to_owned()],
-                    }
+                    (
+                        xai_grok_foreign_sessions::import::ImportDiscovery {
+                            sessions: Vec::new(),
+                            warnings: vec!["Foreign session discovery failed.".to_owned()],
+                        },
+                        Default::default(),
+                    )
                 });
                 TaskResult::ImportSessionsDiscovered {
                     agent_id,
@@ -1633,6 +1640,7 @@ pub(crate) fn execute(
                     target_cwd,
                     owner_session_id,
                     candidates: discovery.sessions,
+                    imported,
                     warnings: discovery.warnings,
                 }
             });

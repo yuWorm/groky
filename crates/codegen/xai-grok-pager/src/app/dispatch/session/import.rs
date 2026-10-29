@@ -3,7 +3,9 @@ use crate::app::actions::Effect;
 use crate::app::agent::AgentId;
 use crate::app::app_view::{ActiveView, AppView, SessionPickerEntry};
 use crate::views::modal::ActiveModal;
-use crate::views::session_picker::ImportSessionPreview;
+use crate::views::session_picker::{
+    ImportBatch, ImportSessionPickerState, ImportSessionPreview, ImportSessionRequest,
+};
 use crate::views::session_title::sanitize_display_text;
 use xai_grok_foreign_sessions::import::ImportCandidate;
 
@@ -35,12 +37,17 @@ fn safe_warnings(warnings: Vec<String>) -> Vec<String> {
     safe
 }
 
-fn candidate_entry(candidate: &ImportCandidate) -> SessionPickerEntry {
+fn candidate_entry(candidate: &ImportCandidate, imported_as: Option<&str>) -> SessionPickerEntry {
     let updated_at = chrono::DateTime::<chrono::Utc>::from(candidate.modified);
     let cwd = safe_display(&candidate.cwd.to_string_lossy());
+    let title = safe_display(&candidate.title);
     SessionPickerEntry {
         id: safe_display(&candidate.id),
-        summary: safe_display(&candidate.title),
+        summary: if imported_as.is_some() {
+            format!("{title} · imported")
+        } else {
+            title
+        },
         updated_at,
         created_at: updated_at,
         cwd: cwd.clone(),
@@ -114,20 +121,40 @@ fn discovery_effect(
     generation: u64,
     target_cwd: std::path::PathBuf,
     owner_session_id: Option<String>,
-    all_projects: bool,
+    import: &ImportSessionPickerState,
 ) -> Effect {
     Effect::DiscoverImportSessions {
         agent_id,
-        cwd: (!all_projects).then_some(target_cwd.clone()),
+        cwd: (!import.all_projects).then(|| import.scope_dir.clone()),
         target_cwd,
         owner_session_id,
         generation,
     }
 }
 
+/// Opens the import picker on the hinted transcript of a launch-time foreign resume.
+pub(in crate::app::dispatch) fn foreign_resume_request(
+    tool: xai_grok_foreign_sessions::ForeignSessionTool,
+    native_id: String,
+) -> ImportSessionRequest {
+    use xai_grok_foreign_sessions::ForeignSessionTool;
+    use xai_grok_foreign_sessions::import::ImportSource;
+    let source = match tool {
+        ForeignSessionTool::Claude => Some(ImportSource::Claude),
+        ForeignSessionTool::Codex => Some(ImportSource::Codex),
+        ForeignSessionTool::Cursor => None,
+    };
+    ImportSessionRequest {
+        id: Some(native_id),
+        source,
+        ..Default::default()
+    }
+}
+
 /// Opens the ordinary session picker in import mode, then starts metadata-only discovery.
 pub(in crate::app::dispatch) fn dispatch_show_import_session_picker(
     app: &mut AppView,
+    request: ImportSessionRequest,
 ) -> Vec<Effect> {
     let mut effects = Vec::new();
     if matches!(app.active_view, ActiveView::Welcome) {
@@ -143,10 +170,23 @@ pub(in crate::app::dispatch) fn dispatch_show_import_session_picker(
     let owner_session_id = owner_session_id(app, agent_id);
     let generation = app.alloc_picker_generation();
     let target_cwd = app.cwd.clone();
+    let scope_dir = match &request.dir {
+        Some(dir) if dir.is_relative() => target_cwd.join(dir),
+        Some(dir) => dir.clone(),
+        None => target_cwd.clone(),
+    };
     let Some(agent) = app.agents.get_mut(&agent_id) else {
         return effects;
     };
-    let mut modal = crate::views::modal::import_session_picker_modal();
+    let import = ImportSessionPickerState::new(scope_dir, request);
+    effects.push(discovery_effect(
+        agent_id,
+        generation,
+        target_cwd,
+        owner_session_id,
+        &import,
+    ));
+    let mut modal = crate::views::modal::import_session_picker_modal(import);
     if let ActiveModal::SessionPicker {
         generation: modal_generation,
         ..
@@ -155,13 +195,6 @@ pub(in crate::app::dispatch) fn dispatch_show_import_session_picker(
         *modal_generation = generation;
     }
     agent.active_modal = Some(modal);
-    effects.push(discovery_effect(
-        agent_id,
-        generation,
-        target_cwd,
-        owner_session_id,
-        false,
-    ));
     effects
 }
 
@@ -202,10 +235,12 @@ pub(in crate::app::dispatch) fn dispatch_toggle_import_session_scope(
     *modal_generation = next_generation;
     import.all_projects = !import.all_projects;
     import.candidates.clear();
+    import.imported_as.clear();
     import.discovery_warnings.clear();
     import.preview = None;
     import.inspecting = None;
     import.importing = None;
+    import.batch = None;
     *entries = Some(Vec::new());
     *loading = true;
     state.selected = 0;
@@ -216,7 +251,7 @@ pub(in crate::app::dispatch) fn dispatch_toggle_import_session_scope(
         next_generation,
         target_cwd,
         owner_session_id,
-        import.all_projects,
+        import,
     )]
 }
 
@@ -366,7 +401,8 @@ pub(in crate::app::dispatch) fn handle_import_sessions_discovered(
     generation: u64,
     target_cwd: std::path::PathBuf,
     owner_session_id: Option<String>,
-    candidates: Vec<ImportCandidate>,
+    mut candidates: Vec<ImportCandidate>,
+    imported: std::collections::HashMap<(String, String), String>,
     warnings: Vec<String>,
 ) -> Vec<Effect> {
     if !current_import_picker_matches(
@@ -378,10 +414,48 @@ pub(in crate::app::dispatch) fn handle_import_sessions_discovered(
     ) {
         return vec![];
     }
-    let entries: Vec<SessionPickerEntry> = candidates.iter().map(candidate_entry).collect();
     let Some(agent) = app.agents.get_mut(&agent_id) else {
         return vec![];
     };
+    let Some(ActiveModal::SessionPicker {
+        import: Some(import),
+        ..
+    }) = agent.active_modal.as_ref()
+    else {
+        return vec![];
+    };
+    // Arguments apply to the first discovery only; a later scope toggle shows everything.
+    let request = import.request.clone();
+    if let Some(source) = request.source {
+        candidates.retain(|candidate| candidate.source == source);
+    }
+    let mut notice = None;
+    let mut inspect_first = false;
+    if let Some(id) = request.id.as_deref() {
+        let matched = xai_grok_foreign_sessions::import::match_id(candidates.clone(), id);
+        if matched.is_empty() {
+            notice = Some(format!(
+                "No foreign session matches {}; showing every candidate.",
+                safe_display(id)
+            ));
+        } else {
+            inspect_first = matched.len() == 1;
+            candidates = matched;
+        }
+    }
+    let imported_as: Vec<Option<String>> = candidates
+        .iter()
+        .map(|candidate| {
+            imported
+                .get(&(candidate.source.as_str().to_owned(), candidate.id.clone()))
+                .cloned()
+        })
+        .collect();
+    let entries: Vec<SessionPickerEntry> = candidates
+        .iter()
+        .zip(&imported_as)
+        .map(|(candidate, imported_as)| candidate_entry(candidate, imported_as.as_deref()))
+        .collect();
     let Some(ActiveModal::SessionPicker {
         entries: picker_entries,
         loading,
@@ -393,16 +467,121 @@ pub(in crate::app::dispatch) fn handle_import_sessions_discovered(
         return vec![];
     };
     import.candidates = candidates;
+    import.imported_as = imported_as;
     import.discovery_warnings = safe_warnings(warnings);
+    import.request = ImportSessionRequest::default();
     import.preview = None;
     import.inspecting = None;
     import.importing = None;
+    import.batch = None;
     *picker_entries = Some(entries);
     *loading = false;
     state.selected = 0;
     state.scroll_offset = None;
     state.expanded.clear();
+    if let Some(notice) = notice {
+        agent.show_toast(&notice);
+    }
+    if request.all {
+        return dispatch_import_all_sessions(app, generation);
+    }
+    if inspect_first {
+        return dispatch_preview_import_session(app, generation, 0);
+    }
     vec![]
+}
+
+/// Starts importing every candidate that has not already been imported into the live cwd.
+pub(in crate::app::dispatch) fn dispatch_import_all_sessions(
+    app: &mut AppView,
+    generation: u64,
+) -> Vec<Effect> {
+    let ActiveView::Agent(agent_id) = app.active_view else {
+        return vec![];
+    };
+    let target_cwd = app.cwd.clone();
+    let owner_session_id = owner_session_id(app, agent_id);
+    if !current_import_picker_matches(
+        app,
+        agent_id,
+        generation,
+        &target_cwd,
+        owner_session_id.as_deref(),
+    ) {
+        return vec![];
+    }
+    let Some(model_id) = configured_model_id(app, agent_id) else {
+        if let Some(agent) = app.agents.get_mut(&agent_id) {
+            agent.show_toast("Choose a Groky model before importing a session.");
+        }
+        return vec![];
+    };
+    let Some(agent) = app.agents.get_mut(&agent_id) else {
+        return vec![];
+    };
+    let Some(ActiveModal::SessionPicker {
+        import: Some(import),
+        ..
+    }) = agent.active_modal.as_mut()
+    else {
+        return vec![];
+    };
+    if import.inspecting.is_some() || import.importing.is_some() {
+        return vec![];
+    }
+    let queue: std::collections::VecDeque<usize> = import
+        .imported_as
+        .iter()
+        .enumerate()
+        .filter_map(|(index, imported_as)| imported_as.is_none().then_some(index))
+        .collect();
+    let skipped = import.candidates.len() - queue.len();
+    if queue.is_empty() {
+        let message = if import.candidates.is_empty() {
+            "No foreign sessions to import here; press f to search every project.".to_owned()
+        } else {
+            format!("All {skipped} sessions here were already imported.")
+        };
+        agent.show_toast(&message);
+        return vec![];
+    }
+    import.preview = None;
+    import.batch = Some(ImportBatch {
+        total: queue.len(),
+        queue,
+        skipped,
+        ..Default::default()
+    });
+    next_batch_import(import, agent_id, generation, target_cwd, owner_session_id, model_id)
+        .into_iter()
+        .collect()
+}
+
+fn next_batch_import(
+    import: &mut ImportSessionPickerState,
+    agent_id: AgentId,
+    generation: u64,
+    target_cwd: std::path::PathBuf,
+    owner_session_id: Option<String>,
+    model_id: String,
+) -> Option<Effect> {
+    let batch = import.batch.as_mut()?;
+    let (candidate_index, candidate) = loop {
+        let index = batch.queue.pop_front()?;
+        if let Some(candidate) = import.candidates.get(index) {
+            break (index, candidate.clone());
+        }
+    };
+    import.importing = Some(candidate_index);
+    Some(Effect::ImportSession {
+        agent_id,
+        generation,
+        candidate_index,
+        candidate,
+        target_cwd,
+        owner_session_id,
+        model_id,
+    })
 }
 
 pub(in crate::app::dispatch) fn handle_import_session_previewed(
@@ -472,6 +651,7 @@ pub(in crate::app::dispatch) fn handle_import_session_completed(
     ) {
         return vec![];
     }
+    let batch_model_id = configured_model_id(app, agent_id);
     let Some(agent) = app.agents.get_mut(&agent_id) else {
         return vec![];
     };
@@ -486,6 +666,30 @@ pub(in crate::app::dispatch) fn handle_import_session_completed(
         return vec![];
     }
     import.importing = None;
+    if let Some(batch) = import.batch.as_mut() {
+        match session_id {
+            Some(session_id) if error.is_none() => {
+                batch.imported.push(session_id.clone());
+                if let Some(imported_as) = import.imported_as.get_mut(candidate_index) {
+                    *imported_as = Some(session_id);
+                }
+            }
+            _ => batch.failed += 1,
+        }
+        if let Some(effect) = batch_model_id.and_then(|model_id| {
+            next_batch_import(
+                import,
+                agent_id,
+                generation,
+                target_cwd.clone(),
+                owner_session_id,
+                model_id,
+            )
+        }) {
+            return vec![effect];
+        }
+        return finish_batch(app, agent_id, target_cwd);
+    }
     if let Some(error) = error {
         agent.show_toast(&safe_display(&error));
         return vec![];
@@ -506,4 +710,57 @@ pub(in crate::app::dispatch) fn handle_import_session_completed(
     let effects = dispatch_load_session(app, session_id, Some(target_cwd), false);
     app.show_toast(&notice);
     effects
+}
+
+fn finish_batch(
+    app: &mut AppView,
+    agent_id: AgentId,
+    target_cwd: std::path::PathBuf,
+) -> Vec<Effect> {
+    let Some(agent) = app.agents.get_mut(&agent_id) else {
+        return vec![];
+    };
+    let Some(ActiveModal::SessionPicker {
+        import: Some(import),
+        ..
+    }) = agent.active_modal.as_mut()
+    else {
+        return vec![];
+    };
+    let Some(batch) = import.batch.take() else {
+        return vec![];
+    };
+    let mut parts = vec![format!(
+        "Imported {} of {} sessions",
+        batch.imported.len(),
+        batch.total
+    )];
+    if batch.skipped > 0 {
+        parts.push(format!("{} already imported", batch.skipped));
+    }
+    if batch.failed > 0 {
+        parts.push(format!("{} failed", batch.failed));
+    }
+    let mut notice = parts.join(", ");
+    match batch.imported.as_slice() {
+        [] => {
+            notice.push('.');
+            agent.show_toast(&notice);
+            vec![]
+        }
+        [session_id] => {
+            let session_id = session_id.clone();
+            agent.active_modal = None;
+            notice.push('.');
+            let effects = dispatch_load_session(app, session_id, Some(target_cwd), false);
+            app.show_toast(&notice);
+            effects
+        }
+        _ => {
+            agent.active_modal = None;
+            notice.push_str(". Use /resume to open one.");
+            app.show_toast(&notice);
+            vec![]
+        }
+    }
 }

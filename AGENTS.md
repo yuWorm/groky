@@ -27,3 +27,6 @@ Voice: `**Lead** rest.` Lead is the noun the user already knows (`/default`, `Re
 ### Unreleased
 
 Next groky version after `v0.1.31`.
+
+- **`groky sessions import`** scans `--dir` (default: current directory), imports by ID or unique prefix, opens a multi-select picker in a terminal, and `--all` batch-imports with a progress bar, skipping sessions already imported (`--force` to redo). Breaking: the old all-projects `--all` is now `--all-projects`.
+- **`/import-session`** accepts the CLI arguments (ID, directory, `--from`, `--all`), and `a` in the picker imports every new session with progress.

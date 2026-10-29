@@ -47,6 +47,7 @@ pub mod pty_wrap;
 pub mod recent_dirs;
 pub mod scrollback;
 pub mod sessions_cmd;
+mod sessions_import;
 pub mod settings;
 pub mod ssh_cmd;
 pub mod ssh_tui;

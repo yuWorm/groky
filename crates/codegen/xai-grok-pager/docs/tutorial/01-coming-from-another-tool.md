@@ -27,9 +27,12 @@ writes the items you selected into your `.grok` config. Re-run it anytime.
 Use **`/import-session`** to discover omp, pi, Claude Code, Codex, and OpenCode
 sessions for the current directory. Inspect a row, review any migration warnings,
 then confirm to open a new native Groky session. Source files are unchanged and
-historical tools are not rerun. Press `f` to include other projects.
+historical tools are not rerun. Press `f` to include other projects, or `a` to
+import every session at once.
 
-For scripts or explicit transcript paths, use **`groky sessions import`**.
+To bring a whole project over from a shell, run **`groky sessions import --all`**
+(add `--dir PATH` for another project). Without `--all` it opens a picker where
+`space` selects sessions and `Enter` imports them.
 Cursor remains on its existing **`/resume-cursor`** skill path.
 
 ## Check what was discovered

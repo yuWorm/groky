@@ -1070,7 +1070,8 @@ pub(in crate::app::dispatch) fn drain_startup_actions(app: &mut AppView) -> Vec<
             effects.extend(dispatch_new_session_inner(app, None));
             if matches!(tool, xai_grok_foreign_sessions::ForeignSessionTool::Claude
                 | xai_grok_foreign_sessions::ForeignSessionTool::Codex) {
-                effects.extend(super::import::dispatch_show_import_session_picker(app));
+                let request = super::import::foreign_resume_request(tool, native_id);
+                effects.extend(super::import::dispatch_show_import_session_picker(app, request));
             } else {
                 effects.extend(dispatch(
                     Action::SendPrompt(

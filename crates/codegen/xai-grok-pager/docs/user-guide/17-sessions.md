@@ -83,24 +83,45 @@ Confirms, then permanently removes the session history. Returns to the welcome s
 
 Run `/import-session` to find **omp, pi, Claude Code, Codex, and OpenCode**
 sessions for the current working directory. Paths are matched canonically rather
-than by directory-name prefixes. The picker lists source, title and last activity;
-`f` switches to all projects, including sessions from other worktrees.
+than by directory-name prefixes. The picker lists source, title and last activity,
+and marks sessions already imported here. `f` switches to all projects, including
+sessions from other worktrees.
 
 Press `Enter` to inspect a session's effective-context count and migration
-warnings, then `Enter` again to confirm. `Esc` cancels the preview. Import creates
-a new native ID in the current directory and opens its history without sending
-a model prompt. The original agent's session is not changed.
+warnings, then `Enter` again to confirm. `Esc` cancels the preview. Press `a` to
+import every session not yet imported; the footer shows progress and `Esc` stops
+after the current session. Import creates a new native ID in the current directory
+and opens its history without sending a model prompt. The original agent's session
+is not changed.
 
-For non-interactive use:
+`/import-session` accepts the same arguments as the CLI:
+
+```text
+/import-session 0199ab12            # jump to that session's import preview (ID or unique prefix)
+/import-session ~/work/other-repo   # scan another project (same as --dir)
+/import-session --from claude --all # import every Claude Code session for this project
+```
+
+From a shell, `groky sessions import` scans the current directory (or `--dir DIR`)
+and imports into it:
 
 ```sh
+groky sessions import                    # interactive picker: space selects, a selects all, Enter imports
+groky sessions import 0199ab12           # import one session by ID or unique prefix
+groky sessions import --dir ~/work/repo  # scan and import into another project
+groky sessions import --all              # import every new session, with a progress bar
+groky sessions import --all --all-projects   # every project, each into its own directory
 groky sessions import --list --json
-groky sessions import --from omp SESSION_ID
 groky sessions import --from claude /path/to/session.jsonl
 groky sessions import --from opencode /path/to/opencode.db --id SESSION_ID
 ```
 
-Omitting the ID/path only lists candidates; `--all` includes other projects.
+Sessions already imported into the target directory are skipped; pass `--force`
+to import them again. `--all` asks for confirmation in a terminal (`-y` skips it),
+and Ctrl-C stops after the current session. Without a terminal, omitting the ID
+only lists candidates; `--json` prints `imported`, `skipped` and `failed` arrays
+for batches. The command exits non-zero when any import fails.
+
 Explicit paths require `--from`. Import runs locally without authenticating.
 It uses the configured Groky model (or the normal bundled default), not the
 source model; an explicit global `--model` overrides that choice. Deployments

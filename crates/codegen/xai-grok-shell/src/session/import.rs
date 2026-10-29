@@ -43,6 +43,45 @@ pub struct ImportResult {
     pub warnings: Vec<String>,
 }
 
+/// Foreign sessions already imported into `target_cwd`, keyed by `(source, source_id)` with the native session ID.
+///
+/// Reads only the provenance markers written by previous imports; a deleted native session is not reported.
+pub fn imported_sources(target_cwd: &Path) -> std::collections::HashMap<(String, String), String> {
+    imported_sources_in(&crate::util::grok_home::grok_home(), target_cwd)
+}
+
+/// [`imported_sources`] beneath an explicit groky home.
+pub fn imported_sources_in(
+    root: &Path,
+    target_cwd: &Path,
+) -> std::collections::HashMap<(String, String), String> {
+    let mut out = std::collections::HashMap::new();
+    let Some(cwd) = target_cwd.to_str() else {
+        return out;
+    };
+    let Ok(entries) = fs::read_dir(crate::util::grok_home::sessions_cwd_dir_in(root, cwd)) else {
+        return out;
+    };
+    for entry in entries.flatten() {
+        let Ok(bytes) = fs::read(entry.path().join(IMPORT_PROVENANCE_FILE)) else {
+            continue;
+        };
+        let Ok(value) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
+            continue;
+        };
+        let field = |name: &str| value.get(name).and_then(serde_json::Value::as_str);
+        if let (Some(source), Some(source_id), Some(session_id)) =
+            (field("source"), field("sourceId"), field("sessionId"))
+        {
+            out.insert(
+                (source.to_owned(), source_id.to_owned()),
+                session_id.to_owned(),
+            );
+        }
+    }
+    out
+}
+
 /// Import a foreign session into the normal groky home.
 pub async fn import_session(
     candidate: ImportCandidate,
@@ -952,6 +991,31 @@ mod tests {
                 .iter()
                 .any(|item| matches!(item, ConversationItem::System(_)))
         );
+    }
+
+    #[test]
+    fn imported_sources_are_found_by_target_cwd_only() {
+        let root = tempfile::tempdir().unwrap();
+        let source_dir = tempfile::tempdir().unwrap();
+        let source = source_dir.path().join("source.jsonl");
+        fs::write(&source, b"{}\n").unwrap();
+        let target = PathBuf::from("/target/workspace");
+
+        assert!(imported_sources_in(root.path(), &target).is_empty());
+        let result = write_imported_session(
+            imported(source),
+            target.clone(),
+            "grok-current".to_owned(),
+            root.path().to_path_buf(),
+        )
+        .unwrap();
+
+        let found = imported_sources_in(root.path(), &target);
+        assert_eq!(
+            found.get(&("pi".to_owned(), "source-session".to_owned())),
+            Some(&result.session_id)
+        );
+        assert!(imported_sources_in(root.path(), Path::new("/other/workspace")).is_empty());
     }
 
     #[test]

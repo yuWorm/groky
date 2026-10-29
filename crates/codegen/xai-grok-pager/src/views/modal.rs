@@ -177,7 +177,9 @@ pub fn session_picker_modal(previous_palette: Option<PaletteSnapshot>) -> Active
 }
 
 /// Returns the shared picker configured for read-only foreign session discovery.
-pub fn import_session_picker_modal() -> ActiveModal {
+pub fn import_session_picker_modal(
+    import: crate::views::session_picker::ImportSessionPickerState,
+) -> ActiveModal {
     ActiveModal::SessionPicker {
         state: crate::views::picker::PickerState::default(),
         entries: None,
@@ -193,7 +195,7 @@ pub fn import_session_picker_modal() -> ActiveModal {
         entries_query: None,
         source_filter: crate::views::session_picker::SourceFilter::External,
         pending_delete: None,
-        import: Some(crate::views::session_picker::ImportSessionPickerState::new()),
+        import: Some(import),
     }
 }
 /// The currently active modal dialog, if any.
