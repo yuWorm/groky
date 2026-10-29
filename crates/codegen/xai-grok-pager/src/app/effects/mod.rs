@@ -1062,7 +1062,7 @@ pub(crate) fn execute(
             request_id,
             session_id,
             binding_id,
-            approved,
+            choice,
         } => {
             tasks.spawn(async move {
                 let client_id = ssh_control_client_id(client_id).await;
@@ -1073,7 +1073,7 @@ pub(crate) fn execute(
                             request_id: request_id.clone(),
                             session_id: session_id.clone(),
                             binding_id: binding_id.clone(),
-                            approved,
+                            choice,
                         },
                     ),
                     client_id,
@@ -1092,7 +1092,7 @@ pub(crate) fn execute(
                     request_id,
                     session_id,
                     binding_id,
-                    approved,
+                    choice,
                     error,
                 }
             });
@@ -1112,7 +1112,7 @@ pub(crate) fn execute(
                             request_id,
                             session_id: session_id.clone(),
                             binding_id,
-                            approved: false,
+                            choice: None,
                         },
                     ),
                     client_id,

@@ -1518,6 +1518,13 @@ fn worker_install_request(
         version: "1.2.3".into(),
         platform: "linux-aarch64".into(),
         remote_error: "direct remote download failed".into(),
+        attempt: 1,
+        choices: vec![
+            xai_grok_shell::ssh::SshWorkerInstallChoice::RemoteMirror,
+            xai_grok_shell::ssh::SshWorkerInstallChoice::LocalMirror,
+            xai_grok_shell::ssh::SshWorkerInstallChoice::LocalDirect,
+        ],
+        mirror: "https://gh-proxy.com".into(),
     }
 }
 
@@ -1590,7 +1597,7 @@ fn worker_fallback_keeps_its_source_actionable_through_inherited_child_bootstrap
             request_id,
             session_id,
             binding_id,
-            approved: true,
+            choice: Some(xai_grok_shell::ssh::SshWorkerInstallChoice::RemoteMirror),
         }]
             if *client_id == app.ssh_client_id
                 && *effect_owner == owner
@@ -1759,7 +1766,7 @@ fn worker_fallback_decline_flows_from_agent_input_to_exact_rejection_effect() {
             request_id,
             session_id,
             binding_id,
-            approved: false,
+            choice: None,
         }]
             if *effect_client_id == client_id
                 && *effect_owner == owner
@@ -1822,12 +1829,49 @@ fn resumed_ssh_project_fallback_uses_loading_placeholder_input_and_clears_on_suc
             request_id,
             session_id,
             binding_id,
-            approved: true,
+            choice: Some(xai_grok_shell::ssh::SshWorkerInstallChoice::RemoteMirror),
             ..
         }] if *effect_owner == owner
             && request_id == "resume-install"
             && session_id == resumed_session
             && binding_id == "resume-binding"
+    ));
+
+    // The chosen source failed: the same request re-prompts with a higher attempt.
+    app.agents
+        .get_mut(&agent_id)
+        .and_then(|agent| agent.ssh_manager.as_mut())
+        .expect("resume manager stays open while installing")
+        .settle_worker_install_decision(
+            client_id,
+            "resume-install",
+            resumed_session,
+            "resume-binding",
+            Some(xai_grok_shell::ssh::SshWorkerInstallChoice::RemoteMirror),
+            None,
+        );
+    let mut retry = request.clone();
+    retry.attempt = 2;
+    let effects = apply_ssh_control_event(
+        &mut app,
+        None,
+        None,
+        SshEvent::WorkerInstallRequested(retry),
+    );
+    assert!(effects.is_empty());
+    let action = match app.handle_input(&Event::Key(KeyEvent::new(
+        KeyCode::Char('2'),
+        KeyModifiers::NONE,
+    ))) {
+        InputOutcome::Action(action) => action,
+        _ => panic!("resume re-prompt must accept a new source choice"),
+    };
+    assert!(matches!(
+        dispatch(action, &mut app).as_slice(),
+        [Effect::SshApproveWorkerInstall {
+            choice: Some(xai_grok_shell::ssh::SshWorkerInstallChoice::LocalMirror),
+            ..
+        }]
     ));
 
     let _ = handle_session_loaded(

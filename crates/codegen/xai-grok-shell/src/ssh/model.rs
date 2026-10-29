@@ -394,7 +394,25 @@ pub struct SshOperationApprovalDecision {
     pub scope: SshOperationApprovalScope,
 }
 
-/// Local-only consent to download an exact worker build locally and upload it over SSH.
+/// One way to obtain the exact managed worker after the remote host's direct
+/// GitHub download failed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SshWorkerInstallChoice {
+    /// The remote host retries the release download through the GitHub mirror.
+    RemoteMirror,
+    /// This computer downloads the release through the GitHub mirror and uploads it over SFTP.
+    LocalMirror,
+    /// This computer downloads the release directly from GitHub and uploads it over SFTP.
+    LocalDirect,
+    /// This computer uploads its own development executable over SFTP.
+    LocalBuild,
+}
+
+/// Local-only prompt to choose how an exact worker build reaches the remote host.
+///
+/// The same `request_id` is re-published with a higher `attempt` after a chosen
+/// source fails, so the user can pick another one without reopening the project.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SshWorkerInstallRequest {
     pub client_id: u64,
@@ -404,7 +422,14 @@ pub struct SshWorkerInstallRequest {
     pub target_id: String,
     pub version: String,
     pub platform: String,
+    /// Failure of the previous attempt (the remote direct download on attempt 1).
     pub remote_error: String,
+    /// 1-based prompt number for this request.
+    pub attempt: u32,
+    /// Sources offered for this build, in display order.
+    pub choices: Vec<SshWorkerInstallChoice>,
+    /// GitHub mirror base used by the mirror choices.
+    pub mirror: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -413,7 +438,8 @@ pub struct SshWorkerInstallDecision {
     pub request_id: String,
     pub session_id: String,
     pub binding_id: String,
-    pub approved: bool,
+    /// `None` declines installation.
+    pub choice: Option<SshWorkerInstallChoice>,
 }
 
 /// Installation progress belongs only to the client and binding that opened the project.

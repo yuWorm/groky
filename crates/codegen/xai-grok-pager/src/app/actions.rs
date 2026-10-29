@@ -780,13 +780,13 @@ pub enum Action {
     },
     /// Restore per-operation prompts for one current SSH binding.
     ResetSshOperationApprovals { binding_id: String },
-    /// Resolve explicit consent to download an exact managed worker build locally and upload it
-    /// over the already-authenticated SSH connection.
+    /// Resolve how an exact managed worker build reaches the remote host (GitHub mirror, or a
+    /// local download uploaded over the already-authenticated SSH connection).
     ApproveSshWorkerInstall {
         request_id: String,
         session_id: String,
         binding_id: String,
-        approved: bool,
+        choice: Option<xai_grok_shell::ssh::SshWorkerInstallChoice>,
     },
     /// Return a local-only authentication answer to the original client/channel.
     SubmitSshAuthentication {
@@ -2779,14 +2779,14 @@ pub enum Effect {
         client_id: u64,
         owner: SshManagerOwner,
     },
-    /// Resolve one exact managed-worker local-download/upload fallback.
+    /// Resolve one exact managed-worker source choice.
     SshApproveWorkerInstall {
         client_id: u64,
         owner: SshManagerOwner,
         request_id: String,
         session_id: String,
         binding_id: String,
-        approved: bool,
+        choice: Option<xai_grok_shell::ssh::SshWorkerInstallChoice>,
     },
     /// Unblock a worker installer whose manager no longer exists without materializing another
     /// session's modal.
@@ -3009,7 +3009,7 @@ pub enum TaskResult {
         request_id: String,
         session_id: String,
         binding_id: String,
-        approved: bool,
+        choice: Option<xai_grok_shell::ssh::SshWorkerInstallChoice>,
         error: Option<String>,
     },
     /// A targeted local SSH event; it is not a chat, ACP, or replay event.

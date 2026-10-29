@@ -1407,13 +1407,13 @@ fn dispatch_inner(action: Action, app: &mut AppView) -> Vec<Effect> {
             request_id,
             session_id,
             binding_id,
-            approved,
+            choice,
         } => super::ssh::dispatch_approve_ssh_worker_install(
             app,
             request_id,
             session_id,
             binding_id,
-            approved,
+            choice,
         ),
         Action::SubmitSshAuthentication {
             challenge_id,

@@ -25,7 +25,8 @@ pub use model::{
     SshOperationApproval, SshOperationApprovalDecision, SshOperationApprovalScope,
     SshPendingSudoAuthentication, SshProjectPreparation, SshSessionWorkerEvent, SshTargetAccess,
     SshTargetCandidate, SshTargetCandidateSource, SshTargetDiscovery, SshTargetStatus,
-    SshWorkerInstallDecision, SshWorkerInstallProgress, SshWorkerInstallRequest,
+    SshWorkerInstallChoice, SshWorkerInstallDecision, SshWorkerInstallProgress,
+    SshWorkerInstallRequest,
 };
 pub(crate) use prompt_host::remote_prompt_host;
 pub use service::{SessionSsh, SessionSshResource, SshServiceError};

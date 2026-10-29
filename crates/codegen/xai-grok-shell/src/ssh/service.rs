@@ -35,8 +35,8 @@ use super::model::{
     SshHostKeyDecision, SshKeyboardInteractiveQuestion, SshOperationApproval,
     SshOperationApprovalDecision, SshOperationApprovalScope, SshPendingSudoAuthentication,
     SshProjectPreparation, SshSessionWorkerEvent, SshTargetAccess, SshTargetCandidate,
-    SshTargetCandidateSource, SshTargetDiscovery, SshTargetStatus, SshWorkerInstallDecision,
-    SshWorkerInstallProgress, SshWorkerInstallRequest,
+    SshTargetCandidateSource, SshTargetDiscovery, SshTargetStatus, SshWorkerInstallChoice,
+    SshWorkerInstallDecision, SshWorkerInstallProgress, SshWorkerInstallRequest,
 };
 
 const INTERACTION_TIMEOUT: Duration = Duration::from_secs(300);
@@ -573,7 +573,7 @@ struct PendingWorkerInstall {
     client_id: u64,
     binding: SshBinding,
     target_epoch: u64,
-    response: oneshot::Sender<bool>,
+    response: oneshot::Sender<Option<SshWorkerInstallChoice>>,
 }
 #[derive(Clone)]
 struct ProjectRegistration {
@@ -3883,11 +3883,17 @@ impl SessionSsh {
         {
             return Err(SshServiceError::StaleWorkerInstall);
         }
+        if decision
+            .choice
+            .is_some_and(|choice| !waiter.request.choices.contains(&choice))
+        {
+            return Err(SshServiceError::StaleWorkerInstall);
+        }
         waiters
             .remove(&decision.request_id)
             .expect("the checked request remains locked")
             .response
-            .send(decision.approved)
+            .send(decision.choice)
             .map_err(|_| SshServiceError::StaleWorkerInstall)
     }
 
@@ -4440,18 +4446,17 @@ impl super::worker_install::WorkerInstallInteraction for WorkerInstallBridge {
         self.send_progress(Some(message.to_owned()));
     }
 
-    async fn approve_local_upload(
+    async fn choose_install_source(
         &self,
-        version: &str,
-        platform: &str,
-        remote_error: &str,
-    ) -> Result<bool, String> {
+        prompt: super::worker_install::WorkerInstallPrompt<'_>,
+    ) -> Result<Option<SshWorkerInstallChoice>, String> {
         let service = self
             .service
             .upgrade()
             .ok_or("SSH service closed during worker installation")?;
         let client_id = self.client_id.ok_or_else(|| format!(
-            "Remote worker installation failed: {remote_error}. Local download/upload requires confirmation; open the project in the interactive SSH manager."
+            "Remote worker installation failed: {}. Choosing a GitHub mirror or local download/upload requires confirmation; open the project in the interactive SSH manager.",
+            prompt.error
         ))?;
         let request = SshWorkerInstallRequest {
             client_id,
@@ -4459,9 +4464,12 @@ impl super::worker_install::WorkerInstallInteraction for WorkerInstallBridge {
             session_id: self.binding.session_id.clone(),
             binding_id: self.binding.id.clone(),
             target_id: self.binding.target_id.clone(),
-            version: version.to_owned(),
-            platform: platform.to_owned(),
-            remote_error: remote_error.to_owned(),
+            version: prompt.version.to_owned(),
+            platform: prompt.platform.to_owned(),
+            remote_error: prompt.error.to_owned(),
+            attempt: prompt.attempt,
+            choices: prompt.choices.to_vec(),
+            mirror: prompt.mirror.to_owned(),
         };
         let (response, receiver) = oneshot::channel();
         let published = {
@@ -4511,7 +4519,7 @@ impl super::worker_install::WorkerInstallInteraction for WorkerInstallBridge {
             touch_pending_interactions(&service);
         }
         match decision {
-            Ok(Ok(approved)) => {
+            Ok(Ok(choice)) => {
                 let sessions = service.sessions.read().await;
                 if service.target_config_epoch.load(Ordering::Acquire) != self.target_epoch
                     || !sessions
@@ -4526,10 +4534,10 @@ impl super::worker_install::WorkerInstallInteraction for WorkerInstallBridge {
                         "SSH grant changed while waiting for worker installation consent".into(),
                     );
                 }
-                Ok(approved)
+                Ok(choice)
             }
             Ok(Err(_)) => Err("SSH worker installation was cancelled".into()),
-            Err(_) => Err("Timed out waiting for local worker download/upload confirmation".into()),
+            Err(_) => Err("Timed out waiting for SSH worker installation source choice".into()),
         }
     }
 }
@@ -5866,7 +5874,7 @@ mod tests {
         };
         assert!(
             installer
-                .approve_local_upload("0.2.0", "linux-x86_64", "download failed")
+                .choose_install_source(test_install_prompt("linux-x86_64", "download failed"))
                 .await
                 .is_err()
         );
@@ -6129,7 +6137,7 @@ mod tests {
         let mut events = service.subscribe_events();
         let waiting = tokio::spawn(async move {
             bridge
-                .approve_local_upload("0.2.0", "linux-aarch64", "remote worker missing")
+                .choose_install_source(test_install_prompt("linux-aarch64", "remote worker missing"))
                 .await
         });
         assert!(matches!(
@@ -6148,11 +6156,11 @@ mod tests {
                 request_id: "snapshot-install".into(),
                 session_id: granted.session_id,
                 binding_id: granted.id,
-                approved: false,
+                choice: None,
             })
             .await
             .unwrap();
-        assert!(!waiting.await.unwrap().unwrap());
+        assert_eq!(waiting.await.unwrap().unwrap(), None);
         assert!(service
             .pending_interactions(7)
             .await
@@ -6844,6 +6852,24 @@ mod tests {
         (home, service, bridge)
     }
 
+    fn test_install_prompt<'a>(
+        platform: &'a str,
+        error: &'a str,
+    ) -> super::super::worker_install::WorkerInstallPrompt<'a> {
+        super::super::worker_install::WorkerInstallPrompt {
+            version: "0.2.0",
+            platform,
+            error,
+            attempt: 1,
+            choices: &[
+                SshWorkerInstallChoice::RemoteMirror,
+                SshWorkerInstallChoice::LocalMirror,
+                SshWorkerInstallChoice::LocalDirect,
+            ],
+            mirror: "https://mirror.example",
+        }
+    }
+
     #[tokio::test]
     async fn worker_upload_consent_rejects_foreign_owners_without_consuming_request() {
         use super::super::worker_install::WorkerInstallInteraction;
@@ -6851,7 +6877,7 @@ mod tests {
         let mut events = service.subscribe_events();
         let pending = tokio::spawn(async move {
             bridge
-                .approve_local_upload("0.2.0", "linux-aarch64", "download failed")
+                .choose_install_source(test_install_prompt("linux-aarch64", "download failed"))
                 .await
         });
         assert!(matches!(
@@ -6866,7 +6892,7 @@ mod tests {
             request_id: "install".into(),
             session_id: "session".into(),
             binding_id: "binding".into(),
-            approved: true,
+            choice: Some(SshWorkerInstallChoice::LocalMirror),
         };
         for foreign in [
             SshWorkerInstallDecision {
@@ -6879,6 +6905,10 @@ mod tests {
             },
             SshWorkerInstallDecision {
                 binding_id: "other-binding".into(),
+                ..decision.clone()
+            },
+            SshWorkerInstallDecision {
+                choice: Some(SshWorkerInstallChoice::LocalBuild),
                 ..decision.clone()
             },
         ] {
@@ -6896,7 +6926,10 @@ mod tests {
             .control(7, SshControlCommand::SubmitWorkerInstall(decision.clone()))
             .await
             .unwrap();
-        assert!(pending.await.unwrap().unwrap());
+        assert_eq!(
+            pending.await.unwrap().unwrap(),
+            Some(SshWorkerInstallChoice::LocalMirror)
+        );
         assert!(matches!(
             service
                 .control(7, SshControlCommand::SubmitWorkerInstall(decision))
@@ -6912,7 +6945,7 @@ mod tests {
         let mut events = service.subscribe_events();
         let pending = tokio::spawn(async move {
             bridge
-                .approve_local_upload("0.2.0", "linux-aarch64", "download failed")
+                .choose_install_source(test_install_prompt("linux-aarch64", "download failed"))
                 .await
         });
         tokio::time::timeout(Duration::from_secs(1), events.recv())
@@ -6948,7 +6981,7 @@ mod tests {
                         request_id: "install".into(),
                         session_id: "session".into(),
                         binding_id: "binding".into(),
-                        approved: true,
+                        choice: Some(SshWorkerInstallChoice::LocalDirect),
                     })
                 )
                 .await,

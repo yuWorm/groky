@@ -30,6 +30,7 @@ Next groky version after `v0.1.30`.
 
 - **`/remote`** lists remote SSH projects from remembered access and past sessions, with Tab to switch All / Remembered / Recent; Enter starts a new session in the project and Ctrl+R resumes its latest one.
 - **`/ssh`** server picker gains `o` to jump to remote projects; `/remote` is no longer an alias of `/ssh`.
+- **SSH worker installation** asks how to get the worker when the remote host can't download it from GitHub: retry on the remote host through the `https://gh-proxy.com` mirror, or download on this computer (mirror or direct) and upload over SSH; if the chosen source fails, the prompt reappears with its error so you can pick another.
 
 #### Bug Fixes
 

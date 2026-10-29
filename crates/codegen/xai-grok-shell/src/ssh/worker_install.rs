@@ -14,7 +14,8 @@ use xai_grok_ssh::{
 };
 use xai_grok_workspace_types::ssh_wire::{SshWorkerBuildInfo, local_worker_build_info};
 
-use crate::compat::{parse_sha256, release_download_url, repo};
+use super::SshWorkerInstallChoice;
+use crate::compat::{DEFAULT_MIRROR, parse_sha256, release_download_url, repo};
 
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(240);
 const COMMAND_START_TIMEOUT: Duration = Duration::from_secs(20);
@@ -26,18 +27,35 @@ const MAX_ARTIFACT_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 const MAX_CHECKSUM_BYTES: usize = 16 * 1024;
 const COPY_CHUNK_BYTES: usize = 64 * 1024;
 
-/// UI boundary for an exceptional local download and authenticated SFTP upload.
+/// One interactive source prompt after a worker download attempt failed.
+pub(super) struct WorkerInstallPrompt<'a> {
+    pub version: &'a str,
+    pub platform: &'a str,
+    pub error: &'a str,
+    /// 1-based; increases each time a chosen source fails.
+    pub attempt: u32,
+    pub choices: &'a [SshWorkerInstallChoice],
+    pub mirror: &'a str,
+}
+
+/// UI boundary for choosing a mirror, local download, or local upload source.
 #[async_trait]
 pub(super) trait WorkerInstallInteraction: Send + Sync {
     fn progress(&self, message: &str);
 
-    async fn approve_local_upload(
+    /// `Ok(None)` means the user declined installation.
+    async fn choose_install_source(
         &self,
-        version: &str,
-        platform: &str,
-        remote_error: &str,
-    ) -> Result<bool, String>;
+        prompt: WorkerInstallPrompt<'_>,
+    ) -> Result<Option<SshWorkerInstallChoice>, String>;
 }
+
+const RELEASE_CHOICES: &[SshWorkerInstallChoice] = &[
+    SshWorkerInstallChoice::RemoteMirror,
+    SshWorkerInstallChoice::LocalMirror,
+    SshWorkerInstallChoice::LocalDirect,
+];
+const DEV_CHOICES: &[SshWorkerInstallChoice] = &[SshWorkerInstallChoice::LocalBuild];
 
 /// Resolve, validate, and if necessary install the exact worker required by this
 /// client. This is deliberately only used for the built-in worker command;
@@ -103,56 +121,53 @@ async fn prepare_worker_with_sources(
 
     let stage = target.stage();
     let result = async {
-        create_remote_stage(remote, &target, &stage).await?;
         match &desired.kind {
             DesiredKind::Release => {
                 let urls = release_urls
                     .as_ref()
                     .ok_or_else(|| "release worker installation is missing release URLs".to_owned())?;
+                create_remote_stage(remote, &target, &stage).await?;
                 interaction.progress("Downloading exact worker release on remote host");
-                if let Err(remote_error) = download_and_validate_remote(
+                let mut last_error = match download_and_validate_remote(
                     remote,
                     &stage,
-                    urls,
+                    &urls.direct,
                     &desired.expected,
                 )
                 .await
                 {
+                    Ok(()) => None,
+                    Err(error) => Some(error),
+                };
+                let mut attempt = 0;
+                while let Some(error) = last_error.take() {
                     cleanup_remote_stage(remote, &target, &stage).await;
-                    interaction.progress("Remote download failed; local download and SSH upload require approval");
-                    let approved = interaction
-                        .approve_local_upload(
-                            &desired.display_version,
-                            &platform.label(),
-                            &remote_error,
-                        )
-                        .await
-                        .map_err(|error| {
-                            format!(
-                                "could not obtain approval for local worker upload after remote download failed: {error}"
-                            )
-                        })?;
-                    if !approved {
-                        return Err(format!(
-                            "local worker upload cancelled after remote download failed: {remote_error}"
-                        ));
+                    attempt += 1;
+                    interaction.progress("Worker download failed; choose another source");
+                    let choice = choose_source(
+                        interaction,
+                        &desired,
+                        &platform,
+                        &error,
+                        attempt,
+                        RELEASE_CHOICES,
+                        &urls.mirror_label,
+                    )
+                    .await?;
+                    if let Err(error) = install_release_from(
+                        remote,
+                        local_home,
+                        interaction,
+                        &target,
+                        &stage,
+                        urls,
+                        &desired,
+                        choice,
+                    )
+                    .await
+                    {
+                        last_error = Some(error);
                     }
-
-                    interaction.progress("Downloading exact worker release locally");
-                    let local_artifact =
-                        download_verified_locally(local_home, urls, &desired.display_version).await?;
-                    let upload_result = async {
-                        create_remote_stage(remote, &target, &stage).await?;
-                        interaction.progress("Uploading worker over authenticated SFTP");
-                        timeout(UPLOAD_TIMEOUT, remote.upload(&local_artifact.path, &stage.binary))
-                            .await
-                            .map_err(|_| "authenticated SFTP worker upload timed out".to_owned())??;
-                        write_remote_checksum(remote, &stage.checksum, &local_artifact.checksum).await?;
-                        validate_remote_stage(remote, &stage, &desired.expected).await
-                    }
-                    .await;
-                    let _ = tokio::fs::remove_file(&local_artifact.path).await;
-                    upload_result?;
                 }
             }
             DesiredKind::Dev => {
@@ -160,19 +175,17 @@ async fn prepare_worker_with_sources(
                     "development worker installation was missing the local executable".to_owned()
                 })?;
                 interaction.progress("Local development build requires explicit SSH upload approval");
-                let approved = interaction
-                    .approve_local_upload(
-                        &desired.display_version,
-                        &platform.label(),
-                        "development builds are not published as releases",
-                    )
-                    .await
-                    .map_err(|error| {
-                        format!("could not obtain approval for local development worker upload: {error}")
-                    })?;
-                if !approved {
-                    return Err("local development worker upload cancelled".into());
-                }
+                choose_source(
+                    interaction,
+                    &desired,
+                    &platform,
+                    "development builds are not published as releases",
+                    1,
+                    DEV_CHOICES,
+                    "",
+                )
+                .await?;
+                create_remote_stage(remote, &target, &stage).await?;
                 interaction.progress("Uploading local development worker over authenticated SFTP");
                 timeout(UPLOAD_TIMEOUT, remote.upload(current_executable, &stage.binary))
                     .await
@@ -212,6 +225,91 @@ async fn prepare_worker_with_sources(
     result
 }
 
+async fn choose_source(
+    interaction: &dyn WorkerInstallInteraction,
+    desired: &DesiredWorker,
+    platform: &RemotePlatform,
+    error: &str,
+    attempt: u32,
+    choices: &[SshWorkerInstallChoice],
+    mirror: &str,
+) -> Result<SshWorkerInstallChoice, String> {
+    let choice = interaction
+        .choose_install_source(WorkerInstallPrompt {
+            version: &desired.display_version,
+            platform: &platform.label(),
+            error,
+            attempt,
+            choices,
+            mirror,
+        })
+        .await
+        .map_err(|prompt_error| {
+            format!("could not ask how to install the SSH worker after: {error}; {prompt_error}")
+        })?;
+    match choice {
+        Some(choice) if choices.contains(&choice) => Ok(choice),
+        Some(_) => Err("SSH worker installation received an unavailable source choice".into()),
+        None => Err(format!("SSH worker installation cancelled; last failure: {error}")),
+    }
+}
+
+/// Fill a fresh stage from one user-chosen release source and validate it.
+#[allow(clippy::too_many_arguments)]
+async fn install_release_from(
+    remote: &dyn RemoteTransport,
+    local_home: &Path,
+    interaction: &dyn WorkerInstallInteraction,
+    target: &InstallTarget,
+    stage: &InstallStage,
+    urls: &ReleaseUrls,
+    desired: &DesiredWorker,
+    choice: SshWorkerInstallChoice,
+) -> Result<(), String> {
+    let local_assets = match choice {
+        SshWorkerInstallChoice::RemoteMirror => {
+            create_remote_stage(remote, target, stage).await?;
+            interaction.progress("Downloading exact worker release on remote host via GitHub mirror");
+            return download_and_validate_remote(
+                remote,
+                stage,
+                &urls.mirror,
+                &desired.expected,
+            )
+            .await;
+        }
+        SshWorkerInstallChoice::LocalMirror => {
+            interaction.progress("Downloading exact worker release locally via GitHub mirror");
+            &urls.mirror
+        }
+        SshWorkerInstallChoice::LocalDirect => {
+            interaction.progress("Downloading exact worker release locally from GitHub");
+            &urls.direct
+        }
+        SshWorkerInstallChoice::LocalBuild => {
+            return Err("release workers cannot be installed from the local development build".into());
+        }
+    };
+    let local_artifact = download_verified_locally(
+        local_home,
+        local_assets,
+        &desired.display_version,
+    )
+    .await?;
+    let upload_result = async {
+        create_remote_stage(remote, target, stage).await?;
+        interaction.progress("Uploading worker over authenticated SFTP");
+        timeout(UPLOAD_TIMEOUT, remote.upload(&local_artifact.path, &stage.binary))
+            .await
+            .map_err(|_| "authenticated SFTP worker upload timed out".to_owned())??;
+        write_remote_checksum(remote, &stage.checksum, &local_artifact.checksum).await?;
+        validate_remote_stage(remote, stage, &desired.expected).await
+    }
+    .await;
+    let _ = tokio::fs::remove_file(&local_artifact.path).await;
+    upload_result
+}
+
 #[derive(Clone, Debug)]
 struct RemotePlatform {
     home: String,
@@ -247,12 +345,20 @@ fn expected_worker_info_for_remote(
     local
 }
 
+/// Direct GitHub and mirrored URLs for one exact release asset.
 #[derive(Clone, Debug)]
 struct ReleaseUrls {
+    direct: ReleaseAssets,
+    mirror: ReleaseAssets,
+    mirror_label: String,
+}
+
+#[derive(Clone, Debug)]
+struct ReleaseAssets {
     artifact: String,
     checksum: String,
     /// Only the module-private local fixture may disable this. Production URLs
-    /// are fixed GitHub HTTPS release assets.
+    /// are fixed GitHub (or GitHub mirror) HTTPS release assets.
     require_https: bool,
 }
 
@@ -541,7 +647,7 @@ async fn create_remote_stage(
 async fn download_and_validate_remote(
     remote: &dyn RemoteTransport,
     stage: &InstallStage,
-    urls: &ReleaseUrls,
+    urls: &ReleaseAssets,
     expected: &SshWorkerBuildInfo,
 ) -> Result<(), String> {
     download_remote_file(
@@ -734,16 +840,26 @@ fn release_urls(version: &str, platform: &RemotePlatform) -> Result<ReleaseUrls,
     let asset = format!("groky-{version}-{}-{}", platform.os, platform.arch);
     let tag = format!("v{version}");
     let repository = repo();
+    let artifact = release_download_url(&repository, &tag, &asset);
+    let checksum = release_download_url(&repository, &tag, &format!("{asset}.sha256"));
     Ok(ReleaseUrls {
-        artifact: release_download_url(&repository, &tag, &asset),
-        checksum: release_download_url(&repository, &tag, &format!("{asset}.sha256")),
-        require_https: true,
+        mirror: ReleaseAssets {
+            artifact: format!("{DEFAULT_MIRROR}/{artifact}"),
+            checksum: format!("{DEFAULT_MIRROR}/{checksum}"),
+            require_https: true,
+        },
+        direct: ReleaseAssets {
+            artifact,
+            checksum,
+            require_https: true,
+        },
+        mirror_label: DEFAULT_MIRROR.to_owned(),
     })
 }
 
 async fn download_verified_locally(
     local_home: &Path,
-    urls: &ReleaseUrls,
+    urls: &ReleaseAssets,
     version: &str,
 ) -> Result<DownloadedArtifact, String> {
     if urls.require_https
@@ -1187,7 +1303,8 @@ fn posix_command(script: &str) -> Result<String, String> {
 mod tests {
     use std::path::{Path, PathBuf};
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     use async_trait::async_trait;
     use axum::{Router, routing::get};
@@ -1246,9 +1363,17 @@ mod tests {
         )
         .unwrap();
 
-        assert!(urls.artifact.ends_with("/v1.2.3/groky-1.2.3-macos-aarch64"));
-        assert!(urls.checksum.ends_with(".sha256"));
-        assert!(!urls.artifact.contains("/latest/"));
+        assert!(urls.direct.artifact.ends_with("/v1.2.3/groky-1.2.3-macos-aarch64"));
+        assert!(urls.direct.checksum.ends_with(".sha256"));
+        assert!(!urls.direct.artifact.contains("/latest/"));
+        assert_eq!(
+            urls.mirror.artifact,
+            format!("{DEFAULT_MIRROR}/{}", urls.direct.artifact)
+        );
+        assert_eq!(
+            urls.mirror.checksum,
+            format!("{DEFAULT_MIRROR}/{}", urls.direct.checksum)
+        );
     }
 
     #[tokio::test]
@@ -1268,16 +1393,52 @@ mod tests {
     #[tokio::test]
     async fn failed_remote_download_can_fall_back_to_local_stream_and_sftp_upload() {
         let fixture = InstallerFixture::new(true, true).await;
+        fixture.interaction.script([Some(SshWorkerInstallChoice::LocalDirect)]);
 
         assert_eq!(fixture.install().await.unwrap(), fixture.expected_argv());
         assert_eq!(fixture.interaction.approvals(), 1);
         fixture.assert_installed().await;
     }
 
+    #[tokio::test]
+    async fn remote_mirror_retry_installs_after_direct_download_fails() {
+        let mut fixture = InstallerFixture::new(false, true).await;
+        fixture.urls.direct.artifact = fixture.urls.direct.artifact.replace("/asset", "/missing");
+        fixture.interaction.script([Some(SshWorkerInstallChoice::RemoteMirror)]);
+
+        assert_eq!(fixture.install().await.unwrap(), fixture.expected_argv());
+        fixture.assert_installed().await;
+        let prompts = fixture.interaction.prompts();
+        assert_eq!(prompts.len(), 1);
+        assert_eq!(prompts[0].attempt, 1);
+        assert_eq!(prompts[0].choices, RELEASE_CHOICES);
+        assert_eq!(prompts[0].mirror, fixture.urls.mirror_label);
+    }
+
+    #[tokio::test]
+    async fn failed_source_choice_prompts_again_with_its_error() {
+        let fixture = InstallerFixture::new(true, true).await;
+        fixture.interaction.script([
+            Some(SshWorkerInstallChoice::RemoteMirror),
+            Some(SshWorkerInstallChoice::LocalMirror),
+        ]);
+
+        assert_eq!(fixture.install().await.unwrap(), fixture.expected_argv());
+        fixture.assert_installed().await;
+        let prompts = fixture.interaction.prompts();
+        assert_eq!(
+            prompts.iter().map(|prompt| prompt.attempt).collect::<Vec<_>>(),
+            [1, 2]
+        );
+        // The fixture's disabled downloader exits 7; the re-prompt carries the mirror failure.
+        assert!(prompts[1].error.contains("status 7"), "{}", prompts[1].error);
+    }
+
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[tokio::test]
     async fn dev_build_uses_only_the_explicit_same_platform_upload() {
         let fixture = InstallerFixture::new(false, true).await;
+        fixture.interaction.script([Some(SshWorkerInstallChoice::LocalBuild)]);
         let (os, arch) = local_platform().unwrap();
         let expected = SshWorkerBuildInfo {
             product_version: None,
@@ -1331,7 +1492,6 @@ mod tests {
     #[tokio::test]
     async fn denied_local_upload_leaves_existing_worker_untouched() {
         let fixture = InstallerFixture::new(true, true).await;
-        fixture.interaction.set_approved(false);
         let previous = fixture.seed_old_worker().await;
 
         let error = fixture.install().await.unwrap_err();
@@ -1345,9 +1505,12 @@ mod tests {
         let fixture = InstallerFixture::new(false, false).await;
         let previous = fixture.seed_old_worker().await;
 
+        fixture.interaction.script([Some(SshWorkerInstallChoice::LocalDirect)]);
+
         let error = fixture.install().await.unwrap_err();
-        assert!(error.contains("checksum mismatch"));
-        assert_eq!(fixture.interaction.approvals(), 1);
+        assert!(error.contains("cancelled"), "{error}");
+        assert!(error.contains("checksum mismatch"), "{error}");
+        assert_eq!(fixture.interaction.approvals(), 2);
         assert_eq!(tokio::fs::read(previous).await.unwrap(), b"old worker");
     }
 
@@ -1628,27 +1791,32 @@ mod tests {
         }
     }
 
-    struct TestInteraction {
-        approved: AtomicBool,
-        approvals: AtomicUsize,
+    #[derive(Clone, Debug)]
+    struct RecordedPrompt {
+        error: String,
+        attempt: u32,
+        choices: Vec<SshWorkerInstallChoice>,
+        mirror: String,
     }
 
-    impl Default for TestInteraction {
-        fn default() -> Self {
-            Self {
-                approved: AtomicBool::new(true),
-                approvals: AtomicUsize::new(0),
-            }
-        }
+    /// Answers prompts from a script; an exhausted script declines.
+    #[derive(Default)]
+    struct TestInteraction {
+        answers: Mutex<std::collections::VecDeque<Option<SshWorkerInstallChoice>>>,
+        prompts: Mutex<Vec<RecordedPrompt>>,
     }
 
     impl TestInteraction {
-        fn set_approved(&self, approved: bool) {
-            self.approved.store(approved, Ordering::SeqCst);
+        fn script(&self, answers: impl IntoIterator<Item = Option<SshWorkerInstallChoice>>) {
+            *self.answers.lock().unwrap() = answers.into_iter().collect();
         }
 
         fn approvals(&self) -> usize {
-            self.approvals.load(Ordering::SeqCst)
+            self.prompts.lock().unwrap().len()
+        }
+
+        fn prompts(&self) -> Vec<RecordedPrompt> {
+            self.prompts.lock().unwrap().clone()
         }
     }
 
@@ -1656,9 +1824,17 @@ mod tests {
     impl WorkerInstallInteraction for TestInteraction {
         fn progress(&self, _: &str) {}
 
-        async fn approve_local_upload(&self, _: &str, _: &str, _: &str) -> Result<bool, String> {
-            self.approvals.fetch_add(1, Ordering::SeqCst);
-            Ok(self.approved.load(Ordering::SeqCst))
+        async fn choose_install_source(
+            &self,
+            prompt: WorkerInstallPrompt<'_>,
+        ) -> Result<Option<SshWorkerInstallChoice>, String> {
+            self.prompts.lock().unwrap().push(RecordedPrompt {
+                error: prompt.error.to_owned(),
+                attempt: prompt.attempt,
+                choices: prompt.choices.to_vec(),
+                mirror: prompt.mirror.to_owned(),
+            });
+            Ok(self.answers.lock().unwrap().pop_front().flatten())
         }
     }
 
@@ -1667,33 +1843,22 @@ mod tests {
         checksum: String,
     ) -> (ReleaseUrls, Arc<AtomicUsize>, tokio::task::JoinHandle<()>) {
         let downloads = Arc::new(AtomicUsize::new(0));
-        let asset_downloads = Arc::clone(&downloads);
-        let checksum_downloads = Arc::clone(&downloads);
-        let asset_route = asset.clone();
-        let checksum_route = checksum.clone();
+        let counted = |body: Vec<u8>| {
+            let downloads = Arc::clone(&downloads);
+            get(move || {
+                let body = body.clone();
+                let downloads = Arc::clone(&downloads);
+                async move {
+                    downloads.fetch_add(1, Ordering::SeqCst);
+                    body
+                }
+            })
+        };
         let router = Router::new()
-            .route(
-                "/asset",
-                get(move || {
-                    let body = asset_route.clone();
-                    let downloads = Arc::clone(&asset_downloads);
-                    async move {
-                        downloads.fetch_add(1, Ordering::SeqCst);
-                        body
-                    }
-                }),
-            )
-            .route(
-                "/asset.sha256",
-                get(move || {
-                    let body = checksum_route.clone();
-                    let downloads = Arc::clone(&checksum_downloads);
-                    async move {
-                        downloads.fetch_add(1, Ordering::SeqCst);
-                        body
-                    }
-                }),
-            );
+            .route("/asset", counted(asset.clone()))
+            .route("/asset.sha256", counted(checksum.clone().into_bytes()))
+            .route("/mirror/asset", counted(asset))
+            .route("/mirror/asset.sha256", counted(checksum.into_bytes()));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let base = format!("http://{}", listener.local_addr().unwrap());
         let server = tokio::spawn(async move {
@@ -1701,9 +1866,17 @@ mod tests {
         });
         (
             ReleaseUrls {
-                artifact: format!("{base}/asset"),
-                checksum: format!("{base}/asset.sha256"),
-                require_https: false,
+                direct: ReleaseAssets {
+                    artifact: format!("{base}/asset"),
+                    checksum: format!("{base}/asset.sha256"),
+                    require_https: false,
+                },
+                mirror: ReleaseAssets {
+                    artifact: format!("{base}/mirror/asset"),
+                    checksum: format!("{base}/mirror/asset.sha256"),
+                    require_https: false,
+                },
+                mirror_label: format!("{base}/mirror"),
             },
             downloads,
             server,

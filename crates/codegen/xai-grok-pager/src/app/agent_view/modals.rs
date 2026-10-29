@@ -297,12 +297,12 @@ impl AgentView {
                 request_id,
                 session_id,
                 binding_id,
-                approved,
+                choice,
             } => InputOutcome::Action(Action::ApproveSshWorkerInstall {
                 request_id,
                 session_id,
                 binding_id,
-                approved,
+                choice,
             }),
             SshModalOutcome::AnswerAuthentication {
                 challenge_id,

@@ -132,12 +132,12 @@ fn map_ssh_modal_outcome(outcome: SshModalOutcome) -> InputOutcome {
             request_id,
             session_id,
             binding_id,
-            approved,
+            choice,
         } => InputOutcome::Action(Action::ApproveSshWorkerInstall {
             request_id,
             session_id,
             binding_id,
-            approved,
+            choice,
         }),
         SshModalOutcome::AnswerAuthentication {
             challenge_id,
@@ -608,11 +608,18 @@ fn show_resumed_worker_install_fallback(
                 .as_ref()
                 .is_some_and(|manager| manager.instance_id() == owner.instance_id)
         });
-        return if request_matches && owner_is_current {
-            ResumeWorkerInstallRoute::Displayed(owner)
-        } else {
-            ResumeWorkerInstallRoute::ClosedOrReplaced
-        };
+        if !(request_matches && owner_is_current) {
+            return ResumeWorkerInstallRoute::ClosedOrReplaced;
+        }
+        // A re-prompt after a failed source keeps the request id; the manager ignores replays.
+        if let Some(manager) = app
+            .agents
+            .get_mut(&agent_id)
+            .and_then(|agent| agent.ssh_manager.as_mut())
+        {
+            manager.show_worker_install_fallback(request.clone());
+        }
+        return ResumeWorkerInstallRoute::Displayed(owner);
     }
 
     let Some(agent) = app.agents.get_mut(&agent_id) else {
@@ -1641,7 +1648,7 @@ pub(super) fn dispatch_approve_ssh_worker_install(
     request_id: String,
     session_id: String,
     binding_id: String,
-    approved: bool,
+    choice: Option<xai_grok_shell::ssh::SshWorkerInstallChoice>,
 ) -> Vec<Effect> {
     let Some(owner) = ssh_manager_owner(app) else {
         return vec![];
@@ -1650,7 +1657,7 @@ pub(super) fn dispatch_approve_ssh_worker_install(
     let Some(manager) = ssh_manager_for_owner_mut(app, owner) else {
         return vec![];
     };
-    if !manager.submit_worker_install(client_id, &request_id, &session_id, &binding_id, approved) {
+    if !manager.submit_worker_install(client_id, &request_id, &session_id, &binding_id) {
         return vec![];
     }
     vec![Effect::SshApproveWorkerInstall {
@@ -1659,7 +1666,7 @@ pub(super) fn dispatch_approve_ssh_worker_install(
         request_id,
         session_id,
         binding_id,
-        approved,
+        choice,
     }]
 }
 

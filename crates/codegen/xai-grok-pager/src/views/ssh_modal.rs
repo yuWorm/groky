@@ -1121,7 +1121,7 @@ impl SshOperationApprovalCard {
     }
 }
 
-/// Local-only fallback after the remote host cannot download the exact managed worker build.
+/// Source choice after the remote host cannot download the exact managed worker build.
 ///
 /// The request tuple is retained verbatim so input, local control, progress, and terminal
 /// project setup cannot accidentally cross sessions or bindings.
@@ -1134,10 +1134,15 @@ struct SshWorkerInstallFallbackCard {
     version: String,
     platform: String,
     remote_error: String,
+    attempt: u32,
+    choices: Vec<xai_grok_shell::ssh::SshWorkerInstallChoice>,
+    mirror: String,
+    selected: usize,
     scroll_offset: usize,
     max_scroll_offset: usize,
     submitting: bool,
-    decision_accepted: Option<bool>,
+    /// `Some(None)` once a decline was accepted; `Some(Some(_))` once a source was.
+    decision: Option<Option<xai_grok_shell::ssh::SshWorkerInstallChoice>>,
     progress: Option<String>,
     error: Option<String>,
 }
@@ -1153,10 +1158,14 @@ impl SshWorkerInstallFallbackCard {
             version: request.version,
             platform: request.platform,
             remote_error: request.remote_error,
+            attempt: request.attempt,
+            choices: request.choices,
+            mirror: request.mirror,
+            selected: 0,
             scroll_offset: 0,
             max_scroll_offset: 0,
             submitting: false,
-            decision_accepted: None,
+            decision: None,
             progress: None,
             error: None,
         }
@@ -1176,7 +1185,40 @@ impl SshWorkerInstallFallbackCard {
     }
 
     fn is_decided(&self) -> bool {
-        self.decision_accepted.is_some()
+        self.decision.is_some()
+    }
+
+    fn selected_choice(&self) -> Option<xai_grok_shell::ssh::SshWorkerInstallChoice> {
+        self.choices.get(self.selected).copied()
+    }
+
+    fn outcome(
+        &self,
+        choice: Option<xai_grok_shell::ssh::SshWorkerInstallChoice>,
+    ) -> SshModalOutcome {
+        SshModalOutcome::ApproveWorkerInstall {
+            request_id: self.request_id.clone(),
+            session_id: self.session_id.clone(),
+            binding_id: self.binding_id.clone(),
+            choice,
+        }
+    }
+}
+
+fn worker_install_choice_label(
+    choice: xai_grok_shell::ssh::SshWorkerInstallChoice,
+    mirror: &str,
+) -> String {
+    use xai_grok_shell::ssh::SshWorkerInstallChoice as Choice;
+    match choice {
+        Choice::RemoteMirror => format!("Remote host downloads via GitHub mirror {mirror}"),
+        Choice::LocalMirror => {
+            format!("This computer downloads via GitHub mirror {mirror}, then uploads over SSH")
+        }
+        Choice::LocalDirect => {
+            "This computer downloads from GitHub directly, then uploads over SSH".into()
+        }
+        Choice::LocalBuild => "Upload this computer's development executable over SSH".into(),
     }
 }
 
@@ -3402,12 +3444,16 @@ impl SshManagerState {
                 &request.binding_id,
             ) && card.target_id == request.target_id
         };
-        if matches!(&self.page, SshModalPage::WorkerInstallFallback(card) if matches_request(card))
+        // A re-prompt after a failed source reuses the request id with a higher attempt;
+        // replays of the same or an older attempt are ignored.
+        let stale_or_duplicate =
+            |card: &SshWorkerInstallFallbackCard| matches_request(card) && card.attempt >= request.attempt;
+        if matches!(&self.page, SshModalPage::WorkerInstallFallback(card) if stale_or_duplicate(card))
             || self.pending_interactions.iter().any(|interaction| match interaction {
-                PendingSshInteraction::WorkerInstall(card) => matches_request(card),
+                PendingSshInteraction::WorkerInstall(card) => stale_or_duplicate(card),
                 PendingSshInteraction::Suspended(surface) => matches!(
                     &surface.page,
-                    SshModalPage::WorkerInstallFallback(card) if matches_request(card)
+                    SshModalPage::WorkerInstallFallback(card) if stale_or_duplicate(card)
                 ),
                 PendingSshInteraction::Grant(_)
                 | PendingSshInteraction::Operation(_)
@@ -3416,10 +3462,29 @@ impl SshManagerState {
         {
             return;
         }
+        for interaction in &mut self.pending_interactions {
+            let card = match interaction {
+                PendingSshInteraction::WorkerInstall(card) => card,
+                PendingSshInteraction::Suspended(surface) => match &mut surface.page {
+                    SshModalPage::WorkerInstallFallback(card) => card,
+                    _ => continue,
+                },
+                PendingSshInteraction::Grant(_)
+                | PendingSshInteraction::Operation(_)
+                | PendingSshInteraction::Authentication(_) => continue,
+            };
+            if matches_request(card) {
+                *card = SshWorkerInstallFallbackCard::new(request);
+                return;
+            }
+        }
+        let replaces_previous_attempt =
+            matches!(&self.page, SshModalPage::WorkerInstallFallback(card) if matches_request(card));
         let continues_project = self.pending_project_open.as_ref().is_some_and(|project| {
             project.session_id == request.session_id && project.target_id == request.target_id
         }) && matches!(&self.page, SshModalPage::ProjectBrowser);
-        let replaces_decided_attempt = matches!(&self.page, SshModalPage::WorkerInstallFallback(card)
+        let replaces_decided_attempt = replaces_previous_attempt
+            || matches!(&self.page, SshModalPage::WorkerInstallFallback(card)
             if card.is_decided() && card.client_id == request.client_id
                 && card.session_id == request.session_id && card.binding_id == request.binding_id
                 && card.target_id == request.target_id);
@@ -3439,7 +3504,6 @@ impl SshManagerState {
         request_id: &str,
         session_id: &str,
         binding_id: &str,
-        approved: bool,
     ) -> bool {
         let SshModalPage::WorkerInstallFallback(card) = &mut self.page else {
             return false;
@@ -3462,7 +3526,7 @@ impl SshManagerState {
         request_id: &str,
         session_id: &str,
         binding_id: &str,
-        approved: bool,
+        choice: Option<xai_grok_shell::ssh::SshWorkerInstallChoice>,
         error: Option<String>,
     ) {
         if let SshModalPage::WorkerInstallFallback(card) = &mut self.page
@@ -3473,7 +3537,7 @@ impl SshManagerState {
             if let Some(error) = error {
                 card.error = Some(error);
             } else {
-                card.decision_accepted = Some(approved);
+                card.decision = Some(choice);
             }
             return;
         }
@@ -3498,7 +3562,7 @@ impl SshManagerState {
             if let Some(error) = error {
                 card.error = Some(error);
             } else {
-                card.decision_accepted = Some(approved);
+                card.decision = Some(choice);
             }
             return;
         }
@@ -4502,7 +4566,8 @@ pub enum SshModalOutcome {
         request_id: String,
         session_id: String,
         binding_id: String,
-        approved: bool,
+        /// `None` declines installation.
+        choice: Option<xai_grok_shell::ssh::SshWorkerInstallChoice>,
     },
     AnswerAuthentication {
         challenge_id: String,
@@ -5025,7 +5090,7 @@ const WORKER_INSTALL_FALLBACK_SHORTCUTS: &[Shortcut<'static>] = &[
         id: 0,
     },
     Shortcut {
-        label: "Enter/y install via this computer",
+        label: "Tab/1-9 select · Enter use source",
         clickable: true,
         id: FOOTER_WORKER_INSTALL_APPROVE,
     },
@@ -6764,7 +6829,10 @@ fn render_worker_install_fallback(
             Style::default()
                 .fg(theme.accent_error)
                 .add_modifier(Modifier::BOLD)
-        } else if line.starts_with("Requested version:") || line.starts_with("Remote platform:") {
+        } else if line.starts_with("Requested version:")
+            || line.starts_with("Remote platform:")
+            || line.starts_with("› ")
+        {
             Style::default()
                 .fg(theme.accent_user)
                 .add_modifier(Modifier::BOLD)
@@ -6786,15 +6854,28 @@ fn worker_install_fallback_lines(card: &SshWorkerInstallFallbackCard, width: usi
         .break_words(true)
         .wrap_algorithm(textwrap::WrapAlgorithm::FirstFit);
     let mut paragraphs = vec![
-        "Remote worker installation needs a local transfer.".into(),
+        if card.attempt > 1 {
+            format!("Remote worker installation failed again (attempt {}).", card.attempt)
+        } else {
+            "Remote worker installation could not download from GitHub.".into()
+        },
         format!("Requested version: {}", card.version),
         format!("Remote platform: {}", card.platform),
         format!("SSH target: {}", card.target_id),
         String::new(),
-        "Approve to obtain this exact build on this computer and upload it through the already-authenticated SSH connection. Release builds are downloaded using this computer's network; development builds use this computer's executable. No SSH credentials or tokens are sent to the remote host.".into(),
+        "Choose how to obtain this exact build. A mirror serves both the build and its SHA-256, so use only a mirror you trust; the staged worker's build identity is verified either way. Local downloads are uploaded through the already-authenticated SSH connection. No SSH credentials or tokens are sent to the remote host or the mirror.".into(),
         String::new(),
-        "Remote installation detail:".into(),
     ];
+    for (index, choice) in card.choices.iter().enumerate() {
+        let marker = if index == card.selected { "›" } else { " " };
+        paragraphs.push(format!(
+            "{marker} {}. {}",
+            index + 1,
+            worker_install_choice_label(*choice, &card.mirror)
+        ));
+    }
+    paragraphs.push(String::new());
+    paragraphs.push("Remote installation detail:".into());
     paragraphs.extend(card.remote_error.lines().map(str::to_owned));
     if card.remote_error.is_empty() {
         paragraphs.push("(No remote error detail was supplied.)".into());
@@ -6803,15 +6884,18 @@ fn worker_install_fallback_lines(card: &SshWorkerInstallFallbackCard, width: usi
     paragraphs.push(if let Some(error) = card.error.as_deref() {
         format!("Error: {error}")
     } else if card.submitting {
-        "Submitting local fallback decision…".into()
+        "Submitting worker source choice…".into()
     } else if let Some(progress) = card.progress.as_deref() {
         progress.to_owned()
-    } else if card.decision_accepted == Some(true) {
-        "Local transfer approved; waiting for project setup…".into()
-    } else if card.decision_accepted == Some(false) {
-        "Local transfer declined; waiting for project setup…".into()
+    } else if let Some(Some(choice)) = card.decision {
+        format!(
+            "{}; waiting for project setup…",
+            worker_install_choice_label(choice, &card.mirror)
+        )
+    } else if card.decision == Some(None) {
+        "Worker installation declined; waiting for project setup…".into()
     } else {
-        "Obtain locally and upload this exact build? Enter/y approve · n/Esc decline".into()
+        "1-9/Enter use source · Tab/←/→ select · n/Esc decline".into()
     });
     paragraphs.iter().flat_map(|paragraph| {
         textwrap::wrap(paragraph, &options).into_iter().map(std::borrow::Cow::into_owned)
@@ -7890,12 +7974,7 @@ fn close_current_page(state: &mut SshManagerState) -> SshModalOutcome {
         if card.submitting || card.is_decided() {
             return SshModalOutcome::Unchanged;
         }
-        return SshModalOutcome::ApproveWorkerInstall {
-            request_id: card.request_id.clone(),
-            session_id: card.session_id.clone(),
-            binding_id: card.binding_id.clone(),
-            approved: false,
-        };
+        return card.outcome(None);
     }
     if let SshModalPage::Authentication(card) = &mut state.page {
         let challenge_id = card.challenge_id.clone();
@@ -8825,22 +8904,34 @@ fn handle_worker_install_fallback_key(
             card.error = None;
             SshModalOutcome::Changed
         }
+        KeyCode::Tab | KeyCode::Right | KeyCode::Char('l') if key.modifiers.is_empty() => {
+            card.selected = (card.selected + 1) % card.choices.len().max(1);
+            card.error = None;
+            SshModalOutcome::Changed
+        }
+        KeyCode::BackTab | KeyCode::Left | KeyCode::Char('h') => {
+            let count = card.choices.len().max(1);
+            card.selected = (card.selected + count - 1) % count;
+            card.error = None;
+            SshModalOutcome::Changed
+        }
+        KeyCode::Char(digit @ '1'..='9') if key.modifiers.is_empty() => {
+            let index = digit as usize - '1' as usize;
+            match card.choices.get(index).copied() {
+                Some(choice) => {
+                    card.selected = index;
+                    card.outcome(Some(choice))
+                }
+                None => SshModalOutcome::Unchanged,
+            }
+        }
         KeyCode::Enter | KeyCode::Char('y') if key.modifiers.is_empty() => {
-            SshModalOutcome::ApproveWorkerInstall {
-                request_id: card.request_id.clone(),
-                session_id: card.session_id.clone(),
-                binding_id: card.binding_id.clone(),
-                approved: true,
+            match card.selected_choice() {
+                Some(choice) => card.outcome(Some(choice)),
+                None => SshModalOutcome::Unchanged,
             }
         }
-        KeyCode::Char('n') | KeyCode::Esc if key.modifiers.is_empty() => {
-            SshModalOutcome::ApproveWorkerInstall {
-                request_id: card.request_id.clone(),
-                session_id: card.session_id.clone(),
-                binding_id: card.binding_id.clone(),
-                approved: false,
-            }
-        }
+        KeyCode::Char('n') | KeyCode::Esc if key.modifiers.is_empty() => card.outcome(None),
         _ => SshModalOutcome::Unchanged,
     }
 }
@@ -9039,6 +9130,13 @@ mod tests {
             remote_error: format!(
                 "remote download failed because proxy rejected artifact request {request_id}; diagnostic-tail-{request_id}"
             ),
+            attempt: 1,
+            choices: vec![
+                xai_grok_shell::ssh::SshWorkerInstallChoice::RemoteMirror,
+                xai_grok_shell::ssh::SshWorkerInstallChoice::LocalMirror,
+                xai_grok_shell::ssh::SshWorkerInstallChoice::LocalDirect,
+            ],
+            mirror: "https://gh-proxy.com".into(),
         }
     }
 
@@ -9087,27 +9185,80 @@ mod tests {
         };
         assert!(matches!(
             handle_ssh_mouse(&mut state, &click),
-            SshModalOutcome::ApproveWorkerInstall { approved: true, .. }
+            SshModalOutcome::ApproveWorkerInstall {
+                choice: Some(xai_grok_shell::ssh::SshWorkerInstallChoice::RemoteMirror),
+                ..
+            }
         ));
 
         let mut declined = SshManagerState::new(Some("source-session".into()));
         declined.show_worker_install_fallback(worker_install_request("fallback-2"));
         assert!(matches!(
             handle_ssh_key(&mut declined, &key(KeyCode::Esc)),
-            SshModalOutcome::ApproveWorkerInstall {
-                approved: false,
-                ..
-            }
+            SshModalOutcome::ApproveWorkerInstall { choice: None, .. }
         ));
 
         let mut closed = SshManagerState::new(Some("source-session".into()));
         closed.show_worker_install_fallback(worker_install_request("fallback-3"));
         assert!(matches!(
             close_current_page(&mut closed),
-            SshModalOutcome::ApproveWorkerInstall {
-                approved: false,
-                ..
-            }
+            SshModalOutcome::ApproveWorkerInstall { choice: None, .. }
+        ));
+    }
+
+    #[test]
+    fn worker_fallback_selects_sources_and_replaces_only_newer_attempts() {
+        use xai_grok_shell::ssh::SshWorkerInstallChoice as Choice;
+        let mut state = SshManagerState::new(Some("source-session".into()));
+        state.show_worker_install_fallback(worker_install_request("fallback-1"));
+        assert!(matches!(
+            handle_ssh_key(&mut state, &key(KeyCode::Char('3'))),
+            SshModalOutcome::ApproveWorkerInstall { choice: Some(Choice::LocalDirect), .. }
+        ));
+        assert!(matches!(
+            handle_ssh_key(&mut state, &key(KeyCode::Char('9'))),
+            SshModalOutcome::Unchanged
+        ));
+        handle_ssh_key(&mut state, &key(KeyCode::Tab));
+        assert!(matches!(
+            handle_ssh_key(&mut state, &key(KeyCode::Enter)),
+            SshModalOutcome::ApproveWorkerInstall { choice: Some(Choice::RemoteMirror), .. }
+        ));
+        handle_ssh_key(&mut state, &key(KeyCode::Left));
+        assert!(matches!(
+            handle_ssh_key(&mut state, &key(KeyCode::Enter)),
+            SshModalOutcome::ApproveWorkerInstall { choice: Some(Choice::LocalDirect), .. }
+        ));
+
+        assert!(state.submit_worker_install(7, "fallback-1", "project-session", "project-binding"));
+        state.settle_worker_install_decision(
+            7,
+            "fallback-1",
+            "project-session",
+            "project-binding",
+            Some(Choice::LocalDirect),
+            None,
+        );
+        // Replaying the decided attempt keeps the decision.
+        state.show_worker_install_fallback(worker_install_request("fallback-1"));
+        assert!(matches!(
+            &state.page,
+            SshModalPage::WorkerInstallFallback(card) if card.is_decided()
+        ));
+
+        let mut retry = worker_install_request("fallback-1");
+        retry.attempt = 2;
+        retry.remote_error = "local download failed: mirror timed out".into();
+        state.show_worker_install_fallback(retry.clone());
+        assert!(matches!(
+            &state.page,
+            SshModalPage::WorkerInstallFallback(card)
+                if !card.is_decided() && card.attempt == 2 && card.remote_error.contains("mirror timed out")
+        ));
+        state.show_worker_install_fallback(worker_install_request("fallback-1"));
+        assert!(matches!(
+            &state.page,
+            SshModalPage::WorkerInstallFallback(card) if card.attempt == 2
         ));
     }
 
@@ -9120,7 +9271,6 @@ mod tests {
             "fallback-1",
             "project-session",
             "project-binding",
-            true,
         ));
         state.apply_worker_install_progress(
             7,
@@ -9135,13 +9285,13 @@ mod tests {
             "fallback-1",
             "project-session",
             "project-binding",
-            true,
+            Some(xai_grok_shell::ssh::SshWorkerInstallChoice::LocalDirect),
             None,
         );
         assert!(matches!(
             &state.page,
             SshModalPage::WorkerInstallFallback(card)
-                if card.decision_accepted == Some(true)
+                if card.decision == Some(Some(xai_grok_shell::ssh::SshWorkerInstallChoice::LocalDirect))
                     && card.progress.as_deref() == Some("Uploading exact build…")
         ));
 
@@ -9151,7 +9301,7 @@ mod tests {
             "fallback-1",
             "project-session",
             "project-binding",
-            true,
+            Some(xai_grok_shell::ssh::SshWorkerInstallChoice::LocalDirect),
             Some("late local control failure".into()),
         );
         assert!(matches!(

@@ -13,7 +13,7 @@ use sha2::{Digest, Sha256};
 use tokio::io::AsyncWriteExt;
 
 const DEFAULT_REPO: &str = "yuWorm/groky";
-const DEFAULT_MIRROR: &str = "https://gh-proxy.com";
+pub(crate) const DEFAULT_MIRROR: &str = "https://gh-proxy.com";
 const TTL: Duration = Duration::from_secs(30 * 60);
 const INSTALL_HINT: &str = "curl -fsSL https://raw.githubusercontent.com/yuWorm/groky/main/scripts/install-groky.sh | bash";
 

@@ -983,7 +983,7 @@ pub(super) fn dispatch_task_result(result: TaskResult, app: &mut AppView) -> Vec
             request_id,
             session_id,
             binding_id,
-            approved,
+            choice,
             error,
         } => {
             app.ssh_client_id = client_id;
@@ -993,7 +993,7 @@ pub(super) fn dispatch_task_result(result: TaskResult, app: &mut AppView) -> Vec
                     &request_id,
                     &session_id,
                     &binding_id,
-                    approved,
+                    choice,
                     error,
                 );
             }
