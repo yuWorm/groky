@@ -4,7 +4,7 @@
 # rust-toolchain.toml. Does not call x.ai/cli — that CDN is official grok.
 #
 #   git tag v0.1.0 && git push origin v0.1.0
-#   # or Actions → Release groky → Run workflow
+#   # To rebuild an existing tag: Actions → Release groky → Run workflow
 name: Release groky
 
 on:
@@ -14,7 +14,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "Release tag (e.g. v0.1.0). Created if missing."
+        description: "Existing release tag to build (e.g. v0.1.0)."
         required: true
         type: string
 
@@ -23,7 +23,9 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
-  # Native runner per target so jemalloc/protoc do not need cross.
+  # Preserve the shipped macOS 11.0 minimum when building on newer hosts.
+  MACOSX_DEPLOYMENT_TARGET: "11.0"
+  # macOS uses Intel hosts for both targets to avoid ARM64 runner capacity shortages.
   # Asset names match grok's gh-release pattern: {bin}-{version}-{os}-{arch}
 
 jobs:
@@ -34,11 +36,11 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - runner: macos-14
+          - runner: macos-15-intel
             artifact_os: macos
             artifact_arch: aarch64
             rust_target: aarch64-apple-darwin
-          - runner: macos-14
+          - runner: macos-15-intel
             artifact_os: macos
             artifact_arch: x86_64
             rust_target: x86_64-apple-darwin
@@ -58,6 +60,8 @@ jobs:
 
     steps:
       - uses: actions/checkout@v5
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
 
       - name: Install protobuf (Linux)
         if: runner.os == 'Linux'
@@ -145,6 +149,8 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v5
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
 
       - uses: actions/download-artifact@v4
         with:
@@ -157,12 +163,6 @@ jobs:
         run: |
           set -euo pipefail
           tag="${{ github.event.inputs.tag || github.ref_name }}"
-          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
-            git config user.name "groky-ci"
-            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-            git tag "$tag" 2>/dev/null || true
-            git push origin "refs/tags/$tag" 2>/dev/null || true
-          fi
           ls -la dist
           shopt -s nullglob
           assets=(dist/groky-*)
