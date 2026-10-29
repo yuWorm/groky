@@ -727,6 +727,10 @@ impl SessionActor {
     /// Reload hooks mid-session: re-discovers global and project hooks, re-evaluates project trust, and re-appends plugin-contributed hooks.
     /// `pub(super)` so the `SessionCommand::ReloadHooks` arm in `run_session` (parent module) can call it after an interactive folder-trust grant.
     pub(super) async fn reload_hooks_impl(self: &std::sync::Arc<Self>) -> String {
+        if self.workspace_ops.is_ssh() {
+            return "Hooks for this SSH project are discovered and run by the remote worker."
+                .to_owned();
+        }
         let git_root = xai_grok_workspace::session::git::find_git_root_from_path(
             std::path::Path::new(&self.session_info.cwd),
         )
@@ -903,44 +907,50 @@ impl SessionActor {
 
         *self.plugin_registry.borrow_mut() = new_registry_snapshot.clone();
 
-        // Reload hooks in the current session
-        let t_hooks = std::time::Instant::now();
-        let new_specs = new_registry_snapshot
-            .as_deref()
-            .map(xai_grok_agent::plugins::hooks_adapter::active_plugin_hook_specs)
-            .unwrap_or_default();
-        let hooks_reloaded = new_specs.len();
-        let current = self.hook_registry.borrow().clone();
-        let base = match current {
-            Some(registry) => Some(registry),
-            None if new_specs.is_empty() => None,
-            None => {
-                // No registry yet: bootstrap config-layer and file hooks the way reload_hooks_impl does
-                // Starting from empty sources instead would let a plugin-first snapshot drop config hooks
-                let git_root =
-                    xai_grok_workspace::session::git::find_git_root_from_path(session_cwd).ok();
-                let is_trusted =
-                    crate::agent::folder_trust::resolve_and_record(session_cwd, None, false);
-                let (registry, _errs) = crate::util::hooks::discover_hooks(
-                    &crate::util::hooks::process_hook_inputs(),
-                    git_root.as_deref(),
-                    &self.rebuild_spec.compat,
-                    xai_grok_hooks::trust::Trust::from_verdict(is_trusted),
-                );
-                (!registry.is_empty()).then(|| Arc::new(registry))
-            }
-        };
-        *self.hook_registry.borrow_mut() =
-            xai_grok_agent::plugins::hooks_adapter::replace_plugin_hooks(base, new_specs);
+        // Reload hooks in the current session. SSH projects' hooks are owned
+        // by the worker; plugins must not add local ones.
+        let hooks_reloaded = if self.workspace_ops.is_ssh() {
+            0
+        } else {
+            let t_hooks = std::time::Instant::now();
+            let new_specs = new_registry_snapshot
+                .as_deref()
+                .map(xai_grok_agent::plugins::hooks_adapter::active_plugin_hook_specs)
+                .unwrap_or_default();
+            let hooks_reloaded = new_specs.len();
+            let current = self.hook_registry.borrow().clone();
+            let base = match current {
+                Some(registry) => Some(registry),
+                None if new_specs.is_empty() => None,
+                None => {
+                    // No registry yet: bootstrap config-layer and file hooks the way reload_hooks_impl does
+                    // Starting from empty sources instead would let a plugin-first snapshot drop config hooks
+                    let git_root =
+                        xai_grok_workspace::session::git::find_git_root_from_path(session_cwd).ok();
+                    let is_trusted =
+                        crate::agent::folder_trust::resolve_and_record(session_cwd, None, false);
+                    let (registry, _errs) = crate::util::hooks::discover_hooks(
+                        &crate::util::hooks::process_hook_inputs(),
+                        git_root.as_deref(),
+                        &self.rebuild_spec.compat,
+                        xai_grok_hooks::trust::Trust::from_verdict(is_trusted),
+                    );
+                    (!registry.is_empty()).then(|| Arc::new(registry))
+                }
+            };
+            *self.hook_registry.borrow_mut() =
+                xai_grok_agent::plugins::hooks_adapter::replace_plugin_hooks(base, new_specs);
 
-        xai_grok_telemetry::unified_log::info(
-            "reload_plugins_impl: hooks done",
-            Some(sid),
-            Some(serde_json::json!({
-                "hooks_reload_ms": t_hooks.elapsed().as_millis() as u64,
-                "hooks_reloaded": hooks_reloaded,
-            })),
-        );
+            xai_grok_telemetry::unified_log::info(
+                "reload_plugins_impl: hooks done",
+                Some(sid),
+                Some(serde_json::json!({
+                    "hooks_reload_ms": t_hooks.elapsed().as_millis() as u64,
+                    "hooks_reloaded": hooks_reloaded,
+                })),
+            );
+            hooks_reloaded
+        };
 
         // Always re-merge plugin-contributed MCP servers and apply them via an order-insensitive diff.
         // Unchanged servers stay connected; only added, changed, or removed ones are re-initialized.

@@ -8,8 +8,10 @@ mod model;
 mod native_files;
 mod native_tasks;
 mod project_browser;
+mod prompt_host;
 mod service;
 mod tools;
+mod terminal;
 mod worker_install;
 
 pub use control::{SshAuthControlResponse, SshControlCommand, SshControlReply};
@@ -25,7 +27,9 @@ pub use model::{
     SshTargetCandidate, SshTargetCandidateSource, SshTargetDiscovery, SshTargetStatus,
     SshWorkerInstallDecision, SshWorkerInstallProgress, SshWorkerInstallRequest,
 };
+pub(crate) use prompt_host::remote_prompt_host;
 pub use service::{SessionSsh, SessionSshResource, SshServiceError};
+pub(crate) use terminal::SshTerminalRunner;
 pub(crate) use tools::configure_default_tools;
 pub use tools::register_tool_pack;
 pub use xai_grok_workspace_types::ssh::{

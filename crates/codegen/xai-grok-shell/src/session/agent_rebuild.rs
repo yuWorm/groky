@@ -139,6 +139,8 @@ pub(crate) struct AgentRebuildSpec {
     pub paths_config: xai_grok_agent::prompt::paths::PathsConfig,
     pub context_window_tokens: u64,
     pub prompt_working_directory: Option<String>,
+    /// Remote OS and shell for `<user_info>`; `None` describes the local machine.
+    pub prompt_host: Option<xai_grok_agent::PromptHost>,
     pub lsp: Option<Arc<dyn LspBackend>>,
     pub plugin_registry: Option<Arc<xai_grok_agent::plugins::PluginRegistry>>,
     pub api_key_provider: Option<SharedApiKeyProvider>,
@@ -252,6 +254,7 @@ impl AgentRebuildSpec {
             paths_config,
             context_window_tokens,
             prompt_working_directory,
+            prompt_host,
             lsp,
             plugin_registry,
             api_key_provider,
@@ -404,6 +407,9 @@ impl AgentRebuildSpec {
         }
         if let Some(prompt_working_directory) = prompt_working_directory.clone() {
             builder = builder.with_prompt_working_directory(prompt_working_directory);
+        }
+        if let Some(prompt_host) = prompt_host.clone() {
+            builder = builder.with_prompt_host(prompt_host);
         }
         if let Some(names) = persisted_skill_names {
             builder = builder.with_persisted_announced_skill_names(names);
@@ -561,6 +567,7 @@ pub(crate) fn test_rebuild_spec_default() -> Arc<AgentRebuildSpec> {
         paths_config: Default::default(),
         context_window_tokens: 256_000,
         prompt_working_directory: None,
+        prompt_host: None,
         lsp: None,
         plugin_registry: None,
         api_key_provider: None,

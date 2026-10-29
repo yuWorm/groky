@@ -33,3 +33,6 @@ Next groky version after `v0.1.30`.
 - **Messages backend** retries a stream that ends before `message_stop` instead of committing a truncated reply.
 - **Messages backend** forced tool calls turn thinking off, and `tool_choice: none` is sent as `none` rather than `auto`.
 - **Title refresh** reuses the conversation's prompt cache on Claude models instead of re-reading the whole session.
+- **SSH projects** `!` bash mode runs the command on the remote host instead of failing to start a shell in a directory that exists only remotely.
+- **SSH projects** tell the model the remote host's OS and shell instead of the local machine's.
+- **SSH projects** no longer run local or plugin hooks on this machine; the project's hooks run only on the remote worker.

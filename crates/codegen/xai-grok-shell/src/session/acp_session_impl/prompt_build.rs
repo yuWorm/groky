@@ -674,7 +674,7 @@ impl SessionActor {
         ctx.render(&bridge).await
     }
     fn construct_legacy_prefix(&self, cwd: &std::path::Path) -> String {
-        construct_user_message_minimal(cwd, None)
+        construct_user_message_minimal(cwd, self.rebuild_spec.prompt_host.as_ref())
     }
     /// `None` twin: descriptor materialization is unavailable in this build.
     fn workspace_mcps_root(_cwd: &std::path::Path) -> Option<std::path::PathBuf> {

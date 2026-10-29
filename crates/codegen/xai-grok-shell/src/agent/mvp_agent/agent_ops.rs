@@ -4524,7 +4524,11 @@ impl MvpAgent {
         let gateway_enabled = std::sync::Arc::new(
             std::sync::atomic::AtomicBool::new(true),
         );
-        let terminal: std::sync::Arc<dyn crate::terminal::AsyncTerminalRunner> = if client_terminal {
+        // An SSH project's cwd exists only on the remote host; a local or
+        // client terminal would spawn in a nonexistent local directory.
+        let terminal: std::sync::Arc<dyn crate::terminal::AsyncTerminalRunner> = if is_ssh_project {
+            std::sync::Arc::new(crate::ssh::SshTerminalRunner::new(workspace_ops.clone()))
+        } else if client_terminal {
             std::sync::Arc::new(AcpTerminalRunner {
                 gateway: self.gateway.clone(),
                 session_id: session_info.id.clone(),

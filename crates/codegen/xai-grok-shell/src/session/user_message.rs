@@ -11,35 +11,23 @@ pub(crate) fn user_query(user_message: String) -> String {
     )
 }
 
-/// Environment info for constructing the `<user_info>` block.
-/// When `None`, values are read from the local machine.
-/// When `Some`, the provided values are used (e.g. from a remote workspace via `workspace.info` RPC).
-pub(crate) struct UserInfoOverride {
-    pub os: String,
-    pub shell: String,
-    pub cwd: String,
-}
-
 /// Minimal user message prefix for fast-start / headless contexts.
 /// Intentionally excludes workspace snapshot and git status — training/actors
 /// never put `<git_status>` on the first-message prefix, and the harness matches that.
-/// When `override_info` is provided, uses remote workspace info instead of local machine introspection.
+/// `host` overrides the local machine's OS and shell (remote workspaces).
 pub(crate) fn construct_user_message_minimal(
     working_directory: &Path,
-    override_info: Option<&UserInfoOverride>,
+    host: Option<&xai_grok_agent::PromptHost>,
 ) -> String {
     let local_shell;
-    let (os, shell, cwd) = match override_info {
-        Some(info) => (info.os.as_str(), info.shell.as_str(), info.cwd.clone()),
+    let (os, shell) = match host {
+        Some(host) => (host.os.as_str(), host.shell.as_str()),
         None => {
             local_shell = resolve_shell_display();
-            (
-                std::env::consts::OS,
-                local_shell.as_str(),
-                working_directory.to_string_lossy().to_string(),
-            )
+            (std::env::consts::OS, local_shell.as_str())
         }
     };
+    let cwd = working_directory.to_string_lossy();
     let today = chrono::Local::now().format("%Y-%m-%d");
     format!(
         r#"<user_info>

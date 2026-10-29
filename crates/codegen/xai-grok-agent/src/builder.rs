@@ -18,6 +18,14 @@ use xai_grok_tools::implementations::grok_build::task::model_policy::{
 use xai_grok_tools::notification::ToolNotificationHandle;
 use xai_grok_tools::registry::types::SessionContext;
 use xai_grok_tools::types::tool::ToolKind;
+/// Machine the session's tools run on, as shown in the `<user_info>` prompt
+/// block. Remote workspaces report their own OS and shell.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PromptHost {
+    pub os: String,
+    pub shell: String,
+}
+
 /// Builds an [`Agent`] from an [`AgentDefinition`] (`from_definition`) or programmatic `with_*` calls, plus session context.
 #[derive(Clone)]
 pub struct AgentBuilder {
@@ -25,6 +33,8 @@ pub struct AgentBuilder {
     /// Forked sessions: the real `working_directory` is an overlay/worktree path that must stay hidden from the model,
     /// so the system prompt shows this instead; tool execution keeps the real path.
     prompt_working_directory: Option<String>,
+    /// Remote workspaces: OS and shell shown in the prompt instead of the local machine's.
+    prompt_host: Option<PromptHost>,
     terminal_backend: Arc<dyn TerminalBackend>,
     fs_backend: Arc<dyn AsyncFileSystem>,
     mcp_file_input_preparation: bool,
@@ -285,6 +295,7 @@ impl AgentBuilder {
         Self {
             working_directory,
             prompt_working_directory: None,
+            prompt_host: None,
             terminal_backend,
             fs_backend: Arc::new(xai_grok_tools::computer::local::LocalFs),
             mcp_file_input_preparation: false,
@@ -665,6 +676,10 @@ impl AgentBuilder {
     }
     pub fn with_prompt_working_directory(mut self, cwd: String) -> Self {
         self.prompt_working_directory = Some(cwd);
+        self
+    }
+    pub fn with_prompt_host(mut self, host: PromptHost) -> Self {
+        self.prompt_host = Some(host);
         self
     }
     fn resolve_definition(&self) -> AgentDefinition {
@@ -1310,8 +1325,15 @@ impl AgentBuilder {
             memory_workspace_path: self.memory_workspace_path,
             role_instructions: self.role_instructions,
             persona_instructions: self.persona_instructions,
-            os_name: Some(std::env::consts::OS.to_string()),
-            shell_path: Some(resolve_shell_for_prompt()),
+            os_name: Some(
+                self.prompt_host
+                    .as_ref()
+                    .map_or_else(|| std::env::consts::OS.to_string(), |host| host.os.clone()),
+            ),
+            shell_path: Some(
+                self.prompt_host
+                    .map_or_else(resolve_shell_for_prompt, |host| host.shell),
+            ),
             working_directory: Some(display_working_dir),
             current_date: Some(
                 now.with_timezone(&chrono::Local)

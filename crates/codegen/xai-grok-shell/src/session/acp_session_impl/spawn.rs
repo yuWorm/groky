@@ -1182,6 +1182,16 @@ pub(crate) async fn spawn_session_actor(
         .map(|snapshot| (snapshot.specs, snapshot.task_model_selection))
         .unzip();
     let task_model_selection = LatchedTaskModelSelection::default();
+    // The prompt must describe the machine the tools run on, not this one.
+    let prompt_host = if workspace_ops.is_ssh() {
+        Some(
+            crate::ssh::remote_prompt_host(&workspace_ops)
+                .await
+                .map_err(xai_grok_agent::AgentBuildError::InvalidConfig)?,
+        )
+    } else {
+        None
+    };
     let rebuild_spec = std::sync::Arc::new(crate::session::agent_rebuild::AgentRebuildSpec {
         working_directory: tool_context.cwd.as_path().to_path_buf(),
         ssh_workspace: workspace_ops.is_ssh().then(|| workspace_ops.clone()),
@@ -1246,6 +1256,7 @@ pub(crate) async fn spawn_session_actor(
         paths_config: paths_config.clone(),
         context_window_tokens,
         prompt_working_directory: prompt_display_cwd.clone(),
+        prompt_host,
         lsp: tool_context.lsp.clone(),
         plugin_registry: plugin_registry.clone(),
         api_key_provider: api_key_provider.clone(),
@@ -1584,7 +1595,19 @@ pub(crate) async fn spawn_session_actor(
     let allowed_subagent_types_for_handle = agent.definition().allowed_subagent_types.clone();
     let mut hook_discovery_errors: Vec<xai_grok_hooks::error::HookError> = Vec::new();
     let hooks_discovery = spawn_step!("hooks_discovery");
-    let (built_hook_registry, hook_disabled) = if let Some(override_reg) = hook_registry_override {
+    // The worker discovers and runs an SSH project's hooks. A local registry
+    // would run the launch directory's and plugins' hooks on this machine for
+    // every event path that is not explicitly forwarded to the worker.
+    let local_hooks = !workspace_ops.is_ssh();
+    let (built_hook_registry, hook_disabled) = if !local_hooks {
+        (
+            None,
+            xai_grok_workspace::permission::resolution::disabled_hooks_snapshot(
+                xai_grok_workspace::permission::resolution::managed_settings(),
+                xai_grok_config::user_grok_home().as_deref(),
+            ),
+        )
+    } else if let Some(override_reg) = hook_registry_override {
         (
             Some(override_reg),
             xai_grok_workspace::permission::resolution::disabled_hooks_snapshot(
@@ -1630,10 +1653,14 @@ pub(crate) async fn spawn_session_actor(
             plugin_registry.as_deref(),
         )
     };
-    let built_hook_registry = xai_grok_agent::plugins::hooks_adapter::with_plugin_hooks(
-        built_hook_registry,
-        plugin_hook_source,
-    );
+    let built_hook_registry = local_hooks
+        .then(|| {
+            xai_grok_agent::plugins::hooks_adapter::with_plugin_hooks(
+                built_hook_registry,
+                plugin_hook_source,
+            )
+        })
+        .flatten();
     drop(hooks_discovery);
     let hook_registry_for_handle = built_hook_registry.clone();
     let workspace_ops_for_handle = workspace_ops.clone();

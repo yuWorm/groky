@@ -18,7 +18,7 @@ pub mod timing;
 pub mod tool_list;
 
 pub use agent::Agent;
-pub use builder::AgentBuilder;
+pub use builder::{AgentBuilder, PromptHost};
 pub use compaction::CompactionPolicy;
 pub use config::AgentDefinition;
 pub use config::api_backed_tool_ids;
