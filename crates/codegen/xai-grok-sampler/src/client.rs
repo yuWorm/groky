@@ -3692,6 +3692,20 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn error_event_without_sequence_number_keeps_message() {
+        let data = r#"{"type":"error","message":"Invalid inference request.","code":"invalid_request","param":null}"#;
+        let event = deserialize_named_response_event("error", data)
+            .expect("gateway error event without sequence_number parses");
+        match event {
+            rs::ResponseStreamEvent::ResponseError(err) => {
+                assert_eq!(err.message, "Invalid inference request.");
+                assert_eq!(err.code.as_deref(), Some("invalid_request"));
+            }
+            other => panic!("expected ResponseError, got {other:?}"),
+        }
+    }
+
     /// A request as the builder emits it: `reasoning.summary` already set to the built-in default.
     fn built_response_request() -> CreateResponseWrapper {
         CreateResponseWrapper::new(rs::CreateResponse {

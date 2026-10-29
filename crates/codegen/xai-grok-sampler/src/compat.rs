@@ -193,11 +193,14 @@ pub(crate) fn apply_codex_session_headers(
 /// Fill missing `id` / `annotations` first; only then drop items the typed
 /// schema still cannot parse (encrypted reasoning, extra types).
 pub(crate) fn prepare_lenient_response_json(event_name: &str, value: &mut Value) {
-    if let Some(obj) = value.as_object_mut()
-        && !obj.contains_key("type")
-        && event_name.starts_with("response.")
-    {
-        obj.insert("type".into(), Value::String(event_name.to_owned()));
+    if let Some(obj) = value.as_object_mut() {
+        if !obj.contains_key("type") && event_name.starts_with("response.") {
+            obj.insert("type".into(), Value::String(event_name.to_owned()));
+        }
+        // OpenAI-compatible gateways (vLLM/SGLang proxies) omit `sequence_number`,
+        // which the typed schema requires; without it an `error` event is
+        // dropped and the turn surfaces as a synthetic 500 instead.
+        obj.entry("sequence_number").or_insert(Value::from(0u64));
     }
     sanitize_response_event_json(value);
     fill_response_usage_defaults(value);

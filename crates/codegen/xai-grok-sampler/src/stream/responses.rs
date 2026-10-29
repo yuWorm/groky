@@ -32,6 +32,11 @@ const INCOMPLETE_REASON_MAX_PROMPT_TOKENS: &str = "max_prompt_tokens";
 /// A server-side time limit cut generation short (xAI extension).
 const INCOMPLETE_REASON_MAX_TIME_LIMIT: &str = "max_time_limit";
 
+/// `error` event codes that reject the request itself; resending it unchanged fails the same way.
+fn is_request_rejection_code(code: &str) -> bool {
+    matches!(code, "invalid_request" | "invalid_request_error")
+}
+
 /// Returns whether a Responses API event reflects real model progress rather than a liveness-only heartbeat or status transition.
 pub(crate) fn responses_event_has_meaningful_content(event: &rs::ResponseStreamEvent) -> bool {
     use rs::ResponseStreamEvent;
@@ -510,7 +515,11 @@ pub(crate) fn stream_responses_tracked<'a>(
                         message: error_message,
                         model_metadata: None,
                         retry_after_secs: None,
-                        should_retry: None,
+                        should_retry: error_event
+                            .code
+                            .as_deref()
+                            .is_some_and(is_request_rejection_code)
+                            .then_some(false),
                         // The wire code, absent when the event carried none.
                         error_code: error_event
                             .code
@@ -1271,6 +1280,35 @@ mod tests {
             }
             other => panic!("expected Failed, got {other:?}"),
         }
+    }
+
+    /// A request-validation `error` event is terminal; a transient one stays retryable.
+    #[tokio::test]
+    async fn response_error_event_request_rejection_vetoes_retry() {
+        async fn should_retry_for(code: &str) -> Option<bool> {
+            let error_event =
+                rs::ResponseStreamEvent::ResponseError(rs_types::ResponseErrorEvent {
+                    sequence_number: 0,
+                    code: Some(code.into()),
+                    message: "boom".into(),
+                    param: None,
+                });
+            let raw = stream::iter(vec![Ok(error_event)]).boxed();
+            let events = collect(stream_responses(
+                raw,
+                None,
+                rid(),
+                Duration::from_secs(60),
+                None,
+            ))
+            .await;
+            match events.last().unwrap() {
+                SamplingEvent::Failed { error, .. } => error.should_retry,
+                other => panic!("expected Failed, got {other:?}"),
+            }
+        }
+        assert_eq!(should_retry_for("invalid_request").await, Some(false));
+        assert_eq!(should_retry_for("server_error").await, None);
     }
 
     #[tokio::test]

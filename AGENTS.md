@@ -41,3 +41,4 @@ Next groky version after `v0.1.30`.
 - **SSH projects** `!` bash mode runs the command on the remote host instead of failing to start a shell in a directory that exists only remotely.
 - **SSH projects** tell the model the remote host's OS and shell instead of the local machine's.
 - **SSH projects** no longer run local or plugin hooks on this machine; the project's hooks run only on the remote worker.
+- **Custom providers** on OpenAI-compatible gateways now show the provider's error (e.g. an unsupported reasoning effort) instead of retrying a generic `Server error (500)`.
