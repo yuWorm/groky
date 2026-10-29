@@ -420,7 +420,7 @@ async fn file_advertisement_requires_host_preparation_and_bounded_filesystem() {
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn messages_backend_advertises_inline_only_use_tool() {
+async fn non_xai_or_messages_endpoints_advertise_inline_only_use_tool() {
     use xai_grok_agent::AgentDefinition;
     use xai_grok_sampling_types::ApiBackend;
     use xai_grok_tools::registry::types::{ToolConfig, ToolServerConfig};
@@ -446,15 +446,27 @@ async fn messages_backend_advertises_inline_only_use_tool() {
                 .await
                 .unwrap();
 
-            for backend in [
-                ApiBackend::Responses,
-                ApiBackend::Messages,
-                ApiBackend::ChatCompletions,
+            let xai_base_url = actor
+                .chat_state_handle
+                .get_sampling_config()
+                .await
+                .unwrap()
+                .base_url;
+            for (backend, base_url, hidden) in [
+                (ApiBackend::Responses, xai_base_url.as_str(), false),
+                (ApiBackend::Messages, xai_base_url.as_str(), true),
+                (ApiBackend::ChatCompletions, xai_base_url.as_str(), false),
+                (
+                    ApiBackend::Responses,
+                    "https://chatgpt.com/backend-api/codex",
+                    true,
+                ),
+                (ApiBackend::ChatCompletions, "https://api.openai.com/v1", true),
             ] {
                 let mut config = actor.chat_state_handle.get_sampling_config().await.unwrap();
                 config.api_backend = backend.clone();
+                config.base_url = base_url.to_owned();
                 actor.chat_state_handle.update_sampling_config(config);
-                let hidden = backend == ApiBackend::Messages;
 
                 let definitions = actor.prepare_tool_definitions_inner().await;
                 let tool = &definitions

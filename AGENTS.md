@@ -42,3 +42,4 @@ Next groky version after `v0.1.30`.
 - **SSH projects** tell the model the remote host's OS and shell instead of the local machine's.
 - **SSH projects** no longer run local or plugin hooks on this machine; the project's hooks run only on the remote worker.
 - **Custom providers** on OpenAI-compatible gateways now show the provider's error (e.g. an unsupported reasoning effort) instead of retrying a generic `Server error (500)`.
+- **OpenAI Codex** and other non-xAI OpenAI-compatible models no longer fail every turn with `Invalid schema for function 'use_tool'` when MCP file input is enabled; they get the inline-only `use_tool`.

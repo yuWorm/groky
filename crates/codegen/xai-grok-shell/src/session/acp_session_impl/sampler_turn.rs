@@ -440,15 +440,16 @@ impl SessionActor {
         filter_cursor_tools_by_plan_mode(defs, plan_active)
     }
 
-    /// Messages-backed models never see `use_tool`'s file forms: the Anthropic Messages API rejects the schema's
-    /// root-level union (`oneOf`) with HTTP 400, which fails every turn. Checked per request because a model switch
-    /// mid-session keeps the finalized toolset.
+    /// Only xAI endpoints see `use_tool`'s file forms. Their schema is a root-level union (`oneOf`), which the
+    /// Anthropic Messages API and OpenAI function schemas (ChatGPT Codex, OpenAI-compatible gateways) reject with
+    /// HTTP 400 on every turn. Checked per request because a model switch mid-session keeps the finalized toolset.
     pub(crate) async fn mcp_file_forms_hidden(&self) -> bool {
         self.chat_state_handle
             .get_sampling_config()
             .await
             .is_some_and(|config| {
                 config.api_backend == xai_grok_sampling_types::ApiBackend::Messages
+                    || !crate::util::is_xai_api_url(&config.base_url)
             })
     }
 
