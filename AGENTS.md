@@ -20,6 +20,8 @@ Welcome Changelog, `/release-notes`, and the once-per-upgrade Release Notes prom
 4. Delete the shipped bullets from Unreleased. Done when Unreleased is empty or only holds work not in this tag.
 5. GitHub Release body: paste the same markdown section. `.github/workflows/release.yml` writes a stub; replace the notes after the tag.
 
+Release recovery: manual `Release groky` runs require an existing `tag` and build that tag, not the selected workflow branch. Push workflow-only fixes to `main`, then dispatch from `main` for the original tag; keep the tag unchanged.
+
 Voice: `**Lead** rest.` Lead is the noun the user already knows (`/default`, `Resume`, `Settings Default model`). One bullet per user-visible change.
 
 ### Unreleased
