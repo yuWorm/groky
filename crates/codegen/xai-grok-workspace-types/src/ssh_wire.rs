@@ -88,6 +88,10 @@ pub struct SshWorkerCapabilities {
     pub approvals: bool,
     pub cancellation: bool,
     pub operation_query: bool,
+    /// Built-ins are enabled only through the client's explicit toolset.
+    pub configure_session_tools: bool,
+    /// Connection-scoped cancellation of a read call, without killing its task.
+    pub cancel_read_calls: bool,
 }
 
 impl SshWorkerCapabilities {
@@ -99,6 +103,8 @@ impl SshWorkerCapabilities {
             approvals: true,
             cancellation: true,
             operation_query: true,
+            configure_session_tools: true,
+            cancel_read_calls: true,
         }
     }
 }
@@ -283,6 +289,12 @@ pub enum SshWorkerRequest {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         mutation_id: Option<SshMutationId>,
     },
+    /// Cancels only an outstanding read ToolCall on this same connection.
+    /// It cannot reference a task, mutation, or another connection's request.
+    CancelRead {
+        request_id: SshRequestId,
+        waiting_request_id: SshRequestId,
+    },
     Cancel {
         request_id: SshRequestId,
         invocation: ResolvedSshInvocation,
@@ -388,6 +400,7 @@ pub enum SshWorkerResponse {
     Tasks(Vec<SshTaskRecord>),
     CanonicalPath(String),
     CancellationRequested(SshCancellation),
+    ReadCancelled,
     ApprovalRecorded,
     Pong,
 }

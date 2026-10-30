@@ -1896,6 +1896,16 @@ pub(crate) async fn run_shell_child(
                 .seed_resources(&child_tool_bridge, child_session_id.0.to_string())
                 .await;
         }
+        if let Err(error) = service
+            .attach_project_notifications(&child_tool_bridge, &child_workspace_ops)
+            .await
+        {
+            return child_run_output(
+                failure_result(&request, &format!("failed to attach SSH subagent notifications: {error}")),
+                completion_data,
+                None,
+            );
+        }
         if let Err(error) = child_workspace_ops.register_remote_tools(&child_tool_bridge).await {
             return child_run_output(
                 failure_result(
@@ -1910,7 +1920,8 @@ pub(crate) async fn run_shell_child(
             .subscribe_session_events(child_session_id.0.to_string())
             .await;
         let worker_gateway = gateway.clone();
-        tokio::task::spawn_local(async move {
+        // Child setup runs on the Send worker runtime, not the parent's LocalSet.
+        tokio::spawn(async move {
             loop {
                 match worker_events.recv().await {
                     Ok(event) => {

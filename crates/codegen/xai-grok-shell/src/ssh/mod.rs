@@ -7,6 +7,7 @@ mod control_client;
 mod model;
 mod native_files;
 mod native_tasks;
+mod notifications;
 mod project_browser;
 mod prompt_host;
 mod service;
@@ -28,6 +29,7 @@ pub use model::{
     SshWorkerInstallChoice, SshWorkerInstallDecision, SshWorkerInstallProgress,
     SshWorkerInstallRequest,
 };
+pub(crate) use notifications::RemoteNotifications;
 pub(crate) use prompt_host::remote_prompt_host;
 pub use service::{SessionSsh, SessionSshResource, SshServiceError};
 pub(crate) use terminal::SshTerminalRunner;

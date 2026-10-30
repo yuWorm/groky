@@ -703,6 +703,7 @@ impl SessionActor {
         };
         let shared_recovery = Arc::new(tokio::sync::OnceCell::<bool>::const_new());
         let workspace_ops = self.workspace_ops.clone();
+        let toolset = self.agent.borrow().tool_bridge().toolset();
         let workflow_smoke_check_cwd = self.tool_context.cwd.to_path_buf();
         let workflow_smoke_check_display_cwd = self.display_cwd.get().map(std::path::PathBuf::from);
         let workflow_smoke_check_session_dir =
@@ -785,6 +786,7 @@ impl SessionActor {
                 let am = self.auth_manager.clone();
                 let shared_recovery = Arc::clone(&shared_recovery);
                 let workspace_ops = workspace_ops.clone();
+                let toolset = Arc::clone(&toolset);
                 let session_id = session_id.clone();
                 let workflow_smoke_check_cwd = workflow_smoke_check_cwd.clone();
                 let workflow_smoke_check_display_cwd = workflow_smoke_check_display_cwd.clone();
@@ -868,6 +870,7 @@ impl SessionActor {
                     let run_tool = || {
                         let prepared = Arc::clone(&prepared);
                         let workspace_ops = workspace_ops.clone();
+                        let toolset = Arc::clone(&toolset);
                         let session_id = session_id.clone();
                         let lock = lock.clone();
                         let workflow_smoke_check_cwd = workflow_smoke_check_cwd.clone();
@@ -895,6 +898,7 @@ impl SessionActor {
                                 };
                                 dispatch_observed(
                                     &workspace_ops,
+                                    &toolset,
                                     &prepared,
                                     &session_id,
                                     origin,

@@ -5345,6 +5345,13 @@ impl MvpAgent {
                 acp::Error::invalid_params()
                     .data("SSH projects require a host-owned SSH service")
             })?;
+            service
+                .attach_project_notifications(&tool_bridge, &workspace_ops)
+                .await
+                .map_err(|error| {
+                    acp::Error::internal_error()
+                        .data(format!("failed to attach SSH task notifications: {error}"))
+                })?;
             workspace_ops
                 .register_remote_tools(&tool_bridge)
                 .await

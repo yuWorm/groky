@@ -13,6 +13,8 @@
 //! The struct carries a `METHOD` constant and derives `Serialize + Deserialize`.
 //! Both the proxy client (`WorkspaceOps`) and the server (`WorkspaceRpcHandler::dispatch`) use the same struct.
 //! Add or rename a field and the compiler catches both sides.
+mod task_routing;
+
 use crate::error::{WorkspaceError, WorkspaceResult};
 use crate::file_system::ContentSearchRequest;
 use crate::handle::WorkspaceHandle;
@@ -30,6 +32,10 @@ use std::sync::LazyLock;
 use std::sync::atomic::AtomicBool;
 use xai_computer_hub_sdk::ToolHarness;
 use xai_grok_tools::bridge::ToolBridge;
+use xai_grok_tools::implementations::grok_build::task_output::routed::{
+    RemoteTaskExecutorResource, RoutedTaskControl,
+};
+use xai_grok_tools::registry::types::ToolServerConfig;
 use xai_grok_tools::types::definition::ToolDefinition;
 use xai_grok_tools::types::output::{ToolOutput, ToolRunResult};
 use xai_grok_tools::types::resources::SessionFolder;
@@ -37,6 +43,7 @@ use xai_grok_tools::types::tool::{ToolKind, ToolNamespace};
 use xai_grok_tools::types::tool_metadata::ToolMetadata;
 use xai_grok_workspace_client::ssh::{SshClientError, SshWorkspaceClient};
 use xai_grok_workspace_client::{WorkspaceClient, is_transport_fatal};
+use xai_grok_workspace_types::rpc::workspace::ConfigureSessionToolsReq;
 use xai_grok_workspace_types::ssh::{ResolvedSshInvocation, SshOperation};
 use xai_grok_workspace_types::ssh_wire::{
     SshPostToolHookOutcome, SshPostToolReplacement, SshProjectBootstrap,
@@ -1559,6 +1566,7 @@ struct RemoteWorkspaceTool {
     session_id: String,
     name: String,
     description: String,
+    operation: SshOperation,
 }
 
 impl std::fmt::Debug for RemoteWorkspaceTool {
@@ -1609,7 +1617,13 @@ impl xai_tool_runtime::Tool for RemoteWorkspaceTool {
         args: serde_json::Value,
     ) -> Result<Self::Output, xai_tool_runtime::ToolError> {
         self.workspace
-            .call_tool_with_context(&self.name, args, Some(&self.session_id), ctx)
+            .call_tool_with_operation(
+                &self.name,
+                args,
+                Some(&self.session_id),
+                ctx,
+                Some(self.operation),
+            )
             .await
             .map(|result| result.output)
     }
@@ -1801,32 +1815,106 @@ impl WorkspaceOps {
         })
     }
 
-    /// Register the bound worker's tool catalog into an otherwise remote shell
-    /// bridge. Every resulting model call is sent back through the authenticated
-    /// worker; this never starts an MCP server locally.
+    /// Delegate only this bridge's workspace tools to the bound worker. Local
+    /// session tools and their resources remain on the client. Rebuilds and
+    /// child sessions each configure their own final enabled tool subset.
     pub async fn register_remote_tools(&self, bridge: &ToolBridge) -> WorkspaceResult<Vec<String>> {
         let Self::Ssh { client, .. } = self else {
             return Err(WorkspaceError::HubError(
                 "remote tool registration is available only for SSH workspaces".into(),
             ));
         };
-        let session_id = client.binding().await.session_id;
-        let definitions = self.remote_tool_definitions().await?;
+        let toolset = bridge.toolset();
+        let mut tools = toolset.tool_configs(|tool| {
+            // Explicit SSH tools use the client's SessionSshResource and can
+            // target a different host. Their kinds do not imply project ownership.
+            !tool.id.starts_with("GrokBuild:ssh_")
+                && ssh_tool_ownership(tool.kind) != SshToolOwnership::Local
+        });
+        let task_executor = if tools.iter().any(|tool| RoutedTaskControl::from_registry_id(&tool.id).is_some()) {
+            let session_id = client.binding().await.session_id;
+            let executor = Arc::new(task_routing::SshTaskExecutor::new(self.clone(), session_id, &tools));
+            // Install before any fallible RPC: a routed tool may never consult
+            // the client's terminal, including after configuration failure.
+            toolset.resources.lock().await.insert(RemoteTaskExecutorResource(executor.clone()));
+            Some(executor)
+        } else {
+            None
+        };
+        if !task_routing::has_remote_background_commands(&tools) {
+            // A subagent-only session needs local task controls, not a worker
+            // command provider injected just to satisfy their requirements.
+            tools.retain(|tool| RoutedTaskControl::from_registry_id(&tool.id).is_none());
+        }
+        let mut remote_operations = HashMap::with_capacity(tools.len());
+        for tool in &tools {
+            let name = toolset.tool_name_for_registry_id(&tool.id).ok_or_else(|| {
+                WorkspaceError::Finalize(format!("missing finalized SSH tool {}", tool.id))
+            })?;
+            let kind = bridge.tool_kind(&name).unwrap_or(ToolKind::Other);
+            remote_operations.insert(name, ssh_operation_for_tool_kind(kind));
+        }
+        // Fail closed even if configuration fails or the worker rejects a tool.
+        // Routed controls retain only coordinator + authenticated-remote paths.
+        for name in remote_operations.keys() {
+            if !task_executor.as_ref().is_some_and(|executor| executor.contains_name(name)) {
+                bridge.unregister_tool_by_name(name);
+            }
+        }
+        let invocation = ssh_invocation(client, SshOperation::Read).await?;
+        let session_id = invocation.session_id.clone();
+        let response = client
+            .rpc(
+                invocation,
+                &ConfigureSessionToolsReq {
+                    session_id: session_id.clone(),
+                    tool_config: serde_json::to_value(ToolServerConfig {
+                        tools,
+                        behavior_preset: None,
+                    })
+                    .map_err(|error| WorkspaceError::Finalize(error.to_string()))?,
+                },
+                None,
+            )
+            .await
+            .map_err(|error| WorkspaceError::HubError(error.to_string()))?;
+        for tool_id in response.unserved_tool_ids {
+            tracing::warn!(%session_id, %tool_id, "SSH worker does not serve delegated tool");
+        }
+        let definitions: Vec<ToolDefinition> = serde_json::from_value(response.definitions)
+            .map_err(|error| {
+                WorkspaceError::Finalize(format!("decode configured SSH worker tools: {error}"))
+            })?;
         let mut registered = Vec::with_capacity(definitions.len());
         for definition in definitions {
             let name = definition.function.name;
+            let operation = match remote_operations.get(&name) {
+                Some(operation) => *operation,
+                None => {
+                    // Only project MCP tools may be added beyond the delegated
+                    // subset. Never replace a retained local tool or broaden a
+                    // restricted child's built-in catalog.
+                    if bridge.tool_kind(&name).is_some()
+                        || ssh_worker_tool_operations().contains_key(&name)
+                    {
+                        return Err(WorkspaceError::Finalize(format!(
+                            "SSH worker returned an undelegated tool {name:?}"
+                        )));
+                    }
+                    SshOperation::Execute
+                }
+            };
             xai_tool_protocol::ToolId::new(&name).map_err(|error| {
                 WorkspaceError::Finalize(format!("invalid SSH worker tool name {name:?}: {error}"))
             })?;
+            if task_executor.as_ref().is_some_and(|executor| executor.enable(&name)) {
+                registered.push(name);
+                continue;
+            }
             let description = definition
                 .function
                 .description
                 .unwrap_or_else(|| format!("Remote workspace tool {name}"));
-            // The bridge may already hold the local generic implementation
-            // under this public name. Remove it before the worker-owned
-            // adapter claims the name so an SSH project cannot accidentally
-            // dispatch one of its tools on the local machine.
-            bridge.unregister_tool_by_name(&name);
             bridge
                 .register_mcp_tools(
                     name.clone(),
@@ -1835,6 +1923,7 @@ impl WorkspaceOps {
                         session_id: session_id.clone(),
                         name: name.clone(),
                         description,
+                        operation,
                     },
                     Some(definition.function.parameters),
                 )
@@ -2201,6 +2290,17 @@ impl WorkspaceOps {
         session_id: Option<&str>,
         ctx: xai_tool_runtime::ToolCallContext,
     ) -> Result<ToolRunResult, xai_tool_runtime::ToolError> {
+        self.call_tool_with_operation(name, args, session_id, ctx, None).await
+    }
+
+    async fn call_tool_with_operation(
+        &self,
+        name: &str,
+        args: Value,
+        session_id: Option<&str>,
+        ctx: xai_tool_runtime::ToolCallContext,
+        ssh_operation: Option<SshOperation>,
+    ) -> Result<ToolRunResult, xai_tool_runtime::ToolError> {
         match self {
             Self::Local { handle } => {
                 let session_id = session_id.ok_or_else(|| {
@@ -2258,7 +2358,7 @@ impl WorkspaceOps {
                         "The SSH workspace worker connection was lost. Query the operation before retrying any mutation.",
                     ));
                 }
-                let operation = ssh_tool_operation(name);
+                let operation = ssh_operation.unwrap_or_else(|| ssh_tool_operation(name));
                 let call_id = ctx.call_id.to_string();
                 let invocation = ssh_invocation_with_call_id(client, operation, call_id.clone())
                     .await
@@ -2283,10 +2383,12 @@ impl WorkspaceOps {
                 };
                 let mutation_id =
                     (operation != SshOperation::Read).then(|| ctx.call_id.to_string());
-                let response = match client
-                    .call_tool(invocation, name, args, mutation_id)
-                    .await
-                {
+                let response = if ctx.get::<task_routing::CancelRemoteRead>().is_some() {
+                    client.call_tool_cancellable(invocation, name, args).await
+                } else {
+                    client.call_tool(invocation, name, args, mutation_id).await
+                };
+                let response = match response {
                     Ok(response) => response,
                     Err(SshClientError::Remote(error)) => {
                         let message = format!("{}: {}", error.code, error.message);
@@ -2452,6 +2554,59 @@ fn remote_post_tool_replacement_text(
         xai_grok_hooks::event::MAX_HOOK_OUTPUT_REPLACEMENT_CHARS,
     ))
 }
+/// Execution owner for tools in a groky SSH project. Session resources and
+/// credentials stay on the client; workspace files and processes stay remote.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SshToolOwnership {
+    Remote,
+    Local,
+    /// Task controls combine local subagents with worker commands; monitor
+    /// remains worker-owned until its separate event-return design is implemented.
+    Routed,
+}
+
+pub fn ssh_tool_ownership(kind: Option<ToolKind>) -> SshToolOwnership {
+    match kind.unwrap_or(ToolKind::Other) {
+        ToolKind::Read
+        | ToolKind::Edit
+        | ToolKind::Delete
+        | ToolKind::ListDir
+        | ToolKind::Write
+        | ToolKind::Move
+        | ToolKind::Search
+        | ToolKind::List
+        | ToolKind::Lsp
+        | ToolKind::Execute
+        | ToolKind::Skill => SshToolOwnership::Remote,
+        ToolKind::BackgroundTaskAction
+        | ToolKind::WaitTasksAction
+        | ToolKind::KillTaskAction
+        | ToolKind::Monitor => SshToolOwnership::Routed,
+        ToolKind::Task
+        | ToolKind::ActiveAgentMessage
+        | ToolKind::EnterPlan
+        | ToolKind::ExitPlan
+        | ToolKind::AskUser
+        | ToolKind::Plan
+        | ToolKind::GoalUpdate
+        | ToolKind::Workflow
+        | ToolKind::Feedback
+        | ToolKind::SearchTool
+        | ToolKind::UseTool
+        | ToolKind::WebSearch
+        | ToolKind::WebFetch
+        | ToolKind::MemorySearch
+        | ToolKind::MemoryGet
+        | ToolKind::ImageGen
+        | ToolKind::VideoGen
+        | ToolKind::ImageToVideo
+        | ToolKind::ReferenceToVideo
+        | ToolKind::DeployApp
+        | ToolKind::InitOrUpdateApp
+        | ToolKind::Other => SshToolOwnership::Local,
+    }
+}
+
 
 /// Translate the registry's intrinsic tool category into the SSH grant
 /// category. Unknown categories deliberately require execute authority.
@@ -2476,9 +2631,9 @@ pub(crate) fn ssh_operation_for_tool_kind(kind: ToolKind) -> SshOperation {
     }
 }
 
-/// Baseline tools available to an SSH worker. The catalog deliberately includes
-/// both GrokBuild and OpenCode tool families so an authenticated remote session
-/// can run the same filesystem and command operations as a local workspace.
+/// Executable catalog (not a default toolset) for an SSH worker. A session
+/// starts empty and only enables built-ins explicitly delegated by its client.
+/// Both GrokBuild and OpenCode filesystem/command families are available.
 pub(crate) fn ssh_worker_toolset() -> xai_grok_tools::registry::types::ToolServerConfig {
     use xai_grok_tools::implementations::opencode::{
         OpenCodeBashTool, OpenCodeEditTool, OpenCodeGlobTool, OpenCodeReadTool, OpenCodeSkillTool,
@@ -2502,7 +2657,7 @@ pub(crate) fn ssh_worker_toolset() -> xai_grok_tools::registry::types::ToolServe
     toolset
 }
 
-fn ssh_tool_operation(name: &str) -> SshOperation {
+fn ssh_worker_tool_operations() -> &'static HashMap<String, SshOperation> {
     static TOOL_OPERATIONS: LazyLock<HashMap<String, SshOperation>> = LazyLock::new(|| {
         let mut operations = HashMap::new();
         for tool in ssh_worker_toolset().tools {
@@ -2525,7 +2680,11 @@ fn ssh_tool_operation(name: &str) -> SshOperation {
         }
         operations
     });
-    TOOL_OPERATIONS
+    &TOOL_OPERATIONS
+}
+
+fn ssh_tool_operation(name: &str) -> SshOperation {
+    ssh_worker_tool_operations()
         .get(name)
         .copied()
         // A name not present in the worker's baseline catalog may be a custom
@@ -2551,6 +2710,38 @@ impl WorkspaceOps {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ssh_tool_ownership_covers_every_kind_and_workspace_config() {
+        use SshToolOwnership::{Local, Remote, Routed};
+        use ToolKind::*;
+
+        let groups: &[(SshToolOwnership, &[ToolKind])] = &[
+            (Remote, &[Read, Edit, Delete, ListDir, Write, Move, Search, List, Lsp, Execute, Skill]),
+            (Routed, &[BackgroundTaskAction, WaitTasksAction, KillTaskAction, Monitor]),
+            (Local, &[
+                Task, ActiveAgentMessage, EnterPlan, ExitPlan, AskUser, Plan, GoalUpdate,
+                Workflow, Feedback, SearchTool, UseTool, WebSearch, WebFetch, MemorySearch,
+                MemoryGet, ImageGen, VideoGen, ImageToVideo, ReferenceToVideo, DeployApp,
+                InitOrUpdateApp, Other,
+            ]),
+        ];
+        let mut expected = HashMap::new();
+        for &(owner, kinds) in groups {
+            for &kind in kinds {
+                assert!(expected.insert(kind, owner).is_none(), "duplicate kind {kind:?}");
+                assert_eq!(ssh_tool_ownership(Some(kind)), owner, "{kind:?}");
+            }
+        }
+        assert_eq!(expected.len(), ToolKind::VARIANT_COUNT);
+        assert_eq!(ssh_tool_ownership(None), Local);
+        for tool in xai_grok_agent::workspace_grok_build_toolset().tools {
+            let kind = tool.kind.unwrap_or_else(|| {
+                panic!("workspace tool {} needs an explicit ownership category", tool.id)
+            });
+            assert_eq!(ssh_tool_ownership(Some(kind)), expected[&kind], "{}", tool.id);
+        }
+    }
 
     #[test]
     fn ssh_worker_catalog_classifies_client_and_registry_tool_names() {

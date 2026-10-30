@@ -392,6 +392,9 @@ struct ReminderEntry {
 }
 /// A tool ready for dispatch, with pre-built client-facing definition.
 struct FinalizedTool {
+    /// Original enabled config, moved here during finalization. Dynamic tools
+    /// have no built-in config to delegate to another executor.
+    config: Option<ToolConfig>,
     namespace: String,
     id: String,
     /// The key under which this tool is stored in the `LocalRegistry`. For built-in tools this
@@ -1205,7 +1208,7 @@ impl ToolRegistryBuilder {
         });
         persistence.load(&mut resources);
         let local_registry = self.shared_local_registry.take().unwrap_or_default();
-        for tool_config in &config.tools {
+        for tool_config in config.tools {
             let entry = self.tools.remove(&tool_config.id).unwrap();
             (entry.register_in_local)(&local_registry);
             let contract_version = crate::versions::resolve_version(
@@ -1232,7 +1235,7 @@ impl ToolRegistryBuilder {
                 .iter()
                 .map(|(canonical, client)| (client.clone(), canonical.clone()))
                 .collect();
-            let mut effective_params = compute_effective_params(&entry, tool_config)
+            let mut effective_params = compute_effective_params(&entry, &tool_config)
                 .map_err(|e| vec![requirement_error_from_param_error(&tool_config.id, e)])?;
             if entry.kind == ToolKind::UseTool {
                 effective_params = merge_json(
@@ -1292,6 +1295,7 @@ impl ToolRegistryBuilder {
                 reverse_params,
                 parse_input: Arc::from(entry.parse_input),
                 contract_version,
+                config: Some(tool_config),
             });
         }
         let native_tool_names: std::collections::HashSet<String> = tools
@@ -1471,6 +1475,21 @@ impl FinalizedToolset {
             .read()
             .iter()
             .map(|t| t.definition.clone())
+            .collect()
+    }
+    /// Snapshot selected enabled built-ins, preserving aliases and parameter
+    /// overrides. Resolved per-tool versions make the snapshot independent of
+    /// the original server-wide behavior preset. Dynamic tools are excluded.
+    pub fn tool_configs(&self, include: impl Fn(&ToolConfig) -> bool) -> Vec<ToolConfig> {
+        self.tools
+            .read()
+            .iter()
+            .filter_map(|tool| {
+                let config = tool.config.as_ref().filter(|config| include(config))?;
+                let mut config = config.clone();
+                config.behavior_version = tool.contract_version.clone();
+                Some(config)
+            })
             .collect()
     }
     /// Client-facing name of the (first) enabled tool of `kind`, honoring `name_override` / preset
@@ -2054,6 +2073,7 @@ impl FinalizedToolset {
         let definition = ToolDefinition::function(&name, Some(&description), input_schema.clone());
         self.local_registry.register(tool);
         tools.push(FinalizedTool {
+            config: None,
             namespace: ToolNamespace::MCP.to_string(),
             id: name.clone(),
             registry_id,

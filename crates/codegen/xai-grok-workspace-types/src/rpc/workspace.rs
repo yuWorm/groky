@@ -58,6 +58,33 @@ impl WorkspaceRpc for ToolDefinitionsReq {
     type Response = Value;
 }
 
+/// `workspace.configure_session_tools` replaces the SSH worker's explicit
+/// built-in toolset. The tool configuration remains raw JSON so this crate
+/// does not depend on the tools registry.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ConfigureSessionToolsReq {
+    pub session_id: String,
+    pub tool_config: Value,
+}
+
+/// Result of an SSH worker toolset configuration.
+///
+/// `definitions` remains raw JSON for the same dependency boundary as
+/// [`ConfigureSessionToolsReq::tool_config`]. Callers decode it as their
+/// local `ToolDefinition` type.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ConfigureSessionToolsResponse {
+    pub definitions: Value,
+    #[serde(default)]
+    pub unserved_tool_ids: Vec<String>,
+}
+
+impl WorkspaceRpc for ConfigureSessionToolsReq {
+    const METHOD: &'static str = "workspace.configure_session_tools";
+    const ACTIVITY: RpcActivityClass = RpcActivityClass::Read;
+    type Response = ConfigureSessionToolsResponse;
+}
+
 /// `workspace.resolve_file_references` resolves `@file` references against the workspace root.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ResolveFileReferencesReq {

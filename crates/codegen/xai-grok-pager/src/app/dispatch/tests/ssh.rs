@@ -1060,6 +1060,82 @@ fn broadcast_duplicate_of_a_direct_grant_reply_cannot_reopen_a_dismissed_manager
 }
 
 #[test]
+fn ssh_child_operation_approval_routes_to_parent_without_changing_authority() {
+    let mut app = test_app_with_agent();
+    let parent_id = AgentId(0);
+    let child_id = "ssh-child";
+    let child = AgentView::new(
+        make_test_agent_session(&app, AgentId(1), child_id),
+        ScrollbackState::new(),
+    );
+    app.agents.get_mut(&parent_id).unwrap()
+        .insert_test_child(child_id.into(), Box::new(child));
+    let other_id = AgentId(2);
+    let other = AgentView::new(
+        make_test_agent_session(&app, other_id, "other-root"),
+        ScrollbackState::new(),
+    );
+    app.agents.insert(other_id, other);
+    app.active_view = ActiveView::Agent(other_id);
+    let client_id = app.ssh_client_id;
+    for (session, client) in [("unknown-child", client_id), (child_id, client_id + 1)] {
+        apply_ssh_control_event(&mut app, None, None,
+            SshEvent::OperationApproval(operation_approval("foreign", session, client)));
+        assert!(app.agents.get(&parent_id).unwrap().ssh_manager.is_none());
+    }
+    apply_ssh_control_event(&mut app, None, None,
+        SshEvent::OperationApproval(operation_approval("child-operation", child_id, client_id)));
+    let manager = app.agents.get(&parent_id).unwrap().ssh_manager.as_ref()
+        .expect("child approval must be visible on its owning parent");
+    assert_eq!(manager.session_id.as_deref(), Some("test-session"));
+    assert!(manager.is_visible());
+    assert!(app.agents.get(&other_id).unwrap().ssh_manager.is_none(),
+        "background child consent must not leak to the active unrelated session");
+    app.active_view = ActiveView::Agent(parent_id);
+    let effects = dispatch(Action::ApproveSshOperation {
+        approval_id: "child-operation".into(), approved: true,
+        scope: xai_grok_shell::ssh::SshOperationApprovalScope::Session,
+    }, &mut app);
+    assert!(effects.iter().any(|effect| matches!(effect,
+        Effect::SshApproveOperation { approval_id, client_id: actual_client, owner, .. }
+        if approval_id == "child-operation" && *actual_client == client_id
+            && owner.agent_id == Some(parent_id)
+    )), "submit must keep the original child approval ID and client; the service owns its binding");
+    apply_ssh_control_event(&mut app, None, None, SshEvent::OperationApprovalExpired {
+        client_id, session_id: child_id.into(), approval_id: "child-operation".into(),
+    });
+    assert!(dispatch(Action::ApproveSshOperation {
+        approval_id: "child-operation".into(), approved: true,
+        scope: xai_grok_shell::ssh::SshOperationApprovalScope::Once,
+    }, &mut app).is_empty(), "expired child consent must not be submitted again");
+}
+
+#[test]
+fn ssh_child_operation_approval_prefers_an_exact_root_session() {
+    let mut app = test_app_with_agent();
+    let child_id = "loaded-child";
+    let child = AgentView::new(
+        make_test_agent_session(&app, AgentId(1), child_id),
+        ScrollbackState::new(),
+    );
+    app.agents.get_mut(&AgentId(0)).unwrap()
+        .insert_test_child(child_id.into(), Box::new(child));
+    let loaded = AgentView::new(
+        make_test_agent_session(&app, AgentId(2), child_id),
+        ScrollbackState::new(),
+    );
+    app.agents.insert(AgentId(2), loaded);
+    let client_id = app.ssh_client_id;
+    apply_ssh_control_event(&mut app, None, None,
+        SshEvent::OperationApproval(operation_approval("loaded-operation", child_id, client_id)));
+    assert!(app.agents.get(&AgentId(0)).unwrap().ssh_manager.is_none());
+    let manager = app.agents.get(&AgentId(2)).unwrap().ssh_manager.as_ref()
+        .expect("an explicitly opened child owns its approval surface");
+    assert_eq!(manager.session_id.as_deref(), Some(child_id));
+    assert!(manager.is_visible());
+}
+
+#[test]
 fn operation_expiration_event_is_scoped_to_its_client_session_and_visible_card() {
     let mut app = test_app_with_agent();
     let source_id = AgentId(0);

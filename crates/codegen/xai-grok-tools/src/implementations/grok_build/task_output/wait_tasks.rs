@@ -151,6 +151,15 @@ impl xai_tool_runtime::Tool for WaitTasksTool {
                 "task_ids exceeds maximum of {MAX_MULTI_WAIT_IDS} entries."
             )));
         }
+        let remote = resources
+            .lock()
+            .await
+            .get::<super::routed::RemoteTaskExecutorResource>()
+            .cloned();
+        if let Some(remote) = remote {
+            return super::routed::wait(&remote, ctx, input).await;
+        }
+
 
         // wait_all (the common case) shares the unified multi path on get_task_output.
         if matches!(input.mode, WaitMode::WaitAll) {

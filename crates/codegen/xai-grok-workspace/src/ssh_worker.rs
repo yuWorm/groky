@@ -14,6 +14,9 @@ use crate::hub_server::{WorkspaceRpcHandler, workspace_rpc_operation};
 use crate::permission::ToolApprovalGate;
 use crate::session::tool_config::WorkspaceSessionContextFactory;
 use crate::workspace_ops::ssh_operation_for_tool_kind;
+use xai_grok_workspace_types::rpc::workspace::{
+    ConfigureSessionToolsReq, ConfigureSessionToolsResponse,
+};
 use anyhow::{Context, anyhow, bail};
 use std::collections::{HashMap, HashSet};
 use std::path::{Component, Path, PathBuf};
@@ -59,6 +62,8 @@ pub struct SshWorkerService {
     operations: Mutex<HashMap<SshOperationId, OperationEntry>>,
     mutations: Mutex<HashMap<(String, String, SshMutationId), SshOperationId>>,
     next_id: AtomicU64,
+    #[cfg(any(test, feature = "test-support"))]
+    discover_extensions: bool,
 }
 
 struct WorkerWorkspace {
@@ -105,7 +110,20 @@ impl SshWorkerService {
             operations: Mutex::new(HashMap::new()),
             mutations: Mutex::new(HashMap::new()),
             next_id: AtomicU64::new(1),
+            #[cfg(any(test, feature = "test-support"))]
+            discover_extensions: true,
         })
+    }
+
+    /// Real worker transport/runtime without discovering the test host's MCP,
+    /// hooks or LSP configuration. No process-global environment mutation.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn for_test() -> Arc<Self> {
+        let mut service = Self::new();
+        Arc::get_mut(&mut service)
+            .expect("new service has one owner")
+            .discover_extensions = false;
+        service
     }
 
     async fn bind(
@@ -154,7 +172,10 @@ impl SshWorkerService {
                 .create_session_with_config(
                     binding.session_id.clone(),
                     Some(cwd),
-                    None,
+                    Some(xai_grok_tools::registry::types::ToolServerConfig {
+                        tools: Vec::new(),
+                        behavior_preset: None,
+                    }),
                     CapabilityMode::All,
                     None,
                     false,
@@ -330,6 +351,8 @@ impl SshWorkerService {
         root: PathBuf,
         extensions_enabled: bool,
     ) -> Result<Arc<WorkerWorkspace>, SshWireError> {
+        #[cfg(any(test, feature = "test-support"))]
+        let extensions_enabled = extensions_enabled && self.discover_extensions;
         let cache_key = (root.clone(), extensions_enabled);
         let mut workspaces = self.workspaces.lock().await;
         if let Some(workspace) = workspaces.get(&cache_key) {
@@ -341,7 +364,13 @@ impl SshWorkerService {
             .with_tool_state_home(crate::handle::resolve_workspace_home().join("ssh-worker"));
         let config = WorkspaceConfig {
             root_cwd: root.clone(),
-            default_tool_config: crate::workspace_ops::ssh_worker_toolset(),
+            // The worker catalog is an upper bound only. New SSH sessions
+            // begin with an explicit empty built-in toolset until the client
+            // delegates its finalized remote tools.
+            default_tool_config: xai_grok_tools::registry::types::ToolServerConfig {
+                tools: Vec::new(),
+                behavior_preset: None,
+            },
             respect_gitignore: true,
             memory_config: None,
             event_buffer_capacity: DEFAULT_EVENT_BUFFER_CAPACITY,
@@ -359,7 +388,7 @@ impl SshWorkerService {
             server_metadata: None,
             status_config: Default::default(),
             project_lsp_trusted: extensions_enabled && project_trusted,
-            require_explicit_toolset: false,
+            require_explicit_toolset: true,
             confine_fs_to_workspace_root: true,
             bind_mcp: None,
             // SSH uses the protocol approval gate below. The Hub gate cannot
@@ -462,6 +491,7 @@ impl SshWorkerService {
         binding: &SshBinding,
         operation: SshOperation,
         mutation_id: Option<SshMutationId>,
+        cancellation: Option<CancellationToken>,
     ) -> Result<BeginOperation, SshWireError> {
         let mutation_key = mutation_id.as_ref().map(|mutation_id| {
             (
@@ -493,7 +523,7 @@ impl SshWorkerService {
             ));
         }
         let operation_id = format!("ssh-op-{}", self.next_id.fetch_add(1, Ordering::Relaxed));
-        let cancellation = CancellationToken::new();
+        let cancellation = cancellation.unwrap_or_default();
         let record = SshOperationRecord {
             operation_id: operation_id.clone(),
             mutation_id,
@@ -593,7 +623,11 @@ impl SshWorkerService {
                 // field. The immediate wire error retains them separately, but
                 // a queried operation must not serialize the same outcome twice.
                 error.post_hook = None;
-                operation.record.state = SshOperationState::Failed;
+                operation.record.state = if error.code == "cancelled" {
+                    SshOperationState::Cancelled
+                } else {
+                    SshOperationState::Failed
+                };
                 operation.record.error = Some(error);
                 operation.record.result = None;
                 operation.record.post_hook = post_hook;
@@ -820,6 +854,66 @@ impl WorkerWorkspace {
         Ok(crate::discovery::load_project_config(&self.root))
     }
 
+    /// Replace the session's built-in toolset with the caller-selected subset
+    /// of the worker catalog. Tool fields other than `kind` remain caller
+    /// owned, so model-facing names, parameter renames, and behavior versions
+    /// remain byte-for-byte compatible with the local finalized toolset.
+    async fn configure_session_tools(
+        &self,
+        session_id: &str,
+        tool_config: serde_json::Value,
+    ) -> Result<ConfigureSessionToolsResponse, SshWireError> {
+        let requested: xai_grok_tools::registry::types::ToolServerConfig =
+            serde_json::from_value(tool_config)
+                .map_err(|error| wire_error("invalid_tool_config", error.to_string()))?;
+        let catalog = crate::workspace_ops::ssh_worker_toolset();
+        let catalog_by_id: HashMap<&str, &xai_grok_tools::registry::types::ToolConfig> = catalog
+            .tools
+            .iter()
+            .map(|tool| (tool.id.as_str(), tool))
+            .collect();
+        let mut served = Vec::with_capacity(requested.tools.len());
+        let mut unserved_tool_ids = Vec::new();
+        for (index, mut requested_tool) in requested.tools.into_iter().enumerate() {
+            xai_grok_tools_api::config_validation::validate_name_override(
+                index,
+                &requested_tool.id,
+                requested_tool.name_override.as_deref(),
+            )
+            .map_err(|error| wire_error("invalid_tool_config", error.to_string()))?;
+            let Some(catalog_tool) = catalog_by_id.get(requested_tool.id.as_str()) else {
+                unserved_tool_ids.push(requested_tool.id);
+                continue;
+            };
+            // The client owns presentation/configuration but never the
+            // authorization category. Dispatch classifies from registry
+            // metadata too; assigning the catalog kind here keeps both layers
+            // aligned even for a forged wire `kind`.
+            requested_tool.kind = catalog_tool.kind;
+            served.push(requested_tool);
+        }
+        unserved_tool_ids.sort_unstable();
+        let accepted = xai_grok_tools::registry::types::ToolServerConfig {
+            tools: served,
+            behavior_preset: requested.behavior_preset,
+        };
+        self.handle
+            .update_tool_config(session_id, session_id, accepted)
+            .await
+            .map_err(|error| wire_error("tool_configure_failed", error.to_string()))?;
+
+        let session = self
+            .handle
+            .session(session_id)
+            .ok_or_else(|| wire_error("session_not_found", "worker session not found"))?;
+        let definitions = serde_json::to_value(session.toolset().tool_definitions())
+            .map_err(|error| wire_error("tool_definitions_encode_failed", error.to_string()))?;
+        Ok(ConfigureSessionToolsResponse {
+            definitions,
+            unserved_tool_ids,
+        })
+    }
+
     async fn project_bootstrap(
         &self,
         session_id: &str,
@@ -939,6 +1033,7 @@ struct WorkerConnection<W> {
     writer: Arc<Mutex<W>>,
     accepted_bindings: Arc<RwLock<HashSet<String>>>,
     approvals: Arc<Mutex<HashMap<String, PendingApproval>>>,
+    read_calls: Arc<Mutex<HashMap<String, CancellationToken>>>,
     revocation_only: bool,
 }
 
@@ -949,6 +1044,7 @@ impl<W> Clone for WorkerConnection<W> {
             writer: Arc::clone(&self.writer),
             accepted_bindings: Arc::clone(&self.accepted_bindings),
             approvals: Arc::clone(&self.approvals),
+            read_calls: Arc::clone(&self.read_calls),
             revocation_only: self.revocation_only,
         }
     }
@@ -1200,8 +1296,10 @@ where
         writer: Arc::new(Mutex::new(writer)),
         accepted_bindings: Arc::new(RwLock::new(HashSet::from([binding.id]))),
         approvals: Arc::new(Mutex::new(HashMap::new())),
+        read_calls: Arc::new(Mutex::new(HashMap::new())),
         revocation_only,
     };
+    let result = async {
     while let Some(frame) = read_frame(&mut reader)
         .await
         .context("reading worker frame")?
@@ -1210,13 +1308,26 @@ where
             bail!("SSH worker received non-request after handshake");
         };
         let connection = connection.clone();
+        let request_id = request_id(&request).to_owned();
+        // Register before spawning: a following CancelRead cannot overtake the
+        // call's registration. This table contains no mutation or task IDs.
+        if matches!(&request, SshWorkerRequest::ToolCall { invocation, .. }
+            if invocation.operation == SshOperation::Read)
+        {
+            connection.read_calls.lock().await.insert(request_id.clone(), CancellationToken::new());
+        }
         tokio::spawn(async move {
-            let request_id = request_id(&request).to_owned();
             let result = dispatch_request(&connection, request).await;
+            connection.read_calls.lock().await.remove(&request_id);
             let _ = connection.reply(request_id, result).await;
         });
     }
-    Ok(())
+        Ok::<_, anyhow::Error>(())
+    }.await;
+    for (_, cancellation) in connection.read_calls.lock().await.drain() {
+        cancellation.cancel();
+    }
+    result
 }
 
 async fn dispatch_request<W: AsyncWrite + Unpin + Send + 'static>(
@@ -1319,12 +1430,21 @@ async fn dispatch_request<W: AsyncWrite + Unpin + Send + 'static>(
             ..
         } => run_rpc(connection, invocation, method, params, mutation_id).await,
         SshWorkerRequest::ToolCall {
+            request_id,
             invocation,
             tool_name,
             args,
             mutation_id,
-            ..
-        } => run_tool(connection, invocation, tool_name, args, mutation_id).await,
+        } => {
+            let cancellation = connection.read_calls.lock().await.get(&request_id).cloned();
+            run_tool(connection, invocation, tool_name, args, mutation_id, cancellation).await
+        }
+        SshWorkerRequest::CancelRead { waiting_request_id, .. } => {
+            if let Some(cancellation) = connection.read_calls.lock().await.get(&waiting_request_id) {
+                cancellation.cancel();
+            }
+            Ok(SshWorkerResponse::ReadCancelled)
+        }
         SshWorkerRequest::Cancel {
             invocation,
             operation_id,
@@ -1410,6 +1530,12 @@ async fn run_rpc<W: AsyncWrite + Unpin + Send + 'static>(
     params: serde_json::Value,
     mutation_id: Option<SshMutationId>,
 ) -> Result<SshWorkerResponse, SshWireError> {
+    if method == "workspace.update_tool_config" {
+        return Err(wire_error(
+            "ssh_tool_config_managed",
+            "SSH worker toolsets must be configured with workspace.configure_session_tools",
+        ));
+    }
     let expected = workspace_rpc_operation(&method);
     let authorized = connection
         .service
@@ -1421,7 +1547,7 @@ async fn run_rpc<W: AsyncWrite + Unpin + Send + 'static>(
         .map_err(|e| wire_error("session_denied", e.to_string()))?;
     let begin = connection
         .service
-        .begin_operation(&authorized.binding, expected, mutation_id)
+        .begin_operation(&authorized.binding, expected, mutation_id, None)
         .await?;
     let (operation_id, cancellation) = match begin {
         BeginOperation::Existing(operation) => {
@@ -1518,7 +1644,18 @@ async fn run_rpc<W: AsyncWrite + Unpin + Send + 'static>(
         emit_operation_update(connection, operation).await;
         return Err(error);
     }
-    let result = if method == "workspace.project_bootstrap" {
+    let result = if method == "workspace.configure_session_tools" {
+        let request: ConfigureSessionToolsReq = serde_json::from_value(params)
+            .map_err(|error| wire_error("invalid_tool_config", error.to_string()))?;
+        authorized
+            .workspace
+            .configure_session_tools(&request.session_id, request.tool_config)
+            .await
+            .and_then(|response| {
+                serde_json::to_value(response)
+                    .map_err(|error| wire_error("tool_definitions_encode_failed", error.to_string()))
+            })
+    } else if method == "workspace.project_bootstrap" {
         authorized
             .workspace
             .project_bootstrap(&authorized.binding.session_id)
@@ -1621,6 +1758,7 @@ async fn run_tool<W: AsyncWrite + Unpin + Send + 'static>(
     tool_name: String,
     args: serde_json::Value,
     mutation_id: Option<SshMutationId>,
+    read_cancellation: Option<CancellationToken>,
 ) -> Result<SshWorkerResponse, SshWireError> {
     let binding_id = invocation.binding_id.clone();
     let session_id = invocation.session_id.clone();
@@ -1655,7 +1793,7 @@ async fn run_tool<W: AsyncWrite + Unpin + Send + 'static>(
         .await?;
     let begin = connection
         .service
-        .begin_operation(&authorized.binding, expected, mutation_id)
+        .begin_operation(&authorized.binding, expected, mutation_id, read_cancellation)
         .await?;
     let (operation_id, cancellation) = match begin {
         BeginOperation::Existing(operation) => {
@@ -1865,7 +2003,13 @@ async fn run_tool<W: AsyncWrite + Unpin + Send + 'static>(
     let mut stream =
         toolset.call_streaming_with_context(&resolved_tool_name, args.clone(), context);
     let mut result = loop {
-        let item = std::future::poll_fn(|cx| stream.as_mut().poll_next(cx)).await;
+        let item = tokio::select! {
+            biased;
+            _ = cancellation.cancelled(), if expected == SshOperation::Read => {
+                break Err(wire_error("cancelled", "read tool call cancelled"));
+            }
+            item = std::future::poll_fn(|cx| stream.as_mut().poll_next(cx)) => item,
+        };
         match item {
             Some(ToolStreamItem::Progress(progress)) => {
                 let _ = connection
@@ -1891,6 +2035,9 @@ async fn run_tool<W: AsyncWrite + Unpin + Send + 'static>(
             }
         }
     };
+    // Read cancellation drops coordinator/terminal wait futures before hooks
+    // and the terminal reply. Mutations still require cooperative completion.
+    drop(stream);
     let mut post_hook = if let Ok(hook_authorized) = connection
         .service
         .authorize(&connection.accepted_bindings, &invocation, expected)
@@ -2806,6 +2953,7 @@ fn request_id(request: &SshWorkerRequest) -> &str {
         | SshWorkerRequest::Rpc { request_id, .. }
         | SshWorkerRequest::ToolCall { request_id, .. }
         | SshWorkerRequest::Cancel { request_id, .. }
+        | SshWorkerRequest::CancelRead { request_id, .. }
         | SshWorkerRequest::Operation { request_id, .. }
         | SshWorkerRequest::Mutation { request_id, .. }
         | SshWorkerRequest::Tasks { request_id, .. }
@@ -3632,6 +3780,7 @@ mod tests {
                 "binding-a".to_owned(),
                 "binding-b".to_owned(),
             ]))),
+            read_calls: Arc::new(Mutex::new(HashMap::new())),
             approvals: Arc::new(Mutex::new(HashMap::from([(
                 "approval".to_owned(),
                 PendingApproval {
@@ -3703,6 +3852,7 @@ mod tests {
             writer: Arc::new(Mutex::new(writer)),
             accepted_bindings: Arc::new(RwLock::new(HashSet::from([binding.id.clone()]))),
             approvals: Arc::new(Mutex::new(HashMap::new())),
+            read_calls: Arc::new(Mutex::new(HashMap::new())),
             revocation_only: true,
         };
         let denied = dispatch_request(
@@ -3773,6 +3923,195 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn ssh_worker_configure_session_tools_is_explicit_intersected_and_replaceable() {
+        use xai_grok_tools::registry::types::{ToolConfig, ToolServerConfig};
+        use xai_grok_tools::types::definition::ToolDefinition;
+        use xai_grok_workspace_client::ssh::{BoxSshStream, DenySshApprovals, SshWorkspaceClient};
+        use xai_grok_workspace_types::rpc::workspace::{
+            ConfigureSessionToolsReq, ConfigureSessionToolsResponse,
+        };
+
+        let temp = tempfile::tempdir().expect("create workspace root");
+        let fixture = temp.path().join("fixture.txt");
+        std::fs::write(&fixture, "configured through a renamed SSH tool")
+            .expect("write fixture");
+        let root = dunce::canonicalize(temp.path()).expect("canonical workspace root");
+        let mut binding = test_binding();
+        binding.root = root.to_string_lossy().into_owned();
+        binding.cwd = binding.root.clone();
+        binding.capabilities = xai_grok_workspace_types::ssh::SshCapabilities::read_only();
+
+        let service = SshWorkerService::new();
+        let (client_stream, worker_stream) = tokio::io::duplex(64 * 1024);
+        let server = tokio::spawn(serve_stream(Arc::clone(&service), worker_stream));
+        let client_stream: BoxSshStream = Box::pin(client_stream);
+        let client =
+            SshWorkspaceClient::connect(client_stream, binding.clone(), Arc::new(DenySshApprovals))
+                .await
+                .expect("connect worker");
+
+        let workspace = service
+            .workspace_for_root(root, false)
+            .await
+            .expect("worker workspace remains available");
+        let session = workspace
+            .handle
+            .session(&binding.session_id)
+            .expect("binding creates session");
+        assert!(
+            session.toolset().tool_definitions_builtins_only().is_empty(),
+            "a newly bound SSH session must not expose built-in tools before configuration"
+        );
+
+        let read = ToolConfig::from_id("GrokBuild:read_file")
+            .with_name("open_fixture")
+            .with_param_rename("target_file", "path");
+        let first: ConfigureSessionToolsResponse = client
+            .rpc(
+                test_invocation(&binding, "configure-first"),
+                &ConfigureSessionToolsReq {
+                    session_id: binding.session_id.clone(),
+                    tool_config: serde_json::to_value(ToolServerConfig {
+                        tools: vec![
+                            read,
+                            ToolConfig::from_id("GrokBuild:web_search"),
+                        ],
+                        behavior_preset: None,
+                    })
+                    .expect("serialize tool config"),
+                },
+                None,
+            )
+            .await
+            .expect("configure first SSH toolset");
+        assert_eq!(
+            first.unserved_tool_ids,
+            vec!["GrokBuild:web_search".to_owned()]
+        );
+        let first_definitions: Vec<ToolDefinition> =
+            serde_json::from_value(first.definitions).expect("decode first definitions");
+        assert_eq!(
+            first_definitions
+                .iter()
+                .map(|definition| definition.function.name.as_str())
+                .collect::<Vec<_>>(),
+            ["open_fixture"],
+            "only the worker-catalog intersection is advertised"
+        );
+
+        let result = client
+            .call_tool(
+                test_invocation(&binding, "renamed-read"),
+                "open_fixture",
+                serde_json::json!({"path": fixture}),
+                None,
+            )
+            .await
+            .expect("renamed tool and parameter dispatch on the worker");
+        assert!(
+            result
+                .value
+                .to_string()
+                .contains("configured through a renamed SSH tool"),
+            "worker dispatch must preserve the configured name and parameter rename"
+        );
+
+        let second: ConfigureSessionToolsResponse = client
+            .rpc(
+                test_invocation(&binding, "configure-second"),
+                &ConfigureSessionToolsReq {
+                    session_id: binding.session_id.clone(),
+                    tool_config: serde_json::to_value(ToolServerConfig {
+                        tools: vec![
+                            ToolConfig::from_id("GrokBuild:list_dir").with_name("list_remote"),
+                        ],
+                        behavior_preset: None,
+                    })
+                    .expect("serialize replacement tool config"),
+                },
+                None,
+            )
+            .await
+            .expect("replace SSH toolset");
+        assert!(second.unserved_tool_ids.is_empty());
+        let second_definitions: Vec<ToolDefinition> =
+            serde_json::from_value(second.definitions).expect("decode replacement definitions");
+        assert_eq!(
+            second_definitions
+                .iter()
+                .map(|definition| definition.function.name.as_str())
+                .collect::<Vec<_>>(),
+            ["list_remote"],
+            "replacement must revoke the prior built-in tool"
+        );
+        assert!(
+            client
+                .call_tool(
+                    test_invocation(&binding, "revoked-read"),
+                    "open_fixture",
+                    serde_json::json!({"path": fixture}),
+                    None,
+                )
+                .await
+                .is_err(),
+            "replacement must make the prior built-in undispatchable"
+        );
+        let mut spoofed_execute = ToolConfig::from_id("GrokBuild:run_terminal_cmd")
+            .with_name("spoofed_terminal")
+            .with_param("enabled_background", false);
+        spoofed_execute.kind = Some(xai_grok_tools::types::tool::ToolKind::Read);
+        let _: ConfigureSessionToolsResponse = client
+            .rpc(
+                test_invocation(&binding, "configure-spoofed-execute"),
+                &ConfigureSessionToolsReq {
+                    session_id: binding.session_id.clone(),
+                    tool_config: serde_json::to_value(ToolServerConfig {
+                        tools: vec![spoofed_execute],
+                        behavior_preset: None,
+                    })
+                    .expect("serialize spoofed execute tool"),
+                },
+                None,
+            )
+            .await
+            .expect("configure accepts a known tool regardless of an untrusted kind");
+        assert!(
+            client
+                .call_tool(
+                    test_invocation(&binding, "spoofed-execute"),
+                    "spoofed_terminal",
+                    serde_json::json!({"command": "printf should-not-run"}),
+                    None,
+                )
+                .await
+                .is_err(),
+            "worker must authorize the catalog tool kind, not the caller-supplied kind"
+        );
+
+        let legacy = client
+            .rpc_raw(
+                test_invocation(&binding, "legacy-update"),
+                "workspace.update_tool_config",
+                serde_json::json!({
+                    "caller_session_id": binding.session_id,
+                    "session_id": binding.session_id,
+                    "new_config": {"tools": [], "behavior_preset": null},
+                }),
+                None,
+            )
+            .await
+            .err()
+            .expect("legacy tool-config RPC cannot bypass the SSH catalog intersection");
+        assert!(
+            matches!(&legacy, SshClientError::Remote(error) if error.code == "ssh_tool_config_managed"),
+            "unexpected legacy update result: {legacy:?}"
+        );
+
+        drop(client);
+        server.abort();
+    }
+
+    #[tokio::test]
     async fn read_binding_creates_provider_free_workspace_session() {
         use xai_grok_workspace_client::ssh::{BoxSshStream, DenySshApprovals, SshWorkspaceClient};
 
@@ -3794,6 +4133,20 @@ mod tests {
             SshWorkspaceClient::connect(client_stream, binding.clone(), Arc::new(DenySshApprovals))
                 .await
                 .expect("a read-only SSH binding initializes local tools without Hub credentials");
+        let _: xai_grok_workspace_types::rpc::workspace::ConfigureSessionToolsResponse = client
+            .rpc(
+                test_invocation(&binding, "configure-provider-free-read"),
+                &xai_grok_workspace_types::rpc::workspace::ConfigureSessionToolsReq {
+                    session_id: binding.session_id.clone(),
+                    tool_config: serde_json::json!({
+                        "tools": [{"id": "GrokBuild:read_file"}],
+                        "behavior_preset": null,
+                    }),
+                },
+                None,
+            )
+            .await
+            .expect("configure read tool explicitly");
 
         let invocation = ResolvedSshInvocation {
             binding_id: binding.id.clone(),
@@ -4340,6 +4693,20 @@ mod tests {
             SshWorkspaceClient::connect(client_stream, binding.clone(), Arc::new(DenySshApprovals))
                 .await
                 .expect("connect execute-capable worker");
+        let _: xai_grok_workspace_types::rpc::workspace::ConfigureSessionToolsResponse = client
+            .rpc(
+                test_invocation(&binding, "configure-pre-post-read"),
+                &xai_grok_workspace_types::rpc::workspace::ConfigureSessionToolsReq {
+                    session_id: binding.session_id.clone(),
+                    tool_config: serde_json::json!({
+                        "tools": [{"id": "GrokBuild:read_file"}],
+                        "behavior_preset": null,
+                    }),
+                },
+                None,
+            )
+            .await
+            .expect("configure hook-tested read tool explicitly");
 
         let result = client
             .call_tool(
@@ -4453,6 +4820,18 @@ mod tests {
         }
     }
 
+    fn test_invocation(binding: &SshBinding, call_id: &str) -> ResolvedSshInvocation {
+        ResolvedSshInvocation {
+            binding_id: binding.id.clone(),
+            target_id: binding.target_id.clone(),
+            session_id: binding.session_id.clone(),
+            epoch: binding.epoch,
+            cwd: binding.cwd.clone(),
+            operation: SshOperation::Read,
+            call_id: call_id.to_owned(),
+        }
+    }
+
     #[tokio::test]
     async fn operation_lookup_rejects_known_cross_binding_operation() {
         let service = SshWorkerService::new();
@@ -4461,7 +4840,7 @@ mod tests {
         other.id = "other-binding".into();
         other.session_id = "other-session".into();
         let BeginOperation::Started { operation_id, .. } = service
-            .begin_operation(&owner, SshOperation::Read, None)
+            .begin_operation(&owner, SshOperation::Read, None, None)
             .await
             .expect("start operation")
         else {
@@ -4493,7 +4872,7 @@ mod tests {
         let first = async move {
             first_barrier.wait().await;
             first_service
-                .begin_operation(&first_binding, SshOperation::Write, Some("mutation".into()))
+                .begin_operation(&first_binding, SshOperation::Write, Some("mutation".into()), None)
                 .await
         };
         let second_service = Arc::clone(&service);
@@ -4501,7 +4880,7 @@ mod tests {
         let second = async move {
             second_barrier.wait().await;
             second_service
-                .begin_operation(&binding, SshOperation::Write, Some("mutation".into()))
+                .begin_operation(&binding, SshOperation::Write, Some("mutation".into()), None)
                 .await
         };
         let (first, second) = tokio::join!(first, second);

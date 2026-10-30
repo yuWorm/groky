@@ -1136,6 +1136,10 @@ impl WorkspaceHandle {
                 }
             }
         }
+        // A rebuild creates native tools only; retain live per-session MCP handlers.
+        if self.shared.hub_config.is_none() {
+            crate::mcp::reregister_local_qualified(session, new_toolset.as_ref()).await;
+        }
         session
             .replace_carrying_browser_service(Arc::new(effective), new_toolset)
             .await;

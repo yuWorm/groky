@@ -107,6 +107,10 @@ impl xai_tool_runtime::Tool for MonitorTool {
                 .map(|o| o.0.clone());
             (terminal, notif, cwd, session_folder, owner)
         };
+        let notification_handle = match ctx.extensions.get::<crate::notification::PerCallNotificationSink>() {
+            Some(sink) => ToolNotificationHandle::tee(vec![notification_handle, sink.0.clone()]),
+            None => notification_handle,
+        };
 
         // Output file lives in the session folder alongside bash terminal logs.
         let output_file = session_folder

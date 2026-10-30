@@ -235,7 +235,23 @@ impl SshWorkspaceClient {
                 "revocation-only worker hello unexpectedly admitted an active binding".into(),
             ));
         }
-        if hello.capabilities != SshWorkerCapabilities::complete() {
+        let mut capabilities = hello.capabilities;
+        if revocation_only {
+            // Revocation tombstones must still reach protocol-1 workers that
+            // predate explicit toolsets; this path cannot execute tools.
+            capabilities.configure_session_tools = true;
+            capabilities.cancel_read_calls = true;
+        } else if !capabilities.configure_session_tools {
+            return Err(SshClientError::Protocol(
+                "SSH worker is too old to configure session tools; reconnect to upgrade the managed worker, or update your custom worker command".into(),
+            ));
+        }
+        if !capabilities.cancel_read_calls {
+            return Err(SshClientError::Protocol(
+                "SSH worker is too old to cancel task waits; reconnect to upgrade the managed worker, or update your custom worker command".into(),
+            ));
+        }
+        if capabilities != SshWorkerCapabilities::complete() {
             return Err(SshClientError::Protocol(
                 "worker does not implement the required SSH workspace capabilities".into(),
             ));
@@ -428,6 +444,52 @@ impl SshWorkspaceClient {
         Ok(SshCallResult { operation, value })
     }
 
+    /// A read whose waiter is cancelled when the caller drops this future.
+    /// The frame is sent to completion before cancellation, so a dropped wait
+    /// cannot corrupt the multiplexed stream or cancel a later request.
+    pub async fn call_tool_cancellable(
+        &self,
+        invocation: ResolvedSshInvocation,
+        tool_name: &str,
+        args: Value,
+    ) -> Result<SshCallResult, SshClientError> {
+        if invocation.operation != xai_grok_workspace_types::ssh::SshOperation::Read {
+            return Err(SshClientError::Protocol("only reads support drop cancellation".into()));
+        }
+        let request_id = self.request_id();
+        let request = SshWorkerRequest::ToolCall {
+            request_id: request_id.clone(),
+            invocation,
+            tool_name: tool_name.to_owned(),
+            args,
+            mutation_id: None,
+        };
+        let (owner, abandoned) = oneshot::channel::<()>();
+        let client = self.clone();
+        let operation = tokio::spawn(async move {
+            let mut reply = client.send_request(request).await?;
+            tokio::select! {
+                reply = &mut reply => reply.map_err(|_| SshClientError::Closed)?,
+                _ = abandoned => {
+                    let cancellation = client.request(SshWorkerRequest::CancelRead {
+                        request_id: client.request_id(),
+                        waiting_request_id: request_id,
+                    }).await?;
+                    if !matches!(cancellation, SshWorkerResponse::ReadCancelled) {
+                        return Err(SshClientError::UnexpectedResponse);
+                    }
+                    reply.await.map_err(|_| SshClientError::Closed)?
+                }
+            }
+        });
+        let response = operation.await.map_err(|_| SshClientError::Closed)??;
+        drop(owner);
+        let SshWorkerResponse::Tool { operation, value } = response else {
+            return Err(SshClientError::UnexpectedResponse);
+        };
+        Ok(SshCallResult { operation, value })
+    }
+
     /// Find an operation retained by this worker without crossing binding/session authority.
     pub async fn operation(
         &self,
@@ -562,6 +624,13 @@ impl SshWorkspaceClient {
         &self,
         request: SshWorkerRequest,
     ) -> Result<SshWorkerResponse, SshClientError> {
+        self.send_request(request).await?.await.map_err(|_| SshClientError::Closed)?
+    }
+
+    async fn send_request(
+        &self,
+        request: SshWorkerRequest,
+    ) -> Result<oneshot::Receiver<Result<SshWorkerResponse, SshClientError>>, SshClientError> {
         let request_id = request_id(&request).to_owned();
         let (tx, rx) = oneshot::channel();
         {
@@ -582,11 +651,14 @@ impl SshWorkspaceClient {
             close_pending(&self.inner).await;
             return Err(error);
         }
-        rx.await.map_err(|_| SshClientError::Closed)?
+        Ok(rx)
     }
 }
 
 async fn read_loop(mut reader: SshReader, client: SshWorkspaceClient) {
+    // One dispatcher preserves wire order without blocking replies while an
+    // event callback awaits a request. Human approvals run independently.
+    let events = event_dispatcher(client.clone());
     loop {
         let frame = match read_frame(&mut reader).await {
             Ok(Some(frame)) => frame,
@@ -594,7 +666,9 @@ async fn read_loop(mut reader: SshReader, client: SshWorkspaceClient) {
         };
         match frame {
             SshWireFrame::Reply(reply) => deliver_reply(&client.inner, reply).await,
-            SshWireFrame::Event(event) => deliver_event(client.clone(), event),
+            SshWireFrame::Event(event) => {
+                let _ = events.send(event);
+            }
             SshWireFrame::ClientHello(_)
             | SshWireFrame::WorkerHello(_)
             | SshWireFrame::HandshakeError(_)
@@ -615,15 +689,29 @@ async fn deliver_reply(inner: &Inner, reply: SshWorkerReply) {
     let _ = sender.send(result);
 }
 
-fn deliver_event(client: SshWorkspaceClient, event: SshWorkerEvent) {
+fn event_dispatcher(
+    client: SshWorkspaceClient,
+) -> tokio::sync::mpsc::UnboundedSender<SshWorkerEvent> {
+    let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel::<SshWorkerEvent>();
     let callbacks = Arc::clone(&client.inner.callbacks);
     tokio::spawn(async move {
-        callbacks.on_event(event.clone()).await;
-        if let SshWorkerEvent::ApprovalRequired(request) = event {
-            let decision = callbacks.approve(request.clone()).await;
-            let _ = client.approve(&request, decision).await;
+        while let Some(event) = receiver.recv().await {
+            let approval = match &event {
+                SshWorkerEvent::ApprovalRequired(request) => Some(request.clone()),
+                _ => None,
+            };
+            callbacks.on_event(event).await;
+            if let Some(request) = approval {
+                let callbacks = Arc::clone(&callbacks);
+                let client = client.clone();
+                tokio::spawn(async move {
+                    let decision = callbacks.approve(request.clone()).await;
+                    let _ = client.approve(&request, decision).await;
+                });
+            }
         }
     });
+    sender
 }
 
 async fn close_pending(inner: &Inner) {
@@ -642,6 +730,7 @@ fn request_id(request: &SshWorkerRequest) -> &str {
         | SshWorkerRequest::Rpc { request_id, .. }
         | SshWorkerRequest::ToolCall { request_id, .. }
         | SshWorkerRequest::Cancel { request_id, .. }
+        | SshWorkerRequest::CancelRead { request_id, .. }
         | SshWorkerRequest::Operation { request_id, .. }
         | SshWorkerRequest::Mutation { request_id, .. }
         | SshWorkerRequest::Tasks { request_id, .. }
@@ -832,6 +921,53 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn worker_without_task_routing_capabilities_is_rejected_before_requests() {
+        for configure_session_tools in [false, true] {
+        let (stream, mut worker) = duplex(4096);
+        let binding = test_binding();
+        let worker_binding = binding.clone();
+        let worker_task = tokio::spawn(async move {
+            assert!(matches!(
+                read_frame(&mut worker).await.expect("read hello"),
+                Some(SshWireFrame::ClientHello(_))
+            ));
+            write_frame(
+                &mut worker,
+                &SshWireFrame::WorkerHello(SshWorkerHello {
+                    protocol_version: SSH_WIRE_PROTOCOL_VERSION,
+                    product_version: local_worker_build_info().product_version,
+                    worker_id: "legacy-worker".into(),
+                    os: std::env::consts::OS.into(),
+                    path_semantics: if cfg!(windows) {
+                        xai_grok_workspace_types::ssh_wire::SshPathSemantics::Windows
+                    } else {
+                        xai_grok_workspace_types::ssh_wire::SshPathSemantics::Posix
+                    },
+                    capabilities: SshWorkerCapabilities {
+                        configure_session_tools,
+                        cancel_read_calls: !configure_session_tools,
+                        ..SshWorkerCapabilities::complete()
+                    },
+                    root: worker_binding.root.clone(),
+                    binding: worker_binding,
+                    resume_token: "resume".into(),
+                }),
+            )
+            .await
+            .expect("write legacy hello");
+            assert!(read_frame(&mut worker).await.expect("read disconnect").is_none());
+        });
+        let error = SshWorkspaceClient::connect(
+            Box::pin(stream), binding, Arc::new(DenySshApprovals),
+        )
+        .await
+        .expect_err("legacy worker must never admit a normal session");
+        assert!(matches!(error, SshClientError::Protocol(_)));
+        worker_task.await.expect("worker task");
+        }
+    }
+
+    #[tokio::test]
     async fn revocation_tombstone_works_with_a_protocol_one_worker() {
         use tokio::io::AsyncReadExt;
 
@@ -870,7 +1006,11 @@ mod tests {
                     } else {
                         xai_grok_workspace_types::ssh_wire::SshPathSemantics::Posix
                     },
-                    capabilities: SshWorkerCapabilities::complete(),
+                    capabilities: SshWorkerCapabilities {
+                        configure_session_tools: false,
+                        cancel_read_calls: false,
+                        ..SshWorkerCapabilities::complete()
+                    },
                     root: worker_binding.root.clone(),
                     binding: worker_binding.clone(),
                     resume_token: "resume".into(),
@@ -908,6 +1048,98 @@ mod tests {
         assert_eq!(acknowledged.binding_id, binding.id);
         assert_eq!(acknowledged.epoch, binding.epoch);
         worker_task.await.expect("worker task");
+    }
+
+    #[tokio::test]
+    async fn event_callbacks_preserve_order_without_blocking_replies_or_on_approval() {
+        struct Callbacks {
+            entered: tokio::sync::Notify,
+            release: tokio::sync::Semaphore,
+            approve: tokio::sync::Semaphore,
+            delivered: tokio::sync::mpsc::UnboundedSender<u64>,
+        }
+        #[async_trait]
+        impl SshClientCallbacks for Callbacks {
+            async fn on_event(&self, event: SshWorkerEvent) {
+                if let SshWorkerEvent::ToolNotification { notification, .. } = event {
+                    let sequence = notification.as_u64().unwrap();
+                    if sequence == 1 {
+                        self.entered.notify_one();
+                        self.release.acquire().await.unwrap().forget();
+                    }
+                    self.delivered.send(sequence).unwrap();
+                }
+            }
+            async fn approve(&self, _: SshApprovalRequest) -> SshApprovalDecision {
+                self.approve.acquire().await.unwrap().forget();
+                SshApprovalDecision::Approve
+            }
+        }
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            let (stream, mut worker) = duplex(8192);
+            let binding = test_binding();
+            let worker_binding = binding.clone();
+            let server = tokio::spawn(async move {
+                assert!(matches!(read_frame(&mut worker).await.unwrap(), Some(SshWireFrame::ClientHello(_))));
+                write_frame(&mut worker, &SshWireFrame::WorkerHello(SshWorkerHello {
+                    protocol_version: SSH_WIRE_PROTOCOL_VERSION,
+                    product_version: local_worker_build_info().product_version,
+                    worker_id: "worker".into(),
+                    os: std::env::consts::OS.into(),
+                    path_semantics: if cfg!(windows) {
+                        xai_grok_workspace_types::ssh_wire::SshPathSemantics::Windows
+                    } else {
+                        xai_grok_workspace_types::ssh_wire::SshPathSemantics::Posix
+                    },
+                    capabilities: SshWorkerCapabilities::complete(),
+                    root: worker_binding.root.clone(),
+                    binding: worker_binding.clone(),
+                    resume_token: "resume".into(),
+                })).await.unwrap();
+                write_frame(&mut worker, &SshWireFrame::Event(SshWorkerEvent::ApprovalRequired(SshApprovalRequest {
+                    approval_id: "approval".into(),
+                    operation_id: "operation".into(),
+                    binding_id: worker_binding.id,
+                    session_id: worker_binding.session_id,
+                    operation: xai_grok_workspace_types::ssh::SshOperation::Execute,
+                    title: "approve command".into(),
+                    detail: Value::Null,
+                }))).await.unwrap();
+                for sequence in [1, 2] {
+                    write_frame(&mut worker, &SshWireFrame::Event(SshWorkerEvent::ToolNotification {
+                        operation_id: "operation".into(), notification: serde_json::json!(sequence),
+                    })).await.unwrap();
+                }
+                let Some(SshWireFrame::Request(SshWorkerRequest::Ping { request_id })) =
+                    read_frame(&mut worker).await.unwrap() else { panic!("expected ping") };
+                write_frame(&mut worker, &SshWireFrame::Reply(SshWorkerReply {
+                    request_id, result: Ok(SshWorkerResponse::Pong),
+                })).await.unwrap();
+                let Some(SshWireFrame::Request(SshWorkerRequest::Approval { request_id, decision, .. })) =
+                    read_frame(&mut worker).await.unwrap() else { panic!("expected approval") };
+                assert_eq!(decision, SshApprovalDecision::Approve);
+                write_frame(&mut worker, &SshWireFrame::Reply(SshWorkerReply {
+                    request_id, result: Ok(SshWorkerResponse::ApprovalRecorded),
+                })).await.unwrap();
+            });
+            let (delivered, mut received) = tokio::sync::mpsc::unbounded_channel();
+            let callbacks = Arc::new(Callbacks {
+                entered: tokio::sync::Notify::new(),
+                release: tokio::sync::Semaphore::new(0),
+                approve: tokio::sync::Semaphore::new(0),
+                delivered,
+            });
+            let client = SshWorkspaceClient::connect(Box::pin(stream), binding, callbacks.clone()).await.unwrap();
+            callbacks.entered.notified().await;
+            assert!(matches!(client.request(SshWorkerRequest::Ping {
+                request_id: "during-callback".into(),
+            }).await.unwrap(), SshWorkerResponse::Pong));
+            callbacks.release.add_permits(1);
+            assert_eq!(received.recv().await, Some(1));
+            assert_eq!(received.recv().await, Some(2));
+            callbacks.approve.add_permits(1);
+            server.await.unwrap();
+        }).await.expect("callbacks must not deadlock replies or wait on human approval");
     }
 
     #[tokio::test]

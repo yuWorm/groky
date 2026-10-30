@@ -842,7 +842,10 @@ impl AgentBuilder {
                 .any(|tc| tc.id.ends_with(":write") || tc.id.ends_with(":Write"));
             let known_kinds = tool_bridge_builder.known_tool_kinds();
             let has_edit_tool = tool_config.tools.iter().any(|tc| {
-                tc.kind.or_else(|| known_kinds.get(&tc.id).copied()) == Some(ToolKind::Edit)
+                // An explicitly targeted SSH edit is not a workspace editor.
+                // It must not grant an otherwise read-only agent a native write tool.
+                !tc.id.starts_with("GrokBuild:ssh_")
+                    && tc.kind.or_else(|| known_kinds.get(&tc.id).copied()) == Some(ToolKind::Edit)
             });
             if self.write_file_enabled && !has_write_tool && has_edit_tool {
                 tool_config

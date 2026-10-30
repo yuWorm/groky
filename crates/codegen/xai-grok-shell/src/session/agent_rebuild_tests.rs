@@ -1,5 +1,9 @@
 use super::*;
 
+#[cfg(unix)]
+#[path = "ssh_task_routing_tests.rs"]
+mod ssh_task_routing_tests;
+
 use xai_grok_tools::implementations::grok_build::task::backend::SubagentBackend;
 use xai_grok_tools::implementations::grok_build::task::coordinator::{
     ChildCompletion, ChildControl, ChildRunOutput, ChildRunRequest, ChildRunner, SendBoxFuture,
@@ -9,6 +13,20 @@ use xai_grok_tools::implementations::grok_build::task::types::{
     AgentMessageSenderResource, SubagentDescribeOutcome, SubagentOwner, SubagentRequest,
     SubagentValidateTypeOutcome,
 };
+#[cfg(unix)]
+use std::collections::BTreeSet;
+#[cfg(unix)]
+use xai_grok_tools::implementations::grok_build::task::types::{SubagentEvent, SubagentResult};
+#[cfg(unix)]
+use xai_grok_tools::registry::types::ToolConfig;
+#[cfg(unix)]
+use xai_grok_workspace::ssh_worker::{SshWorkerService, serve_stream};
+#[cfg(unix)]
+use xai_grok_workspace_client::ssh::{SshClientCallbacks, SshWorkspaceClient};
+#[cfg(unix)]
+use xai_grok_workspace_types::ssh::{SshBinding, SshCapabilities, SshHostIdentity};
+#[cfg(unix)]
+use xai_grok_workspace_types::ssh_wire::{SshApprovalDecision, SshApprovalRequest};
 use xai_grok_tools::types::tool::ToolKind;
 
 struct SenderProbeRunner(tokio::sync::mpsc::UnboundedSender<Option<AgentMessageSender>>);
@@ -205,6 +223,358 @@ async fn child_rebuild_message_authority_respects_grant_workflow_and_capability_
                 true,
             );
             assert_no_child_messaging(&child_agent(definition, Some(sender), true).await).await;
+        })
+        .await;
+}
+
+#[cfg(unix)]
+struct ApproveSshRequests;
+
+#[cfg(unix)]
+#[async_trait::async_trait]
+impl SshClientCallbacks for ApproveSshRequests {
+    async fn approve(&self, _: SshApprovalRequest) -> SshApprovalDecision {
+        SshApprovalDecision::Approve
+    }
+}
+
+#[cfg(unix)]
+struct SshBridgeFixture {
+    local_root: tempfile::TempDir,
+    _remote_root: tempfile::TempDir,
+    remote_cwd: String,
+    workspace: xai_grok_workspace::WorkspaceOps,
+    server: tokio::task::JoinHandle<anyhow::Result<()>>,
+}
+
+#[cfg(unix)]
+impl Drop for SshBridgeFixture {
+    fn drop(&mut self) {
+        self.server.abort();
+    }
+}
+
+#[cfg(unix)]
+async fn ssh_bridge_fixture() -> SshBridgeFixture {
+    ssh_bridge_fixture_with_callbacks(Arc::new(ApproveSshRequests)).await
+}
+
+#[cfg(unix)]
+async fn ssh_bridge_fixture_with_callbacks(callbacks: Arc<dyn SshClientCallbacks>) -> SshBridgeFixture {
+    let local_root = tempfile::tempdir().expect("local workspace");
+    let remote_root = tempfile::tempdir().expect("remote workspace");
+    std::fs::write(local_root.path().join("fixture.txt"), "local fixture\n")
+        .expect("write local fixture");
+    std::fs::write(remote_root.path().join("fixture.txt"), "remote fixture\n")
+        .expect("write remote fixture");
+    let remote_cwd = dunce::canonicalize(remote_root.path())
+        .expect("canonical remote root")
+        .to_string_lossy()
+        .into_owned();
+    let binding = SshBinding {
+        id: "ssh-rebuild-test-binding".into(),
+        session_id: format!("ssh-rebuild-{}", uuid::Uuid::now_v7()),
+        target_id: "ssh-rebuild-test-target".into(),
+        identity: SshHostIdentity {
+            hostname: "test-host".into(),
+            port: 22,
+            username: "test-user".into(),
+            fingerprint: "test-fingerprint".into(),
+        },
+        root: remote_cwd.clone(),
+        cwd: remote_cwd.clone(),
+        capabilities: SshCapabilities::all(),
+        epoch: 1,
+        revoked: false,
+    };
+    let (client_stream, worker_stream) = tokio::io::duplex(64 * 1024);
+    let server = tokio::spawn(serve_stream(SshWorkerService::for_test(), worker_stream));
+    let client = SshWorkspaceClient::connect(
+        Box::pin(client_stream),
+        binding,
+        callbacks,
+    )
+    .await
+    .expect("connect SSH worker");
+    SshBridgeFixture {
+        local_root,
+        _remote_root: remote_root,
+        remote_cwd,
+        workspace: xai_grok_workspace::WorkspaceOps::ssh(client),
+        server,
+    }
+}
+
+#[cfg(unix)]
+fn ssh_rebuild_spec(
+    fixture: &SshBridgeFixture,
+    subagent_event_tx: Option<tokio::sync::mpsc::UnboundedSender<SubagentEvent>>,
+) -> Arc<AgentRebuildSpec> {
+    let mut spec = test_rebuild_spec_default();
+    let fields = Arc::get_mut(&mut spec).expect("new rebuild spec has one owner");
+    fields.working_directory = fixture.local_root.path().to_path_buf();
+    fields.bridge_state_path = fixture.local_root.path().join("tool-state.json");
+    fields.ssh_workspace = Some(fixture.workspace.clone());
+    fields.subagents_enabled = subagent_event_tx.is_some();
+    fields.subagent_event_tx = subagent_event_tx;
+    spec
+}
+
+#[cfg(unix)]
+async fn build_delegated_ssh_agent(
+    spec: &Arc<AgentRebuildSpec>,
+    fixture: &SshBridgeFixture,
+    definition: AgentDefinition,
+) -> Agent {
+    let agent = spec
+        .build_agent(
+            definition,
+            xai_grok_agent::DEFAULT_SYSTEM_PROMPT_LABEL,
+        )
+        .await
+        .expect("build SSH project agent");
+    fixture
+        .workspace
+        .register_remote_tools(agent.tool_bridge())
+        .await
+        .expect("delegate remote SSH tools");
+    agent
+}
+
+#[cfg(unix)]
+async fn respond_to_local_subagent_events(
+    mut events: tokio::sync::mpsc::UnboundedReceiver<SubagentEvent>,
+) {
+    while let Some(event) = events.recv().await {
+        match event {
+            SubagentEvent::ValidateType(request) => {
+                let _ = request.respond_to.send(SubagentValidateTypeOutcome::Ok);
+            }
+            SubagentEvent::Spawn(request) => {
+                let _ = request.respond_with(|request| SubagentResult {
+                    success: true,
+                    output: Arc::from("local subagent completed"),
+                    subagent_id: request.id.clone(),
+                    child_session_id: request.id.clone(),
+                    subagent_type: request.subagent_type.clone(),
+                    ..Default::default()
+                });
+            }
+            _ => {}
+        }
+    }
+}
+
+#[cfg(unix)]
+async fn assert_local_spawn_subagent(agent: &Agent, call_id: &str) {
+    let bridge = agent.tool_bridge();
+    for id in ["GrokBuild:ssh_read", "GrokBuild:ssh_edit", "GrokBuild:ssh_run"] {
+        assert!(
+            bridge.tool_for_registry_id(id).is_some(),
+            "explicit SSH tools must retain their local SessionSsh implementation: {id}"
+        );
+    }
+    assert!(
+        bridge
+            .read_resource::<
+                xai_grok_tools::implementations::grok_build::task::backend::SubagentBackendResource,
+            >()
+            .await
+            .is_some(),
+        "the local Task tool must retain its real subagent backend resource"
+    );
+    let task_name = bridge
+        .tool_for_kind(ToolKind::Task)
+        .await
+        .expect("spawn_subagent remains a local tool");
+    let result = bridge
+        .call(
+            &task_name,
+            serde_json::json!({
+                "description": "verify local Task ownership",
+                "prompt": "Reply with the fixture marker.",
+                "subagent_type": "explore",
+                "background": false,
+            }),
+            call_id,
+        )
+        .await
+        .expect("local spawn_subagent call");
+    match result.output {
+        xai_grok_tools::types::output::ToolOutput::SubagentCompleted(result) => {
+            assert_eq!(result.output, "local subagent completed");
+        }
+        other => panic!("expected local subagent completion, got {other:?}"),
+    }
+}
+
+#[cfg(unix)]
+fn definition_with_renamed_read() -> AgentDefinition {
+    let mut definition = AgentDefinition::default_grok_build();
+    let read = definition
+        .tool_config
+        .tools
+        .iter_mut()
+        .find(|tool| tool.kind == Some(ToolKind::Read))
+        .expect("default agent has a read tool");
+    *read = read
+        .clone()
+        .with_name("remote_read_file")
+        .with_param_rename("target_file", "remote_path");
+    definition
+}
+
+#[cfg(unix)]
+async fn assert_remote_dispatch(agent: &Agent, fixture: &SshBridgeFixture, call_suffix: &str) {
+    let bridge = agent.tool_bridge();
+    let read = bridge
+        .call(
+            "remote_read_file",
+            serde_json::json!({"remote_path": "fixture.txt"}),
+            &format!("ssh-read-{call_suffix}"),
+        )
+        .await
+        .expect("renamed read dispatches to SSH worker");
+    assert!(
+        read.prompt_text.contains("remote fixture"),
+        "expected remote file content, got:\n{}",
+        read.prompt_text
+    );
+    assert!(
+        !read.prompt_text.contains("local fixture"),
+        "read must not fall back to the local filesystem: {}",
+        read.prompt_text
+    );
+    let command = bridge
+        .call(
+            "run_terminal_command",
+            serde_json::json!({"command": "pwd", "description": "Verify remote working directory"}),
+            &format!("ssh-command-{call_suffix}"),
+        )
+        .await
+        .expect("run_terminal_command dispatches to SSH worker");
+    assert!(
+        command.prompt_text.contains(&fixture.remote_cwd),
+        "expected worker cwd {}, got:\n{}",
+        fixture.remote_cwd,
+        command.prompt_text
+    );
+    assert!(
+        !command
+            .prompt_text
+            .contains(&fixture.local_root.path().display().to_string()),
+        "command must not execute in local cwd: {}",
+        command.prompt_text
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "current_thread")]
+async fn ssh_project_rebuild_preserves_local_subagent_and_remote_dispatch() {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let fixture = ssh_bridge_fixture().await;
+            let (subagent_event_tx, subagent_events) = tokio::sync::mpsc::unbounded_channel();
+            let responder =
+                tokio::task::spawn_local(respond_to_local_subagent_events(subagent_events));
+            let spec = ssh_rebuild_spec(&fixture, Some(subagent_event_tx));
+            let definition = definition_with_renamed_read();
+
+            let first =
+                build_delegated_ssh_agent(&spec, &fixture, definition.clone()).await;
+            assert_local_spawn_subagent(&first, "ssh-local-subagent-first").await;
+            assert_remote_dispatch(&first, &fixture, "first").await;
+
+            let rebuilt = build_delegated_ssh_agent(&spec, &fixture, definition).await;
+            assert_local_spawn_subagent(&rebuilt, "ssh-local-subagent-rebuilt").await;
+            assert_remote_dispatch(&rebuilt, &fixture, "rebuilt").await;
+            responder.abort();
+        })
+        .await;
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "current_thread")]
+async fn ssh_project_unserved_remote_tool_is_removed_without_local_fallback() {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let fixture = ssh_bridge_fixture().await;
+            let spec = ssh_rebuild_spec(&fixture, None);
+            let mut definition = AgentDefinition::default_grok_build();
+            // No dependent tools: isolate worker rejection from finalization.
+            definition.tool_config.tools = vec![
+                ToolConfig::for_tool::<
+                    xai_grok_tools::implementations::grok_build_concise::ReadFileConciseTool,
+                >()
+                .with_name("unsupported_remote_read"),
+            ];
+            let agent = build_delegated_ssh_agent(&spec, &fixture, definition).await;
+            let bridge = agent.tool_bridge();
+            assert!(
+                bridge
+                    .tool_definitions()
+                    .await
+                    .iter()
+                    .all(|definition| definition.function.name != "unsupported_remote_read"),
+                "worker-rejected remote tool must not survive as a local fallback"
+            );
+            assert!(
+                bridge
+                    .call(
+                        "unsupported_remote_read",
+                        serde_json::json!({"target_file": "fixture.txt"}),
+                        "ssh-unserved-read",
+                    )
+                    .await
+                    .is_err(),
+                "worker-rejected remote tool must be absent from the bridge"
+            );
+        })
+        .await;
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "current_thread")]
+async fn ssh_explore_child_configures_only_read_only_worker_tools() {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let fixture = ssh_bridge_fixture().await;
+            // Use the production built-in without discovering user-home overrides.
+            let mut definition = AgentDefinition::explore();
+            xai_grok_subagent_resolution::apply_harness_toolset(
+                "explore",
+                &xai_grok_subagent_resolution::HarnessToolsetContext {
+                    harness_override: None,
+                    parent_agent_name: None,
+                    parent_model_agent_type: None,
+                    file_tool_overrides: None,
+                },
+                &mut definition,
+            );
+            xai_grok_subagent_resolution::apply_child_tool_policy(&mut definition, None, false);
+
+            let mut spec = ssh_rebuild_spec(&fixture, None);
+            Arc::get_mut(&mut spec)
+                .expect("unique child spec")
+                .prompt_audience = PromptAudience::Subagent;
+            let _agent = build_delegated_ssh_agent(&spec, &fixture, definition).await;
+            let remote_names = fixture
+                .workspace
+                .remote_tool_definitions()
+                .await
+                .expect("inspect configured SSH worker toolset")
+                .into_iter()
+                .map(|definition| definition.function.name)
+                .collect::<BTreeSet<_>>();
+            assert_eq!(
+                remote_names,
+                BTreeSet::from([
+                    "grep".to_string(),
+                    "list_dir".to_string(),
+                    "read_file".to_string(),
+                ]),
+                "the actual explore child worker toolset must exclude write and execute tools"
+            );
         })
         .await;
 }

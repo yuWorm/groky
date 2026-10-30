@@ -1835,6 +1835,9 @@ pub(super) fn apply_ssh_control_event(
 ) -> Vec<Effect> {
     let client_id = app.ssh_client_id;
     let event_targets_this_client = match &event {
+        xai_grok_shell::ssh::SshEvent::OperationApproval(approval) => {
+            approval.client_id == client_id
+        }
         xai_grok_shell::ssh::SshEvent::GrantRequested(request) => {
             request.client_id == Some(client_id)
         }
@@ -2002,6 +2005,25 @@ pub(super) fn apply_ssh_control_event(
         xai_grok_shell::ssh::SshEvent::Worker(worker) => Some(worker.session_id.clone()),
     };
     let manager_session_id = match &event {
+        xai_grok_shell::ssh::SshEvent::OperationApproval(
+            xai_grok_shell::ssh::SshOperationApproval { session_id, .. },
+        )
+        | xai_grok_shell::ssh::SshEvent::OperationApprovalExpired { session_id, .. } => {
+            // A child has no top-level SSH manager. Present consent on its
+            // owning parent; the original approval ID still selects the
+            // child's binding/epoch in the host's approval waiter.
+            let is_root = app.agents.values().any(|agent| {
+                agent.session.session_id.as_ref()
+                    .is_some_and(|id| id.0.as_ref() == session_id)
+            });
+            let parent = (!is_root).then(|| {
+                app.agents.values()
+                    .find(|agent| agent.subagent_views.contains_key(session_id.as_str()))
+                    .and_then(|agent| agent.session.session_id.as_ref())
+                    .map(|id| id.0.as_ref())
+            }).flatten();
+            Some(parent.unwrap_or(session_id).to_owned())
+        }
         xai_grok_shell::ssh::SshEvent::GrantRequested(request) => {
             worktree_source_session_for_grant(app, request, client_id)
                 .or_else(|| event_session_id.clone())
@@ -2186,7 +2208,7 @@ pub(super) fn apply_ssh_control_event(
             }
             xai_grok_shell::ssh::SshEvent::OperationApproval(approval) => {
                 if approval.client_id == client_id
-                    && manager.session_id.as_deref() == Some(approval.session_id.as_str())
+                    && manager.session_id.as_deref() == manager_session_id.as_deref()
                 {
                     let (target_label, target_identity) =
                         operation_approval_target(&approval.detail, &approval.binding_id, manager);
@@ -2207,11 +2229,11 @@ pub(super) fn apply_ssh_control_event(
             }
             xai_grok_shell::ssh::SshEvent::OperationApprovalExpired {
                 client_id: event_client_id,
-                session_id: expired_session_id,
+                session_id: _,
                 approval_id,
             } => {
                 if event_client_id == client_id
-                    && manager.session_id.as_deref() == Some(expired_session_id.as_str())
+                    && manager.session_id.as_deref() == manager_session_id.as_deref()
                 {
                     manager.expire_operation_approval(&approval_id);
                 }

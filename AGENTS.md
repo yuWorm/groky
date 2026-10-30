@@ -32,3 +32,8 @@ Next groky version after `v0.1.32`.
 - **Imported sessions** render tool history as native cards: commands with output and exit code, file reads, and per-file diffs (including Codex/OpenCode `apply_patch`, omp hashline edits, and Codex code-mode scripts) for Claude Code, Codex, omp, pi and OpenCode. Codex environment/AGENTS.md preambles no longer show as user messages.
 - **`/import-session`** and **`groky sessions import`** can import upstream grok CLI sessions (`--from grok`), copied as-is under a new ID.
 - **Session import** finds omp sessions in large stores (previously none were listed) and Codex sessions whose first 64 KB ends mid-character; never-used Codex sessions are hidden.
+- **SSH projects** can spawn foreground subagents again; session and orchestration tools stay local while explicitly delegated workspace tools run on the worker.
+- **SSH subagents** retain their own workspace tool restrictions; read-only explore agents no longer inherit the worker's write and command tools.
+- **SSH task controls** query, wait for, and cancel local background subagents alongside remote commands. Mixed waits honor any/all, and ending a wait leaves the underlying tasks running.
+- **SSH monitors** stream remote events back into the owning session and wake the agent while it is idle. Watcher status and natural completion reach the TUI; explicitly stopping a monitor does not trigger another completion wake.
+- **SSH subagents** show remote-operation approvals in their parent session, avoiding invisible five-minute approval waits.

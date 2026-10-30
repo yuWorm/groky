@@ -187,6 +187,18 @@ impl xai_tool_runtime::Tool for KillTaskTool {
     ) -> Result<KillTaskOutput, xai_tool_runtime::ToolError> {
         use crate::types::tool_metadata::shared_resources;
         let resources = shared_resources(&ctx)?;
+        let remote = resources
+            .lock()
+            .await
+            .get::<crate::implementations::grok_build::task_output::routed::RemoteTaskExecutorResource>()
+            .cloned();
+        if let Some(remote) = remote {
+            return crate::implementations::grok_build::task_output::routed::kill(
+                &remote, ctx, input,
+            )
+            .await;
+        }
+
 
         let is_legacy = crate::versions::is_legacy_contract(
             crate::types::tool_metadata::behavior_version(&ctx).as_deref(),

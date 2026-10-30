@@ -52,7 +52,7 @@ fn assert_emit_background_tasks_snapshot(cmd_rx: &mut mpsc::UnboundedReceiver<Se
 }
 
 #[allow(clippy::type_complexity)]
-fn make_test_config_full() -> (
+pub(crate) fn make_test_config_full() -> (
     NotificationBridgeConfig,
     mpsc::UnboundedReceiver<xai_acp_lib::AcpClientMessage>,
     mpsc::UnboundedReceiver<PersistenceMsg>,

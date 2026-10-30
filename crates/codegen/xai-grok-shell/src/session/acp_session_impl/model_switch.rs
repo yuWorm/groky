@@ -342,11 +342,14 @@ impl SessionActor {
         }
         let new_agent_name = definition.name.clone();
         let previous_mcp_servers = self.agent.borrow().definition().mcp_servers.clone();
-        let ssh_resource = if self.workspace_ops.is_ssh() {
+        let (ssh_resource, ssh_notifications) = if self.workspace_ops.is_ssh() {
             let bridge = self.agent.borrow().tool_bridge().clone();
-            bridge.read_resource::<crate::ssh::SessionSshResource>().await
+            (
+                bridge.read_resource::<crate::ssh::SessionSshResource>().await,
+                bridge.read_resource::<crate::ssh::RemoteNotifications>().await,
+            )
         } else {
-            None
+            (None, None)
         };
         tracing::info!(
             session_id = %self.session_info.id.0,
@@ -379,6 +382,9 @@ impl SessionActor {
                 })?;
             if let Some(resource) = ssh_resource {
                 new_bridge.update_resource(resource).await;
+            }
+            if let Some(notifications) = ssh_notifications {
+                new_bridge.update_resource(notifications).await;
             }
         }
         let new_system_prompt = new_agent.system_prompt().to_string();

@@ -733,7 +733,7 @@ pub(crate) async fn spawn_session_actor(
     let task_output_tool_name = Arc::new(std::sync::OnceLock::new());
     let read_tool_name = Arc::new(std::sync::OnceLock::new());
     let queue_exit_reminder_on_approved_exit = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let emit_local_background_tasks = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let emit_local_background_tasks = Arc::new(std::sync::atomic::AtomicBool::new(!workspace_ops.is_ssh()));
     let background_tasks_snapshot_pending = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let tools_notification_handle = crate::tools::notification_bridge::spawn_notification_bridge(
         crate::tools::notification_bridge::NotificationBridgeConfig {

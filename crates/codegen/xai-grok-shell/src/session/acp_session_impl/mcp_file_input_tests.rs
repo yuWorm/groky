@@ -2,7 +2,6 @@ use super::*;
 use crate::session::acp_session::{
     sampler_turn::call_with_auth_retry,
     support::{create_test_actor, prepare_call, test_agent_with_tools},
-    tool_dispatch::dispatch_tool,
 };
 use serde_json::json;
 use std::sync::{
@@ -236,7 +235,7 @@ async fn concatenated_inline_recovers_first_object_without_rewriting_authored_ar
                 assert_eq!(authored, prepared.raw_arguments);
                 assert_eq!(&first, prepared.execution_arguments());
                 assert!(prepared.mcp_file.is_none());
-                dispatch_tool(&actor.workspace_ops, &prepared, &actor.session_id_string())
+                actor.dispatch_tool(&prepared)
                     .await
                     .unwrap();
             }
@@ -1227,9 +1226,8 @@ async fn real_auth_retry_uses_one_read_and_post_hook_snapshot() {
             assert_eq!(&rewritten, prepared.execution_arguments());
             assert_eq!(&rewritten, prepared.hook_arguments().as_ref());
             assert!(!format!("{:?}", prepared.mcp_file.as_ref().unwrap()).contains("rewritten"));
-            let session = actor.session_id_string();
             let result = call_with_auth_retry(Some(&auth), None, &prepared.tool_name, || {
-                dispatch_tool(&actor.workspace_ops, &prepared, &session)
+                actor.dispatch_tool(&prepared)
             })
             .await
             .unwrap();

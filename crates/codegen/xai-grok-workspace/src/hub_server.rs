@@ -102,6 +102,7 @@ pub fn workspace_rpc_operation(method: &str) -> xai_grok_workspace_types::ssh::S
             | "workspace.git_status"
             | "workspace.git_branch_info"
             | "workspace.tool_definitions"
+            | "workspace.configure_session_tools"
             | "workspace.list_background_tasks"
             | "workspace.tasks_snapshot"
             | "workspace.list_todos"

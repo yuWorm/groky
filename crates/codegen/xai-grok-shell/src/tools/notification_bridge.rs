@@ -819,4 +819,4 @@ async fn handle_notification(
 }
 #[cfg(test)]
 #[path = "notification_bridge_tests.rs"]
-mod tests;
+pub(crate) mod tests;

@@ -189,6 +189,7 @@ struct SessionSshInner {
     sudo_gates: Mutex<HashMap<String, PendingSudoGate>>,
     worker_install_waiters: Mutex<HashMap<String, PendingWorkerInstall>>,
     session_event_sinks: Mutex<HashMap<String, broadcast::Sender<SshSessionWorkerEvent>>>,
+    tool_notifications: super::notifications::NotificationTargets,
     grant_waiters: StdMutex<HashMap<String, PendingToolGrant>>,
     approval_waiters: Mutex<HashMap<String, PendingOperationApproval>>,
     approval_generation: AtomicU64,
@@ -664,6 +665,7 @@ impl SessionSsh {
                 sudo_auth_waiters: Mutex::new(HashMap::new()),
                 sudo_gates: Mutex::new(HashMap::new()),
                 session_event_sinks: Mutex::new(HashMap::new()),
+                tool_notifications: Default::default(),
                 grant_waiters: StdMutex::new(HashMap::new()),
                 approval_waiters: Mutex::new(HashMap::new()),
                 approval_generation: AtomicU64::new(0),
@@ -870,6 +872,20 @@ impl SessionSsh {
         };
         sender.subscribe()
     }
+
+    /// Install the live task sink before exposing this SSH project's tools.
+    /// Its resource is retained across bridge rebuilds and released on teardown.
+    pub(crate) async fn attach_project_notifications(
+        &self,
+        bridge: &xai_grok_tools::bridge::ToolBridge,
+        workspace: &xai_grok_workspace::WorkspaceOps,
+    ) -> Result<(), SshServiceError> {
+        let client = workspace.ssh_client().ok_or_else(|| {
+            SshServiceError::Worker("task notification relay requires an SSH workspace".into())
+        })?;
+        self.inner.tool_notifications.attach(bridge, &client.binding().await).await
+    }
+
     /// Registers the exact location that owns this session. The location is
     /// never inferred from a host, cwd, or repository configuration.
     pub async fn register_project_location(
@@ -1916,6 +1932,7 @@ impl SessionSsh {
 
     /// Removes all nonpersistent approval state for a terminal session close.
     pub async fn clear_session_interactions(&self, session_id: &str) {
+        self.inner.tool_notifications.forget(session_id);
         expire_operation_approvals(&self.inner, |_, waiter| {
             waiter.binding.session_id.as_str() == session_id
         })
@@ -4701,6 +4718,12 @@ impl SshClientCallbacks for WorkerCallbacks {
         let Some(service) = self.service.upgrade() else {
             return;
         };
+        if let SshWorkerEvent::ToolNotification { notification, .. } = &event
+            && service.target_config_epoch.load(Ordering::Acquire) == self.target_epoch
+            && binding_is_live_for_operation(&service, &self.binding, SshOperation::Execute).await
+        {
+            service.tool_notifications.forward(&self.binding, notification);
+        }
         let event = SshSessionWorkerEvent {
             session_id: self.binding.session_id.clone(),
             binding_id: self.binding.id.clone(),
@@ -8788,3 +8811,7 @@ mod tests {
         );
     }
 }
+
+#[cfg(all(test, unix))]
+#[path = "monitor_tests.rs"]
+mod monitor_tests;

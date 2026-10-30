@@ -7,43 +7,36 @@ use super::*;
 const BASH_MODE_FINAL_OUTPUT_LINES: usize = 10;
 const BASH_MODE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60 * 60);
 
-/// Phase 2: dispatch a tool call through [`WorkspaceOps::call_tool`].
-///
-/// Agent sessions always use local workspace ops (in-process toolset).
-/// Production dispatch builds the origin itself and calls [`dispatch_observed`].
-#[cfg(test)]
-pub(super) async fn dispatch_tool(
-    workspace_ops: &xai_grok_workspace::WorkspaceOps,
-    prepared: &PreparedToolCall,
-    session_id: &str,
-) -> Result<ToolRunResult, xai_tool_runtime::ToolError> {
-    tracing::debug!(
-        tool = %prepared.tool_name,
-        call_id = %prepared.tool_call_id.0,
-        session = %session_id,
-        mode = "local",
-        "dispatch_tool"
-    );
-    let origin = crate::session::telemetry::model_origin(
-        &prepared.invocation_id,
-        session_id,
-        None,
-        prepared.model_id.as_deref(),
-        &prepared.tool_id,
-        prepared.tool_version.as_deref(),
-    );
-    dispatch_observed(
-        workspace_ops,
-        prepared,
-        session_id,
-        origin,
-        xai_grok_tools::types::source_summary::SourceSummarySlot::new(),
-    )
-    .await
+impl SessionActor {
+    #[cfg(test)]
+    pub(super) async fn dispatch_tool(
+        &self,
+        prepared: &PreparedToolCall,
+    ) -> Result<ToolRunResult, xai_tool_runtime::ToolError> {
+        let origin = crate::session::telemetry::model_origin(
+            &prepared.invocation_id,
+            &self.session_id_string(),
+            None,
+            prepared.model_id.as_deref(),
+            &prepared.tool_id,
+            prepared.tool_version.as_deref(),
+        );
+        let toolset = self.agent.borrow().tool_bridge().toolset();
+        dispatch_observed(
+            &self.workspace_ops,
+            &toolset,
+            prepared,
+            &self.session_id_string(),
+            origin,
+            xai_grok_tools::types::source_summary::SourceSummarySlot::new(),
+        )
+        .await
+    }
 }
 
 pub(super) async fn dispatch_observed(
     workspace_ops: &xai_grok_workspace::WorkspaceOps,
+    toolset: &Arc<xai_grok_tools::registry::types::FinalizedToolset>,
     prepared: &PreparedToolCall,
     session_id: &str,
     origin: xai_grok_tools::types::tool_call_origin::ToolCallOrigin,
@@ -55,14 +48,26 @@ pub(super) async fn dispatch_observed(
     );
     ctx.insert(origin);
     ctx.insert(slot);
-    workspace_ops
-        .call_tool_with_context(
-            &prepared.tool_name,
-            prepared.execution_arguments().clone(),
-            Some(session_id),
-            ctx,
-        )
-        .await
+    if workspace_ops.is_ssh() {
+        // This finalized registry owns local tools, mixed-task routers and
+        // remote proxies. Calling WorkspaceOps directly bypasses ownership.
+        toolset
+            .call_with_context(
+                &prepared.tool_name,
+                prepared.execution_arguments().clone(),
+                ctx,
+            )
+            .await
+    } else {
+        workspace_ops
+            .call_tool_with_context(
+                &prepared.tool_name,
+                prepared.execution_arguments().clone(),
+                Some(session_id),
+                ctx,
+            )
+            .await
+    }
 }
 
 /// First string-valued argument among `keys`, in priority order.
@@ -442,3 +447,7 @@ mod tests {
         );
     }
 }
+
+#[cfg(all(test, unix))]
+#[path = "ssh_dispatch_tests.rs"]
+mod ssh_dispatch_tests;

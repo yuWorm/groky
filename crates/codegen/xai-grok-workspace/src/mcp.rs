@@ -26,8 +26,7 @@ use xai_tool_types::ToolDescription;
 
 use crate::error::{WorkspaceError, WorkspaceResult};
 use crate::mcp_claim::{ClaimOffer, McpServerTier, plan_claims};
-use crate::session::{SessionMcpServer, WorkspaceMcpBinding, WorkspaceSession};
-
+use crate::session::{ActiveMcp, SessionMcpServer, WorkspaceMcpBinding, WorkspaceSession};
 /// The slice of the hub's per-session tool surface that MCP reconfiguration drives: what a session currently advertises, plus dynamic registration in both directions.
 /// The seam exists so the reload tests can substitute an in-memory hub — a real `ToolServer` cannot be built without a live hub connection.
 pub(crate) trait HubToolRegistry: Send + Sync {
@@ -1026,26 +1025,75 @@ pub(crate) async fn install_and_register_local_qualified(
     started: Vec<StartedMcpServer>,
     life: u64,
 ) -> WorkspaceResult<()> {
-    let mcp_state = Arc::clone(&session.mcp_state);
+    let registrations = local_mcp_registrations(
+        started
+            .iter()
+            .map(|server| (server.name.as_str(), &server.bridge)),
+        Arc::clone(&session.mcp_state),
+    );
+    let installed = install_servers(session, started, life).await?;
+    // Registration is synchronous, so keep it in the same life-gated binding
+    // critical section as ownership. A stop/rebind cannot leave a stale tool
+    // registration behind or remove a newer life’s registration.
+    let mut binding = session.mcp_binding.lock().await;
+    if session.mcp_epoch.load(std::sync::atomic::Ordering::SeqCst) != life {
+        return Ok(());
+    }
+    let Some(active) = binding.active_mut() else {
+        return Ok(());
+    };
+    register_local_qualified(
+        toolset,
+        active,
+        registrations
+            .into_iter()
+            .filter(|(server, _)| installed.contains(server)),
+    );
+    Ok(())
+}
+
+/// Re-register already-running per-session MCP tools in a replacement local
+/// toolset. A toolset rebuild owns only built-ins, while the session keeps the
+/// live MCP bridges and their lifecycle ledger.
+pub(crate) async fn reregister_local_qualified(
+    session: &WorkspaceSession,
+    toolset: &xai_grok_tools::registry::types::FinalizedToolset,
+) {
+    let mut binding = session.mcp_binding.lock().await;
+    let Some(active) = binding.active_mut() else {
+        return;
+    };
+    let registrations = local_mcp_registrations(
+        active
+            .servers
+            .iter()
+            .map(|(name, server)| (name.as_str(), &server.bridge)),
+        Arc::clone(&session.mcp_state),
+    );
+    register_local_qualified(toolset, active, registrations);
+}
+
+fn local_mcp_registrations<'a>(
+    servers: impl Iterator<Item = (&'a str, &'a McpBridgeHandle)>,
+    mcp_state: Arc<tokio::sync::Mutex<xai_grok_mcp::servers::McpState>>,
+) -> Vec<(String, Vec<xai_grok_mcp::servers::McpToolRegistration>)> {
     let mut advertised = 0usize;
-    let registrations: Vec<(String, Vec<xai_grok_mcp::servers::McpToolRegistration>)> = started
-        .iter()
-        .map(|server| {
-            let registrations = server
-                .bridge
+    servers
+        .map(|(server_name, bridge)| {
+            let registrations = bridge
                 .bridge
                 .handlers()
                 .iter()
                 .filter_map(|handler| {
                     let description = handler.description();
-                    let server_name = description
+                    let namespace = description
                         .namespace
                         .clone()
-                        .unwrap_or_else(|| server.name.clone());
+                        .unwrap_or_else(|| server_name.to_owned());
                     McpTool::new(
                         handler.tool_id().as_str().to_owned(),
                         description.description,
-                        server_name,
+                        namespace,
                         Arc::clone(&mcp_state),
                         handler.input_schema().unwrap_or_else(|| {
                             serde_json::json!({"type": "object", "properties": {}})
@@ -1054,7 +1102,7 @@ pub(crate) async fn install_and_register_local_qualified(
                     )
                     .into_registration()
                     .map_err(|error| {
-                        tracing::warn!(server = %server.name, %error, "skipping invalid local MCP tool")
+                        tracing::warn!(server = %server_name, %error, "skipping invalid local MCP tool")
                     })
                     .ok()
                 })
@@ -1067,24 +1115,17 @@ pub(crate) async fn install_and_register_local_qualified(
                     }
                 })
                 .collect();
-            (server.name.clone(), registrations)
+            (server_name.to_owned(), registrations)
         })
-        .collect();
-    let installed = install_servers(session, started, life).await?;
-    // Registration is synchronous, so keep it in the same life-gated binding
-    // critical section as ownership. A stop/rebind cannot leave a stale tool
-    // registration behind or remove a newer life’s registration.
-    let mut binding = session.mcp_binding.lock().await;
-    if session.mcp_epoch.load(std::sync::atomic::Ordering::SeqCst) != life {
-        return Ok(());
-    }
-    let Some(active) = binding.active_mut() else {
-        return Ok(());
-    };
-    for (server, registrations) in registrations
-        .into_iter()
-        .filter(|(server, _)| installed.contains(server))
-    {
+        .collect()
+}
+
+fn register_local_qualified(
+    toolset: &xai_grok_tools::registry::types::FinalizedToolset,
+    active: &mut ActiveMcp,
+    registrations: impl IntoIterator<Item = (String, Vec<xai_grok_mcp::servers::McpToolRegistration>)>,
+) {
+    for (server, registrations) in registrations {
         let mut owned = Vec::new();
         for registration in registrations {
             let name = registration.name.clone();
@@ -1110,7 +1151,6 @@ pub(crate) async fn install_and_register_local_qualified(
             server.tool_ids = owned;
         }
     }
-    Ok(())
 }
 
 /// What converging one session onto a new configuration changed.

@@ -116,12 +116,26 @@ mod tests {
             revoked: false,
         };
         let (client_stream, worker_stream) = tokio::io::duplex(64 * 1024);
-        let server = tokio::spawn(serve_stream(SshWorkerService::new(), worker_stream));
+        let server = tokio::spawn(serve_stream(SshWorkerService::for_test(), worker_stream));
         let client =
             SshWorkspaceClient::connect(Box::pin(client_stream), binding, Arc::new(Approve))
                 .await
                 .expect("connect worker");
-        let runner = SshTerminalRunner::new(xai_grok_workspace::WorkspaceOps::ssh(client));
+        let workspace = xai_grok_workspace::WorkspaceOps::ssh(client);
+        workspace
+            .rpc_raw(
+                "workspace.configure_session_tools",
+                serde_json::json!({
+                    "session_id": "session",
+                    "tool_config": {"tools": [{
+                        "id": "GrokBuild:run_terminal_cmd",
+                        "params": {"enabled_background": false},
+                    }]},
+                }),
+            )
+            .await
+            .expect("explicitly enable the remote terminal");
+        let runner = SshTerminalRunner::new(workspace);
 
         let result = runner
             .run(TerminalRunRequest {

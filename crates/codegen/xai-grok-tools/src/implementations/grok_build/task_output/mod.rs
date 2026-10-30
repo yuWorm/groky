@@ -3,6 +3,7 @@
 //! Positive `timeout_ms` waits (multi-id = wait-all). Also provides helpers used
 //! by the legacy `wait_tasks` tool.
 
+pub mod routed;
 pub mod terminal_command;
 pub mod wait_tasks;
 use std::time::Duration;
@@ -940,6 +941,14 @@ impl TaskOutputTool {
             return Err(xai_tool_runtime::ToolError::invalid_arguments(format!(
                 "task_ids exceeds maximum of {MAX_MULTI_WAIT_IDS} entries."
             )));
+        }
+        let remote = resources
+            .lock()
+            .await
+            .get::<routed::RemoteTaskExecutorResource>()
+            .cloned();
+        if let Some(remote) = remote {
+            return routed::output(&remote, ctx, ids, input.timeout_ms).await;
         }
 
         if ids.len() == 1 {
