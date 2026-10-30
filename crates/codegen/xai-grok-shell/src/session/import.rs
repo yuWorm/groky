@@ -114,6 +114,12 @@ pub async fn import_session_in_root(
         ));
     }
 
+    if xai_grok_foreign_sessions::import::is_native(&candidate) {
+        return tokio::task::spawn_blocking(move || copy_native_session(candidate, target_cwd, root))
+            .await
+            .map_err(|error| io::Error::other(format!("native session copy panicked: {error}")))?;
+    }
+
     let imported =
         tokio::task::spawn_blocking(move || xai_grok_foreign_sessions::import::load(&candidate))
             .await
@@ -250,6 +256,107 @@ fn write_imported_session(
     })
 }
 
+/// Files a copied session must not inherit: locks, live terminals, title workers, and the
+/// provenance of an earlier import (this import writes its own).
+fn skip_native_entry(name: &str) -> bool {
+    name.ends_with(".lock")
+        || matches!(
+            name,
+            "terminal" | "title_refresh_idx" | IMPORT_PROVENANCE_FILE
+        )
+}
+
+/// Copy `src` into `dst`, replacing the source session ID in every text file.
+fn copy_native_tree(src: &Path, dst: &Path, old_id: &str, new_id: &str) -> io::Result<()> {
+    for entry in fs::read_dir(src)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let Some(name_str) = name.to_str() else {
+            continue;
+        };
+        if skip_native_entry(name_str) {
+            continue;
+        }
+        let file_type = entry.file_type()?;
+        let target = dst.join(&name);
+        if file_type.is_dir() {
+            create_private_dir(&target)?;
+            copy_native_tree(&entry.path(), &target, old_id, new_id)?;
+        } else if file_type.is_file() {
+            let bytes = fs::read(entry.path())?;
+            let bytes = match String::from_utf8(bytes) {
+                Ok(text) => text.replace(old_id, new_id).into_bytes(),
+                Err(error) => error.into_bytes(),
+            };
+            write_private(&target, |file| file.write_all(&bytes))?;
+        }
+    }
+    Ok(())
+}
+
+/// Import an upstream grok session: it is already native, so copy it under a new ID with the
+/// target cwd and this home, then record provenance like any other import.
+fn copy_native_session(
+    candidate: ImportCandidate,
+    target_cwd: PathBuf,
+    root: PathBuf,
+) -> io::Result<ImportResult> {
+    let cwd = target_cwd
+        .to_str()
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "the target working directory is not valid UTF-8",
+            )
+        })?
+        .to_owned();
+    let session_id = uuid::Uuid::now_v7().to_string();
+    let session_parent = crate::util::grok_home::ensure_sessions_cwd_dir_in(&root, &cwd)?;
+    let destination = session_parent.join(&session_id);
+    ensure_absent(&destination)?;
+    let stage = session_parent.join(format!(".{session_id}.import-{}.tmp", uuid::Uuid::now_v7()));
+    create_private_dir(&stage)?;
+    let mut staged = StagedSession::new(stage);
+    copy_native_tree(&candidate.path, staged.path(), &candidate.id, &session_id)?;
+
+    let summary_path = staged.path().join(SUMMARY_FILE);
+    let mut summary: serde_json::Value = serde_json::from_slice(&fs::read(&summary_path)?)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+    summary["info"]["id"] = serde_json::json!(session_id);
+    summary["info"]["cwd"] = serde_json::json!(cwd);
+    summary["grok_home"] = serde_json::json!(root.to_str());
+    // Never carry another install's credentials, agent identity, or remote state.
+    for key in ["vendor_accounts", "agent_id", "attempt_id", "request_id", "ssh_state"] {
+        if let Some(object) = summary.as_object_mut() {
+            object.remove(key);
+        }
+    }
+    let message_count = summary
+        .get("num_chat_messages")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or_default() as usize;
+    // The private writers create files exclusively; replace the copied summary.
+    fs::remove_file(&summary_path)?;
+    write_private_json(&summary_path, &summary)?;
+    write_private_json(
+        &staged.path().join(IMPORT_PROVENANCE_FILE),
+        &ImportProvenance::from_candidate(&candidate, &[], &cwd, &session_id, Utc::now()),
+    )?;
+    crate::session::storage::sync_dir_durable(staged.path())?;
+    publish_staged_dir(staged.path(), &destination)?;
+    if let Err(error) = crate::session::storage::sync_dir_durable(&session_parent) {
+        let _ = fs::remove_dir_all(&destination);
+        return Err(error);
+    }
+    staged.publish();
+    Ok(ImportResult {
+        session_id,
+        cwd,
+        message_count,
+        warnings: Vec::new(),
+    })
+}
+
 fn source_label(candidate: &ImportCandidate) -> String {
     let title = candidate.title.trim();
     let label = if title.is_empty() {
@@ -354,6 +461,7 @@ fn display_updates(
 
     for message in &imported.messages {
         match message {
+            ImportMessage::User { content } if is_injected_context(content) => {}
             ImportMessage::User { content } => {
                 let timestamp = timeline.next();
                 active_turn_start = Some(timestamp);
@@ -391,68 +499,66 @@ fn display_updates(
                     );
                 }
                 for call in tool_calls {
-                    let raw_input = serde_json::from_str::<serde_json::Value>(&call.arguments)
-                        .map_err(|error| {
-                            io::Error::new(
-                                io::ErrorKind::InvalidData,
-                                format!("validated import tool arguments no longer parse: {error}"),
-                            )
-                        })?;
-                    open_calls.push(call.id.clone());
-                    push_acp_update(
-                        &mut updates,
-                        session_id,
-                        timeline.next(),
-                        turn_start,
-                        acp::SessionUpdate::ToolCall(
-                            acp::ToolCall::new(
-                                acp::ToolCallId::new(Arc::<str>::from(call.id.as_str())),
-                                call.name.clone(),
-                            )
-                            .kind(acp::ToolKind::Other)
-                            .status(acp::ToolCallStatus::Pending)
-                            .raw_input(Some(raw_input)),
-                        ),
+                    let view = xai_grok_foreign_sessions::import::tools::classify(
+                        imported.candidate.source,
+                        &call.name,
+                        &call.arguments,
                     );
+                    let presented =
+                        super::import_tools::present_call(view, &call.id, &call.name);
+                    let timestamp = timeline.next();
+                    let card_ids = presented
+                        .calls
+                        .iter()
+                        .map(|card| card.tool_call_id.clone())
+                        .collect();
+                    for card in presented.calls {
+                        push_acp_update(
+                            &mut updates,
+                            session_id,
+                            timestamp,
+                            turn_start,
+                            acp::SessionUpdate::ToolCall(card),
+                        );
+                    }
+                    open_calls.push(OpenCall {
+                        id: call.id.clone(),
+                        view: presented.view,
+                        card_ids,
+                    });
                 }
             }
             ImportMessage::ToolResult {
                 id,
                 content,
                 is_error,
-            } if open_calls
-                .iter()
-                .position(|call_id| call_id == id)
-                .map(|index| open_calls.remove(index))
-                .is_some() =>
-            {
+            } if open_calls.iter().any(|call| call.id == *id) => {
+                let index = open_calls
+                    .iter()
+                    .position(|call| call.id == *id)
+                    .unwrap_or_default();
+                let call = open_calls.remove(index);
                 let timestamp = timeline.next();
                 let turn_start = Some(current_turn_start(&mut active_turn_start, timestamp));
-                let mut blocks = acp_blocks(content);
-                if *is_error {
-                    blocks.insert(
-                        0,
-                        acp::ContentBlock::Text(acp::TextContent::new(HISTORICAL_TOOL_FAILURE)),
+                let text = content_text(content);
+                for card_id in call.card_ids {
+                    let fields = super::import_tools::result_fields(
+                        &call.view,
+                        &text,
+                        acp_blocks(content),
+                        *is_error,
+                        HISTORICAL_TOOL_FAILURE,
+                    );
+                    push_acp_update(
+                        &mut updates,
+                        session_id,
+                        timestamp,
+                        turn_start,
+                        acp::SessionUpdate::ToolCallUpdate(acp::ToolCallUpdate::new(
+                            card_id, fields,
+                        )),
                     );
                 }
-                push_acp_update(
-                    &mut updates,
-                    session_id,
-                    timestamp,
-                    turn_start,
-                    acp::SessionUpdate::ToolCallUpdate(acp::ToolCallUpdate::new(
-                        acp::ToolCallId::new(Arc::<str>::from(id.as_str())),
-                        acp::ToolCallUpdateFields::new()
-                            .status(Some(if *is_error {
-                                acp::ToolCallStatus::Failed
-                            } else {
-                                acp::ToolCallStatus::Completed
-                            }))
-                            .content(Some(
-                                blocks.into_iter().map(acp::ToolCallContent::from).collect(),
-                            )),
-                    )),
-                );
             }
             ImportMessage::ToolResult {
                 id,
@@ -510,7 +616,7 @@ fn display_updates(
 
     // Historical sessions can end during a tool call. Mark those records as
     // finished evidence so opening this session never creates runnable work.
-    for id in open_calls {
+    for card_id in open_calls.into_iter().flat_map(|call| call.card_ids) {
         let timestamp = timeline.next();
         push_acp_update(
             &mut updates,
@@ -518,7 +624,7 @@ fn display_updates(
             timestamp,
             Some(current_turn_start(&mut active_turn_start, timestamp)),
             acp::SessionUpdate::ToolCallUpdate(acp::ToolCallUpdate::new(
-                acp::ToolCallId::new(Arc::<str>::from(id)),
+                card_id,
                 acp::ToolCallUpdateFields::new()
                     .status(Some(acp::ToolCallStatus::Failed))
                     .content(Some(vec![acp::ToolCallContent::from(
@@ -530,6 +636,46 @@ fn display_updates(
 
     let message_count = updates.len();
     Ok((updates, message_count))
+}
+
+/// Harness text some agents (notably Codex) record as user turns: environment and instruction
+/// preambles. It stays in model context but is not something the user typed, so it is hidden.
+fn is_injected_context(content: &[ImportContent]) -> bool {
+    const PREFIXES: &[&str] = &[
+        "<environment_context>",
+        "<user_instructions>",
+        "<permissions instructions>",
+        "<turn_aborted>",
+        "# AGENTS.md instructions for ",
+    ];
+    let mut texts = content.iter().filter_map(|part| match part {
+        ImportContent::Text(text) => Some(text.trim_start()),
+        ImportContent::Image { .. } => None,
+    });
+    let mut any = false;
+    let all = texts.all(|text| {
+        any = true;
+        text.is_empty() || PREFIXES.iter().any(|prefix| text.starts_with(prefix))
+    });
+    any && all && content.iter().all(|part| matches!(part, ImportContent::Text(_)))
+}
+
+/// A displayed call still waiting for its recorded result.
+struct OpenCall {
+    id: String,
+    view: xai_grok_foreign_sessions::import::tools::ToolView,
+    card_ids: Vec<acp::ToolCallId>,
+}
+
+fn content_text(content: &[ImportContent]) -> String {
+    content
+        .iter()
+        .filter_map(|part| match part {
+            ImportContent::Text(text) => Some(text.as_str()),
+            ImportContent::Image { .. } => None,
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 fn current_turn_start(active_turn_start: &mut Option<u64>, timestamp: u64) -> u64 {
@@ -883,7 +1029,22 @@ impl ImportProvenance {
         session_id: &str,
         imported_at: DateTime<Utc>,
     ) -> Self {
-        let candidate = &imported.candidate;
+        Self::from_candidate(
+            &imported.candidate,
+            &imported.warnings,
+            target_cwd,
+            session_id,
+            imported_at,
+        )
+    }
+
+    fn from_candidate(
+        candidate: &ImportCandidate,
+        warnings: &[String],
+        target_cwd: &str,
+        session_id: &str,
+        imported_at: DateTime<Utc>,
+    ) -> Self {
         Self {
             schema_version: 1,
             session_id: session_id.to_owned(),
@@ -895,7 +1056,7 @@ impl ImportProvenance {
             source_cwd: candidate.cwd.to_string_lossy().into_owned(),
             source_leaf_id: candidate.leaf_id.clone(),
             source_modified_at: DateTime::<Utc>::from(candidate.modified).to_rfc3339(),
-            warnings: imported.warnings.clone(),
+            warnings: warnings.to_vec(),
         }
     }
 }
@@ -990,6 +1151,69 @@ mod tests {
                 .chat_history
                 .iter()
                 .any(|item| matches!(item, ConversationItem::System(_)))
+        );
+    }
+
+    #[test]
+    fn injected_codex_context_is_hidden_but_real_prompts_are_not() {
+        let text = |value: &str| vec![ImportContent::Text(value.to_owned())];
+        assert!(is_injected_context(&text("<environment_context>\n<cwd>/w</cwd>")));
+        assert!(is_injected_context(&text("# AGENTS.md instructions for /w\n...")));
+        assert!(!is_injected_context(&text("fix <environment_context> parsing")));
+        assert!(!is_injected_context(&[]));
+    }
+
+    #[test]
+    fn native_grok_sessions_are_copied_under_a_new_id() {
+        let source_home = tempfile::tempdir().unwrap();
+        let old_id = "01a06a54-4b55-7272-8757-fde833cec9fd";
+        let source = source_home.path().join(old_id);
+        fs::create_dir_all(source.join("compaction_checkpoints")).unwrap();
+        fs::write(
+            source.join(SUMMARY_FILE),
+            serde_json::json!({
+                "info": {"id": old_id, "cwd": "/old"},
+                "num_chat_messages": 3,
+                "grok_home": "/Users/x/.grok",
+                "vendor_accounts": {"secret": true},
+            })
+            .to_string(),
+        )
+        .unwrap();
+        fs::write(source.join(UPDATES_FILE), format!("{{\"sessionId\":\"{old_id}\"}}\n")).unwrap();
+        fs::write(source.join("compaction_checkpoints/c.json"), "{}").unwrap();
+        fs::write(source.join("summary.json.lock"), "").unwrap();
+        let candidate = ImportCandidate {
+            source: xai_grok_foreign_sessions::import::ImportSource::Grok,
+            id: old_id.to_owned(),
+            path: source.clone(),
+            cwd: PathBuf::from("/old"),
+            title: "grok".to_owned(),
+            modified: UNIX_EPOCH,
+            leaf_id: None,
+        };
+        let root = tempfile::tempdir().unwrap();
+        let target = PathBuf::from("/target/workspace");
+
+        let result =
+            copy_native_session(candidate, target.clone(), root.path().to_path_buf()).unwrap();
+
+        assert_ne!(result.session_id, old_id);
+        assert_eq!(result.message_count, 3);
+        let dir = crate::util::grok_home::sessions_cwd_dir_in(root.path(), "/target/workspace")
+            .join(&result.session_id);
+        let summary: serde_json::Value =
+            serde_json::from_slice(&fs::read(dir.join(SUMMARY_FILE)).unwrap()).unwrap();
+        assert_eq!(summary["info"]["id"], result.session_id.as_str());
+        assert_eq!(summary["info"]["cwd"], "/target/workspace");
+        assert!(summary.get("vendor_accounts").is_none());
+        let updates = fs::read_to_string(dir.join(UPDATES_FILE)).unwrap();
+        assert!(updates.contains(&result.session_id) && !updates.contains(old_id));
+        assert!(dir.join("compaction_checkpoints/c.json").is_file());
+        assert!(!dir.join("summary.json.lock").exists());
+        assert!(
+            imported_sources_in(root.path(), &target)
+                .contains_key(&("grok".to_owned(), old_id.to_owned()))
         );
     }
 

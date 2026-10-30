@@ -24,7 +24,7 @@ writes the items you selected into your `.grok` config. Re-run it anytime.
 
 ## Pick up where you left off
 
-Use **`/import-session`** to discover omp, pi, Claude Code, Codex, and OpenCode
+Use **`/import-session`** to discover omp, pi, Claude Code, Codex, OpenCode, and grok
 sessions for the current directory. Inspect a row, review any migration warnings,
 then confirm to open a new native Groky session. Source files are unchanged and
 historical tools are not rerun. Press `f` to include other projects, or `a` to

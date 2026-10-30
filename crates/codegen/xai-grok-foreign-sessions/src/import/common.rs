@@ -171,13 +171,23 @@ pub(super) fn json_lines_with_warnings(path: &Path) -> io::Result<(Vec<Value>, V
 pub(super) fn json_head(path: &Path, max_bytes: u64) -> io::Result<Vec<Value>> {
     let reader = BufReader::new(source_reader(path)?.take(max_bytes));
     let mut records = Vec::new();
-    for line in reader.lines() {
-        let line = line?;
-        if let Ok(record) = serde_json::from_str(line.trim()) {
+    // Split on bytes: the byte cap can end inside a multibyte character, which must only
+    // drop that final partial line rather than fail the whole session.
+    for line in reader.split(b'\n') {
+        if let Ok(record) = serde_json::from_slice(line?.trim_ascii()) {
             records.push(record);
         }
     }
     Ok(records)
+}
+
+/// omp/pi keep each session's tool logs in a directory named after its `<session>.jsonl`;
+/// those can hold thousands of files and never contain sessions.
+#[cfg(unix)]
+fn is_artifact_dir(name: &std::ffi::OsStr, siblings: &[std::ffi::OsString]) -> bool {
+    let mut transcript = name.to_os_string();
+    transcript.push(".jsonl");
+    siblings.iter().any(|sibling| *sibling == transcript)
 }
 
 /// Traverse directories without following symlinks. Capability-relative opens
@@ -206,12 +216,12 @@ pub(super) fn walk_files(
             )));
         }
         names.sort();
-        for name in names {
-            let relative = Path::new(&name);
+        for name in &names {
+            let relative = Path::new(name);
             let path = directory.join(relative);
             if accept(&path) && directory.resolve_regular_file(relative).is_some() {
                 files.push(path);
-            } else if depth < max_depth {
+            } else if depth < max_depth && !is_artifact_dir(name, &names) {
                 if let Some(child) = directory.subroot(relative) {
                     pending.push((child, depth + 1));
                 }
@@ -255,7 +265,10 @@ pub(super) fn walk_files(
             let path = entry.path();
             if kind.is_file() && accept(&path) && approved.resolve_regular_file(&path).is_some() {
                 files.push(path);
-            } else if kind.is_dir() && depth < max_depth {
+            } else if kind.is_dir()
+                && depth < max_depth
+                && !path.with_extension("jsonl").is_file()
+            {
                 pending.push((path, depth + 1));
             }
         }
@@ -427,5 +440,33 @@ mod tests {
             .unwrap()
             .is_empty()
         );
+    }
+
+    #[test]
+    fn head_cut_inside_a_multibyte_character_keeps_earlier_records() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("s.jsonl");
+        let first = "{\"type\":\"session_meta\"}\n";
+        std::fs::write(&path, format!("{first}{{\"text\":\"中文中文\"}}\n")).unwrap();
+        // Cut two bytes into the second line's first CJK character.
+        let cut = first.len() as u64 + "{\"text\":\"".len() as u64 + 2;
+        let records = json_head(&path, cut).unwrap();
+        assert_eq!(records.len(), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn session_artifact_directories_are_not_walked() {
+        let temp = tempfile::tempdir().unwrap();
+        let project = temp.path().join("project");
+        std::fs::create_dir_all(project.join("session-1")).unwrap();
+        std::fs::write(project.join("session-1.jsonl"), "{}").unwrap();
+        std::fs::write(project.join("session-1/nested.jsonl"), "{}").unwrap();
+        let files = walk_files(temp.path(), 3, |path| {
+            path.extension().is_some_and(|extension| extension == "jsonl")
+        })
+        .unwrap();
+        assert_eq!(files.len(), 1);
+        assert!(files[0].ends_with("project/session-1.jsonl"));
     }
 }

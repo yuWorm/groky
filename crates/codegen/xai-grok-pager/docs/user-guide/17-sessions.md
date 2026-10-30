@@ -81,7 +81,7 @@ Confirms, then permanently removes the session history. Returns to the welcome s
 
 ## Importing Other Agents
 
-Run `/import-session` to find **omp, pi, Claude Code, Codex, and OpenCode**
+Run `/import-session` to find **omp, pi, Claude Code, Codex, OpenCode, and grok**
 sessions for the current working directory. Paths are matched canonically rather
 than by directory-name prefixes. The picker lists source, title and last activity,
 and marks sessions already imported here. `f` switches to all projects, including
@@ -127,6 +127,14 @@ It uses the configured Groky model (or the normal bundled default), not the
 source model; an explicit global `--model` overrides that choice. Deployments
 using an external model catalogue must configure a model rather than inherit
 the bundled default.
+
+Imported history renders like native groky history: commands show as command
+cards with their output and exit code, reads as file reads, and edits (including
+Codex/OpenCode `apply_patch` and omp hashline patches) as per-file diffs. omp
+hashline edits record anchors rather than removed text, so replaced ranges show
+as a "lines N–M replaced" note. Upstream grok sessions are already native and are
+copied as-is under a new ID. Internal child threads (Codex guardian reviews,
+grok subagent/headless runs) are not listed.
 
 The importer separates visible history from effective model context, preserving
 branch selection, compaction and supported rollback semantics. Incomplete tool

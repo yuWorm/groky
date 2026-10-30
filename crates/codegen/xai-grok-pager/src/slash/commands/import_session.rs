@@ -18,7 +18,7 @@ pub struct ImportSessionCommand;
 impl SlashCommand for ImportSessionCommand {
     slash_meta! {
         name: "import-session",
-        description: "Import sessions from omp, pi, Claude Code, Codex, or OpenCode",
+        description: "Import sessions from omp, pi, Claude Code, Codex, OpenCode, or grok",
         usage: "/import-session [ID] [DIR | --dir DIR] [--from SOURCE] [--all] [--all-projects]",
         takes_args: true,
         arg_placeholder: "[id] [--dir path] [--all]",

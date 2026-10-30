@@ -4,8 +4,10 @@
 mod claude;
 mod codex;
 mod common;
+mod grok;
 mod opencode;
 mod pi;
+pub mod tools;
 
 use std::collections::{HashMap, HashSet};
 use std::fmt;
@@ -25,15 +27,17 @@ pub enum ImportSource {
     Codex,
     #[serde(rename = "opencode")]
     OpenCode,
+    Grok,
 }
 
 impl ImportSource {
-    pub const ALL: [Self; 5] = [
+    pub const ALL: [Self; 6] = [
         Self::Omp,
         Self::Pi,
         Self::Claude,
         Self::Codex,
         Self::OpenCode,
+        Self::Grok,
     ];
 
     pub const fn as_str(self) -> &'static str {
@@ -43,6 +47,7 @@ impl ImportSource {
             Self::Claude => "claude",
             Self::Codex => "codex",
             Self::OpenCode => "opencode",
+            Self::Grok => "grok",
         }
     }
 }
@@ -71,7 +76,7 @@ impl FromStr for ImportSource {
                     .then_some(Self::OpenCode)
             })
             .ok_or_else(|| {
-                format!("Unknown session source {value:?}; use omp, pi, claude, codex, or opencode")
+                format!("Unknown session source {value:?}; use omp, pi, claude, codex, opencode, or grok")
             })
     }
 }
@@ -174,6 +179,7 @@ pub fn discover(cwd: Option<&Path>) -> ImportDiscovery {
     claude::discover(cwd, &mut out);
     codex::discover(cwd, &mut out);
     opencode::discover(cwd, &mut out);
+    grok::discover(cwd, &mut out);
     out.sessions.sort_by(|a, b| {
         b.modified
             .cmp(&a.modified)
@@ -220,7 +226,21 @@ pub fn inspect(source: ImportSource, path: &Path, id: Option<&str>) -> io::Resul
         ImportSource::Claude => claude::inspect(path, id),
         ImportSource::Codex => codex::inspect(path, id),
         ImportSource::OpenCode => opencode::inspect(path, id),
+        ImportSource::Grok => grok::inspect(path, id),
     }
+}
+
+/// True when a candidate is already in the native layout and is copied rather than decoded.
+pub fn is_native(candidate: &ImportCandidate) -> bool {
+    candidate.source == ImportSource::Grok
+}
+
+/// Effective-context size and migration warnings, for the confirmation before import.
+pub fn preview(candidate: &ImportCandidate) -> io::Result<(usize, Vec<String>)> {
+    if is_native(candidate) {
+        return grok::context_len(candidate).map(|count| (count, Vec::new()));
+    }
+    load(candidate).map(|imported| (imported.context.len(), imported.warnings))
 }
 
 pub fn load(candidate: &ImportCandidate) -> io::Result<ImportedSession> {
@@ -229,6 +249,9 @@ pub fn load(candidate: &ImportCandidate) -> io::Result<ImportedSession> {
         ImportSource::Claude => claude::load(candidate),
         ImportSource::Codex => codex::load(candidate),
         ImportSource::OpenCode => opencode::load(candidate),
+        ImportSource::Grok => Err(common::invalid(
+            "grok sessions are already native; they are copied, not decoded",
+        )),
     }?;
     validate(&mut imported)?;
     Ok(imported)

@@ -77,8 +77,10 @@ pub(super) fn discover(cwd: Option<&Path>, out: &mut ImportDiscovery) {
         }
     };
     for path in paths {
-        match candidate_from_path(&path) {
-            Ok(candidate) if matches_cwd(&candidate.cwd, cwd) => out.sessions.push(candidate),
+        match scan_path(&path) {
+            Ok((candidate, false)) if matches_cwd(&candidate.cwd, cwd) && !is_unused(&path) => {
+                out.sessions.push(candidate);
+            }
             Ok(_) => {}
             Err(error) => out.warnings.push(format!(
                 "Could not inspect Codex session {}: {error}",
@@ -270,7 +272,36 @@ fn rollout_paths(root: &Path) -> io::Result<Vec<PathBuf>> {
 }
 
 fn candidate_from_path(path: &Path) -> io::Result<ImportCandidate> {
+    scan_path(path).map(|(candidate, _)| candidate)
+}
+
+/// Codex records child threads (guardian approval reviews, `/review`, spawned agents) as
+/// `session_meta.source.subagent`. Their first "user" turn is a replayed transcript of the
+/// parent, so discovery hides them; an explicit path can still import one.
+fn is_subagent_thread(records: &[Value]) -> bool {
+    records
+        .iter()
+        .find(|record| record_type(record) == Some("session_meta"))
+        .and_then(|record| record.pointer("/payload/source/subagent"))
+        .is_some()
+}
+
+/// A rollout opened and abandoned before any turn holds only `session_meta`. Judge only files
+/// small enough to have been read whole, so a long session is never hidden.
+fn is_unused(path: &Path) -> bool {
+    let small = std::fs::metadata(path).is_ok_and(|meta| meta.len() <= DISCOVERY_READ_BYTES);
+    small
+        && json_head(path, DISCOVERY_READ_BYTES).is_ok_and(|records| {
+            !records
+                .iter()
+                .any(|record| record_type(record) == Some("response_item"))
+        })
+}
+
+/// The candidate plus whether it is a Codex-internal child thread.
+fn scan_path(path: &Path) -> io::Result<(ImportCandidate, bool)> {
     let records = json_head(path, DISCOVERY_READ_BYTES)?;
+    let subagent = is_subagent_thread(&records);
     let metadata = metadata(&records, path)?;
     let title = records
         .iter()
@@ -278,7 +309,7 @@ fn candidate_from_path(path: &Path) -> io::Result<ImportCandidate> {
         .map(|text| short_title(&text))
         .filter(|title| !title.is_empty())
         .unwrap_or_else(|| "Codex session".to_owned());
-    Ok(ImportCandidate {
+    let candidate = ImportCandidate {
         source: ImportSource::Codex,
         id: metadata.id,
         path: path.to_path_buf(),
@@ -286,7 +317,8 @@ fn candidate_from_path(path: &Path) -> io::Result<ImportCandidate> {
         title,
         modified: modified(path),
         leaf_id: None,
-    })
+    };
+    Ok((candidate, subagent))
 }
 
 fn load_rollout(
@@ -1064,6 +1096,14 @@ mod tests {
             modified: modified(path),
             leaf_id: None,
         }
+    }
+
+    #[test]
+    fn subagent_threads_are_recognized_from_session_meta() {
+        let guardian = vec![json!({"type":"session_meta","payload":{"id":"g","cwd":"/w","source":{"subagent":{"other":"guardian"}}}})];
+        let user = vec![json!({"type":"session_meta","payload":{"id":"u","cwd":"/w","source":"cli"}})];
+        assert!(is_subagent_thread(&guardian));
+        assert!(!is_subagent_thread(&user));
     }
 
     fn meta(id: &str, cwd: &Path) -> Value {

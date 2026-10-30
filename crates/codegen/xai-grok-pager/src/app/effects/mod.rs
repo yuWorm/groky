@@ -1655,9 +1655,7 @@ pub(crate) fn execute(
         } => {
             tasks.spawn(async move {
                 let result = tokio::task::spawn_blocking(move || {
-                    xai_grok_foreign_sessions::import::load(&candidate).map(|imported| {
-                        (imported.context.len(), imported.warnings)
-                    })
+                    xai_grok_foreign_sessions::import::preview(&candidate)
                 })
                 .await;
                 match result {

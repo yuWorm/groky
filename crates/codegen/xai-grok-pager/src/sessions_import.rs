@@ -259,10 +259,10 @@ async fn discover(
                 .expect("valid discovery spinner template"),
         );
         spinner.set_message(if all_projects {
-            "Scanning omp, pi, Claude Code, Codex and OpenCode sessions in every project…".to_owned()
+            "Scanning omp, pi, Claude Code, Codex, OpenCode and grok sessions in every project…".to_owned()
         } else {
             format!(
-                "Scanning omp, pi, Claude Code, Codex and OpenCode sessions for {}…",
+                "Scanning omp, pi, Claude Code, Codex, OpenCode and grok sessions for {}…",
                 project_dir.display()
             )
         });

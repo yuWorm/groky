@@ -27,3 +27,8 @@ Voice: `**Lead** rest.` Lead is the noun the user already knows (`/default`, `Re
 ### Unreleased
 
 Next groky version after `v0.1.32`.
+
+- **Session import** no longer lists Codex internal child threads (guardian approval reviews, `/review`, spawned agents), which imported as walls of `[N] tool … call` user messages.
+- **Imported sessions** render tool history as native cards: commands with output and exit code, file reads, and per-file diffs (including Codex/OpenCode `apply_patch`, omp hashline edits, and Codex code-mode scripts) for Claude Code, Codex, omp, pi and OpenCode. Codex environment/AGENTS.md preambles no longer show as user messages.
+- **`/import-session`** and **`groky sessions import`** can import upstream grok CLI sessions (`--from grok`), copied as-is under a new ID.
+- **Session import** finds omp sessions in large stores (previously none were listed) and Codex sessions whose first 64 KB ends mid-character; never-used Codex sessions are hidden.

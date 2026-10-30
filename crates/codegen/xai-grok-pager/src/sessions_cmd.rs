@@ -31,7 +31,7 @@ enum SessionsCommand {
         /// Session id to delete.
         id: String,
     },
-    /// Import foreign agent transcripts (omp, pi, Claude Code, Codex, OpenCode) as native Groky sessions.
+    /// Import foreign agent transcripts (omp, pi, Claude Code, Codex, OpenCode, grok) as native Groky sessions.
     ///
     /// Scans DIR (default: the current directory). With a session ID imports that session, with --all
     /// imports every discovered session, and in an interactive terminal otherwise opens a picker.
