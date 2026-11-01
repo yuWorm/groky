@@ -282,6 +282,7 @@ pub(crate) fn test_app() -> AppView {
         import_claude_modal: None,
         welcome_vendor_login: None,
         welcome_ssh_manager: None,
+        ssh_attention: Default::default(),
         ssh_client_id: 1,
         ssh_event_pump_generation: 0,
         ssh_event_control_generation: 0,

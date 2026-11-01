@@ -1111,6 +1111,128 @@ fn ssh_child_operation_approval_routes_to_parent_without_changing_authority() {
 }
 
 #[test]
+fn session_scoped_authentication_routes_to_its_origin_for_live_and_recovery_events() {
+    let mut app = test_app_with_agent();
+    let parent_id = AgentId(0);
+    let child_id = "ssh-auth-child";
+    let child = AgentView::new(
+        make_test_agent_session(&app, AgentId(1), child_id),
+        ScrollbackState::new(),
+    );
+    app.agents
+        .get_mut(&parent_id)
+        .unwrap()
+        .insert_test_child(child_id.into(), Box::new(child));
+    let other_id = AgentId(2);
+    app.agents.insert(
+        other_id,
+        AgentView::new(
+            make_test_agent_session(&app, other_id, "unrelated-active-session"),
+            ScrollbackState::new(),
+        ),
+    );
+    app.active_view = ActiveView::Agent(other_id);
+    let client_id = app.ssh_client_id;
+    let prompt = SshAuthPrompt {
+        client_id,
+        connection_generation: 4,
+        challenge_id: "child-password".into(),
+        target_id: TARGET_ID.into(),
+        session_id: Some(child_id.into()),
+        kind: SshAuthPromptKind::Password,
+        detail: SshAuthPromptDetail::Secret {
+            username: "fixture-user".into(),
+            message: "Password required".into(),
+            allow_remember: false,
+        },
+    };
+    apply_ssh_control_event(
+        &mut app,
+        None,
+        None,
+        SshEvent::Authentication(prompt.clone()),
+    );
+    let manager = app
+        .agents
+        .get(&parent_id)
+        .and_then(|agent| agent.ssh_manager.as_ref())
+        .expect("a child authentication prompt must use its parent's manager");
+    assert_eq!(manager.session_id.as_deref(), Some("test-session"));
+    let mut attention_sessions = Vec::new();
+    manager.for_each_attention(|attention| {
+        attention_sessions.push(attention.session_id.map(str::to_owned));
+    });
+    assert_eq!(attention_sessions, vec![Some(child_id.into())]);
+    assert!(
+        app.agents.get(&other_id).unwrap().ssh_manager.is_none(),
+        "the active unrelated session must not receive the child's authentication prompt",
+    );
+    assert!(
+        app.welcome_ssh_manager.is_none(),
+        "a session-scoped prompt must not fall back to a sessionless manager",
+    );
+
+    app.agents.get_mut(&parent_id).unwrap().ssh_manager = None;
+    dispatch(
+        Action::TaskComplete(TaskResult::SshEventStreamRecovered {
+            pump_generation: app.ssh_event_pump_generation,
+            control_generation: 1,
+            client_id,
+            snapshot: xai_grok_shell::ssh::PendingSshInteractions {
+                client_id,
+                sequence: 1,
+                authentication: vec![prompt],
+                ..Default::default()
+            },
+        }),
+        &mut app,
+    );
+    let recovered = app
+        .agents
+        .get(&parent_id)
+        .and_then(|agent| agent.ssh_manager.as_ref())
+        .expect("recovery must restore the prompt to its exact originating session owner");
+    let mut recovered_sessions = Vec::new();
+    recovered.for_each_attention(|attention| {
+        recovered_sessions.push(attention.session_id.map(str::to_owned));
+    });
+    assert_eq!(recovered_sessions, vec![Some(child_id.into())]);
+    assert!(app.agents.get(&other_id).unwrap().ssh_manager.is_none());
+}
+
+#[test]
+fn sessionless_authentication_uses_the_welcome_manager() {
+    let mut app = test_app_with_agent();
+    app.active_view = ActiveView::Agent(AgentId(0));
+    let client_id = app.ssh_client_id;
+    apply_ssh_control_event(
+        &mut app,
+        None,
+        None,
+        SshEvent::Authentication(SshAuthPrompt {
+            client_id,
+            connection_generation: 1,
+            challenge_id: "manager-password".into(),
+            target_id: TARGET_ID.into(),
+            session_id: None,
+            kind: SshAuthPromptKind::Password,
+            detail: SshAuthPromptDetail::Secret {
+                username: "fixture-user".into(),
+                message: "Password required".into(),
+                allow_remember: false,
+            },
+        }),
+    );
+    assert!(
+        app.welcome_ssh_manager
+            .as_ref()
+            .is_some_and(|manager| manager.session_id.is_none() && manager.is_visible()),
+        "a manager-scoped prompt must remain sessionless even while an agent is selected",
+    );
+    assert!(app.agents.get(&AgentId(0)).unwrap().ssh_manager.is_none());
+}
+
+#[test]
 fn ssh_child_operation_approval_prefers_an_exact_root_session() {
     let mut app = test_app_with_agent();
     let child_id = "loaded-child";
@@ -1444,6 +1566,119 @@ fn reopening_manager_during_dormant_root_wait_preserves_its_owner() {
 }
 
 #[test]
+fn late_root_password_completion_restores_the_reopened_surface_after_enter() {
+    for remote_projects in [false, true] {
+        let mut app = test_app_with_agent();
+        let source = AgentId(0);
+        app.active_view = ActiveView::Agent(source);
+        let session_id = app.agents.get(&source).unwrap().session.session_id.as_ref().unwrap().to_string();
+        let client_id = app.ssh_client_id;
+        let approval_id = if remote_projects {
+            "root-reopen-projects"
+        } else {
+            "root-reopen-manager"
+        };
+        apply_ssh_control_event(
+            &mut app,
+            None,
+            None,
+            SshEvent::OperationApproval(root_operation_approval(
+                approval_id,
+                &session_id,
+                client_id,
+            )),
+        );
+        let owner = ssh_manager_owner(&app).expect("root approval owns its acknowledgement");
+        dispatch(
+            Action::ApproveSshOperation {
+                approval_id: approval_id.into(),
+                approved: true,
+                scope: xai_grok_shell::ssh::SshOperationApprovalScope::Once,
+            },
+            &mut app,
+        );
+        dispatch(
+            Action::TaskComplete(TaskResult::SshOperationApprovalComplete {
+                session_id: Some(session_id.clone()),
+                client_id,
+                owner,
+                approval_id: approval_id.into(),
+                expired: false,
+                error: None,
+            }),
+            &mut app,
+        );
+        if remote_projects {
+            dispatch(Action::ShowRemoteProjects, &mut app);
+        } else {
+            dispatch(Action::OpenSshManager, &mut app);
+        }
+        assert!(
+            app.agents
+                .get(&source)
+                .and_then(|agent| agent.ssh_manager.as_ref())
+                .is_some_and(|manager| manager.is_visible() && manager.is_remote_projects() == remote_projects),
+            "the independently reopened surface must be visible before the late password prompt",
+        );
+        apply_ssh_control_event(
+            &mut app,
+            None,
+            None,
+            SshEvent::SudoAuthentication {
+                session_id: session_id.clone(),
+                operation_id: format!("operation-{approval_id}"),
+                prompt: SshAuthPrompt {
+                    client_id,
+                    connection_generation: 1,
+                    challenge_id: format!("{approval_id}-password"),
+                    target_id: TARGET_ID.into(),
+                    session_id: None,
+                    kind: SshAuthPromptKind::SudoPassword,
+                    detail: SshAuthPromptDetail::Secret {
+                        username: "fixture-user".into(),
+                        message: "Root password required".into(),
+                        allow_remember: false,
+                    },
+                },
+            },
+        );
+        assert!(matches!(
+            app.handle_input(&Event::Paste("fixture-only-password".into())),
+            InputOutcome::Changed
+        ));
+        let InputOutcome::Action(action) =
+            app.handle_input(&Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)))
+        else {
+            panic!("the late root password prompt must submit from the actual Enter input");
+        };
+        assert!(matches!(
+            action,
+            Action::SubmitSshAuthentication { ref challenge_id, .. }
+                if challenge_id == &format!("{approval_id}-password")
+        ));
+        dispatch(action, &mut app);
+        apply_ssh_control_event(
+            &mut app,
+            None,
+            None,
+            SshEvent::SudoAuthenticationResolved {
+                client_id,
+                session_id,
+                challenge_id: format!("{approval_id}-password"),
+                error: None,
+            },
+        );
+        assert!(
+            app.agents
+                .get(&source)
+                .and_then(|agent| agent.ssh_manager.as_ref())
+                .is_some_and(|manager| manager.is_visible() && manager.is_remote_projects() == remote_projects),
+            "late password completion must restore, not close, the newer independent surface",
+        );
+    }
+}
+
+#[test]
 fn sudo_authentication_events_stay_on_their_original_client_session_and_operation() {
     let mut app = test_app_with_agent();
     let source_id = AgentId(0);
@@ -1506,6 +1741,7 @@ fn sudo_authentication_events_stay_on_their_original_client_session_and_operatio
             connection_generation: 4,
             challenge_id: "sudo-challenge".into(),
             target_id: TARGET_ID.into(),
+            session_id: None,
             kind: SshAuthPromptKind::SudoPassword,
             detail: SshAuthPromptDetail::Secret {
                 username: "fixture-user".into(),
@@ -2591,6 +2827,7 @@ fn ssh_tool_grant_authentication_stays_with_its_hidden_originating_session() {
             connection_generation: 3,
             challenge_id: "grant-password".into(),
             target_id: TARGET_ID.into(),
+            session_id: Some(session_id.clone()),
             kind: xai_grok_shell::ssh::SshAuthPromptKind::Password,
             detail: xai_grok_shell::ssh::SshAuthPromptDetail::Secret {
                 username: "fixture-user".into(),
@@ -2974,7 +3211,7 @@ fn ssh_recovery_restores_authoritative_sudo_prompt_and_preserves_typed_secret() 
             session_id, operation_id:"live-root-operation".into(),
             prompt:SshAuthPrompt {
                 client_id, connection_generation:3, challenge_id:"live-root-password".into(),
-                target_id:"fixture".into(), kind:SshAuthPromptKind::SudoPassword,
+                target_id:"fixture".into(), session_id:None, kind:SshAuthPromptKind::SudoPassword,
                 detail:SshAuthPromptDetail::Secret {
                     username:"operator".into(), message:String::new(), allow_remember:false,
                 },
@@ -3000,3 +3237,6 @@ fn ssh_recovery_restores_authoritative_sudo_prompt_and_preserves_typed_secret() 
     assert_eq!(challenge_id, "live-root-password");
     assert_eq!(secret.into_bytes(), b"fixture-only-password");
 }
+
+#[path = "ssh_attention.rs"]
+mod attention;

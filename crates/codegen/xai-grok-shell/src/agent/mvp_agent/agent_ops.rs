@@ -5314,6 +5314,7 @@ impl MvpAgent {
                     None,
                     None,
                     spawn_trace,
+                    self.session_ssh.clone(),
                 )
                 .await?
         };

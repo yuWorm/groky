@@ -462,6 +462,10 @@ pub struct SshAuthPrompt {
     pub connection_generation: u64,
     pub challenge_id: String,
     pub target_id: String,
+    /// The exact session whose live operation is waiting for this answer.
+    /// Manager-only authentication has no session owner.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
     pub kind: SshAuthPromptKind,
     pub detail: SshAuthPromptDetail,
 }

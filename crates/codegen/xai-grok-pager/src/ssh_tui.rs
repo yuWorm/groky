@@ -74,6 +74,7 @@ impl TerminalGuard {
         execute!(
             stdout,
             EnterAlternateScreen,
+            event::EnableFocusChange,
             event::EnableMouseCapture,
             event::EnableBracketedPaste,
             cursor::Hide,
@@ -93,6 +94,7 @@ impl Drop for TerminalGuard {
             stdout,
             cursor::Show,
             event::DisableBracketedPaste,
+            event::DisableFocusChange,
             event::DisableMouseCapture,
             LeaveAlternateScreen,
         );
@@ -181,6 +183,7 @@ struct StandaloneSshRunner {
     connect_only_target: Option<String>,
     last_authentication_submission: Option<AuthenticationSubmission>,
     focus_target: Option<String>,
+    attention: crate::app::ssh_attention::SshAttentionState,
 }
 
 impl StandaloneSshRunner {
@@ -212,6 +215,7 @@ impl StandaloneSshRunner {
             connect_only_target,
             last_authentication_submission: None,
             focus_target,
+            attention: Default::default(),
         }
     }
 
@@ -771,6 +775,10 @@ impl StandaloneSshRunner {
                     || !Arc::ptr_eq(&backend, &self.backend);
                 self.backend = backend;
                 self.client_id = client_id;
+                if changed_client {
+                    self.attention = Default::default();
+                }
+                self.attention.reconcile(&snapshot);
                 let live = crate::views::ssh_modal::SshLiveInteractionIds {
                     grant_ids: Vec::new(), operation_approval_ids: Vec::new(),
                     active_operation_ids: Vec::new(),
@@ -908,6 +916,18 @@ async fn run_terminal(start: SshTuiStart) -> Result<Option<SshProjectOpen>> {
         }
     };
     let theme = Theme::current();
+    let config = xai_grok_shell::config::load_effective_config_with_layers()
+        .inspect_err(|error| tracing::debug!(%error, "failed to load SSH notification config"))
+        .ok()
+        .map(|loaded| crate::notifications::load_notification_config(&loaded.effective))
+        .unwrap_or_default();
+    let (notification_tx, notification_rx) = std::sync::mpsc::channel();
+    let notification_writer = crate::render::draw::EscapeWriter::new(
+        notification_tx, crate::render::draw::WriterSync::new(),
+    );
+    let mut notifications = crate::notifications::NotificationService::new(
+        config, notification_writer.clone(),
+    );
     let mut input_tick = tokio::time::interval(Duration::from_millis(25));
     input_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut sigint = std::pin::pin!(tokio::signal::ctrl_c());
@@ -921,6 +941,10 @@ async fn run_terminal(start: SshTuiStart) -> Result<Option<SshProjectOpen>> {
 
     let result = 'run: loop {
         if dirty {
+            if let Some(runner) = runner.as_mut() {
+                runner.attention.begin_update(runner.client_id);
+                runner.attention.observe(&runner.state, None, &notifications);
+            }
             let draw_result = terminal.draw(|frame| {
                 let area = frame.area();
                 frame.render_widget(Clear, area);
@@ -957,6 +981,17 @@ async fn run_terminal(start: SshTuiStart) -> Result<Option<SshProjectOpen>> {
             }
             dirty = false;
         }
+        let title = crate::notifications::TitleState {
+            session_name: Some("SSH"), model: None, activity: None, cwd: None, turn_elapsed: None,
+            needs_user_action: runner.as_ref().is_some_and(|runner| runner.attention.is_pending()),
+            is_busy: false, focused: notifications.focus_tracker.is_focused(),
+        };
+        if let Some(escapes) = notifications.on_tick(&title) {
+            notification_writer.emit(escapes);
+        }
+        if let Err(error) = flush_notification_output(&mut terminal, &notification_rx) {
+            break Err(error.into());
+        }
 
         if let Some(active_runner) = runner.as_mut() {
             tokio::select! {
@@ -973,6 +1008,11 @@ async fn run_terminal(start: SshTuiStart) -> Result<Option<SshProjectOpen>> {
                             Ok(input) => input,
                             Err(error) => break 'run Err(error.into()),
                         };
+                        match &input {
+                            Event::FocusGained => notifications.focus_tracker.on_focus_gained(),
+                            Event::FocusLost => notifications.focus_tracker.on_focus_lost(),
+                            _ => {}
+                        }
                         let redraw_before_next = match &input {
                             Event::Mouse(_) | Event::Resize(_, _) => true,
                             _ => false,
@@ -1016,6 +1056,11 @@ async fn run_terminal(start: SshTuiStart) -> Result<Option<SshProjectOpen>> {
                             Ok(input) => input,
                             Err(error) => break 'run Err(error.into()),
                         };
+                        match &input {
+                            Event::FocusGained => notifications.focus_tracker.on_focus_gained(),
+                            Event::FocusLost => notifications.focus_tracker.on_focus_lost(),
+                            _ => {}
+                        }
                         dirty = true;
                         match startup_input(input) {
                             LoopAction::Continue => {}
@@ -1043,11 +1088,23 @@ async fn run_terminal(start: SshTuiStart) -> Result<Option<SshProjectOpen>> {
     if let Some(active_runner) = runner.as_mut() {
         active_runner.shutdown().await;
     }
+    notifications.shutdown();
+    let notification_cleanup = flush_notification_output(&mut terminal, &notification_rx);
     drop(runner);
     drop(initialization);
     drop(terminal);
     drop(guard);
-    result
+    result.and_then(|result| notification_cleanup.map(|()| result).map_err(Into::into))
+}
+
+fn flush_notification_output(
+    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+    receiver: &std::sync::mpsc::Receiver<crate::render::draw::WriterPayload>,
+) -> io::Result<()> {
+    for payload in receiver.try_iter() {
+        terminal.backend_mut().write_all(payload.data())?;
+    }
+    terminal.backend_mut().flush()
 }
 
 #[cfg(test)]

@@ -329,10 +329,15 @@ pub(super) fn reconcile_ssh_pending_interactions(
         ));
     }
     for prompt in snapshot.authentication {
+        let owner = prompt
+            .session_id
+            .is_none()
+            .then(|| ssh_manager_owner_for_authentication(app, &prompt.target_id))
+            .flatten();
         effects.extend(apply_ssh_control_event(
             app,
             None,
-            ssh_manager_owner_for_authentication(app, &prompt.target_id),
+            owner,
             xai_grok_shell::ssh::SshEvent::Authentication(prompt),
         ));
     }
@@ -458,6 +463,30 @@ fn ssh_manager_owner_for_authentication(app: &AppView, target_id: &str) -> Optio
             agent_id: Some(*agent_id), instance_id: manager.instance_id(),
         })
     })
+}
+
+/// Select the top-level UI manager that owns a session-scoped interaction.
+///
+/// Child sessions use the existing parent manager, while an independent root keeps its own
+/// manager. The interaction itself retains the original session correlation.
+fn manager_session_for_session_scoped_interaction(app: &AppView, session_id: &str) -> String {
+    let is_root = app.agents.values().any(|agent| {
+        agent
+            .session
+            .session_id
+            .as_ref()
+            .is_some_and(|id| id.0.as_ref() == session_id)
+    });
+    let parent = (!is_root)
+        .then(|| {
+            app.agents
+                .values()
+                .find(|agent| agent.subagent_views.contains_key(session_id))
+                .and_then(|agent| agent.session.session_id.as_ref())
+                .map(|id| id.0.as_ref())
+        })
+        .flatten();
+    parent.unwrap_or(session_id).to_owned()
 }
 
 /// Find the exact manager entitled to answer a managed-worker fallback without creating an
@@ -1434,9 +1463,12 @@ pub(super) fn dispatch_approve_ssh_grant(
         manager.show_error("Open or create a session before granting SSH access.");
         return vec![];
     };
-    if approved {
-        let _ = manager.record_grant_approval(&request_id, target_id.as_deref(), root.as_deref());
-    }
+    let _ = manager.record_grant_decision(
+        &request_id,
+        approved,
+        target_id.as_deref(),
+        root.as_deref(),
+    );
     vec![Effect::SshApproveGrant {
         session_id,
         request_id,
@@ -1465,6 +1497,7 @@ pub(super) fn dispatch_cancel_ssh_grant(
     let Some(session_id) = manager.grant_session_id_for(&request_id) else {
         return vec![];
     };
+    let _ = manager.record_grant_cancellation(&request_id);
     vec![Effect::SshCancelGrant {
         session_id,
         request_id,
@@ -1870,8 +1903,10 @@ pub(super) fn apply_ssh_control_event(
         | xai_grok_shell::ssh::SshEvent::SudoAuthenticationResolved { session_id, .. } => {
             ssh_manager_owner_for_session(app, Some(session_id))
         }
-        xai_grok_shell::ssh::SshEvent::Authentication(prompt) => owner
-            .or_else(|| ssh_manager_owner_for_authentication(app, &prompt.target_id)),
+        xai_grok_shell::ssh::SshEvent::Authentication(prompt) if prompt.session_id.is_none() => {
+            owner.or_else(|| ssh_manager_owner_for_authentication(app, &prompt.target_id))
+        }
+        xai_grok_shell::ssh::SshEvent::Authentication(_) => None,
         _ => owner,
     };
     match &event {
@@ -1991,8 +2026,8 @@ pub(super) fn apply_ssh_control_event(
         xai_grok_shell::ssh::SshEvent::OperationApproval(approval) => {
             Some(approval.session_id.clone())
         }
-        xai_grok_shell::ssh::SshEvent::Authentication(_)
-        | xai_grok_shell::ssh::SshEvent::TargetStatus(_) => {
+        xai_grok_shell::ssh::SshEvent::Authentication(prompt) => prompt.session_id.clone(),
+        xai_grok_shell::ssh::SshEvent::TargetStatus(_) => {
             active_session_id(app).or_else(|| session_id.clone())
         }
         xai_grok_shell::ssh::SshEvent::GrantResolved { .. } => session_id.clone(),
@@ -2009,21 +2044,13 @@ pub(super) fn apply_ssh_control_event(
             xai_grok_shell::ssh::SshOperationApproval { session_id, .. },
         )
         | xai_grok_shell::ssh::SshEvent::OperationApprovalExpired { session_id, .. } => {
-            // A child has no top-level SSH manager. Present consent on its
-            // owning parent; the original approval ID still selects the
-            // child's binding/epoch in the host's approval waiter.
-            let is_root = app.agents.values().any(|agent| {
-                agent.session.session_id.as_ref()
-                    .is_some_and(|id| id.0.as_ref() == session_id)
-            });
-            let parent = (!is_root).then(|| {
-                app.agents.values()
-                    .find(|agent| agent.subagent_views.contains_key(session_id.as_str()))
-                    .and_then(|agent| agent.session.session_id.as_ref())
-                    .map(|id| id.0.as_ref())
-            }).flatten();
-            Some(parent.unwrap_or(session_id).to_owned())
+            Some(manager_session_for_session_scoped_interaction(app, session_id))
         }
+        xai_grok_shell::ssh::SshEvent::Authentication(prompt) => prompt
+            .session_id
+            .as_deref()
+            .map(|session_id| manager_session_for_session_scoped_interaction(app, session_id))
+            .or_else(|| event_session_id.clone()),
         xai_grok_shell::ssh::SshEvent::GrantRequested(request) => {
             worktree_source_session_for_grant(app, request, client_id)
                 .or_else(|| event_session_id.clone())
@@ -2361,7 +2388,7 @@ pub(crate) fn handle_welcome_ssh_input(
             _ => return InputOutcome::Unchanged,
         }
     };
-    if matches!(outcome, SshModalOutcome::Close) {
+    let input = if matches!(outcome, SshModalOutcome::Close) {
         if !app
             .welcome_ssh_manager
             .as_mut()
@@ -2372,5 +2399,9 @@ pub(crate) fn handle_welcome_ssh_input(
         InputOutcome::Changed
     } else {
         map_ssh_modal_outcome(outcome)
+    };
+    if matches!(&input, InputOutcome::Changed) {
+        app.sync_ssh_attention();
     }
+    input
 }

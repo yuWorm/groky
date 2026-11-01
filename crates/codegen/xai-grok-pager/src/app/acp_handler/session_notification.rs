@@ -1465,7 +1465,7 @@ fn queue_wake_turn_complete_notification(app: &mut AppView, agent_id: AgentId) {
         session_name: session_name.as_deref(),
         model: model.as_deref(),
         activity: None,
-        has_pending_permissions: false,
+        needs_user_action: app.needs_user_action(),
         cwd: Some(cwd_str.as_str()),
         turn_elapsed: None,
         is_busy: false,

@@ -25,7 +25,7 @@ pub struct TitleState<'a> {
     pub session_name: Option<&'a str>,
     pub model: Option<&'a str>,
     pub activity: Option<&'a TurnActivity>,
-    pub has_pending_permissions: bool,
+    pub needs_user_action: bool,
     pub cwd: Option<&'a str>,
     pub turn_elapsed: Option<std::time::Duration>,
     /// Whether the agent is busy (turn or command running), even if `activity` is `None` (the "Waiting" gap before first chunk).
@@ -179,7 +179,7 @@ fn write_item(
             let _ = write!(buf, "{}s", secs);
         }
         TitleItem::ActionRequired => {
-            if !state.has_pending_permissions {
+            if !state.needs_user_action {
                 return false;
             }
             // Blink (oscillate) only while unfocused, for tab attention.
@@ -286,7 +286,7 @@ mod tests {
             session_name: None,
             model: None,
             activity: None,
-            has_pending_permissions: false,
+            needs_user_action: false,
             cwd: None,
             turn_elapsed: None,
             is_busy: false,
@@ -564,7 +564,7 @@ mod tests {
         let cfg = config_with_items(vec![TitleItem::ActionRequired, TitleItem::Grok]);
         let mut mgr = TitleManager::new(&cfg);
         let state = TitleState {
-            has_pending_permissions: true,
+            needs_user_action: true,
             ..idle_state()
         };
 
@@ -582,7 +582,7 @@ mod tests {
         let cfg = config_with_items(vec![TitleItem::ActionRequired, TitleItem::Grok]);
         let mut mgr = TitleManager::new(&cfg);
         let state = TitleState {
-            has_pending_permissions: true,
+            needs_user_action: true,
             focused: false, // unfocused, so it blinks
             ..idle_state()
         };
@@ -614,7 +614,7 @@ mod tests {
         let cfg = config_with_items(vec![TitleItem::ActionRequired, TitleItem::Grok]);
         let mut mgr = TitleManager::new(&cfg);
         let state = TitleState {
-            has_pending_permissions: false,
+            needs_user_action: false,
             ..idle_state()
         };
         mgr.update(&state);
@@ -755,7 +755,7 @@ mod tests {
         let state = TitleState {
             session_name: Some("my-session"),
             activity: Some(&activity),
-            has_pending_permissions: true,
+            needs_user_action: true,
             focused: false, // unfocused, so it blinks
             ..idle_state()
         };

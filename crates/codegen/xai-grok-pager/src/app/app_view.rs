@@ -1056,6 +1056,7 @@ pub struct AppView {
     pub(crate) welcome_vendor_login: Option<crate::views::vendor_login_modal::VendorLoginState>,
     /// SSH manager available before provider/model authentication.
     pub(crate) welcome_ssh_manager: Option<crate::views::ssh_modal::SshManagerState>,
+    pub(crate) ssh_attention: crate::app::ssh_attention::SshAttentionState,
     /// Stable local-control identity for SSH authentication and consent events.
     pub(crate) ssh_client_id: u64,
     /// Monotonic identity of the one pager-owned SSH event pump.
@@ -1589,6 +1590,7 @@ impl AppView {
             import_claude_modal: None,
             welcome_vendor_login: None,
             welcome_ssh_manager: None,
+            ssh_attention: Default::default(),
             ssh_client_id: rand::random(),
             ssh_event_pump_generation: 0,
             ssh_event_control_generation: 0,
@@ -2684,6 +2686,12 @@ impl AppView {
                 {
                     return outcome;
                 }
+                let ssh_modal_was_visible = self.agents.get(&id).is_some_and(|agent| {
+                    agent
+                        .ssh_manager
+                        .as_ref()
+                        .is_some_and(crate::views::ssh_modal::SshManagerState::is_visible)
+                });
                 let prompt_paging = !overlay_active && !self.screen_mode.is_minimal();
                 let outcome = match self.agents.get_mut(&id) {
                     Some(agent) => {
@@ -2711,6 +2719,9 @@ impl AppView {
                     }
                     None => InputOutcome::Unchanged,
                 };
+                if ssh_modal_was_visible && matches!(&outcome, InputOutcome::Changed) {
+                    self.sync_ssh_attention();
+                }
                 if self.pending_editor.is_some()
                     && matches!(outcome, InputOutcome::Action(Action::EditPromptExternal))
                 {
@@ -2825,7 +2836,13 @@ impl AppView {
                             return InputOutcome::Unchanged;
                         }
                     }
-                    match self.agents.get_mut(&agent_id) {
+                    let ssh_modal_was_visible = self.agents.get(&agent_id).is_some_and(|agent| {
+                        agent
+                            .ssh_manager
+                            .as_ref()
+                            .is_some_and(crate::views::ssh_modal::SshManagerState::is_visible)
+                    });
+                    let outcome = match self.agents.get_mut(&agent_id) {
                         Some(agent) => {
                             let transcript_before = agent.active_subagent.clone();
                             let workflows_before = agent.show_workflows;
@@ -2856,7 +2873,11 @@ impl AppView {
                             outcome
                         }
                         None => InputOutcome::Unchanged,
+                    };
+                    if ssh_modal_was_visible && matches!(&outcome, InputOutcome::Changed) {
+                        self.sync_ssh_attention();
                     }
+                    outcome
                 } else if let Some(ref mut dashboard) = self.dashboard {
                     let outcome = dashboard.handle_input_with_paste_provenance(
                         ev,
@@ -5855,7 +5876,7 @@ impl AppView {
     /// Stores any resulting escape sequences in `pending_notification_escapes`.
     /// Also clears the permission notification flag when no permissions remain queued, so the next batch fires a fresh bell/popup.
     pub fn update_notifications(&mut self) {
-        let (session_name, model, activity, has_perms, turn_elapsed, is_busy) =
+        let (session_name, model, activity, turn_elapsed, is_busy) =
             if let ActiveView::Agent(id) = self.active_view
                 && let Some(agent) = self.agents.get(&id)
             {
@@ -5870,12 +5891,11 @@ impl AppView {
                 } else {
                     agent.resolve_turn_activity()
                 };
-                let has_perms = !agent.permission_queue.is_empty();
                 let elapsed = if parked { None } else { agent.turn_elapsed() };
                 let is_busy = agent.session.state.is_busy() && !parked;
-                (name, model, activity, has_perms, elapsed, is_busy)
+                (name, model, activity, elapsed, is_busy)
             } else {
-                (None, None, None, false, None, false)
+                (None, None, None, None, false)
             };
         let any_agent_has_perms = self.agents.values().any(|a| !a.permission_queue.is_empty());
         if !any_agent_has_perms {
@@ -5886,7 +5906,7 @@ impl AppView {
             session_name,
             model: model.as_deref(),
             activity: activity.as_ref(),
-            has_pending_permissions: has_perms,
+            needs_user_action: self.needs_user_action(),
             cwd: Some(&cwd_str),
             turn_elapsed,
             is_busy,

@@ -339,6 +339,7 @@ pub(crate) async fn spawn_session_actor(
     is_chat_kind: bool,
     spawn_ctx: Option<xai_grok_telemetry::subagent_spawn::SpawnPhaseContext>,
     sampling_gate: Option<Arc<tokio::sync::Semaphore>>,
+    ssh_attention_service: Option<Arc<crate::ssh::SessionSsh>>,
 ) -> Result<(SessionInitResult, tokio::sync::oneshot::Receiver<()>), xai_grok_agent::AgentBuildError>
 {
     if max_turns == Some(0) {
@@ -2249,6 +2250,10 @@ pub(crate) async fn spawn_session_actor(
     }
     .instrument(actor_setup_span)
     .await;
+    let ssh_attention_registration = ssh_attention_service
+        .as_ref()
+        .map(|service| session.wire_ssh_attention_notifications(service));
+    let ssh_attention_session_id = session.session_id_string();
     drop(actor_setup_timer);
     if let Some(storage) = session
         .memory
@@ -2473,6 +2478,11 @@ pub(crate) async fn spawn_session_actor(
         .await;
         if let Some(file_acceleration_session) = file_acceleration_session {
             file_acceleration_session.finish();
+        }
+        if let (Some(service), Some(generation)) =
+            (ssh_attention_service, ssh_attention_registration)
+        {
+            service.unregister_session_attention_sink(&ssh_attention_session_id, generation);
         }
         let _ = session_done_tx.send(());
     });
@@ -2718,6 +2728,7 @@ pub(crate) async fn spawn_session_on_thread(
     spawn_ctx: Option<xai_grok_telemetry::subagent_spawn::SpawnPhaseContext>,
     sampling_gate: Option<Arc<tokio::sync::Semaphore>>,
     spawn_trace: Option<xai_grok_telemetry::startup::SpawnTraceContext>,
+    ssh_attention_service: Option<Arc<crate::ssh::SessionSsh>>,
 ) -> Result<(SessionInitResult, SessionThread), acp::Error> {
     let (init_tx, init_rx) = tokio::sync::oneshot::channel::<
         Result<SessionInitResult, xai_grok_agent::AgentBuildError>,
@@ -2927,6 +2938,7 @@ pub(crate) async fn spawn_session_on_thread(
                     is_chat_kind,
                     spawn_ctx,
                     sampling_gate,
+                    ssh_attention_service,
                 );
                 let actor_result = actor_fut.instrument(session_spawn_span).await;
                 let (init, session_done_rx) = match actor_result {

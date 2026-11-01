@@ -37,3 +37,5 @@ Next groky version after `v0.1.32`.
 - **SSH task controls** query, wait for, and cancel local background subagents alongside remote commands. Mixed waits honor any/all, and ending a wait leaves the underlying tasks running.
 - **SSH monitors** stream remote events back into the owning session and wake the agent while it is idle. Watcher status and natural completion reach the TUI; explicitly stopping a monitor does not trigger another completion wake.
 - **SSH subagents** show remote-operation approvals in their parent session, avoiding invisible five-minute approval waits.
+- **SSH root authentication** closes its prompt after the password response settles instead of leaving the SSH list open, while preserving other pending requests and independently reopened pages.
+- **SSH interaction prompts** trigger the originating session's `permission_prompt` hooks and configured terminal notifications, with an `Action Required` title for pending input, including background sessions and child-session startup.

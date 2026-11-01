@@ -468,6 +468,7 @@ pub(crate) fn authentication_card(
 ) -> std::result::Result<crate::views::ssh_modal::SshAuthCard, String> {
     use crate::views::ssh_modal::{SshAuthCard, SshAuthKind};
     use xai_grok_shell::ssh::{SshAuthPromptDetail, SshAuthPromptKind};
+    let session_id = prompt.session_id;
     let kind = match (prompt.kind, prompt.detail) {
         (SshAuthPromptKind::HostKey, SshAuthPromptDetail::HostKey {
             hostname, port, algorithm, fingerprint, status, previous_keys, can_replace,
@@ -490,7 +491,15 @@ pub(crate) fn authentication_card(
         },
         _ => return Err("SSH authentication prompt kind did not match its local details.".into()),
     };
-    Ok(SshAuthCard::new(prompt.challenge_id, prompt.connection_generation, prompt.target_id, kind))
+    Ok(
+        SshAuthCard::new(
+            prompt.challenge_id,
+            prompt.connection_generation,
+            prompt.target_id,
+            kind,
+        )
+        .with_session_id(session_id),
+    )
 }
 
 async fn receive_ssh_envelope(

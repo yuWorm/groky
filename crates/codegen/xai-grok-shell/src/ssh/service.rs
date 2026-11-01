@@ -8,7 +8,7 @@ use async_trait::async_trait;
 use thiserror::Error;
 use zeroize::Zeroize;
 
-use tokio::sync::{Mutex, RwLock, broadcast, oneshot};
+use tokio::sync::{Mutex, RwLock, broadcast, mpsc, oneshot};
 use uuid::Uuid;
 use xai_grok_ssh::{
     ConfigError, ConnectionLease, ConnectionManager, ConnectionPhase, HostKeyDecision,
@@ -40,6 +40,30 @@ use super::model::{
 };
 
 const INTERACTION_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// A fixed, local-only summary for an SSH wait that needs its originating
+/// session's user to act. It deliberately carries no command, target, error,
+/// or credential material.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub(crate) enum SshAttentionKind {
+    Grant,
+    OperationApproval,
+    Authentication,
+    SudoPassword,
+    WorkerInstall,
+}
+
+impl SshAttentionKind {
+    pub(crate) const fn message(self) -> &'static str {
+        match self {
+            Self::Grant => "SSH access approval requested",
+            Self::OperationApproval => "SSH operation approval requested",
+            Self::Authentication => "SSH authentication requested",
+            Self::SudoPassword => "SSH sudo password requested",
+            Self::WorkerInstall => "SSH worker installation source requested",
+        }
+    }
+}
 
 #[derive(Debug, Error)]
 pub enum SshServiceError {
@@ -190,6 +214,10 @@ struct SessionSshInner {
     worker_install_waiters: Mutex<HashMap<String, PendingWorkerInstall>>,
     session_event_sinks: Mutex<HashMap<String, broadcast::Sender<SshSessionWorkerEvent>>>,
     tool_notifications: super::notifications::NotificationTargets,
+    /// Local session actors that should surface a newly publishable SSH wait
+    /// through their existing permission-prompt hook.
+    attention_sinks: StdMutex<HashMap<String, SessionAttentionSink>>,
+    attention_sink_generation: AtomicU64,
     grant_waiters: StdMutex<HashMap<String, PendingToolGrant>>,
     approval_waiters: Mutex<HashMap<String, PendingOperationApproval>>,
     approval_generation: AtomicU64,
@@ -269,6 +297,7 @@ struct PendingAuthentication {
     target_epoch: u64,
     client_id: u64,
     connection_generation: u64,
+    session_id: Option<String>,
     response: oneshot::Sender<SshAuthResponse>,
 }
 
@@ -293,6 +322,41 @@ struct PendingSudoGate {
     active: Arc<AtomicBool>,
     resolved: Arc<AtomicBool>,
     challenge_id: Arc<StdMutex<Option<String>>>,
+}
+
+struct SessionAttentionSink {
+    generation: u64,
+    sender: mpsc::UnboundedSender<SshAttentionKind>,
+}
+
+/// Temporarily routes a child session's SSH attention to its explicitly named
+/// parent while the child actor is not yet available to register its own sink.
+/// The generation check makes a later real child registration authoritative.
+pub(crate) struct ProvisionalChildAttentionRegistration {
+    service: Weak<SessionSshInner>,
+    child_session_id: String,
+    generation: Option<u64>,
+}
+
+impl Drop for ProvisionalChildAttentionRegistration {
+    fn drop(&mut self) {
+        let Some(generation) = self.generation else {
+            return;
+        };
+        let Some(service) = self.service.upgrade() else {
+            return;
+        };
+        let mut sinks = service
+            .attention_sinks
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if sinks
+            .get(&self.child_session_id)
+            .is_some_and(|sink| sink.generation == generation)
+        {
+            sinks.remove(&self.child_session_id);
+        }
+    }
 }
 
 struct PendingToolGrant {
@@ -532,6 +596,19 @@ fn publish_event(service: &SessionSshInner, event: SshEvent) -> usize {
     control_receivers.max(raw_receivers)
 }
 
+fn notify_session_attention(service: &SessionSshInner, session_id: &str, kind: SshAttentionKind) {
+    let mut sinks = service
+        .attention_sinks
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if sinks
+        .get(session_id)
+        .is_some_and(|sink| sink.sender.send(kind).is_err())
+    {
+        sinks.remove(session_id);
+    }
+}
+
 async fn expire_operation_approvals(
     service: &SessionSshInner,
     mut should_expire: impl FnMut(&str, &PendingOperationApproval) -> bool,
@@ -666,6 +743,8 @@ impl SessionSsh {
                 sudo_gates: Mutex::new(HashMap::new()),
                 session_event_sinks: Mutex::new(HashMap::new()),
                 tool_notifications: Default::default(),
+                attention_sinks: StdMutex::new(HashMap::new()),
+                attention_sink_generation: AtomicU64::new(0),
                 grant_waiters: StdMutex::new(HashMap::new()),
                 approval_waiters: Mutex::new(HashMap::new()),
                 approval_generation: AtomicU64::new(0),
@@ -693,6 +772,78 @@ impl SessionSsh {
 
     pub fn subscribe_control_events(&self) -> broadcast::Receiver<SshEventEnvelope> {
         self.inner.control_events.subscribe()
+    }
+
+    pub(crate) fn register_session_attention_sink(
+        &self,
+        session_id: String,
+        sender: mpsc::UnboundedSender<SshAttentionKind>,
+    ) -> u64 {
+        let generation = self
+            .inner
+            .attention_sink_generation
+            .fetch_add(1, Ordering::AcqRel);
+        self.inner
+            .attention_sinks
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(session_id, SessionAttentionSink { generation, sender });
+        generation
+    }
+
+    pub(crate) fn unregister_session_attention_sink(&self, session_id: &str, generation: u64) {
+        let mut sinks = self
+            .inner
+            .attention_sinks
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if sinks
+            .get(session_id)
+            .is_some_and(|sink| sink.generation == generation)
+        {
+            sinks.remove(session_id);
+        }
+    }
+
+    /// Routes child bootstrap attention through an already-live parent actor.
+    /// A real child sink always wins; this registration never replaces one.
+    pub(crate) fn register_provisional_child_attention_sink(
+        &self,
+        parent_session_id: &str,
+        child_session_id: &str,
+    ) -> ProvisionalChildAttentionRegistration {
+        let mut registration = ProvisionalChildAttentionRegistration {
+            service: Arc::downgrade(&self.inner),
+            child_session_id: child_session_id.to_owned(),
+            generation: None,
+        };
+        if parent_session_id == child_session_id {
+            return registration;
+        }
+        let mut sinks = self
+            .inner
+            .attention_sinks
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(sender) = sinks
+            .get(parent_session_id)
+            .map(|parent| parent.sender.clone())
+        else {
+            return registration;
+        };
+        if sinks.contains_key(child_session_id) {
+            return registration;
+        }
+        let generation = self
+            .inner
+            .attention_sink_generation
+            .fetch_add(1, Ordering::AcqRel);
+        sinks.insert(
+            child_session_id.to_owned(),
+            SessionAttentionSink { generation, sender },
+        );
+        registration.generation = Some(generation);
+        registration
     }
 
     /// Snapshot active non-secret interactions for exactly one local client.
@@ -1047,7 +1198,7 @@ impl SessionSsh {
         let target_id = self.canonical_target_id(target_id)?;
         let target_epoch = self.target_config_epoch();
         let lease = self
-            .acquire_native(&target_id, Some(client_id), true)
+            .acquire_native(&target_id, Some(client_id), true, None)
             .await?;
         let listing = super::project_browser::browse(&lease, target_id.clone(), path)
             .await
@@ -1086,7 +1237,7 @@ impl SessionSsh {
         }
         let target_epoch = self.target_config_epoch();
         let lease = self
-            .acquire_native_after_refresh(&target_id, Some(client_id), true)
+            .acquire_native_after_refresh(&target_id, Some(client_id), true, None)
             .await?;
         let identity = lease.identity().clone();
         if expected_identity.is_some_and(|expected| expected != &identity) {
@@ -1933,6 +2084,11 @@ impl SessionSsh {
     /// Removes all nonpersistent approval state for a terminal session close.
     pub async fn clear_session_interactions(&self, session_id: &str) {
         self.inner.tool_notifications.forget(session_id);
+        self.inner
+            .attention_sinks
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(session_id);
         expire_operation_approvals(&self.inner, |_, waiter| {
             waiter.binding.session_id.as_str() == session_id
         })
@@ -2127,13 +2283,21 @@ impl SessionSsh {
         &self,
         request: SshGrantRequest,
     ) -> Result<SshGrantRequest, SshServiceError> {
-        let mut sessions = self.inner.sessions.write().await;
-        let state = sessions.entry(request.session_id.clone()).or_default();
-        let mut candidate = state.clone();
-        candidate.pending_requests.insert(request.id.clone(), request.clone());
-        self.persist_state(&request.session_id, &candidate).await?;
-        *state = candidate;
-        let _ = publish_event(&self.inner, SshEvent::GrantRequested(request.clone()));
+        let originating_session_id = request.originating_session_id.clone();
+        let published = {
+            let mut sessions = self.inner.sessions.write().await;
+            let state = sessions.entry(request.session_id.clone()).or_default();
+            let mut candidate = state.clone();
+            candidate.pending_requests.insert(request.id.clone(), request.clone());
+            self.persist_state(&request.session_id, &candidate).await?;
+            *state = candidate;
+            publish_event(&self.inner, SshEvent::GrantRequested(request.clone())) != 0
+        };
+        if published
+            && let Some(session_id) = originating_session_id.as_deref()
+        {
+            notify_session_attention(&self.inner, session_id, SshAttentionKind::Grant);
+        }
         Ok(request)
     }
 
@@ -2141,27 +2305,37 @@ impl SessionSsh {
         &self,
         request: SshGrantRequest,
     ) -> Result<(), SshServiceError> {
-        let mut sessions = self.inner.sessions.write().await;
-        let state = sessions.entry(request.session_id.clone()).or_default();
-        let mut candidate = state.clone();
-        candidate.pending_requests.insert(request.id.clone(), request.clone());
-        self.persist_state(&request.session_id, &candidate).await?;
-        // Publication and cancellation share this lock: a detached client cannot
-        // leave a newly published prompt after its waiter has already been cleared.
-        let waiters = self.inner.grant_waiters.lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if !waiters.get(&request.id).is_some_and(|waiter| {
-            !waiter.cancelled.load(Ordering::Acquire)
-                && waiter.response.as_ref().is_some_and(|response| !response.is_closed())
-        }) {
-            return Err(SshServiceError::GrantCancelled);
+        let session_id = request.session_id.clone();
+        let published = {
+            let mut sessions = self.inner.sessions.write().await;
+            let state = sessions.entry(request.session_id.clone()).or_default();
+            let mut candidate = state.clone();
+            candidate.pending_requests.insert(request.id.clone(), request.clone());
+            self.persist_state(&request.session_id, &candidate).await?;
+            // Publication and cancellation share this lock: a detached client cannot
+            // leave a newly published prompt after its waiter has already been cleared.
+            let waiters = self
+                .inner
+                .grant_waiters
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if !waiters.get(&request.id).is_some_and(|waiter| {
+                !waiter.cancelled.load(Ordering::Acquire)
+                    && waiter
+                        .response
+                        .as_ref()
+                        .is_some_and(|response| !response.is_closed())
+            }) {
+                return Err(SshServiceError::GrantCancelled);
+            }
+            *state = candidate;
+            publish_event(&self.inner, SshEvent::GrantRequested(request)) != 0
+        };
+        if !published {
+            return Err(SshServiceError::InteractiveClientRequired);
         }
-        *state = candidate;
-        if publish_event(&self.inner, SshEvent::GrantRequested(request)) == 0 {
-            Err(SshServiceError::InteractiveClientRequired)
-        } else {
-            Ok(())
-        }
+        notify_session_attention(&self.inner, &session_id, SshAttentionKind::Grant);
+        Ok(())
     }
 
 
@@ -2412,9 +2586,18 @@ impl SessionSsh {
             return Err(SshServiceError::RootSelectionRequired);
         }
 
+        let origin_session_id = request
+            .originating_session_id
+            .as_deref()
+            .or_else(|| request.awaiting_tool.then_some(request.session_id.as_str()));
         let target_epoch = self.target_config_epoch();
         let lease = self
-            .acquire_native_after_refresh(target_id.as_str(), Some(client_id), true)
+            .acquire_native_after_refresh(
+                target_id.as_str(),
+                Some(client_id),
+                true,
+                origin_session_id,
+            )
             .await?;
         let identity = lease.identity().clone();
         ensure_inspection_identity(&request, expected_identity.as_ref(), &identity)?;
@@ -2544,8 +2727,17 @@ impl SessionSsh {
         let root = choose_narrower_root(&request, decision.root.as_deref())?;
         let capabilities = choose_narrower_capabilities(&request, decision.capabilities)?;
         let target_epoch = self.target_config_epoch();
+        let origin_session_id = request
+            .originating_session_id
+            .as_deref()
+            .or_else(|| request.awaiting_tool.then_some(request.session_id.as_str()));
         let lease = self
-            .acquire_native_after_refresh(&target_id, Some(decision.client_id), true)
+            .acquire_native_after_refresh(
+                &target_id,
+                Some(decision.client_id),
+                true,
+                origin_session_id,
+            )
             .await?;
         let identity = lease.identity().clone();
         if let Some(inspected) = &request.verified_identity {
@@ -3028,7 +3220,12 @@ impl SessionSsh {
         let target_epoch = self.target_config_epoch();
         let binding = self.binding_for_invocation(&request.invocation).await?;
         let lease = self
-            .acquire(&binding.target_id, client_id, client_id.is_some())
+            .acquire(
+                &binding.target_id,
+                client_id,
+                client_id.is_some(),
+                client_id.is_some().then_some(binding.session_id.as_str()),
+            )
             .await?;
         if lease.identity() != &binding.identity {
             return Err(SshServiceError::IdentityChanged);
@@ -3383,7 +3580,7 @@ impl SessionSsh {
         let target_id = self.canonical_target_id(target_id)?;
         let target_epoch = self.target_config_epoch();
         let lease = self
-            .acquire(&target_id, Some(client_id), interactive)
+            .acquire(&target_id, Some(client_id), interactive, None)
             .await?;
         let identity = lease.identity();
         let status = SshTargetStatus {
@@ -4104,7 +4301,12 @@ impl SessionSsh {
             }
         }
         let lease = self
-            .acquire_native_after_refresh(&binding.target_id, client_id, client_id.is_some())
+            .acquire_native_after_refresh(
+                &binding.target_id,
+                client_id,
+                client_id.is_some(),
+                client_id.is_some().then_some(binding.session_id.as_str()),
+            )
             .await?;
         self.sync_pending_revocations(&lease, &binding.target_id).await?;
         if lease.identity() != &binding.identity {
@@ -4258,9 +4460,10 @@ impl SessionSsh {
         target_id: &str,
         client_id: Option<u64>,
         interactive: bool,
+        origin_session_id: Option<&str>,
     ) -> Result<ConnectionLease, SshServiceError> {
         self.refresh_external_target_changes().await?;
-        self.acquire_native_after_refresh(target_id, client_id, interactive)
+        self.acquire_native_after_refresh(target_id, client_id, interactive, origin_session_id)
             .await
     }
 
@@ -4269,11 +4472,13 @@ impl SessionSsh {
         target_id: &str,
         client_id: Option<u64>,
         interactive: bool,
+        origin_session_id: Option<&str>,
     ) -> Result<ConnectionLease, SshServiceError> {
         let interaction: Arc<dyn Interaction> = Arc::new(LocalInteractionBridge {
             service: Arc::downgrade(&self.inner),
             client_id,
             interactive,
+            session_id: origin_session_id.map(str::to_owned),
         });
         self.inner
             .connections
@@ -4287,9 +4492,10 @@ impl SessionSsh {
         target_id: &str,
         client_id: Option<u64>,
         interactive: bool,
+        origin_session_id: Option<&str>,
     ) -> Result<ConnectionLease, SshServiceError> {
         let lease = self
-            .acquire_native(target_id, client_id, interactive)
+            .acquire_native(target_id, client_id, interactive, origin_session_id)
             .await?;
         self.sync_pending_revocations(&lease, target_id).await?;
         Ok(lease)
@@ -4525,6 +4731,11 @@ impl super::worker_install::WorkerInstallInteraction for WorkerInstallBridge {
                     .into(),
             );
         }
+        notify_session_attention(
+            &service,
+            &self.binding.session_id,
+            SshAttentionKind::WorkerInstall,
+        );
         let decision = tokio::time::timeout(INTERACTION_TIMEOUT, receiver).await;
         if service
             .worker_install_waiters
@@ -4563,6 +4774,7 @@ struct LocalInteractionBridge {
     service: Weak<SessionSshInner>,
     client_id: Option<u64>,
     interactive: bool,
+    session_id: Option<String>,
 }
 
 #[async_trait]
@@ -4582,11 +4794,13 @@ impl Interaction for LocalInteractionBridge {
             client_id,
             prompt.connection_generation,
             prompt.challenge_id.to_string(),
+            self.session_id.as_deref(),
             SshAuthPrompt {
                 client_id,
                 connection_generation: prompt.connection_generation,
                 challenge_id: prompt.challenge_id.to_string(),
                 target_id: prompt.target_id,
+                session_id: None,
                 kind: SshAuthPromptKind::HostKey,
                 detail: SshAuthPromptDetail::HostKey {
                     hostname: prompt.hostname,
@@ -4597,7 +4811,7 @@ impl Interaction for LocalInteractionBridge {
                     previous_keys: prompt.previous_keys,
                     can_replace: prompt.can_replace,
                 },
-            },
+            }
         )
         .await?;
         match response
@@ -4627,18 +4841,20 @@ impl Interaction for LocalInteractionBridge {
             client_id,
             prompt.connection_generation,
             prompt.challenge_id.to_string(),
+            self.session_id.as_deref(),
             SshAuthPrompt {
                 client_id,
                 connection_generation: prompt.connection_generation,
                 challenge_id: prompt.challenge_id.to_string(),
                 target_id: prompt.target_id,
+                session_id: None,
                 kind,
                 detail: SshAuthPromptDetail::Secret {
                     username: prompt.username,
                     message: prompt.message,
                     allow_remember: prompt.allow_remember,
                 },
-            },
+            }
         )
         .await?;
         let mut response = response;
@@ -4668,11 +4884,13 @@ impl Interaction for LocalInteractionBridge {
             client_id,
             prompt.connection_generation,
             prompt.challenge_id.to_string(),
+            self.session_id.as_deref(),
             SshAuthPrompt {
                 client_id,
                 connection_generation: prompt.connection_generation,
                 challenge_id: prompt.challenge_id.to_string(),
                 target_id: prompt.target_id,
+                session_id: None,
                 kind: SshAuthPromptKind::KeyboardInteractive,
                 detail: SshAuthPromptDetail::KeyboardInteractive {
                     name: prompt.name,
@@ -4686,7 +4904,7 @@ impl Interaction for LocalInteractionBridge {
                         })
                         .collect(),
                 },
-            },
+            }
         )
         .await?;
         if response.answers.len() != expected_answers {
@@ -4802,6 +5020,11 @@ impl SshClientCallbacks for WorkerCallbacks {
         if !published {
             return SshApprovalDecision::Deny;
         }
+        notify_session_attention(
+            &service,
+            &self.binding.session_id,
+            SshAttentionKind::OperationApproval,
+        );
         let mut guard = OperationApprovalWaitGuard::new(
             self.service.clone(),
             client_id,
@@ -4902,31 +5125,42 @@ async fn await_auth_response(
     client_id: u64,
     connection_generation: u64,
     challenge_id: String,
+    origin_session_id: Option<&str>,
     prompt: SshAuthPrompt,
 ) -> Result<SshAuthResponse, InteractionError> {
     let Some(service) = service.upgrade() else {
         return Err(InteractionError::Unavailable);
     };
+    let origin_session_id = origin_session_id.map(str::to_owned);
+    let prompt = SshAuthPrompt {
+        session_id: origin_session_id.clone(),
+        ..prompt
+    };
     let (response, receiver) = oneshot::channel();
-    {
+    let (published, attention_session_id) = {
         let mut waiters = service.auth_waiters.lock().await;
-        if waiters
-            .insert(
-                challenge_id.clone(),
-                PendingAuthentication {
-                    prompt: prompt.clone(),
-                    target_id: prompt.target_id.clone(),
-                    target_epoch: service.target_config_epoch.load(Ordering::Acquire),
-                    client_id,
-                    connection_generation,
-                    response,
-                },
-            )
-            .is_some()
-        {
+        let waiter = PendingAuthentication {
+            prompt: prompt.clone(),
+            target_id: prompt.target_id.clone(),
+            target_epoch: service.target_config_epoch.load(Ordering::Acquire),
+            client_id,
+            connection_generation,
+            session_id: origin_session_id,
+            response,
+        };
+        let attention_session_id = waiter.session_id.clone();
+        if waiters.insert(challenge_id.clone(), waiter).is_some() {
             return Err(InteractionError::Unavailable);
         }
-        let _ = publish_event(&service, SshEvent::Authentication(prompt));
+        (
+            publish_event(&service, SshEvent::Authentication(prompt)) != 0,
+            attention_session_id,
+        )
+    };
+    if published
+        && let Some(session_id) = attention_session_id.as_deref()
+    {
+        notify_session_attention(&service, session_id, SshAttentionKind::Authentication);
     }
     let result = tokio::time::timeout(INTERACTION_TIMEOUT, receiver)
         .await
@@ -5236,6 +5470,7 @@ async fn await_sudo_auth_response(
         connection_generation: prompt.connection_generation,
         challenge_id: challenge_id.clone(),
         target_id: prompt.target_id,
+        session_id: Some(bridge.binding.session_id.clone()),
         kind: SshAuthPromptKind::SudoPassword,
         detail: SshAuthPromptDetail::Secret {
             username: prompt.username,
@@ -5244,7 +5479,7 @@ async fn await_sudo_auth_response(
         },
     };
     let (response, receiver) = oneshot::channel();
-    {
+    let published = {
         let gates = service.sudo_gates.lock().await;
         let Some(gate) = gates.get(&bridge.operation_id) else {
             return Err(InteractionError::Unavailable);
@@ -5277,19 +5512,27 @@ async fn await_sudo_auth_response(
                 response,
             },
         );
-        if publish_event(
+        let published = publish_event(
             &service,
             SshEvent::SudoAuthentication {
                 session_id: bridge.binding.session_id.clone(),
                 operation_id: bridge.operation_id.clone(),
                 prompt,
             },
-        ) == 0
-        {
+        ) != 0;
+        if !published {
             waiters.remove(&challenge_id);
-            return Err(InteractionError::Unavailable);
         }
+        published
+    };
+    if !published {
+        return Err(InteractionError::Unavailable);
     }
+    notify_session_attention(
+        &service,
+        &bridge.binding.session_id,
+        SshAttentionKind::SudoPassword,
+    );
     let result = tokio::time::timeout(INTERACTION_TIMEOUT, receiver)
         .await
         .ok()
@@ -5846,6 +6089,7 @@ mod tests {
             service: Arc::downgrade(&service.inner),
             client_id: None,
             interactive: false,
+            session_id: None,
         };
         let error = bridge
             .confirm_host_key(HostKeyPrompt {
@@ -5923,6 +6167,22 @@ mod tests {
         }
     }
 
+    fn password_auth_prompt(challenge_id: &str) -> SshAuthPrompt {
+        SshAuthPrompt {
+            client_id: 7,
+            connection_generation: 1,
+            challenge_id: challenge_id.into(),
+            target_id: "target".into(),
+            session_id: None,
+            kind: SshAuthPromptKind::Password,
+            detail: SshAuthPromptDetail::Secret {
+                username: "user".into(),
+                message: "SSH_RAW_SECRET_MARKER".into(),
+                allow_remember: false,
+            },
+        }
+    }
+
     async fn service_with_execute_grant() -> (tempfile::TempDir, SessionSsh, SshBinding) {
         let home = tempfile::tempdir().unwrap();
         let service = SessionSsh::new(home.path().to_owned());
@@ -5946,6 +6206,401 @@ mod tests {
             )
             .await;
         (home, service, granted)
+    }
+
+    #[tokio::test]
+    async fn unpublished_tool_grant_does_not_emit_session_attention() {
+        let home = tempfile::tempdir().unwrap();
+        let service = SessionSsh::new(home.path().to_owned());
+        let (sender, mut receiver) = mpsc::unbounded_channel();
+        service.register_session_attention_sink("origin".into(), sender);
+
+        let result = service
+            .request_tool_grant(
+                "origin",
+                None,
+                None,
+                SshCapabilities::all(),
+                "SSH_RAW_SECRET_MARKER".into(),
+                Some(7),
+                None,
+            )
+            .await;
+
+        assert!(matches!(result, Err(SshServiceError::InteractiveClientRequired)));
+        assert!(receiver.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn automatic_operation_approval_does_not_emit_session_attention() {
+        let (_home, service, granted) = service_with_execute_grant().await;
+        let (sender, mut receiver) = mpsc::unbounded_channel();
+        service.register_session_attention_sink("session".into(), sender);
+        service
+            .inner
+            .operation_approval_policies
+            .lock()
+            .await
+            .push(OperationApprovalPolicy {
+                client_id: 7,
+                session_id: granted.session_id.clone(),
+                binding_id: granted.id.clone(),
+                epoch: granted.epoch,
+                identity: granted.identity.clone(),
+                operation: SshOperation::Execute,
+            });
+        let callbacks = WorkerCallbacks {
+            service: Arc::downgrade(&service.inner),
+            client_id: Some(7),
+            binding: granted,
+            target_epoch: service.target_config_epoch(),
+            allow_session: true,
+        };
+
+        let decision = callbacks
+            .approve(SshApprovalRequest {
+                approval_id: "automatic".into(),
+                operation_id: "automatic-operation".into(),
+                binding_id: "binding".into(),
+                session_id: "session".into(),
+                operation: SshOperation::Execute,
+                title: "automatic approval".into(),
+                detail: serde_json::json!({}),
+            })
+            .await;
+
+        assert_eq!(decision, SshApprovalDecision::Approve);
+        assert!(receiver.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn inherited_child_grant_notifies_its_originating_parent_session() {
+        let home = tempfile::tempdir().unwrap();
+        let service = SessionSsh::new(home.path().to_owned());
+        let (parent_sender, mut parent_receiver) = mpsc::unbounded_channel();
+        let (child_sender, mut child_receiver) = mpsc::unbounded_channel();
+        service.register_session_attention_sink("parent".into(), parent_sender);
+        service.register_session_attention_sink("child".into(), child_sender);
+        let mut events = service.subscribe_events();
+
+        let request = service
+            .publish_grant_request(SshGrantRequest {
+                id: "child-root-consent".into(),
+                session_id: "child".into(),
+                originating_session_id: Some("parent".into()),
+                target_id: Some("target".into()),
+                root: Some("/remote/worktree".into()),
+                capabilities: SshCapabilities::all(),
+                reason: "SSH_RAW_SECRET_MARKER".into(),
+                verified_identity: None,
+                client_id: Some(7),
+                awaiting_tool: false,
+            })
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            events.recv().await.unwrap(),
+            SshEvent::GrantRequested(published) if published.id == request.id
+        ));
+        assert_eq!(parent_receiver.recv().await, Some(SshAttentionKind::Grant));
+        assert!(child_receiver.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn originated_auth_wait_notifies_only_its_originating_session() {
+        let home = tempfile::tempdir().unwrap();
+        let service = SessionSsh::new(home.path().to_owned());
+        let (origin_sender, mut origin_receiver) = mpsc::unbounded_channel();
+        let (other_sender, mut other_receiver) = mpsc::unbounded_channel();
+        service.register_session_attention_sink("origin".into(), origin_sender);
+        service.register_session_attention_sink("other".into(), other_sender);
+        let mut events = service.subscribe_events();
+        let service_ref = Arc::downgrade(&service.inner);
+        let waiter = tokio::spawn(async move {
+            await_auth_response(
+                &service_ref,
+                7,
+                1,
+                "originated-auth".into(),
+                Some("origin"),
+                SshAuthPrompt {
+                    client_id: 7,
+                    connection_generation: 1,
+                    challenge_id: "originated-auth".into(),
+                    target_id: "target".into(),
+                    session_id: None,
+                    kind: SshAuthPromptKind::PrivateKeyPassphrase,
+                    detail: SshAuthPromptDetail::Secret {
+                        username: "user".into(),
+                        message: "SSH_RAW_SECRET_MARKER".into(),
+                        allow_remember: false,
+                    },
+                }
+            )
+            .await
+        });
+
+        assert!(matches!(
+            events.recv().await.unwrap(),
+            SshEvent::Authentication(prompt) if prompt.session_id.as_deref() == Some("origin")
+        ));
+        let snapshot = service.pending_interactions(7).await;
+        assert_eq!(
+            snapshot.authentication.as_slice(),
+            [SshAuthPrompt {
+                client_id: 7,
+                connection_generation: 1,
+                challenge_id: "originated-auth".into(),
+                target_id: "target".into(),
+                session_id: Some("origin".into()),
+                kind: SshAuthPromptKind::PrivateKeyPassphrase,
+                detail: SshAuthPromptDetail::Secret {
+                    username: "user".into(),
+                    message: "SSH_RAW_SECRET_MARKER".into(),
+                    allow_remember: false,
+                },
+            }]
+        );
+        assert_eq!(
+            origin_receiver.recv().await,
+            Some(SshAttentionKind::Authentication)
+        );
+        assert!(other_receiver.try_recv().is_err());
+        service.clear_client_interactions(7).await;
+        assert!(matches!(waiter.await.unwrap(), Err(InteractionError::Unavailable)));
+    }
+
+    #[tokio::test]
+    async fn sessionless_auth_wait_does_not_borrow_a_registered_session_attention_sink() {
+        let home = tempfile::tempdir().unwrap();
+        let service = SessionSsh::new(home.path().to_owned());
+        let (sender, mut receiver) = mpsc::unbounded_channel();
+        service.register_session_attention_sink("unrelated-session".into(), sender);
+        let mut events = service.subscribe_events();
+        let service_ref = Arc::downgrade(&service.inner);
+        let waiter = tokio::spawn(async move {
+            await_auth_response(
+                &service_ref,
+                7,
+                1,
+                "manual-auth".into(),
+                None,
+                SshAuthPrompt {
+                    client_id: 7,
+                    connection_generation: 1,
+                    challenge_id: "manual-auth".into(),
+                    target_id: "target".into(),
+                    session_id: None,
+                    kind: SshAuthPromptKind::Password,
+                    detail: SshAuthPromptDetail::Secret {
+                        username: "user".into(),
+                        message: "SSH_RAW_SECRET_MARKER".into(),
+                        allow_remember: false,
+                    },
+                }
+            )
+            .await
+        });
+
+        assert!(matches!(
+            events.recv().await.unwrap(),
+            SshEvent::Authentication(prompt) if prompt.session_id.is_none()
+        ));
+        assert!(receiver.try_recv().is_err());
+        service.clear_client_interactions(7).await;
+        assert!(matches!(waiter.await.unwrap(), Err(InteractionError::Unavailable)));
+    }
+
+    #[tokio::test]
+    async fn provisional_child_attention_routes_bootstrap_operation_to_parent_then_yields_to_child(
+    ) {
+        let home = tempfile::tempdir().unwrap();
+        let service = SessionSsh::new(home.path().to_owned());
+        let child_binding = binding("child-binding", "child", "/remote/project");
+        service
+            .restore_session(
+                "child",
+                PersistedSshState {
+                    grants: vec![PersistedSshGrant {
+                        binding: child_binding.clone(),
+                        parent_binding_id: None,
+                        requires_revalidation: false,
+                        scope: SshGrantScope::CurrentSession,
+                        revoke_status: None,
+                        worker_bound: false,
+                        worker_commands: Vec::new(),
+                    }],
+                    default_binding_id: Some(child_binding.id.clone()),
+                    pending_requests: Vec::new(),
+                },
+            )
+            .await;
+        let (parent_sender, mut parent_receiver) = mpsc::unbounded_channel();
+        service.register_session_attention_sink("parent".into(), parent_sender);
+        let provisional =
+            service.register_provisional_child_attention_sink("parent", "child");
+        let mut events = service.subscribe_events();
+        let callbacks = WorkerCallbacks {
+            service: Arc::downgrade(&service.inner),
+            client_id: Some(7),
+            binding: child_binding,
+            target_epoch: service.target_config_epoch(),
+            allow_session: false,
+        };
+        let operation = tokio::spawn(async move {
+            callbacks
+                .approve(SshApprovalRequest {
+                    approval_id: "bootstrap-operation".into(),
+                    operation_id: "bootstrap-operation".into(),
+                    binding_id: "child-binding".into(),
+                    session_id: "child".into(),
+                    operation: SshOperation::Execute,
+                    title: "bootstrap operation".into(),
+                    detail: serde_json::json!({}),
+                })
+                .await
+        });
+
+        assert!(matches!(
+            events.recv().await.unwrap(),
+            SshEvent::OperationApproval(approval) if approval.session_id == "child"
+        ));
+        assert_eq!(
+            parent_receiver.recv().await,
+            Some(SshAttentionKind::OperationApproval)
+        );
+        service.clear_client_interactions(7).await;
+        assert_eq!(operation.await.unwrap(), SshApprovalDecision::Deny);
+        let mut bootstrap_auth_events = service.subscribe_events();
+        let service_ref = Arc::downgrade(&service.inner);
+        let bootstrap_authentication = tokio::spawn(async move {
+            await_auth_response(
+                &service_ref,
+                7,
+                1,
+                "child-bootstrap-auth".into(),
+                Some("child"),
+                password_auth_prompt("child-bootstrap-auth"),
+            )
+            .await
+        });
+        assert!(matches!(
+            bootstrap_auth_events.recv().await.unwrap(),
+            SshEvent::Authentication(prompt) if prompt.session_id.as_deref() == Some("child")
+        ));
+        assert_eq!(
+            parent_receiver.recv().await,
+            Some(SshAttentionKind::Authentication)
+        );
+        service.clear_client_interactions(7).await;
+        assert!(matches!(
+            bootstrap_authentication.await.unwrap(),
+            Err(InteractionError::Unavailable)
+        ));
+
+
+        let (child_sender, mut child_receiver) = mpsc::unbounded_channel();
+        service.register_session_attention_sink("child".into(), child_sender);
+        drop(provisional);
+        let mut auth_events = service.subscribe_events();
+        let service_ref = Arc::downgrade(&service.inner);
+        let authentication = tokio::spawn(async move {
+            await_auth_response(
+                &service_ref,
+                7,
+                1,
+                "child-after-bootstrap".into(),
+                Some("child"),
+                password_auth_prompt("child-after-bootstrap"),
+            )
+            .await
+        });
+
+        assert!(matches!(
+            auth_events.recv().await.unwrap(),
+            SshEvent::Authentication(prompt) if prompt.session_id.as_deref() == Some("child")
+        ));
+        assert_eq!(
+            child_receiver.recv().await,
+            Some(SshAttentionKind::Authentication)
+        );
+        assert!(parent_receiver.try_recv().is_err());
+        service.clear_client_interactions(7).await;
+        assert!(matches!(
+            authentication.await.unwrap(),
+            Err(InteractionError::Unavailable)
+        ));
+    }
+
+    #[tokio::test]
+    async fn provisional_child_attention_guard_drop_removes_transient_route_without_replacing_child(
+    ) {
+        let home = tempfile::tempdir().unwrap();
+        let service = SessionSsh::new(home.path().to_owned());
+        let (parent_sender, mut parent_receiver) = mpsc::unbounded_channel();
+        service.register_session_attention_sink("parent".into(), parent_sender);
+        let provisional =
+            service.register_provisional_child_attention_sink("parent", "child");
+        drop(provisional);
+        let mut events = service.subscribe_events();
+        let service_ref = Arc::downgrade(&service.inner);
+        let authentication = tokio::spawn(async move {
+            await_auth_response(
+                &service_ref,
+                7,
+                1,
+                "after-provisional-drop".into(),
+                Some("child"),
+                password_auth_prompt("after-provisional-drop"),
+            )
+            .await
+        });
+
+        assert!(matches!(
+            events.recv().await.unwrap(),
+            SshEvent::Authentication(prompt) if prompt.session_id.as_deref() == Some("child")
+        ));
+        assert!(parent_receiver.try_recv().is_err());
+        service.clear_client_interactions(7).await;
+        assert!(matches!(
+            authentication.await.unwrap(),
+            Err(InteractionError::Unavailable)
+        ));
+
+        let (child_sender, mut child_receiver) = mpsc::unbounded_channel();
+        service.register_session_attention_sink("child".into(), child_sender);
+        let provisional =
+            service.register_provisional_child_attention_sink("parent", "child");
+        let mut events = service.subscribe_events();
+        let service_ref = Arc::downgrade(&service.inner);
+        let authentication = tokio::spawn(async move {
+            await_auth_response(
+                &service_ref,
+                7,
+                1,
+                "real-child-sink".into(),
+                Some("child"),
+                password_auth_prompt("real-child-sink"),
+            )
+            .await
+        });
+
+        assert!(matches!(
+            events.recv().await.unwrap(),
+            SshEvent::Authentication(prompt) if prompt.session_id.as_deref() == Some("child")
+        ));
+        assert_eq!(
+            child_receiver.recv().await,
+            Some(SshAttentionKind::Authentication)
+        );
+        assert!(parent_receiver.try_recv().is_err());
+        drop(provisional);
+        service.clear_client_interactions(7).await;
+        assert!(matches!(
+            authentication.await.unwrap(),
+            Err(InteractionError::Unavailable)
+        ));
     }
 
     #[tokio::test]
@@ -6150,6 +6805,8 @@ mod tests {
     #[tokio::test]
     async fn pending_interactions_snapshot_includes_live_worker_install_only_until_decided() {
         let (_home, service, granted) = service_with_execute_grant().await;
+        let (sender, mut attention) = mpsc::unbounded_channel();
+        service.register_session_attention_sink("session".into(), sender);
         let bridge = WorkerInstallBridge {
             service: Arc::downgrade(&service.inner),
             client_id: Some(7),
@@ -6167,6 +6824,10 @@ mod tests {
             events.recv().await.unwrap(),
             SshEvent::WorkerInstallRequested(request) if request.request_id == "snapshot-install"
         ));
+        assert_eq!(
+            attention.recv().await,
+            Some(SshAttentionKind::WorkerInstall)
+        );
 
         let snapshot = service.pending_interactions(7).await;
         assert_eq!(snapshot.worker_installs.len(), 1);
@@ -7437,6 +8098,8 @@ mod tests {
             default_binding_id: Some(granted.id.clone()),
             pending_requests: Vec::new(),
         }).await;
+        let (sender, mut attention) = mpsc::unbounded_channel();
+        service.register_session_attention_sink("session".into(), sender);
         let mut events = service.subscribe_events();
         let callbacks = WorkerCallbacks {
             service: Arc::downgrade(&service.inner),
@@ -7460,6 +8123,10 @@ mod tests {
             result = &mut approval => panic!("approval ended before review: {result:?}"),
             event = events.recv() => assert!(matches!(event.unwrap(), SshEvent::OperationApproval(_))),
         }
+        assert_eq!(
+            attention.recv().await,
+            Some(SshAttentionKind::OperationApproval)
+        );
         tokio::time::advance(INTERACTION_TIMEOUT).await;
         assert_eq!(approval.await, SshApprovalDecision::Deny);
         let terminal = events.try_recv().expect("expired approval must retire the client card");

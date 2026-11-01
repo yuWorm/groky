@@ -868,7 +868,7 @@ pub(super) fn dispatch_task_result(result: TaskResult, app: &mut AppView) -> Vec
             effects
         }
         TaskResult::SshAuthenticationComplete {
-            client_id, owner, challenge_id: _, connection_generation: _, target_id, error,
+            client_id, owner, challenge_id, connection_generation, target_id, error,
         } => {
             if app.ssh_event_client_id.is_some_and(|current| current != client_id)
                 || super::ssh::ssh_manager_for_owner_mut(app, owner).is_none()
@@ -877,6 +877,11 @@ pub(super) fn dispatch_task_result(result: TaskResult, app: &mut AppView) -> Vec
             }
             if let Some(mut error) = error {
                 error.retain(|character| !character.is_control());
+                if let Some(manager) = super::ssh::ssh_manager_for_owner_mut(app, owner) {
+                    manager.restore_submitted_sudo_authentication(
+                        client_id, &challenge_id, connection_generation, &target_id, error.clone(),
+                    );
+                }
                 let message = format!("SSH authentication for {target_id} failed: {error}");
                 match owner.agent_id {
                     Some(agent_id) => {
@@ -893,27 +898,30 @@ pub(super) fn dispatch_task_result(result: TaskResult, app: &mut AppView) -> Vec
             super::ssh::drain_ssh_pending_interaction_continuation(app, owner)
         }
         TaskResult::SshActionComplete {
-            session_id: _,
+            session_id,
             client_id,
             owner,
-            target_id: _,
+            target_id,
             message,
             error,
         } => {
             app.ssh_client_id = client_id;
             let refresh = owner.and_then(|owner| {
                 let manager = super::ssh::ssh_manager_for_owner_mut(app, owner)?;
-                match error {
-                    Some(error) => manager.show_error(error),
-                    None => {
-                        if let Some(message) = message
-                            && (message
-                                != "SSH access revoked locally; waiting for worker confirmation."
-                                || !manager.has_worker_acknowledged_revocation())
-                        {
-                            manager.show_info(message);
-                        }
+                if let Some(error) = error {
+                    if !manager.restore_submitted_grant(
+                        session_id.as_deref(),
+                        target_id.as_deref(),
+                        error.clone(),
+                    ) {
+                        manager.show_error(error);
                     }
+                } else if let Some(message) = message
+                    && (message
+                        != "SSH access revoked locally; waiting for worker confirmation."
+                        || !manager.has_worker_acknowledged_revocation())
+                {
+                    manager.show_info(message);
                 }
                 Some(Effect::SshListTargets {
                     session_id: manager.session_id.clone(),
@@ -1011,6 +1019,7 @@ pub(super) fn dispatch_task_result(result: TaskResult, app: &mut AppView) -> Vec
             app.ssh_event_control_generation = control_generation;
             app.ssh_event_client_id = Some(client_id);
             app.ssh_client_id = client_id;
+            app.ssh_attention.reconcile(&snapshot);
             super::ssh::reconcile_ssh_pending_interactions(app, snapshot)
         }
         TaskResult::SshEventStreamEvent {

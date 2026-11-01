@@ -1815,7 +1815,8 @@ pub(super) fn handle_prompt_response(
                     session_name,
                     model: model.as_deref(),
                     activity: None,
-                    has_pending_permissions: false,
+                    needs_user_action: app.ssh_attention.is_pending()
+                        || !agent.permission_queue.is_empty(),
                     cwd: Some(&cwd_str),
                     turn_elapsed: None,
                     is_busy: false,

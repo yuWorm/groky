@@ -72,6 +72,7 @@ pub(crate) mod screen_mode_relaunch;
 mod session_load_barrier;
 mod startup_failure;
 use reader_thread::ReaderThread;
+pub(crate) mod ssh_attention;
 pub(crate) mod ssh_control;
 pub mod signal_handler;
 mod teardown_fence;

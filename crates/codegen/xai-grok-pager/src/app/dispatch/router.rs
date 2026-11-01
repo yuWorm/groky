@@ -164,6 +164,7 @@ pub(crate) fn dispatch(action: Action, app: &mut AppView) -> Vec<Effect> {
     let effects = dispatch_inner(action, app);
     app.dispatch_depth = app.dispatch_depth.saturating_sub(1);
     if app.dispatch_depth == 0 {
+        app.sync_ssh_attention();
         flush_image_notices(app);
     }
     effects

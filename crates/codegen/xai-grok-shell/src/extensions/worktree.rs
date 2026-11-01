@@ -233,6 +233,10 @@ async fn resume_ssh_session_in_worktree(
             req.session_id
         )
     })?;
+    let _ssh_child_attention_guard = service.register_provisional_child_attention_sink(
+        &req.session_id,
+        &new_session_id,
+    );
     let approval_client_id = service
         .interaction_client_id(&source_binding.id)
         .await

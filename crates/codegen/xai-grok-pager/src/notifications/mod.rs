@@ -520,7 +520,7 @@ mod tests {
             session_name: None,
             model: None,
             activity: None,
-            has_pending_permissions: false,
+            needs_user_action: false,
             cwd: None,
             turn_elapsed: None,
             is_busy,

@@ -1,5 +1,6 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Mutex;
 
 use xai_acp_lib::AcpAgentGatewaySender;
 
@@ -17,6 +18,48 @@ fn install_notification_client_hook(actor: &SessionActor) {
         }],
     );
     *actor.client_hooks.borrow_mut() = client_hooks;
+}
+
+async fn setup_ssh_attention_actor(
+    session_id: &str,
+) -> (Arc<SessionActor>, Arc<Mutex<Vec<serde_json::Value>>>) {
+    let (gateway_tx, mut gateway_rx) =
+        tokio::sync::mpsc::unbounded_channel::<xai_acp_lib::AcpClientMessage>();
+    let (persistence_tx, _persistence_rx) =
+        tokio::sync::mpsc::unbounded_channel::<PersistenceMsg>();
+    let mut actor = create_test_actor(0, 256_000, 85, gateway_tx, persistence_tx).await;
+    actor.session_info.id = acp::SessionId::new(session_id);
+    actor.hook_resolved_workspace_root = actor.session_info.cwd.clone();
+    install_notification_client_hook(&actor);
+    let actor = Arc::new(actor);
+    let captured = Arc::new(Mutex::new(Vec::new()));
+    let captured_hooks = captured.clone();
+    tokio::task::spawn_local(async move {
+        while let Some(message) = gateway_rx.recv().await {
+            if let xai_acp_lib::AcpClientMessage::ExtNotification(args) = message
+                && args.request.method.as_ref() == "x.ai/hooks/event"
+            {
+                let params: serde_json::Value =
+                    serde_json::from_str(args.request.params.get()).unwrap();
+                if params.get("notificationType")
+                    == Some(&serde_json::json!("permission_prompt"))
+                {
+                    captured_hooks.lock().unwrap().push(params);
+                }
+            }
+        }
+    });
+    (actor, captured)
+}
+
+async fn wait_for_hook_count(captured: &Arc<Mutex<Vec<serde_json::Value>>>, count: usize) {
+    tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        while captured.lock().unwrap().len() < count {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("permission_prompt hook must arrive");
 }
 
 async fn setup_actor(
@@ -57,6 +100,106 @@ async fn setup_actor_with_pre_tool_use_hook(
         })
         .await;
     (actor, hooks, local)
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn ssh_tool_grant_hook_uses_only_its_originating_session_once_and_excludes_reason() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (source, source_hooks) = setup_ssh_attention_actor("source-session").await;
+            let (other, other_hooks) = setup_ssh_attention_actor("other-session").await;
+            let source_session_id = source.session_id_string();
+            let other_session_id = other.session_id_string();
+            assert_ne!(source_session_id, other_session_id);
+
+            let home = tempfile::tempdir().unwrap();
+            let marker = home.path().join("permission-prompt.json");
+            let mut spec = pre_tool_use_spec(
+                "test/ssh-wait",
+                Some("permission_prompt"),
+                "cat > \"$SSH_NOTIFICATION_MARKER\"",
+            );
+            spec.event = xai_grok_hooks::event::HookEventName::Notification;
+            spec.extra_env.insert(
+                "SSH_NOTIFICATION_MARKER".into(),
+                marker.to_string_lossy().into_owned(),
+            );
+            let (mut registry, _) = xai_grok_hooks::discovery::load_hooks(None, None);
+            registry.append_specs(vec![spec]);
+            *source.hook_registry.borrow_mut() = Some(Arc::new(registry));
+            let service = Arc::new(crate::ssh::SessionSsh::new(home.path().to_owned()));
+            source.wire_ssh_attention_notifications(&service);
+            other.wire_ssh_attention_notifications(&service);
+            let mut events = service.subscribe_events();
+            let request_service = service.clone();
+            let request_session_id = source_session_id.clone();
+            let request = tokio::task::spawn_local(async move {
+                request_service
+                    .request_tool_grant(
+                        request_session_id,
+                        None,
+                        None,
+                        crate::ssh::SshCapabilities::all(),
+                        "SSH_RAW_SECRET_MARKER".into(),
+                        Some(7),
+                        None,
+                    )
+                    .await
+            });
+
+            let request_id = match events.recv().await.unwrap() {
+                crate::ssh::SshEvent::GrantRequested(request) => request.id,
+                event => panic!("expected tool grant request, got {event:?}"),
+            };
+            wait_for_hook_count(&source_hooks, 1).await;
+            let hooks = source_hooks.lock().unwrap().clone();
+            assert_eq!(hooks.len(), 1);
+            assert_eq!(hooks[0]["sessionId"], source_session_id);
+            assert_eq!(hooks[0]["notificationType"], "permission_prompt");
+            assert_eq!(hooks[0]["message"], "SSH access approval requested");
+            assert!(
+                !serde_json::to_string(&hooks).unwrap().contains("SSH_RAW_SECRET_MARKER"),
+                "the hook event must not include the model's access reason"
+            );
+            assert!(
+                other_hooks.lock().unwrap().is_empty(),
+                "a shared SSH service must not broadcast the hook to another session"
+            );
+            let command_event: serde_json::Value =
+                tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                    loop {
+                        if let Ok(bytes) = tokio::fs::read(&marker).await
+                            && let Ok(event) = serde_json::from_slice(&bytes)
+                        {
+                            break event;
+                        }
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .expect("the configured permission_prompt command must execute");
+            assert_eq!(command_event["sessionId"], source_session_id);
+            assert_eq!(command_event["notificationType"], "permission_prompt");
+            assert_eq!(command_event["message"], "SSH access approval requested");
+            assert!(!command_event.to_string().contains("SSH_RAW_SECRET_MARKER"));
+
+            service
+                .cancel_grant(&source_session_id, &request_id, 7)
+                .await
+                .unwrap();
+            assert!(matches!(
+                request.await.unwrap(),
+                Err(crate::ssh::SshServiceError::GrantCancelled)
+            ));
+            tokio::task::yield_now().await;
+            assert_eq!(
+                source_hooks.lock().unwrap().len(),
+                1,
+                "terminal grant events must not replay the permission_prompt hook"
+            );
+        })
+        .await;
 }
 
 #[tokio::test(flavor = "current_thread")]

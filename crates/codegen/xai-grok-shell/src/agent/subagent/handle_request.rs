@@ -944,6 +944,14 @@ pub(crate) async fn run_shell_child(
         ctx.resolve_auto_compact_threshold_percent(&subagent_model_id);
     let subagent_id = request.id.clone();
     let child_session_id = acp::SessionId::new(subagent_id.clone());
+    let ssh_child_attention_guard =
+        match (parent_ssh_binding_id.as_deref(), ctx.session_ssh.as_ref()) {
+            (Some(_), Some(service)) => Some(service.register_provisional_child_attention_sink(
+                &ctx.parent_session_id,
+                child_session_id.0.as_ref(),
+            )),
+            _ => None,
+        };
     let child_workspace_ops = match parent_ssh_binding_id.as_deref() {
         Some(parent_binding_id) => {
             let Some(service) = ctx.session_ssh.as_ref() else {
@@ -1836,6 +1844,7 @@ pub(crate) async fn run_shell_child(
         }),
         Some(ctx.subagent_sampling_semaphore.clone()),
         None,
+        ctx.session_ssh.clone(),
     )
     .await;
     crate::waterfall::mark(&request.id, crate::waterfall::stage::SESSION_UP);
@@ -1864,6 +1873,7 @@ pub(crate) async fn run_shell_child(
             return child_run_output(result, completion_data, None);
         }
     };
+    drop(ssh_child_attention_guard);
     let session::SessionInitResult {
         handle: child_handle,
         permission_events_rx: mut permission_rx,

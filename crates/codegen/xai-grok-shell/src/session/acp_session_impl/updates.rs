@@ -981,6 +981,34 @@ impl SessionActor {
             }
         });
     }
+
+    /// Forward new SSH waits to this actor's local permission-prompt hook.
+    /// The SSH service owns only the channel sender; the listener keeps weak
+    /// references so neither side extends the other's lifetime.
+    pub(super) fn wire_ssh_attention_notifications(
+        self: &std::sync::Arc<Self>,
+        service: &std::sync::Arc<crate::ssh::SessionSsh>,
+    ) -> u64 {
+        let session_id = self.session_id_string();
+        let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+        let generation = service.register_session_attention_sink(session_id.clone(), sender);
+        let session = std::sync::Arc::downgrade(self);
+        let service = std::sync::Arc::downgrade(service);
+        tokio::task::spawn_local(async move {
+            while let Some(attention) = receiver.recv().await {
+                let Some(session) = session.upgrade() else {
+                    break;
+                };
+                session
+                    .dispatch_permission_prompt_notification(attention.message())
+                    .await;
+            }
+            if let Some(service) = service.upgrade() {
+                service.unregister_session_attention_sink(&session_id, generation);
+            }
+        });
+        generation
+    }
     #[tracing::instrument(skip_all)]
     pub(super) async fn send_xai_notification(&self, update: XaiSessionUpdate) {
         self.send_xai_notification_with_extra_meta(
